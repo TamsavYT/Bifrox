@@ -1,0 +1,314 @@
+use crate::config::EngineConfig;
+use crate::protocol::{RecordFrame, HEADER_SIZE};
+use crate::segment::index::IndexSegment;
+use crate::segment::log::{format_segment_filename, LogSegment};
+use std::fs;
+use std::io::Result as IoResult;
+use std::path::{Path, PathBuf};
+
+/// Segment pair holding associated log segment and index segment
+#[derive(Debug)]
+pub struct SegmentPair {
+    pub base_offset: u64,
+    pub log: LogSegment,
+    pub index: IndexSegment,
+}
+
+/// Rotates log and index segments, manages historical segments, and performs index-accelerated seeks
+#[derive(Debug)]
+pub struct SegmentManager {
+    dir: PathBuf,
+    config: EngineConfig,
+    active: SegmentPair,
+    historical: Vec<SegmentPair>,
+    bytes_since_last_index: u64,
+    high_watermark: u64,
+}
+
+impl SegmentManager {
+    pub fn open(dir: impl AsRef<Path>, config: EngineConfig) -> IoResult<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+
+        // Discover existing log segments
+        let mut base_offsets = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "log") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(base_offset) = stem.parse::<u64>() {
+                        base_offsets.push(base_offset);
+                    }
+                }
+            }
+        }
+
+        base_offsets.sort_unstable();
+
+        if base_offsets.is_empty() {
+            base_offsets.push(0);
+        }
+
+        let mut historical = Vec::new();
+        let active_base = base_offsets.pop().unwrap();
+
+        for base in base_offsets {
+            let index_path = dir.join(format!("{}.index", format_segment_filename(base)));
+            let mut index = IndexSegment::open(index_path, base)?;
+            let log = LogSegment::open(
+                &dir,
+                base,
+                config.max_segment_bytes,
+                config.index_interval_bytes,
+                config.preallocate_segments,
+                &mut index,
+            )?;
+            historical.push(SegmentPair {
+                base_offset: base,
+                log,
+                index,
+            });
+        }
+
+        let active_index_path = dir.join(format!("{}.index", format_segment_filename(active_base)));
+        let mut active_index = IndexSegment::open(active_index_path, active_base)?;
+        let active_log = LogSegment::open(
+            &dir,
+            active_base,
+            config.max_segment_bytes,
+            config.index_interval_bytes,
+            config.preallocate_segments,
+            &mut active_index,
+        )?;
+
+        let high_watermark = active_log.next_offset;
+
+        Ok(Self {
+            dir,
+            config,
+            active: SegmentPair {
+                base_offset: active_base,
+                log: active_log,
+                index: active_index,
+            },
+            historical,
+            bytes_since_last_index: 0,
+            high_watermark,
+        })
+    }
+
+    pub fn high_watermark(&self) -> u64 {
+        self.high_watermark
+    }
+
+    /// Append record frames into active segment. Performs segment rotation if size limit reached.
+    pub fn append(&mut self, payload: &[u8], timestamp: u64) -> IoResult<RecordFrame> {
+        let assigned_offset = self.high_watermark;
+        let frame = RecordFrame::create(assigned_offset, timestamp, payload.to_vec());
+        let frame_size = frame.encoded_size() as u64;
+
+        // Rotate segment if active log size exceeds configured threshold
+        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
+            self.rotate_segment()?;
+        }
+
+        let mut encoded = Vec::with_capacity(frame.encoded_size());
+        frame.encode_into(&mut encoded);
+
+        let physical_pos = self.active.log.append_bytes(&encoded)?;
+
+        // Sparse index entry placement
+        if self.bytes_since_last_index >= self.config.index_interval_bytes
+            || self.active.index.entries_count() == 0
+        {
+            self.active
+                .index
+                .append(assigned_offset, physical_pos)?;
+            self.bytes_since_last_index = 0;
+        }
+
+        self.bytes_since_last_index += frame_size;
+        self.high_watermark += 1;
+        self.active.log.next_offset = self.high_watermark;
+
+        Ok(frame)
+    }
+
+    /// Rotate active segment to new segment file
+    fn rotate_segment(&mut self) -> IoResult<()> {
+        let new_base_offset = self.high_watermark;
+        tracing::info!(
+            "Rotating segment at offset {}. Active segment size was {} bytes.",
+            new_base_offset,
+            self.active.log.physical_size
+        );
+
+        self.active.log.finalize()?;
+        self.active.index.sync()?;
+
+        let new_index_path = self
+            .dir
+            .join(format!("{}.index", format_segment_filename(new_base_offset)));
+        let mut new_index = IndexSegment::open(new_index_path, new_base_offset)?;
+        let new_log = LogSegment::open(
+            &self.dir,
+            new_base_offset,
+            self.config.max_segment_bytes,
+            self.config.index_interval_bytes,
+            self.config.preallocate_segments,
+            &mut new_index,
+        )?;
+
+        let new_active = SegmentPair {
+            base_offset: new_base_offset,
+            log: new_log,
+            index: new_index,
+        };
+
+        let old_active = std::mem::replace(&mut self.active, new_active);
+        self.historical.push(old_active);
+        self.bytes_since_last_index = 0;
+
+        Ok(())
+    }
+
+    /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
+    pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
+        let segment_pair = self.find_segment_pair_mut(start_offset);
+        let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
+
+        let start_pos = seek_entry.map_or(0, |e| e.physical_position);
+        let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
+
+        let mut frames = Vec::new();
+        let mut cursor = 0usize;
+
+        while cursor < raw_bytes.len() {
+            if cursor + HEADER_SIZE > raw_bytes.len() {
+                break;
+            }
+            let slice = &raw_bytes[cursor..];
+            match RecordFrame::decode(slice) {
+                Ok((frame, consumed)) => {
+                    cursor += consumed;
+                    if frame.offset >= start_offset {
+                        frames.push(frame);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(frames)
+    }
+
+    /// Fast binary search seek ($O(\log N)$) for nearest physical byte position of logical offset
+    pub fn seek(&self, target_offset: u64) -> Option<(u64, u64)> {
+        let pair = self.find_segment_pair(target_offset);
+        pair.index
+            .find_nearest_physical_pos(target_offset)
+            .map(|e| (pair.base_offset, e.physical_position))
+    }
+
+    /// Garbage collector: unlinks closed segments exceeding configured size or time retention limits
+    pub fn apply_retention(&mut self) -> IoResult<usize> {
+        let mut removed_count = 0;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let retention_bytes = self.config.retention_bytes;
+        let retention_millis = self.config.retention_millis;
+
+        let mut i = 0;
+        while i < self.historical.len() {
+            let pair = &self.historical[i];
+            let file_age_ms = pair.log.modified_time_ms().unwrap_or(0);
+
+            let mut remove = false;
+
+            if let Some(max_age_ms) = retention_millis {
+                if now_ms > file_age_ms && (now_ms - file_age_ms) > max_age_ms {
+                    remove = true;
+                }
+            }
+
+            if let Some(max_bytes) = retention_bytes {
+                let total_bytes: u64 = self.historical.iter().map(|p| p.log.physical_size).sum::<u64>()
+                    + self.active.log.physical_size;
+                if total_bytes > max_bytes {
+                    remove = true;
+                }
+            }
+
+            if remove {
+                let pair_to_remove = self.historical.remove(i);
+                let log_path = pair_to_remove.log.path.clone();
+                let index_path = pair_to_remove.index.path().to_path_buf();
+
+                tracing::info!(
+                    "Garbage Collector: Unlinking expired log segment {} and index {}",
+                    log_path.display(),
+                    index_path.display()
+                );
+
+                // Explicitly drop handles before removing files on Windows
+                drop(pair_to_remove);
+
+                let _ = fs::remove_file(&log_path);
+                let _ = fs::remove_file(&index_path);
+                removed_count += 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(removed_count)
+    }
+
+    /// Flushes log and index files to physical disk
+    pub fn sync(&mut self) -> IoResult<()> {
+        self.active.log.sync()?;
+        self.active.index.sync()?;
+        Ok(())
+    }
+
+    fn find_segment_pair(&self, offset: u64) -> &SegmentPair {
+        if self.historical.is_empty() {
+            return &self.active;
+        }
+
+        match self.historical.binary_search_by_key(&offset, |p| p.base_offset) {
+            Ok(idx) => &self.historical[idx],
+            Err(idx) => {
+                if idx == 0 {
+                    &self.historical[0]
+                } else if idx <= self.historical.len() {
+                    let cand = &self.historical[idx - 1];
+                    if offset >= self.active.base_offset {
+                        &self.active
+                    } else {
+                        cand
+                    }
+                } else {
+                    &self.active
+                }
+            }
+        }
+    }
+
+    fn find_segment_pair_mut(&mut self, offset: u64) -> &mut SegmentPair {
+        if offset >= self.active.base_offset || self.historical.is_empty() {
+            return &mut self.active;
+        }
+
+        for i in (0..self.historical.len()).rev() {
+            if offset >= self.historical[i].base_offset {
+                return &mut self.historical[i];
+            }
+        }
+        &mut self.active
+    }
+}

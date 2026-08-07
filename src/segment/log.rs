@@ -1,0 +1,205 @@
+use crate::protocol::{FrameError, RecordFrame, HEADER_SIZE};
+use crate::segment::index::{IndexEntry, IndexSegment};
+use std::fs::OpenOptions;
+use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+/// Formats a base offset into a 20-digit zero-padded filename string (e.g. `00000000000000000000`)
+pub fn format_segment_filename(base_offset: u64) -> String {
+    format!("{:020}", base_offset)
+}
+
+/// Active or historical log segment file
+#[derive(Debug)]
+pub struct LogSegment {
+    pub base_offset: u64,
+    pub next_offset: u64,
+    pub path: PathBuf,
+    pub file: std::fs::File,
+    pub physical_size: u64, // Actual valid byte offset in log file
+    pub is_preallocated: bool,
+}
+
+impl LogSegment {
+    /// Opens or creates a segment file, performs CRC recovery on startup, truncates partial writes,
+    /// and rebuilds missing/corrupt index entries. Handles Windows NTFS file sharing gracefully.
+    pub fn open(
+        dir: impl AsRef<Path>,
+        base_offset: u64,
+        max_bytes: u64,
+        index_interval: u64,
+        preallocate: bool,
+        index_segment: &mut IndexSegment,
+    ) -> IoResult<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        let filename = format_segment_filename(base_offset);
+        let log_path = dir.join(format!("{}.log", filename));
+
+        let exists = log_path.exists();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        options.share_mode(7); // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+
+        let mut file = options.open(&log_path)?;
+
+        let mut physical_size = 0u64;
+        let mut next_offset = base_offset;
+        let mut rebuilt_index_entries = Vec::new();
+        let mut bytes_since_last_index = 0u64;
+        let mut encountered_corruption = false;
+
+        if exists {
+            // Perform full recovery scan & CRC verification on startup
+            file.seek(SeekFrom::Start(0))?;
+            let raw_len = file.metadata()?.len();
+            let mut read_buf = vec![0u8; raw_len as usize];
+            let read_bytes = file.read(&mut read_buf)?;
+
+            let mut cursor = 0usize;
+            while cursor < read_bytes {
+                if cursor + HEADER_SIZE > read_bytes {
+                    let remaining = &read_buf[cursor..read_bytes];
+                    if remaining.iter().all(|&b| b == 0) {
+                        // Clean unwritten pre-allocated zero padding at EOF
+                        break;
+                    }
+                    tracing::warn!(
+                        "Incomplete frame header at byte position {} in segment {}. Truncating.",
+                        cursor,
+                        base_offset
+                    );
+                    encountered_corruption = true;
+                    break;
+                }
+
+                let slice = &read_buf[cursor..];
+                // Check if remaining frame slice starts with clean pre-allocated zero bytes
+                if slice[0] == 0 && slice[1..std::cmp::min(HEADER_SIZE, slice.len())].iter().all(|&b| b == 0) {
+                    break;
+                }
+
+                match RecordFrame::decode(slice) {
+                    Ok((frame, frame_len)) => {
+                        // Check index entry interval
+                        if bytes_since_last_index >= index_interval || rebuilt_index_entries.is_empty() {
+                            rebuilt_index_entries.push(IndexEntry {
+                                logical_offset: frame.offset,
+                                physical_position: cursor as u64,
+                            });
+                            bytes_since_last_index = 0;
+                        }
+
+                        bytes_since_last_index += frame_len as u64;
+                        cursor += frame_len;
+                        next_offset = frame.offset + 1;
+                    }
+                    Err(FrameError::BufferTooShort { .. }) => {
+                        let remaining = &read_buf[cursor..read_bytes];
+                        if remaining.iter().all(|&b| b == 0) {
+                            break;
+                        }
+                        tracing::warn!(
+                            "Partial payload at byte position {} in segment {}. Truncating.",
+                            cursor,
+                            base_offset
+                        );
+                        encountered_corruption = true;
+                        break;
+                    }
+                    Err(err) => {
+                        let remaining = &read_buf[cursor..read_bytes];
+                        if remaining.iter().all(|&b| b == 0) {
+                            break;
+                        }
+                        tracing::error!(
+                            "Corrupt frame detected at position {} in segment {}: {}. Truncating log.",
+                            cursor,
+                            base_offset,
+                            err
+                        );
+                        encountered_corruption = true;
+                        break;
+                    }
+                }
+            }
+
+            physical_size = cursor as u64;
+
+            // Only truncate if actual corruption occurred (not clean pre-allocated zeros)
+            if encountered_corruption && physical_size != raw_len {
+                file.set_len(physical_size)?;
+                file.sync_data()?;
+            }
+
+            // Sync rebuilt index segment
+            index_segment.truncate_and_rebuild(rebuilt_index_entries)?;
+        } else if preallocate {
+            // Clean space pre-allocation on new file creation to prevent NTFS fragmentation
+            file.set_len(max_bytes)?;
+            file.sync_data()?;
+        }
+
+        file.seek(SeekFrom::Start(physical_size))?;
+
+        Ok(Self {
+            base_offset,
+            next_offset,
+            path: log_path,
+            file,
+            physical_size,
+            is_preallocated: preallocate && !exists,
+        })
+    }
+
+    /// Append raw record frame bytes to log file
+    pub fn append_bytes(&mut self, bytes: &[u8]) -> IoResult<u64> {
+        let written_pos = self.physical_size;
+        self.file.seek(SeekFrom::Start(written_pos))?;
+        self.file.write_all(bytes)?;
+        self.physical_size += bytes.len() as u64;
+        Ok(written_pos)
+    }
+
+    /// Reads raw frame bytes starting at a physical byte position up to max_bytes
+    pub fn read_at(&mut self, physical_pos: u64, max_bytes: usize) -> IoResult<Vec<u8>> {
+        if physical_pos >= self.physical_size {
+            return Ok(Vec::new());
+        }
+
+        self.file.seek(SeekFrom::Start(physical_pos))?;
+        let remaining = (self.physical_size - physical_pos) as usize;
+        let read_len = std::cmp::min(remaining, max_bytes);
+
+        let mut buf = vec![0u8; read_len];
+        let bytes_read = self.file.read(&mut buf)?;
+        buf.truncate(bytes_read);
+        Ok(buf)
+    }
+
+    /// Flushes log segment to physical disk
+    pub fn sync(&mut self) -> IoResult<()> {
+        self.file.sync_data()
+    }
+
+    /// Finalizes segment upon rotation by trimming any unused preallocated trailing space
+    pub fn finalize(&mut self) -> IoResult<()> {
+        self.file.set_len(self.physical_size)?;
+        self.file.sync_data()
+    }
+
+    /// Returns last modified timestamp in milliseconds since Unix epoch
+    pub fn modified_time_ms(&self) -> IoResult<u64> {
+        let metadata = self.file.metadata()?;
+        let modified = metadata.modified()?;
+        Ok(modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64)
+    }
+}

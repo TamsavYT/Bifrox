@@ -1,0 +1,22 @@
+# Rust build target directory
+/target/
+
+# Local Storage Engine Database Data Directories & Logs
+/data_m2/
+/data_store/
+/data/
+*.log
+*.index
+
+# IDEs & Editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+.vs/
+
+# OS-generated files
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,18 @@
+[package]
+name = "Hermes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+bytes = "1.6"
+crc32fast = "1.4"
+parking_lot = "0.12"
+dashmap = "6.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+socket2 = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
