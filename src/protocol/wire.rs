@@ -10,6 +10,10 @@ pub enum CommandCode {
     FetchOffset = 0x04,
     Seek = 0x05,
     LatestOffset = 0x06,
+    BeginTx = 0x07,
+    CommitTx = 0x08,
+    AbortTx = 0x09,
+    FetchByTimestamp = 0x0A,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -23,6 +27,10 @@ impl TryFrom<u8> for CommandCode {
             0x04 => Ok(CommandCode::FetchOffset),
             0x05 => Ok(CommandCode::Seek),
             0x06 => Ok(CommandCode::LatestOffset),
+            0x07 => Ok(CommandCode::BeginTx),
+            0x08 => Ok(CommandCode::CommitTx),
+            0x09 => Ok(CommandCode::AbortTx),
+            0x0A => Ok(CommandCode::FetchByTimestamp),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -72,6 +80,22 @@ pub enum RequestPayload {
     LatestOffset {
         topic: String,
         partition: u32,
+    },
+    BeginTx {
+        transaction_id: String,
+        producer_id: u64,
+    },
+    CommitTx {
+        transaction_id: String,
+    },
+    AbortTx {
+        transaction_id: String,
+    },
+    FetchByTimestamp {
+        topic: String,
+        partition: u32,
+        target_timestamp: u64,
+        max_bytes: u32,
     },
 }
 
@@ -222,6 +246,46 @@ impl WireRequest {
                 let partition = payload_buf.get_u32();
                 RequestPayload::LatestOffset { topic, partition }
             }
+            CommandCode::BeginTx => {
+                let transaction_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 8 {
+                    return Err(WireError::Incomplete {
+                        needed: 8,
+                        available: payload_buf.len(),
+                    });
+                }
+                let producer_id = payload_buf.get_u64();
+                RequestPayload::BeginTx {
+                    transaction_id,
+                    producer_id,
+                }
+            }
+            CommandCode::CommitTx => {
+                let transaction_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::CommitTx { transaction_id }
+            }
+            CommandCode::AbortTx => {
+                let transaction_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::AbortTx { transaction_id }
+            }
+            CommandCode::FetchByTimestamp => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 16 {
+                    return Err(WireError::Incomplete {
+                        needed: 16,
+                        available: payload_buf.len(),
+                    });
+                }
+                let partition = payload_buf.get_u32();
+                let target_timestamp = payload_buf.get_u64();
+                let max_bytes = payload_buf.get_u32();
+                RequestPayload::FetchByTimestamp {
+                    topic,
+                    partition,
+                    target_timestamp,
+                    max_bytes,
+                }
+            }
         };
 
         let total_consumed = 5 + payload_len;
@@ -232,78 +296,6 @@ impl WireRequest {
             },
             total_consumed,
         ))
-    }
-
-    /// Serializes a WireRequest into its wire binary representation: `[Cmd: 1b] | [Payload Len: 4b] | [Payload]`
-    pub fn encode(&self) -> Vec<u8> {
-        let mut inner = Vec::new();
-        match &self.payload {
-            RequestPayload::ProduceBatch {
-                topic,
-                key,
-                num_partitions,
-                records,
-            } => {
-                write_pascal_string(&mut inner, topic);
-                write_pascal_string(&mut inner, key);
-                inner.put_u32(*num_partitions);
-                inner.put_u32(records.len() as u32);
-                for rec in records {
-                    inner.put_u32(rec.len() as u32);
-                    inner.put_slice(rec);
-                }
-            }
-            RequestPayload::Fetch {
-                topic,
-                partition,
-                offset,
-                max_bytes,
-            } => {
-                write_pascal_string(&mut inner, topic);
-                inner.put_u32(*partition);
-                inner.put_u64(*offset);
-                inner.put_u32(*max_bytes);
-            }
-            RequestPayload::CommitOffset {
-                group_id,
-                topic,
-                partition,
-                offset,
-            } => {
-                write_pascal_string(&mut inner, group_id);
-                write_pascal_string(&mut inner, topic);
-                inner.put_u32(*partition);
-                inner.put_u64(*offset);
-            }
-            RequestPayload::FetchOffset {
-                group_id,
-                topic,
-                partition,
-            } => {
-                write_pascal_string(&mut inner, group_id);
-                write_pascal_string(&mut inner, topic);
-                inner.put_u32(*partition);
-            }
-            RequestPayload::Seek {
-                topic,
-                partition,
-                offset,
-            } => {
-                write_pascal_string(&mut inner, topic);
-                inner.put_u32(*partition);
-                inner.put_u64(*offset);
-            }
-            RequestPayload::LatestOffset { topic, partition } => {
-                write_pascal_string(&mut inner, topic);
-                inner.put_u32(*partition);
-            }
-        }
-
-        let mut buf = Vec::with_capacity(5 + inner.len());
-        buf.put_u8(self.cmd as u8);
-        buf.put_u32(inner.len() as u32);
-        buf.extend_from_slice(&inner);
-        buf
     }
 }
 
@@ -336,7 +328,7 @@ pub fn write_pascal_string(buf: &mut Vec<u8>, s: &str) {
 }
 
 /// Binary response returned to clients over TCP: `[Status Code: 1b] | [Payload Len: 4b] | [Payload]`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct WireResponse {
     pub status: u8, // 0 = OK, 1 = Error
     pub payload: Vec<u8>,
@@ -360,25 +352,5 @@ impl WireResponse {
         buf.put_u32(self.payload.len() as u32);
         buf.put_slice(&self.payload);
         buf
-    }
-
-    /// Decodes a WireResponse from a byte buffer: `[Status: 1b] | [Payload Len: 4b] | [Payload]`
-    pub fn decode(mut src: &[u8]) -> Result<(Self, usize), WireError> {
-        if src.len() < 5 {
-            return Err(WireError::Incomplete {
-                needed: 5,
-                available: src.len(),
-            });
-        }
-        let status = src.get_u8();
-        let payload_len = src.get_u32() as usize;
-        if src.len() < payload_len {
-            return Err(WireError::Incomplete {
-                needed: payload_len,
-                available: src.len(),
-            });
-        }
-        let payload = src[..payload_len].to_vec();
-        Ok((Self { status, payload }, 5 + payload_len))
     }
 }

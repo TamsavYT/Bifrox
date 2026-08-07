@@ -2,6 +2,7 @@ use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
 use crate::protocol::RecordFrame;
 use crate::server::partition::PartitionManager;
+use crate::server::transaction::TransactionManager;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::io::Result as IoResult;
@@ -16,21 +17,24 @@ pub fn hash_key(key: &[u8], num_partitions: usize) -> u32 {
     (hash as usize % num_partitions) as u32
 }
 
-/// StorageEngine maintaining multi-topic concurrent partition routing and consumer group offset management
+/// StorageEngine maintaining multi-topic concurrent partition routing, consumer group offsets, and transactions
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
     config: EngineConfig,
     partitions: Arc<DashMap<(String, u32), Arc<PartitionManager>>>,
     consumer_groups: ConsumerGroupManager,
+    transactions: TransactionManager,
 }
 
 impl StorageEngine {
     pub fn new(config: EngineConfig) -> IoResult<Self> {
         let consumer_groups = ConsumerGroupManager::open(&config.data_dir)?;
+        let transactions = TransactionManager::new();
         Ok(Self {
             config,
             partitions: Arc::new(DashMap::new()),
             consumer_groups,
+            transactions,
         })
     }
 
@@ -40,6 +44,10 @@ impl StorageEngine {
 
     pub fn consumer_groups(&self) -> &ConsumerGroupManager {
         &self.consumer_groups
+    }
+
+    pub fn transactions(&self) -> &TransactionManager {
+        &self.transactions
     }
 
     /// Retrieve existing partition or dynamically initialize directory `data/{topic}-{partition}` on demand
@@ -53,7 +61,6 @@ impl StorageEngine {
             return Ok(pm.value().clone());
         }
 
-        // Layout: data/{topic}-{partition}/
         let partition_dir = self
             .config
             .data_dir
@@ -128,7 +135,18 @@ impl StorageEngine {
         self.consumer_groups.fetch_offset(group_id, topic, partition)
     }
 
-    /// Triggers retention garbage collection across all open partitions
+    pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
+        self.transactions.begin_transaction(transaction_id, producer_id)
+    }
+
+    pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
+        self.transactions.commit_transaction(transaction_id)
+    }
+
+    pub fn abort_transaction(&self, transaction_id: &str) -> Result<(), String> {
+        self.transactions.abort_transaction(transaction_id)
+    }
+
     pub fn apply_retention_all(&self) -> IoResult<usize> {
         let mut total_removed = 0;
         for entry in self.partitions.iter() {

@@ -17,7 +17,7 @@ impl Server {
         Self { engine }
     }
 
-    /// Binds TCP socket and returns the listening TcpListener along with the actual bound SocketAddr
+    /// Binds TCP socket and returns bound TcpListener and local SocketAddr
     pub fn bind(&self) -> IoResult<(TcpListener, SocketAddr)> {
         let bind_addr = self.engine.config().bind_addr.clone();
         let addr: SocketAddr = bind_addr
@@ -36,18 +36,17 @@ impl Server {
         socket.bind(&addr.into())?;
         socket.listen(1024)?;
         let std_listener: std::net::TcpListener = socket.into();
-        let local_addr = std_listener.local_addr()?;
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
+        let local_addr = listener.local_addr()?;
         Ok((listener, local_addr))
     }
 
-    /// Run TCP listener loop with an already bound TcpListener
+    /// Runs server event loop with an already bound TcpListener
     pub async fn run_with_listener(&self, listener: TcpListener) -> IoResult<()> {
         let local_addr = listener.local_addr()?;
-        tracing::info!("Milestone 2 TCP Storage Server listening on {}", local_addr);
+        tracing::info!("TCP Storage Server listening on http://{}", local_addr);
 
-        // Spawn periodic WAL flusher if AsyncPeriodic policy is selected
         if let FlushPolicy::AsyncPeriodic { interval, .. } = self.engine.config().flush_policy {
             let engine_clone = self.engine.clone();
             tokio::spawn(async move {
@@ -60,7 +59,6 @@ impl Server {
             });
         }
 
-        // Spawn background Log Retention Garbage Collector task
         let retention_engine = self.engine.clone();
         let retention_interval = self.engine.config().retention_check_interval;
         tokio::spawn(async move {
@@ -108,9 +106,9 @@ impl Server {
         Ok(())
     }
 
-    /// Run TCP listener loop, background WAL flusher, and Log Retention Garbage Collector
+    /// Run TCP listener loop
     pub async fn run(&self) -> IoResult<()> {
-        let (listener, _addr) = self.bind()?;
+        let (listener, _) = self.bind()?;
         self.run_with_listener(listener).await
     }
 }

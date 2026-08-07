@@ -1,4 +1,4 @@
-use cli_file_appender::{
+use hermes::{
     hash_key, EngineConfig, FlushPolicy, RecordFrame, Server, StorageEngine, TestClient,
 };
 use std::net::SocketAddr;
@@ -21,12 +21,16 @@ impl Drop for TestEnv {
 /// - Rule A: Unique Data Directory per test using nanosecond timestamping
 /// - Rule B: Bind TCP Server to Port 0 (Dynamic Ephemeral Port: 127.0.0.1:0)
 /// - Rule C: Clean up test artifacts upon completion via Drop guard
+use std::sync::atomic::{AtomicU64, Ordering};
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 async fn start_test_server() -> TestEnv {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let data_dir = std::env::temp_dir().join(format!("storage_test_{}", nanos));
+    let data_dir = std::env::temp_dir().join(format!("storage_test_{}_{}_{}", std::process::id(), nanos, count));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).unwrap();
 
@@ -320,7 +324,7 @@ async fn test_scenario_6_fault_tolerance_and_edge_cases() {
 
     // 3. Truncated Payload (Payload Len = 100, but only 4 bytes provided)
     let truncated_frame = vec![0x01, 0x00, 0x00, 0x00, 0x64, 0x01, 0x02, 0x03, 0x04];
-    let _ = client.send_raw_bytes(&truncated_frame).await;
+    let _ = client.send_raw_bytes_no_wait(&truncated_frame).await;
 
     // Server should close connection or timeout cleanly on incomplete frame
     sleep(Duration::from_millis(50)).await;
@@ -343,4 +347,52 @@ async fn test_scenario_6_fault_tolerance_and_edge_cases() {
     let fetched = client.fetch("reconnect_topic", 0, 0, 1024).await.unwrap();
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].payload, "post_reconnect_msg".as_bytes());
+}
+
+#[tokio::test]
+async fn test_scenario_7_milestone3_features() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("m3_test_{}", nanos));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    // 1. Time-based Indexing (.timeindex) Test
+    let time_idx_path = test_dir.join("00000000000000000000.timeindex");
+    let mut time_idx = hermes::TimeIndexSegment::open(&time_idx_path, 0).unwrap();
+    time_idx.append(1000, 0).unwrap();
+    time_idx.append(2000, 10).unwrap();
+    time_idx.append(3000, 20).unwrap();
+
+    assert_eq!(time_idx.find_offset_for_timestamp(1500), Some(0));
+    assert_eq!(time_idx.find_offset_for_timestamp(2500), Some(10));
+    assert_eq!(time_idx.find_offset_for_timestamp(3000), Some(20));
+
+    // 2. Transaction Manager Test (Begin, Commit, Abort, Duplicate sequence check)
+    let tx_mgr = hermes::TransactionManager::new();
+    assert!(!tx_mgr.is_duplicate(101, 1));
+    tx_mgr.record_sequence(101, 1);
+    assert!(tx_mgr.is_duplicate(101, 1)); // Duplicate retry detected
+    assert!(!tx_mgr.is_duplicate(101, 2));
+
+    tx_mgr.begin_transaction("tx_orders_99", 101).unwrap();
+    tx_mgr.commit_transaction("tx_orders_99").unwrap();
+
+    // 3. High Availability Replication Manager Test
+    let cluster_config = hermes::ClusterConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        peer_addrs: Vec::new(),
+        min_insync_replicas: 1,
+    };
+    let repl_mgr = hermes::ReplicationManager::new(cluster_config);
+    assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
+
+    let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
+    let res = repl_mgr.replicate_batch("events", 0, &[frame]).await;
+    assert!(res.is_ok());
+
+    let _ = std::fs::remove_dir_all(&test_dir);
 }

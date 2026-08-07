@@ -136,5 +136,47 @@ fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
                 Err(e) => WireResponse::error(&format!("LatestOffset failed: {}", e)),
             }
         }
+        RequestPayload::BeginTx {
+            transaction_id,
+            producer_id,
+        } => match engine.begin_transaction(&transaction_id, producer_id) {
+            Ok(()) => WireResponse::ok(Vec::new()),
+            Err(e) => WireResponse::error(&format!("BeginTx failed: {}", e)),
+        },
+        RequestPayload::CommitTx { transaction_id } => {
+            match engine.commit_transaction(&transaction_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("CommitTx failed: {}", e)),
+            }
+        }
+        RequestPayload::AbortTx { transaction_id } => {
+            match engine.abort_transaction(&transaction_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("AbortTx failed: {}", e)),
+            }
+        }
+        RequestPayload::FetchByTimestamp {
+            topic,
+            partition,
+            target_timestamp,
+            max_bytes,
+        } => {
+            // Point-in-time seek starting from timestamp
+            match engine.fetch(&topic, partition, 0, max_bytes) {
+                Ok(frames) => {
+                    let filtered: Vec<_> = frames
+                        .into_iter()
+                        .filter(|f| f.timestamp >= target_timestamp)
+                        .collect();
+                    let mut resp_buf = Vec::new();
+                    resp_buf.put_u32(filtered.len() as u32);
+                    for frame in filtered {
+                        frame.encode_into(&mut resp_buf);
+                    }
+                    WireResponse::ok(resp_buf)
+                }
+                Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
+            }
+        }
     }
 }
