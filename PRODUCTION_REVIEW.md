@@ -926,28 +926,28 @@ Below is a prioritized list of all issues by category and severity, suitable for
 | [x] | RACE-01 | Move segment I/O to `spawn_blocking` |
 | [x] | RACE-03 | Replace epoch `RwLock<u64>` with `AtomicU64` |
 
-### Sprint 4 — Production Hardening
+### Sprint 4 — Production Hardening — ✅ COMPLETED
 
-| ID | Fix |
-|----|-----|
-| SEC-01 | Add per-request payload size limits |
-| SEC-02 | Add TLS + PSK authentication |
-| OBS-01 | Add Prometheus metrics |
-| OBS-02 | Add structured logging fields |
-| OBS-03 | Add `Ping`/health check command |
-| PROTO-01 | Add correlation IDs to wire protocol |
-| DEP-02 | Fix `windows-sys` feature list in `Cargo.toml` |
+| Status | ID | Fix |
+|--------|----|-----|
+| [x] | SEC-01 | Add per-request payload size limits |
+| [x] | SEC-02 | Add TLS + PSK authentication |
+| [x] | OBS-01 | Add Prometheus metrics |
+| [x] | OBS-02 | Add structured logging fields |
+| [x] | OBS-03 | Add `Ping`/health check command |
+| [x] | PROTO-01 | Add correlation IDs to wire protocol |
+| [x] | DEP-02 | Fix `windows-sys` feature list in `Cargo.toml` |
 
-### Sprint 5 — Feature Completeness
+### Sprint 5 — Feature Completeness — ✅ COMPLETED
 
-| Fix |
-|-----|
-| Add `ListTopics` / `DescribeCluster` wire commands |
-| Add `DeleteTopic` wire command |
-| Add consumer group rebalancing protocol |
-| Add LZ4/Zstandard compression for record batches |
-| Add admin HTTP API on separate port |
-| Add criterion benchmarks |
+| Status | Fix |
+|--------|-----|
+| [x] | Add `ListTopics` / `DescribeCluster` wire commands |
+| [x] | Add `DeleteTopic` wire command |
+| [x] | Add consumer group rebalancing protocol |
+| [x] | Add LZ4/Zstandard compression for record batches |
+| [x] | Add admin HTTP API on separate port |
+| [x] | Add criterion benchmarks |
 
 ---
 

@@ -436,4 +436,46 @@ impl StorageEngine {
         }
         Ok(())
     }
+
+    /// Returns list of all active non-system topics (Sprint 5)
+    pub fn list_topics(&self) -> Vec<String> {
+        let mut topics = std::collections::HashSet::new();
+        for entry in self.partitions.iter() {
+            let (topic, _) = entry.key();
+            if !topic.starts_with("__") {
+                topics.insert(topic.clone());
+            }
+        }
+        let mut vec: Vec<_> = topics.into_iter().collect();
+        vec.sort();
+        vec
+    }
+
+    /// Deletes topic partitions and removes disk directory (Sprint 5)
+    pub fn delete_topic(&self, topic: &str) -> IoResult<()> {
+        let mut to_remove = Vec::new();
+        for entry in self.partitions.iter() {
+            let (t, p) = entry.key();
+            if t == topic {
+                to_remove.push((t.clone(), *p));
+            }
+        }
+        for key in to_remove {
+            self.partitions.remove(&key);
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&self.config.data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with(&format!("{}-", topic)) {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }

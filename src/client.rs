@@ -1,5 +1,5 @@
 use crate::protocol::{CommandCode, RecordFrame, WireResponse};
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -581,5 +581,54 @@ impl TestClient {
             status,
             payload: resp_payload,
         })
+    }
+
+    pub async fn ping(&mut self) -> IoResult<bool> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::Ping as u8);
+        req_buf.put_u32(0);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        Ok(resp.status == 0 && resp.payload == b"PONG")
+    }
+
+    pub async fn list_topics(&mut self) -> IoResult<Vec<String>> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::ListTopics as u8);
+        req_buf.put_u32(0);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status == 0 {
+            let mut src = &resp.payload[..];
+            if src.len() < 4 {
+                return Ok(Vec::new());
+            }
+            let count = src.get_u32() as usize;
+            let mut topics = Vec::with_capacity(count);
+            for _ in 0..count {
+                if src.len() < 2 { break; }
+                let len = src.get_u16() as usize;
+                if src.len() < len { break; }
+                let t = String::from_utf8_lossy(&src[..len]).to_string();
+                src = &src[len..];
+                topics.push(t);
+            }
+            Ok(topics)
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "ListTopics failed"))
+        }
+    }
+
+    pub async fn delete_topic(&mut self, topic: &str) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::DeleteTopic as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "DeleteTopic failed"))
+        }
     }
 }

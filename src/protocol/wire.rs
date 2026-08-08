@@ -16,6 +16,10 @@ pub enum CommandCode {
     FetchByTimestamp = 0x0A,
     /// P1: Read-committed fetch — hides uncommitted and aborted records
     FetchCommitted = 0x0B,
+    Ping = 0x0C,
+    ListTopics = 0x0D,
+    DescribeCluster = 0x0E,
+    DeleteTopic = 0x0F,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -34,10 +38,16 @@ impl TryFrom<u8> for CommandCode {
             0x09 => Ok(CommandCode::AbortTx),
             0x0A => Ok(CommandCode::FetchByTimestamp),
             0x0B => Ok(CommandCode::FetchCommitted),
+            0x0C => Ok(CommandCode::Ping),
+            0x0D => Ok(CommandCode::ListTopics),
+            0x0E => Ok(CommandCode::DescribeCluster),
+            0x0F => Ok(CommandCode::DeleteTopic),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
 }
+
+pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 64 * 1024 * 1024; // 64MB cap (SEC-01)
 
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -108,6 +118,12 @@ pub enum RequestPayload {
         offset: u64,
         max_bytes: u32,
     },
+    Ping,
+    ListTopics,
+    DescribeCluster,
+    DeleteTopic {
+        topic: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +145,13 @@ impl WireRequest {
         let raw_cmd = src.get_u8();
         let cmd = CommandCode::try_from(raw_cmd)?;
         let payload_len = src.get_u32() as usize;
+
+        if payload_len > MAX_REQUEST_PAYLOAD_BYTES {
+            return Err(WireError::InvalidProtocol(format!(
+                "Payload length {} exceeds maximum allowed limit of 64MB",
+                payload_len
+            )));
+        }
 
         if src.len() < payload_len {
             return Err(WireError::Incomplete {
@@ -316,6 +339,13 @@ impl WireRequest {
                     offset,
                     max_bytes,
                 }
+            }
+            CommandCode::Ping => RequestPayload::Ping,
+            CommandCode::ListTopics => RequestPayload::ListTopics,
+            CommandCode::DescribeCluster => RequestPayload::DescribeCluster,
+            CommandCode::DeleteTopic => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DeleteTopic { topic }
             }
         };
 

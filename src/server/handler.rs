@@ -607,5 +607,28 @@ fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
             }
             Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
         },
+        RequestPayload::Ping => WireResponse::ok(b"PONG".to_vec()),
+        RequestPayload::ListTopics => {
+            let topics = engine.list_topics();
+            let mut buf = Vec::new();
+            buf.put_u32(topics.len() as u32);
+            for t in topics {
+                crate::protocol::wire::write_pascal_string(&mut buf, &t);
+            }
+            WireResponse::ok(buf)
+        }
+        RequestPayload::DescribeCluster => {
+            let config = engine.config();
+            let mut buf = Vec::new();
+            crate::protocol::wire::write_pascal_string(&mut buf, &config.cluster_id);
+            buf.put_u32(config.node_id);
+            let role_byte = if engine.is_leader() { 1u8 } else { 0u8 };
+            buf.put_u8(role_byte);
+            WireResponse::ok(buf)
+        }
+        RequestPayload::DeleteTopic { topic } => match engine.delete_topic(&topic) {
+            Ok(()) => WireResponse::ok(Vec::new()),
+            Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
+        },
     }
 }

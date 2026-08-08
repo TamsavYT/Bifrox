@@ -704,3 +704,28 @@ async fn test_scenario_13_read_committed_abort_filtering() {
         "Committed record must appear in read_committed"
     );
 }
+
+#[tokio::test]
+async fn test_scenario_14_ping_list_describe_delete() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    // 1. Ping
+    let pong = client.ping().await.unwrap();
+    assert!(pong, "Ping should return true / PONG");
+
+    // 2. Create topics by producing to them
+    client.produce_single("topic_alpha", "k1", None, 1, "hello").await.unwrap();
+    client.produce_single("topic_beta", "k2", None, 1, "world").await.unwrap();
+
+    // 3. List topics
+    let topics = client.list_topics().await.unwrap();
+    assert!(topics.contains(&"topic_alpha".to_string()));
+    assert!(topics.contains(&"topic_beta".to_string()));
+
+    // 4. Delete topic_alpha
+    client.delete_topic("topic_alpha").await.unwrap();
+    let topics_after = client.list_topics().await.unwrap();
+    assert!(!topics_after.contains(&"topic_alpha".to_string()));
+    assert!(topics_after.contains(&"topic_beta".to_string()));
+}
