@@ -204,6 +204,16 @@ impl TransactionManager {
         self.transactions.get(transaction_id).map(|s| s.status)
     }
 
+    /// Removes completed transactions from memory (MEM-02)
+    pub fn cleanup_completed_transaction(&self, transaction_id: &str) {
+        if let Some(state) = self.transactions.get(transaction_id) {
+            if state.status == TxStatus::Committed {
+                drop(state);
+                self.transactions.remove(transaction_id);
+            }
+        }
+    }
+
     /// Restores a transaction with its full partition list during startup recovery (BUG-12).
     pub fn restore_transaction(&self, transaction_id: &str, producer_id: u64, status: TxStatus, partitions: Vec<(String, u32, u64, u64)>) {
         self.transactions.insert(

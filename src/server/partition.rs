@@ -67,7 +67,8 @@ impl PartitionManager {
         let assigned_offset = frame.offset;
         self.high_watermark.store(assigned_offset + 1, Ordering::Release);
 
-        let wal_guard = self.wal_engine.lock();
+        let mut wal_guard = self.wal_engine.lock();
+        wal_guard.push(&frame);
         if wal_guard.should_flush() {
             seg_guard.sync()?;
         }
@@ -88,7 +89,8 @@ impl PartitionManager {
         let assigned_offset = frame.offset;
         self.high_watermark.store(assigned_offset + 1, Ordering::Release);
 
-        let wal_guard = self.wal_engine.lock();
+        let mut wal_guard = self.wal_engine.lock();
+        wal_guard.push(&frame);
         if wal_guard.should_flush() {
             seg_guard.sync()?;
         }

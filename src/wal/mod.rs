@@ -21,6 +21,10 @@ impl WalEngine {
         &mut self.buffer
     }
 
+    pub fn push(&mut self, frame: &crate::protocol::RecordFrame) {
+        self.buffer.push(frame);
+    }
+
     pub fn buffer(&self) -> &WalBuffer {
         &self.buffer
     }

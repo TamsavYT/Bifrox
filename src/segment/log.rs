@@ -55,81 +55,113 @@ impl LogSegment {
         let mut encountered_corruption = false;
 
         if exists {
-            // Perform full recovery scan & CRC verification on startup
+            // Perform streaming recovery scan & CRC verification on startup (BUG-08)
             file.seek(SeekFrom::Start(0))?;
             let raw_len = file.metadata()?.len();
-            let mut read_buf = vec![0u8; raw_len as usize];
-            let read_bytes = file.read(&mut read_buf)?;
 
-            let mut cursor = 0usize;
-            while cursor < read_bytes {
-                if cursor + HEADER_SIZE > read_bytes {
-                    let remaining = &read_buf[cursor..read_bytes];
-                    if remaining.iter().all(|&b| b == 0) {
-                        // Clean unwritten pre-allocated zero padding at EOF
-                        break;
-                    }
-                    tracing::warn!(
-                        "Incomplete frame header at byte position {} in segment {}. Truncating.",
-                        cursor,
-                        base_offset
-                    );
-                    encountered_corruption = true;
+            let mut chunk_buf = vec![0u8; 64 * 1024];
+            let mut read_buf = Vec::new();
+            let mut file_offset = 0u64;
+
+            loop {
+                let n = file.read(&mut chunk_buf)?;
+                if n == 0 && read_buf.is_empty() {
                     break;
                 }
+                read_buf.extend_from_slice(&chunk_buf[..n]);
 
-                let slice = &read_buf[cursor..];
-                // Check if remaining frame slice starts with clean pre-allocated zero bytes
-                if slice[0] == 0 && slice[1..std::cmp::min(HEADER_SIZE, slice.len())].iter().all(|&b| b == 0) {
-                    break;
+                let mut pos = 0usize;
+                let buf_len = read_buf.len();
+
+                while pos < buf_len {
+                    if pos + HEADER_SIZE > buf_len {
+                        let remaining = &read_buf[pos..];
+                        if remaining.iter().all(|&b| b == 0) {
+                            pos = buf_len;
+                            break;
+                        }
+                        if n > 0 {
+                            break; // need more data from file
+                        } else {
+                            tracing::warn!(
+                                "Incomplete frame header at byte position {} in segment {}. Truncating.",
+                                file_offset + pos as u64,
+                                base_offset
+                            );
+                            encountered_corruption = true;
+                            pos = buf_len;
+                            break;
+                        }
+                    }
+
+                    let slice = &read_buf[pos..];
+                    if slice[0] == 0 && slice[1..std::cmp::min(HEADER_SIZE, slice.len())].iter().all(|&b| b == 0) {
+                        pos = buf_len;
+                        break;
+                    }
+
+                    match RecordFrame::decode(slice) {
+                        Ok((frame, frame_len)) => {
+                            let phys_pos = file_offset + pos as u64;
+                            if bytes_since_last_index >= index_interval || rebuilt_index_entries.is_empty() {
+                                rebuilt_index_entries.push(IndexEntry {
+                                    logical_offset: frame.offset,
+                                    physical_position: phys_pos,
+                                });
+                                bytes_since_last_index = 0;
+                            }
+
+                            bytes_since_last_index += frame_len as u64;
+                            pos += frame_len;
+                            next_offset = frame.offset + 1;
+                        }
+                        Err(FrameError::BufferTooShort { .. }) => {
+                            if n > 0 {
+                                break; // need more data
+                            } else {
+                                let remaining = &read_buf[pos..];
+                                if remaining.iter().all(|&b| b == 0) {
+                                    pos = buf_len;
+                                    break;
+                                }
+                                tracing::warn!(
+                                    "Partial payload at byte position {} in segment {}. Truncating.",
+                                    file_offset + pos as u64,
+                                    base_offset
+                                );
+                                encountered_corruption = true;
+                                pos = buf_len;
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let remaining = &read_buf[pos..];
+                            if remaining.iter().all(|&b| b == 0) {
+                                pos = buf_len;
+                                break;
+                            }
+                            tracing::error!(
+                                "Corrupt frame detected at position {} in segment {}: {}. Truncating log.",
+                                file_offset + pos as u64,
+                                base_offset,
+                                err
+                            );
+                            encountered_corruption = true;
+                            pos = buf_len;
+                            break;
+                        }
+                    }
                 }
 
-                match RecordFrame::decode(slice) {
-                    Ok((frame, frame_len)) => {
-                        // Check index entry interval
-                        if bytes_since_last_index >= index_interval || rebuilt_index_entries.is_empty() {
-                            rebuilt_index_entries.push(IndexEntry {
-                                logical_offset: frame.offset,
-                                physical_position: cursor as u64,
-                            });
-                            bytes_since_last_index = 0;
-                        }
+                file_offset += pos as u64;
+                read_buf.drain(..pos);
 
-                        bytes_since_last_index += frame_len as u64;
-                        cursor += frame_len;
-                        next_offset = frame.offset + 1;
-                    }
-                    Err(FrameError::BufferTooShort { .. }) => {
-                        let remaining = &read_buf[cursor..read_bytes];
-                        if remaining.iter().all(|&b| b == 0) {
-                            break;
-                        }
-                        tracing::warn!(
-                            "Partial payload at byte position {} in segment {}. Truncating.",
-                            cursor,
-                            base_offset
-                        );
-                        encountered_corruption = true;
-                        break;
-                    }
-                    Err(err) => {
-                        let remaining = &read_buf[cursor..read_bytes];
-                        if remaining.iter().all(|&b| b == 0) {
-                            break;
-                        }
-                        tracing::error!(
-                            "Corrupt frame detected at position {} in segment {}: {}. Truncating log.",
-                            cursor,
-                            base_offset,
-                            err
-                        );
-                        encountered_corruption = true;
-                        break;
-                    }
+                if n == 0 || encountered_corruption {
+                    break;
                 }
             }
 
-            physical_size = cursor as u64;
+            physical_size = file_offset;
 
             // Only truncate if actual corruption occurred (not clean pre-allocated zeros)
             if encountered_corruption && physical_size != raw_len {
@@ -137,8 +169,9 @@ impl LogSegment {
                 file.sync_data()?;
             }
 
-            // Sync rebuilt index segment
+            // Sync rebuilt index segment (CORR-01)
             index_segment.truncate_and_rebuild(rebuilt_index_entries)?;
+            index_segment.sync()?;
         } else if preallocate {
             // Clean space pre-allocation on new file creation to prevent NTFS fragmentation
             file.set_len(max_bytes)?;

@@ -902,18 +902,18 @@ Below is a prioritized list of all issues by category and severity, suitable for
 | [x] | ERR-02 | `transaction.rs` | Surface control marker write errors |
 | [x] | SEC-03 | `engine.rs` | Validate topic names, prevent directory traversal |
 
-### Sprint 2 — Reliability & Correctness
+### Sprint 2 — Reliability & Correctness — ✅ COMPLETED
 
-| ID | Fix |
-|----|-----|
-| BUG-01 | Either implement WAL properly or remove the misleading WalEngine abstraction |
-| BUG-08 | Fix segment recovery OOM (streaming read instead of full allocation) |
-| BUG-09 | Implement consumer offset log compaction |
-| CORR-05 | Fix `__consumer_offsets.log` partial-write recovery |
-| MEM-02 | Garbage collect completed transactions from DashMap |
-| MEM-01 | Cap connection buffer growth |
-| REP-03 | Implement follower pull-based catch-up replication |
-| REP-05 | Enforce `min_insync_replicas` before acknowledging produce |
+| Status | ID | Fix |
+|--------|----|-----|
+| [x] | BUG-01 | Either implement WAL properly or remove the misleading WalEngine abstraction |
+| [x] | BUG-08 | Fix segment recovery OOM (streaming read instead of full allocation) |
+| [x] | BUG-09 | Implement consumer offset log compaction |
+| [x] | CORR-05 | Fix `__consumer_offsets.log` partial-write recovery |
+| [x] | MEM-02 | Garbage collect completed transactions from DashMap |
+| [x] | MEM-01 | Cap connection buffer growth |
+| [x] | REP-03 | Implement follower pull-based catch-up replication |
+| [x] | REP-05 | Enforce `min_insync_replicas` before acknowledging produce |
 
 ### Sprint 3 — Performance & Windows Optimization
 

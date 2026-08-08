@@ -279,12 +279,28 @@ impl StorageEngine {
         if self.config.role == NodeRole::Leader && !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
             let topic_str = topic.to_string();
+            let topic_for_spawn = topic_str.clone();
             let frames_clone = frames.clone();
             tokio::spawn(async move {
-                if let Err(e) = repl.replicate_batch(&topic_str, partition_id, &frames_clone).await {
+                if let Err(e) = repl.replicate_batch(&topic_for_spawn, partition_id, &frames_clone).await {
                     tracing::error!("HA Replication: replicate_batch failed: {}", e);
                 }
             });
+
+            // Enforce min_insync_replicas requirement before returning success (REP-05)
+            if self.config.min_insync_replicas > 1 {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let quorum_ok = tokio::task::block_in_place(|| {
+                        handle.block_on(self.replication.await_isr_quorum(&topic_str, partition_id, last_offset, std::time::Duration::from_secs(5)))
+                    });
+                    if !quorum_ok {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "ISR quorum not reached for min_insync_replicas requirement",
+                        ));
+                    }
+                }
+            }
         }
 
         Ok((partition_id, first_offset, last_offset))
@@ -381,6 +397,7 @@ impl StorageEngine {
             if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
                 let _ = tx_pm.produce(&record);
             }
+            self.transactions.cleanup_completed_transaction(transaction_id);
         }
         result
     }

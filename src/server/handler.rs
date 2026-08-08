@@ -176,7 +176,13 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
         }
 
         if filled == buffer.len() {
-            buffer.resize(buffer.len() * 2, 0);
+            const MAX_CONNECTION_BUFFER: usize = 128 * 1024 * 1024;
+            if buffer.len() >= MAX_CONNECTION_BUFFER {
+                tracing::error!("Connection buffer max limit reached (128MB) for {}. Closing.", peer_addr);
+                return;
+            }
+            let new_size = std::cmp::min(buffer.len() * 2, MAX_CONNECTION_BUFFER);
+            buffer.resize(new_size, 0);
         }
     }
 }

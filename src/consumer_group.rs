@@ -102,9 +102,17 @@ impl ConsumerGroupManager {
                     break;
                 }
             }
-        }
 
-        file.seek(SeekFrom::End(0))?;
+            // Truncate trailing partial/corrupt bytes (CORR-05)
+            let last_good_pos = cursor as u64;
+            if (last_good_pos as usize) < raw_len {
+                tracing::warn!("Truncating __consumer_offsets.log from {} to last valid position {}", raw_len, last_good_pos);
+                file.set_len(last_good_pos)?;
+            }
+            file.seek(SeekFrom::Start(last_good_pos))?;
+        } else {
+            file.seek(SeekFrom::End(0))?;
+        }
 
         Ok(Self {
             offsets,
@@ -139,6 +147,43 @@ impl ConsumerGroupManager {
         lock.write_all(&entry)?;
         lock.sync_data()?;
 
+        // Trigger log compaction if log file size exceeds 1MB (BUG-09)
+        if lock.metadata()?.len() > 1024 * 1024 {
+            drop(lock);
+            let _ = self.compact_log();
+        }
+
+        Ok(())
+    }
+
+    /// Compacts __consumer_offsets.log by rewriting file with only latest offset per key (BUG-09)
+    pub fn compact_log(&self) -> IoResult<()> {
+        let mut entry_bytes = Vec::new();
+        for item in self.offsets.iter() {
+            let (group_id, topic, partition) = item.key();
+            let offset = *item.value();
+
+            entry_bytes.put_u8(CONSUMER_OFFSETS_MAGIC);
+            let g_bytes = group_id.as_bytes();
+            entry_bytes.put_u16(g_bytes.len() as u16);
+            entry_bytes.put_slice(g_bytes);
+
+            let t_bytes = topic.as_bytes();
+            entry_bytes.put_u16(t_bytes.len() as u16);
+            entry_bytes.put_slice(t_bytes);
+
+            entry_bytes.put_u32(*partition);
+            entry_bytes.put_u64(offset);
+
+            let crc = Self::compute_crc(group_id, topic, *partition, offset);
+            entry_bytes.put_u32(crc);
+        }
+
+        let mut lock = self.log_file.lock();
+        lock.seek(SeekFrom::Start(0))?;
+        lock.set_len(0)?;
+        lock.write_all(&entry_bytes)?;
+        lock.sync_data()?;
         Ok(())
     }
 
