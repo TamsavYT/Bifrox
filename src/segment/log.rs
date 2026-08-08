@@ -238,7 +238,7 @@ impl LogSegment {
 
     /// Windows Kernel Zero-Copy (Tier 3): Streams bytes directly from OS NTFS page cache to Winsock socket via TransmitFile
     #[cfg(windows)]
-    pub fn transmit_file_zero_copy(
+    pub async fn transmit_file_zero_copy(
         &self,
         socket: &tokio::net::TcpStream,
         physical_pos: u64,
@@ -246,6 +246,7 @@ impl LogSegment {
     ) -> IoResult<()> {
         use std::os::windows::io::{AsRawHandle, AsRawSocket};
         use windows_sys::Win32::Networking::WinSock::TransmitFile;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
 
         let raw_socket = socket.as_raw_socket() as usize;
         let raw_file_handle = self.file.as_raw_handle() as isize;
@@ -261,13 +262,16 @@ impl LogSegment {
             return Ok(());
         }
 
-        unsafe {
+        tokio::task::spawn_blocking(move || unsafe {
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            overlapped.Anonymous.Pointer = physical_pos as *mut _;
+
             let success = TransmitFile(
                 raw_socket,
                 raw_file_handle,
                 bytes_to_send,
                 0,
-                std::ptr::null_mut(),
+                &mut overlapped as *mut _ as *mut _,
                 std::ptr::null_mut(),
                 0,
             );
@@ -277,6 +281,8 @@ impl LogSegment {
             } else {
                 Ok(())
             }
-        }
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
     }
 }

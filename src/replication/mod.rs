@@ -51,8 +51,8 @@ pub struct ClusterConfig {
 #[derive(Debug, Clone)]
 pub struct ReplicationManager {
     config: ClusterConfig,
-    /// Current epoch (term) for consensus
-    epoch: Arc<RwLock<u64>>,
+    /// Current epoch (term) for consensus (RACE-03 atomic)
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Bind address of this node's TCP listener (used in heartbeat announcements)
     bind_addr: String,
     /// Tracking partition high watermarks for replicas: (topic, partition, peer_addr) -> watermark_offset
@@ -87,7 +87,7 @@ impl ReplicationManager {
 
         let mgr = Self {
             config,
-            epoch: Arc::new(RwLock::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bind_addr,
             replica_watermarks: Arc::new(DashMap::new()),
             consensus,
@@ -135,15 +135,14 @@ impl ReplicationManager {
         self.leader_addr.read().unwrap().clone()
     }
 
-    /// Returns the current epoch (term) for this node.
+    /// Returns the current epoch (term) for this node (RACE-03 atomic).
     pub fn get_epoch(&self) -> u64 {
-        *self.epoch.read().unwrap()
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Sets the current epoch (term). Used when this node becomes leader.
+    /// Sets the current epoch (term). Used when this node becomes leader (RACE-03 atomic).
     pub fn set_epoch(&self, epoch: u64) {
-        let mut guard = self.epoch.write().unwrap();
-        *guard = epoch;
+        self.epoch.store(epoch, std::sync::atomic::Ordering::Release);
     }
 
     /// Called by followers when they receive a heartbeat from the leader.
@@ -205,7 +204,7 @@ impl ReplicationManager {
             );
 
             loop {
-                let current_term = *epoch.read().unwrap();
+                let current_term = epoch.load(std::sync::atomic::Ordering::Acquire);
                 for peer in &peer_addrs {
                     match send_leader_heartbeat(peer, &cluster_id, node_id, current_term, &bind_addr).await {
                         Ok(()) => {
@@ -266,12 +265,7 @@ impl ReplicationManager {
 
                 let new_term = consensus.current_term();
                 // Bump epoch to match new term
-                {
-                    let mut ep = epoch.write().unwrap();
-                    if new_term > *ep {
-                        *ep = new_term;
-                    }
-                }
+                epoch.fetch_max(new_term, std::sync::atomic::Ordering::AcqRel);
 
                 tracing::info!(
                     "Hermes Election: Node {} became Candidate for term {}. Broadcasting VoteRequest to {} peer(s).",
@@ -307,10 +301,7 @@ impl ReplicationManager {
                 // Check quorum
                 if consensus.tally_election_votes(votes_granted) {
                     // Promoted to Leader!
-                    {
-                        let mut ep = epoch.write().unwrap();
-                        *ep = new_term;
-                    }
+                    epoch.store(new_term, std::sync::atomic::Ordering::Release);
                     {
                         let mut la = leader_addr.write().unwrap();
                         *la = Some(bind_addr.clone());
@@ -330,7 +321,7 @@ impl ReplicationManager {
                         let epoch_c = epoch.clone();
                         tokio::spawn(async move {
                             loop {
-                                let current_term = *epoch_c.read().unwrap();
+                                let current_term = epoch_c.load(std::sync::atomic::Ordering::Acquire);
                                 for peer in &peer_addrs_c {
                                     let _ = send_leader_heartbeat(peer, &cluster_id_c, node_id, current_term, &bind_addr_c).await;
                                 }
@@ -401,7 +392,7 @@ impl ReplicationManager {
         }
 
         let last_offset = frames.last().unwrap().offset;
-        let epoch = *self.epoch.read().unwrap();
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
 
         // Replicate to each peer concurrently
         let mut handles = Vec::with_capacity(self.config.peer_addrs.len());

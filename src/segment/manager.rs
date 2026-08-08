@@ -12,6 +12,7 @@ pub struct SegmentPair {
     pub base_offset: u64,
     pub log: LogSegment,
     pub index: IndexSegment,
+    pub mmap: Option<crate::segment::mmap::MmapLogSegment>,
 }
 
 /// Rotates log and index segments, manages historical segments, and performs index-accelerated seeks
@@ -50,10 +51,10 @@ impl SegmentManager {
             base_offsets.push(0);
         }
 
+        let active_base = *base_offsets.last().unwrap();
         let mut historical = Vec::new();
-        let active_base = base_offsets.pop().unwrap();
 
-        for base in base_offsets {
+        for &base in &base_offsets[..base_offsets.len() - 1] {
             let index_path = dir.join(format!("{}.index", format_segment_filename(base)));
             let mut index = IndexSegment::open(index_path, base)?;
             let log = LogSegment::open(
@@ -64,10 +65,12 @@ impl SegmentManager {
                 config.preallocate_segments,
                 &mut index,
             )?;
+            let mmap = crate::segment::mmap::MmapLogSegment::open(&log.path, base).ok();
             historical.push(SegmentPair {
                 base_offset: base,
                 log,
                 index,
+                mmap,
             });
         }
 
@@ -91,6 +94,7 @@ impl SegmentManager {
                 base_offset: active_base,
                 log: active_log,
                 index: active_index,
+                mmap: None,
             },
             historical,
             bytes_since_last_index: 0,
@@ -195,9 +199,11 @@ impl SegmentManager {
             base_offset: new_base_offset,
             log: new_log,
             index: new_index,
+            mmap: None,
         };
 
-        let old_active = std::mem::replace(&mut self.active, new_active);
+        let mut old_active = std::mem::replace(&mut self.active, new_active);
+        old_active.mmap = crate::segment::mmap::MmapLogSegment::open(&old_active.log.path, old_active.base_offset).ok();
         self.historical.push(old_active);
         self.bytes_since_last_index = 0;
 
@@ -208,8 +214,12 @@ impl SegmentManager {
     pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
         let segment_pair = self.find_segment_pair_mut(start_offset);
         let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
-
         let start_pos = seek_entry.map_or(0, |e| e.physical_position);
+
+        if let Some(ref mmap) = segment_pair.mmap {
+            return Ok(mmap.fetch_zero_copy(start_pos, start_offset, max_bytes));
+        }
+
         let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
 
         let mut frames = Vec::new();

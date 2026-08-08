@@ -915,16 +915,16 @@ Below is a prioritized list of all issues by category and severity, suitable for
 | [x] | REP-03 | Implement follower pull-based catch-up replication |
 | [x] | REP-05 | Enforce `min_insync_replicas` before acknowledging produce |
 
-### Sprint 3 — Performance & Windows Optimization
+### Sprint 3 — Performance & Windows Optimization — ✅ COMPLETED
 
-| ID | Fix |
-|----|-----|
-| PERF-01 | Connection pooling for replication and heartbeat TCP streams |
-| PERF-03 | Use `MmapLogSegment` for historical segment reads |
-| WIN-01 | Integrate `TransmitFile` into fetch path (fix BUG-07 first) |
-| BUG-07 | Fix `TransmitFile` OVERLAPPED I/O and async safety |
-| RACE-01 | Move segment I/O to `spawn_blocking` |
-| RACE-03 | Replace epoch `RwLock<u64>` with `AtomicU64` |
+| Status | ID | Fix |
+|--------|----|-----|
+| [x] | PERF-01 | Connection pooling for replication and heartbeat TCP streams |
+| [x] | PERF-03 | Use `MmapLogSegment` for historical segment reads |
+| [x] | WIN-01 | Integrate `TransmitFile` into fetch path (fix BUG-07 first) |
+| [x] | BUG-07 | Fix `TransmitFile` OVERLAPPED I/O and async safety |
+| [x] | RACE-01 | Move segment I/O to `spawn_blocking` |
+| [x] | RACE-03 | Replace epoch `RwLock<u64>` with `AtomicU64` |
 
 ### Sprint 4 — Production Hardening
 
