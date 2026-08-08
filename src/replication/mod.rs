@@ -62,6 +62,8 @@ pub struct ReplicationManager {
     leader_addr: Arc<RwLock<Option<String>>>,
     /// Last time a heartbeat was received (used for election timeout)
     last_heartbeat: Arc<RwLock<std::time::Instant>>,
+    /// REP-02: Tracks (term, candidate_id) for which this node voted in the current term
+    voted_for: Arc<RwLock<Option<(u64, u32)>>>,
 }
 
 impl ReplicationManager {
@@ -91,6 +93,7 @@ impl ReplicationManager {
             consensus,
             leader_addr,
             last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
+            voted_for: Arc::new(RwLock::new(None)),
         };
 
         // Leader: start heartbeat broadcaster to all followers
@@ -147,7 +150,36 @@ impl ReplicationManager {
     pub fn set_leader_addr(&self, addr: String) {
         let mut guard = self.leader_addr.write().unwrap();
         *guard = Some(addr);
+        self.record_heartbeat();
+    }
 
+    /// Record receipt of a valid heartbeat (BUG-05)
+    pub fn record_heartbeat(&self) {
+        let mut guard = self.last_heartbeat.write().unwrap();
+        *guard = std::time::Instant::now();
+    }
+
+    /// Checks if a vote can be granted to candidate_id for term (REP-02)
+    pub fn can_vote_for(&self, candidate_id: u32, term: u64) -> bool {
+        let guard = self.voted_for.read().unwrap();
+        match *guard {
+            Some((voted_term, voted_candidate)) => {
+                if voted_term < term {
+                    true
+                } else if voted_term == term {
+                    voted_candidate == candidate_id
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    /// Records a vote for candidate_id in term (REP-02)
+    pub fn record_vote(&self, candidate_id: u32, term: u64) {
+        let mut guard = self.voted_for.write().unwrap();
+        *guard = Some((term, candidate_id));
     }
 
     pub fn update_replica_watermark(&self, topic: &str, partition: u32, peer_addr: &str, offset: u64) {
@@ -289,6 +321,23 @@ impl ReplicationManager {
                     );
                     // Reset heartbeat timestamp so we don't re-trigger election.
                     *last_heartbeat.write().unwrap() = std::time::Instant::now();
+
+                    // REP-01: Newly elected leader starts heartbeat loop to peers
+                    if !peer_addrs.is_empty() {
+                        let peer_addrs_c = peer_addrs.clone();
+                        let cluster_id_c = cluster_id.clone();
+                        let bind_addr_c = bind_addr.clone();
+                        let epoch_c = epoch.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let current_term = *epoch_c.read().unwrap();
+                                for peer in &peer_addrs_c {
+                                    let _ = send_leader_heartbeat(peer, &cluster_id_c, node_id, current_term, &bind_addr_c).await;
+                                }
+                                sleep(HEARTBEAT_INTERVAL).await;
+                            }
+                        });
+                    }
                 } else {
                     tracing::warn!(
                         "Hermes Election: Node {} failed to reach quorum ({} votes) for term {}.",

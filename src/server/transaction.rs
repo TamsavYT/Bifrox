@@ -18,8 +18,8 @@ pub struct TransactionState {
     pub transaction_id: String,
     pub producer_id: u64,
     pub status: TxStatus,
-    /// Partitions touched by this transaction: (topic, partition_id, start_offset)
-    pub partitions: Vec<(String, u32, u64)>,
+    /// Partitions touched by this transaction: (topic, partition_id, start_offset, end_offset)
+    pub partitions: Vec<(String, u32, u64, u64)>,
 }
 
 /// Idempotent Producer and Transaction State Tracker
@@ -60,39 +60,35 @@ impl TransactionManager {
         }
     }
 
-    /// Begins a new transaction.
-    /// Persists an Ongoing marker to the __transaction_state partition.
+    /// Begins a new transaction (RACE-04 atomic entry).
     pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
-        if self.transactions.contains_key(transaction_id) {
-            return Err(format!("Transaction ID '{}' already exists", transaction_id));
+        use dashmap::mapref::entry::Entry;
+        match self.transactions.entry(transaction_id.to_string()) {
+            Entry::Occupied(_) => Err(format!("Transaction ID '{}' already exists", transaction_id)),
+            Entry::Vacant(e) => {
+                e.insert(TransactionState {
+                    transaction_id: transaction_id.to_string(),
+                    producer_id,
+                    status: TxStatus::Ongoing,
+                    partitions: Vec::new(),
+                });
+                Ok(())
+            }
         }
-
-        self.transactions.insert(
-            transaction_id.to_string(),
-            TransactionState {
-                transaction_id: transaction_id.to_string(),
-                producer_id,
-                status: TxStatus::Ongoing,
-                partitions: Vec::new(),
-            },
-        );
-        Ok(())
     }
 
     /// Records that a produce touched (topic, partition) with the given start_offset for this tx.
-    /// Called from StorageEngine::produce_batch when a transaction is active.
     pub fn register_partition(&self, transaction_id: &str, topic: &str, partition: u32, start_offset: u64) {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            // Avoid duplicating the same (topic, partition) pair
-            let already = state.partitions.iter().any(|(t, p, _)| t == topic && *p == partition);
+            let already = state.partitions.iter().any(|(t, p, _, _)| t == topic && *p == partition);
             if !already {
-                state.partitions.push((topic.to_string(), partition, start_offset));
+                state.partitions.push((topic.to_string(), partition, start_offset, u64::MAX));
             }
         }
     }
 
     /// Commits an active transaction.
-    /// Writes a Commit control marker (0xAD / CTRL_COMMIT) to all involved partitions.
+    /// Writes a Commit control marker (0xAD / CTRL_COMMIT) to all involved partitions (ERR-02 check).
     pub fn commit_transaction(
         &self,
         transaction_id: &str,
@@ -109,9 +105,10 @@ impl TransactionManager {
             drop(state);
 
             // Write commit control markers to all involved partition logs
-            for (topic, partition, _) in &partitions {
+            for (topic, partition, _, _) in &partitions {
                 if let Some(pm) = get_partition(topic, *partition) {
-                    let _ = pm.produce_control_marker(1, producer_id, &tx_id); // 1 = CTRL_COMMIT
+                    pm.produce_control_marker(CTRL_COMMIT, producer_id, &tx_id)
+                        .map_err(|e| format!("Failed to write commit marker to {}-{}: {}", topic, partition, e))?;
                     tracing::info!("EOS: Commit marker written to '{}' partition {}", topic, partition);
                 }
             }
@@ -122,7 +119,7 @@ impl TransactionManager {
     }
 
     /// Aborts an active transaction.
-    /// Writes an Abort control marker (0xAD / CTRL_ABORT) to all involved partitions.
+    /// Writes an Abort control marker (0xAD / CTRL_ABORT) and updates end_offset (BUG-03, ERR-02).
     pub fn abort_transaction(
         &self,
         transaction_id: &str,
@@ -131,17 +128,19 @@ impl TransactionManager {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             state.status = TxStatus::Aborted;
             let producer_id = state.producer_id;
-            let partitions = state.partitions.clone();
+            let mut partitions = state.partitions.clone();
             let tx_id = state.transaction_id.clone();
-            drop(state);
 
-            // Write abort control markers to all involved partition logs
-            for (topic, partition, _) in &partitions {
+            // Write abort control markers to all involved partition logs and record end_offset
+            for (topic, partition, _, end_offset) in &mut partitions {
                 if let Some(pm) = get_partition(topic, *partition) {
-                    let _ = pm.produce_control_marker(2, producer_id, &tx_id); // 2 = CTRL_ABORT
+                    let marker_frame = pm.produce_control_marker(CTRL_ABORT, producer_id, &tx_id)
+                        .map_err(|e| format!("Failed to write abort marker to {}-{}: {}", topic, partition, e))?;
+                    *end_offset = marker_frame.offset;
                     tracing::info!("EOS: Abort marker written to '{}' partition {}", topic, partition);
                 }
             }
+            state.partitions = partitions;
             Ok(())
         } else {
             Err(format!("Transaction '{}' not found", transaction_id))
@@ -149,15 +148,12 @@ impl TransactionManager {
     }
 
     /// Returns the Last Stable Offset (LSO) for a given (topic, partition).
-    ///
-    /// LSO = the lowest start_offset among all *Ongoing* transactions touching this partition.
-    /// If no ongoing transactions, returns `u64::MAX` (meaning fetch up to HW is safe).
     pub fn last_stable_offset(&self, topic: &str, partition: u32) -> u64 {
         let mut lso = u64::MAX;
         for entry in self.transactions.iter() {
             let state = entry.value();
             if state.status == TxStatus::Ongoing {
-                for (t, p, start_offset) in &state.partitions {
+                for (t, p, start_offset, _) in &state.partitions {
                     if t == topic && *p == partition {
                         if *start_offset < lso {
                             lso = *start_offset;
@@ -169,22 +165,30 @@ impl TransactionManager {
         lso
     }
 
-    /// Collects all transaction IDs that have been Aborted, with their per-partition offset ranges.
-    /// Used by the read_committed fetch path to filter out aborted records.
+    /// Collects all transaction IDs that have been Aborted, with their exact per-partition offset ranges (BUG-03).
     pub fn aborted_ranges(&self, topic: &str, partition: u32) -> Vec<(u64, u64)> {
         let mut ranges = Vec::new();
         for entry in self.transactions.iter() {
             let state = entry.value();
             if state.status == TxStatus::Aborted {
-                for (t, p, start_offset) in &state.partitions {
+                for (t, p, start_offset, end_offset) in &state.partitions {
                     if t == topic && *p == partition {
-                        // end is unknown until marker; use u64::MAX as conservative upper bound
-                        ranges.push((*start_offset, u64::MAX));
+                        ranges.push((*start_offset, *end_offset));
                     }
                 }
             }
         }
         ranges
+    }
+
+    /// Returns the producer_id for a transaction (CORR-03).
+    pub fn get_producer_id(&self, transaction_id: &str) -> u64 {
+        self.transactions.get(transaction_id).map(|s| s.producer_id).unwrap_or(0)
+    }
+
+    /// Returns the partition list for a transaction (BUG-12).
+    pub fn get_partitions(&self, transaction_id: &str) -> Vec<(String, u32, u64, u64)> {
+        self.transactions.get(transaction_id).map(|s| s.partitions.clone()).unwrap_or_default()
     }
 
     /// Returns whether the given transaction_id is currently Ongoing.
@@ -200,24 +204,23 @@ impl TransactionManager {
         self.transactions.get(transaction_id).map(|s| s.status)
     }
 
-    /// Restores a transaction from a replayed __transaction_state log record.
-    /// Used during startup recovery.
-    pub fn restore_transaction(&self, transaction_id: &str, producer_id: u64, status: TxStatus) {
+    /// Restores a transaction with its full partition list during startup recovery (BUG-12).
+    pub fn restore_transaction(&self, transaction_id: &str, producer_id: u64, status: TxStatus, partitions: Vec<(String, u32, u64, u64)>) {
         self.transactions.insert(
             transaction_id.to_string(),
             TransactionState {
                 transaction_id: transaction_id.to_string(),
                 producer_id,
                 status,
-                partitions: Vec::new(),
+                partitions,
             },
         );
     }
 }
 
-/// Binary encoding for __transaction_state log records.
-/// Format: `[status: 1b] [producer_id: 8b] [tx_id: pascal]`
-pub fn encode_tx_state_record(status: TxStatus, producer_id: u64, transaction_id: &str) -> Vec<u8> {
+/// Binary encoding for __transaction_state log records with partition list (BUG-12).
+/// Format: `[status: 1b] [producer_id: 8b] [tx_id: pascal] [part_count: 4b] { [topic: pascal] [partition: 4b] [start_offset: 8b] [end_offset: 8b] }...`
+pub fn encode_tx_state_record(status: TxStatus, producer_id: u64, transaction_id: &str, partitions: &[(String, u32, u64, u64)]) -> Vec<u8> {
     use bytes::BufMut;
     let mut buf = Vec::new();
     let status_byte = match status {
@@ -228,11 +231,18 @@ pub fn encode_tx_state_record(status: TxStatus, producer_id: u64, transaction_id
     buf.put_u8(status_byte);
     buf.put_u64(producer_id);
     crate::protocol::wire::write_pascal_string(&mut buf, transaction_id);
+    buf.put_u32(partitions.len() as u32);
+    for (t, p, start, end) in partitions {
+        crate::protocol::wire::write_pascal_string(&mut buf, t);
+        buf.put_u32(*p);
+        buf.put_u64(*start);
+        buf.put_u64(*end);
+    }
     buf
 }
 
-/// Decode a __transaction_state log record.
-pub fn decode_tx_state_record(src: &[u8]) -> Option<(TxStatus, u64, String)> {
+/// Decode a __transaction_state log record with partition list (BUG-12).
+pub fn decode_tx_state_record(src: &[u8]) -> Option<(TxStatus, u64, String, Vec<(String, u32, u64, u64)>)> {
     use bytes::Buf;
     if src.len() < 11 {
         return None;
@@ -248,11 +258,34 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<(TxStatus, u64, String)> {
         return None;
     }
     let tx_id = String::from_utf8_lossy(&cursor[..tx_len]).to_string();
+    cursor = &cursor[tx_len..];
+
+    let mut partitions = Vec::new();
+    if cursor.len() >= 4 {
+        let count = cursor.get_u32() as usize;
+        for _ in 0..count {
+            if cursor.len() < 2 {
+                break;
+            }
+            let t_len = cursor.get_u16() as usize;
+            if cursor.len() < t_len + 4 + 8 + 8 {
+                break;
+            }
+            let topic = String::from_utf8_lossy(&cursor[..t_len]).to_string();
+            cursor = &cursor[t_len..];
+            let partition = cursor.get_u32();
+            let start = cursor.get_u64();
+            let end = cursor.get_u64();
+            partitions.push((topic, partition, start, end));
+        }
+    }
+
     let status = match status_byte {
         0x01 => TxStatus::Ongoing,
         0x02 => TxStatus::Committed,
         0x03 => TxStatus::Aborted,
         _ => return None,
     };
-    Some((status, producer_id, tx_id))
+    Some((status, producer_id, tx_id, partitions))
 }
+

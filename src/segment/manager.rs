@@ -299,6 +299,27 @@ impl SegmentManager {
         Ok(removed_count)
     }
 
+    /// Read records starting at target timestamp (BUG-02)
+    pub fn fetch_by_timestamp(&mut self, target_timestamp: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
+        let start_offset = self.find_offset_for_timestamp(target_timestamp);
+        let frames = self.fetch(start_offset, max_bytes)?;
+        Ok(frames.into_iter().filter(|f| f.timestamp >= target_timestamp).collect())
+    }
+
+    /// Finds nearest base_offset for target_timestamp
+    pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
+        for pair in &mut self.historical {
+            if let Ok(raw) = pair.log.read_at(0, HEADER_SIZE) {
+                if let Ok((frame, _)) = RecordFrame::decode(&raw) {
+                    if frame.timestamp >= target_timestamp {
+                        return pair.base_offset;
+                    }
+                }
+            }
+        }
+        0
+    }
+
     /// Flushes log and index files to physical disk
     pub fn sync(&mut self) -> IoResult<()> {
         self.active.log.sync()?;
@@ -307,27 +328,16 @@ impl SegmentManager {
     }
 
     fn find_segment_pair(&self, offset: u64) -> &SegmentPair {
-        if self.historical.is_empty() {
+        if offset >= self.active.base_offset || self.historical.is_empty() {
             return &self.active;
         }
 
-        match self.historical.binary_search_by_key(&offset, |p| p.base_offset) {
-            Ok(idx) => &self.historical[idx],
-            Err(idx) => {
-                if idx == 0 {
-                    &self.historical[0]
-                } else if idx <= self.historical.len() {
-                    let cand = &self.historical[idx - 1];
-                    if offset >= self.active.base_offset {
-                        &self.active
-                    } else {
-                        cand
-                    }
-                } else {
-                    &self.active
-                }
+        for i in (0..self.historical.len()).rev() {
+            if offset >= self.historical[i].base_offset {
+                return &self.historical[i];
             }
         }
+        &self.historical[0]
     }
 
     fn find_segment_pair_mut(&mut self, offset: u64) -> &mut SegmentPair {
@@ -340,6 +350,6 @@ impl SegmentManager {
                 return &mut self.historical[i];
             }
         }
-        &mut self.active
+        &mut self.historical[0]
     }
 }

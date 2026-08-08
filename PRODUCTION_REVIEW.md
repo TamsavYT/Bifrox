@@ -885,22 +885,22 @@ The election timeout jitter uses `node_id.wrapping_mul(2654435761).wrapping_add(
 
 Below is a prioritized list of all issues by category and severity, suitable for a sprint plan:
 
-### Sprint 1 — Critical Data Integrity (Fix Before Any Production Use)
+### Sprint 1 — Critical Data Integrity (Fix Before Any Production Use) — ✅ COMPLETED
 
-| ID | File | Fix |
-|----|------|-----|
-| BUG-04 | `partition.rs` | Fix partition directory double-nesting |
-| BUG-02 | `handler.rs` | Fix `FetchByTimestamp` full scan bug |
-| BUG-03 | `transaction.rs` | Fix `aborted_ranges()` returning `u64::MAX` |
-| BUG-12 | `engine.rs` | Persist partition list in `__transaction_state` |
-| CORR-02 | `manager.rs` | Fix `find_segment_pair()` binary search |
-| RACE-02 | `engine.rs` | Fix TOCTOU race in `get_or_create_partition` |
-| REP-02 | `handler.rs` | Fix Raft double-voting bug |
-| BUG-05 | `mod.rs` | Fix heartbeat not updating `last_heartbeat` |
-| REP-01 | `mod.rs` | Make newly-elected leaders start heartbeat loop |
-| ERR-01 | `engine.rs` | Propagate startup replay errors |
-| ERR-02 | `transaction.rs` | Surface control marker write errors |
-| SEC-03 | `engine.rs` | Validate topic names, prevent directory traversal |
+| Status | ID | File | Fix |
+|--------|----|------|-----|
+| [x] | BUG-04 | `partition.rs` | Fix partition directory double-nesting |
+| [x] | BUG-02 | `handler.rs` | Fix `FetchByTimestamp` full scan bug |
+| [x] | BUG-03 | `transaction.rs` | Fix `aborted_ranges()` returning `u64::MAX` |
+| [x] | BUG-12 | `engine.rs` | Persist partition list in `__transaction_state` |
+| [x] | CORR-02 | `manager.rs` | Fix `find_segment_pair()` binary search |
+| [x] | RACE-02 | `engine.rs` | Fix TOCTOU race in `get_or_create_partition` |
+| [x] | REP-02 | `handler.rs` | Fix Raft double-voting bug |
+| [x] | BUG-05 | `mod.rs` | Fix heartbeat not updating `last_heartbeat` |
+| [x] | REP-01 | `mod.rs` | Make newly-elected leaders start heartbeat loop |
+| [x] | ERR-01 | `engine.rs` | Propagate startup replay errors |
+| [x] | ERR-02 | `transaction.rs` | Surface control marker write errors |
+| [x] | SEC-03 | `engine.rs` | Validate topic names, prevent directory traversal |
 
 ### Sprint 2 — Reliability & Correctness
 

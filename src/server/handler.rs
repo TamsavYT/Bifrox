@@ -265,9 +265,10 @@ fn decode_vote_request_packet(
         return Ok((bytes_consumed, vec![0x00]));
     }
 
-    if term >= our_epoch {
+    if term >= our_epoch && engine.replication().can_vote_for(candidate_id, term) {
         // Grant vote and adopt the new term epoch
         engine.replication().set_epoch(term);
+        engine.replication().record_vote(candidate_id, term);
         tracing::info!(
             "VoteRequest: GRANTED vote to candidate {} for term {} (our epoch was {})",
             candidate_id, term, our_epoch
@@ -275,8 +276,8 @@ fn decode_vote_request_packet(
         Ok((bytes_consumed, vec![0x01]))
     } else {
         tracing::info!(
-            "VoteRequest: DENIED — candidate {} term {} < our epoch {}",
-            candidate_id, term, our_epoch
+            "VoteRequest: DENIED — candidate {} term {} (epoch: {}, can_vote: {})",
+            candidate_id, term, our_epoch, engine.replication().can_vote_for(candidate_id, term)
         );
         Ok((bytes_consumed, vec![0x00]))
     }
@@ -572,15 +573,11 @@ fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
             partition,
             target_timestamp,
             max_bytes,
-        } => match engine.fetch(&topic, partition, 0, max_bytes) {
+        } => match engine.fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes) {
             Ok(frames) => {
-                let filtered: Vec<_> = frames
-                    .into_iter()
-                    .filter(|f| f.timestamp >= target_timestamp)
-                    .collect();
                 let mut buf = Vec::new();
-                buf.put_u32(filtered.len() as u32);
-                for frame in filtered {
+                buf.put_u32(frames.len() as u32);
+                for frame in frames {
                     frame.encode_into(&mut buf);
                 }
                 WireResponse::ok(buf)

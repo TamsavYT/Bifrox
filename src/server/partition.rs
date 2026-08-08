@@ -26,10 +26,7 @@ impl PartitionManager {
         config: EngineConfig,
     ) -> IoResult<Self> {
         let topic = topic.into();
-        let partition_dir = base_data_dir
-            .as_ref()
-            .join(&topic)
-            .join(format!("partition-{}", partition));
+        let partition_dir = base_data_dir.as_ref().to_path_buf();
 
         let segment_manager = SegmentManager::open(&partition_dir, config.clone())?;
         let high_watermark = AtomicU64::new(segment_manager.high_watermark());
@@ -109,6 +106,12 @@ impl PartitionManager {
     pub fn fetch(&self, start_offset: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch(start_offset, max_bytes as usize)
+    }
+
+    /// Reads event records starting from target timestamp
+    pub fn fetch_by_timestamp(&self, target_timestamp: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.fetch_by_timestamp(target_timestamp, max_bytes as usize)
     }
 
     /// Seeks nearest physical position for target logical offset
