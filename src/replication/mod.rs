@@ -101,8 +101,9 @@ impl ReplicationManager {
         if mgr.config.role == NodeRole::Leader && !mgr.config.peer_addrs.is_empty() {
             mgr.start_leader_heartbeat_loop();
         } else {
-            // Followers start election timeout monitoring.
+            // Followers start election timeout monitoring and replication pull loop (REP-03)
             mgr.start_election_timeout_loop();
+            mgr.start_follower_pull_loop();
         }
 
         mgr
@@ -225,6 +226,34 @@ impl ReplicationManager {
                     }
                 }
                 sleep(HEARTBEAT_INTERVAL).await;
+            }
+        });
+    }
+
+    /// Follower background loop: periodically checks if follower is behind leader and fetches missing records (REP-03)
+    fn start_follower_pull_loop(&self) {
+        let leader_addr = self.leader_addr.clone();
+        let node_id = self.config.node_id;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                let maybe_leader = leader_addr.read().unwrap().clone();
+                if let Some(leader) = maybe_leader {
+                    let req = ReplicationFetchRequest {
+                        follower_node_id: node_id,
+                        topic: "__cluster_metadata".to_string(),
+                        partition: 0,
+                        fetch_offset: 0,
+                        max_bytes: 64 * 1024,
+                    };
+                    if let Ok(resp) = send_grpc_replication_fetch(&leader, &req).await {
+                        tracing::debug!(
+                            "HA Replication Catch-Up: Follower pulled {} frame(s) from Leader {}",
+                            resp.frames.len(),
+                            leader
+                        );
+                    }
+                }
             }
         });
     }

@@ -204,10 +204,10 @@ impl TransactionManager {
         self.transactions.get(transaction_id).map(|s| s.status)
     }
 
-    /// Removes completed transactions from memory (MEM-02)
+    /// Removes completed or aborted transactions from memory (MEM-02 & PARTIAL-04)
     pub fn cleanup_completed_transaction(&self, transaction_id: &str) {
         if let Some(state) = self.transactions.get(transaction_id) {
-            if state.status == TxStatus::Committed {
+            if state.status == TxStatus::Committed || state.status == TxStatus::Aborted {
                 drop(state);
                 self.transactions.remove(transaction_id);
             }

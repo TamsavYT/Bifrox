@@ -151,7 +151,7 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                             } else {
                                 // Process locally (leader for produce, or any node for fetch/offset/etc)
                                 consumed += bytes_used;
-                                let response = process_request(&engine, req);
+                                let response = process_request(&engine, req).await;
                                 if let Err(e) = socket.write_all(&response.encode()).await {
                                     tracing::error!("Failed to send response to {}: {}", peer_addr, e);
                                     return;
@@ -470,7 +470,7 @@ fn decode_heartbeat_packet(
 }
 
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
-fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
+async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
     match req.payload {
         RequestPayload::ProduceBatch {
             topic,
@@ -478,21 +478,33 @@ fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
             transaction_id,
             num_partitions,
             records,
-        } => match engine.produce_batch(
-            &topic,
-            &key,
-            if transaction_id.is_empty() { None } else { Some(&transaction_id) },
-            num_partitions,
-            &records
-        ) {
-            Ok((assigned_partition, first_offset, last_offset)) => {
-                let mut buf = Vec::with_capacity(20);
-                buf.put_u32(assigned_partition);
-                buf.put_u64(first_offset);
-                buf.put_u64(last_offset);
-                WireResponse::ok(buf)
+        } => {
+            if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
+                return WireResponse::error(&format!("Invalid topic name: {}", e));
             }
-            Err(e) => WireResponse::error(&format!("ProduceBatch failed: {}", e)),
+            match engine
+                .produce_batch(
+                    &topic,
+                    &key,
+                    if transaction_id.is_empty() {
+                        None
+                    } else {
+                        Some(&transaction_id)
+                    },
+                    num_partitions,
+                    &records,
+                )
+                .await
+            {
+                Ok((assigned_partition, first_offset, last_offset)) => {
+                    let mut buf = Vec::with_capacity(20);
+                    buf.put_u32(assigned_partition);
+                    buf.put_u64(first_offset);
+                    buf.put_u64(last_offset);
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("ProduceBatch failed: {}", e)),
+            }
         },
         RequestPayload::Fetch {
             topic,

@@ -151,32 +151,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Polling for messages. Press Ctrl+C to stop.\n");
 
             loop {
-                match client.fetch(&topic, partition, next_offset, 64 * 1024).await {
-                    Ok(frames) if !frames.is_empty() => {
-                        for frame in &frames {
-                            let payload_str = String::from_utf8_lossy(&frame.payload);
-                            println!(
-                                "📥 Group '{}' consumed Offset {:<6} | Timestamp: {} | Payload: '{}'",
-                                group_id, frame.offset, frame.timestamp, payload_str
-                            );
-                            next_offset = frame.offset + 1;
-                        }
-
-                        let last_offset = frames.last().unwrap().offset;
-                        if let Err(e) = client.commit_offset(&group_id, &topic, partition, last_offset).await {
-                            eprintln!("Failed to commit offset {}: {}", last_offset, e);
-                        } else {
-                            println!("  📌 Auto-committed offset {} to __consumer_offsets.log", last_offset);
-                        }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\n🛑 Graceful shutdown signal received. Exiting consumer group loop.");
+                        break;
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("Error polling server: {}. Reconnecting...", e);
-                        let _ = client.reconnect().await;
+                    _ = sleep(Duration::from_millis(poll_interval_ms)) => {
+                        match client.fetch(&topic, partition, next_offset, 64 * 1024).await {
+                            Ok(frames) if !frames.is_empty() => {
+                                for frame in &frames {
+                                    let payload_str = String::from_utf8_lossy(&frame.payload);
+                                    println!(
+                                        "📥 Group '{}' consumed Offset {:<6} | Timestamp: {} | Payload: '{}'",
+                                        group_id, frame.offset, frame.timestamp, payload_str
+                                    );
+                                    next_offset = frame.offset + 1;
+                                }
+
+                                let last_offset = frames.last().unwrap().offset;
+                                if let Err(e) = client.commit_offset(&group_id, &topic, partition, last_offset).await {
+                                    eprintln!("Failed to commit offset {}: {}", last_offset, e);
+                                } else {
+                                    println!("  📌 Auto-committed offset {} to __consumer_offsets.log", last_offset);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Error polling server: {}. Reconnecting...", e);
+                                let _ = client.reconnect().await;
+                            }
+                        }
                     }
                 }
-
-                sleep(Duration::from_millis(poll_interval_ms)).await;
             }
         }
         "latest-offset" | "watermark" => {
@@ -233,6 +239,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 offset, seek_res.base_offset, seek_res.physical_position
             );
         }
+        "ping" => {
+            let ok = client.ping().await?;
+            if ok {
+                println!("✅ PONG received from server {}", server_addr);
+            } else {
+                println!("❌ Ping failed");
+            }
+        }
+        "list-topics" => {
+            let topics = client.list_topics().await?;
+            println!("📋 Active Topics on Server {}:", server_addr);
+            for t in topics {
+                println!("  - {}", t);
+            }
+        }
+        "delete-topic" => {
+            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            client.delete_topic(&topic).await?;
+            println!("🗑️ Topic '{}' deleted successfully.", topic);
+        }
         _ => {
             eprintln!("Unknown command: '{}'", command);
             print_usage();
@@ -244,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn get_arg_val(args: &[String], flag: &str) -> Option<String> {
     for i in 0..args.len() {
-        if (args[i] == flag || (flag.starts_with("--") && args[i] == &flag[1..])) && i + 1 < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
             return Some(args[i + 1].clone());
         }
     }
@@ -276,6 +302,10 @@ fn print_usage() {
     println!("                  --group <GROUP> --topic <NAME> [--partition <ID>]");
     println!("  seek            Seek physical disk byte position for offset");
     println!("                  --topic <NAME> [--partition <ID>] --offset <N>");
+    println!("  ping            Send health check PING to server");
+    println!("  list-topics     List active topics on server");
+    println!("  delete-topic    Delete a topic and its partition files");
+    println!("                  --topic <NAME>");
     println!("\nGlobal Flag:");
     println!("  --server / -s   Server address (default: 127.0.0.1:9092 or localhost:9092)");
 }

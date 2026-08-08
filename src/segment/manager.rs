@@ -316,18 +316,30 @@ impl SegmentManager {
         Ok(frames.into_iter().filter(|f| f.timestamp >= target_timestamp).collect())
     }
 
-    /// Finds nearest base_offset for target_timestamp
+    /// Finds nearest base_offset for target_timestamp (PARTIAL-02 & NEW-02)
     pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
-        for pair in &mut self.historical {
+        for i in 0..self.historical.len() {
+            let pair = &mut self.historical[i];
             if let Ok(raw) = pair.log.read_at(0, HEADER_SIZE) {
                 if let Ok((frame, _)) = RecordFrame::decode(&raw) {
                     if frame.timestamp >= target_timestamp {
-                        return pair.base_offset;
+                        return if i > 0 { self.historical[i - 1].base_offset } else { pair.base_offset };
                     }
                 }
             }
         }
-        0
+        if !self.historical.is_empty() {
+            let last_idx = self.historical.len() - 1;
+            let last_hist_base = self.historical[last_idx].base_offset;
+            if let Ok(raw) = self.active.log.read_at(0, HEADER_SIZE) {
+                if let Ok((active_first_frame, _)) = RecordFrame::decode(&raw) {
+                    if active_first_frame.timestamp > target_timestamp {
+                        return last_hist_base;
+                    }
+                }
+            }
+        }
+        self.active.base_offset
     }
 
     /// Flushes log and index files to physical disk

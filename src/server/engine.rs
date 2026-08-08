@@ -243,8 +243,8 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Produce a batch of records to a routed partition.
-    pub fn produce_batch(
+    /// Produce a batch of records to a routed partition (PARTIAL-03 async).
+    pub async fn produce_batch(
         &self,
         topic: &str,
         key: &str,
@@ -287,18 +287,17 @@ impl StorageEngine {
                 }
             });
 
-            // Enforce min_insync_replicas requirement before returning success (REP-05)
+            // Enforce min_insync_replicas requirement before returning success (REP-05 & PARTIAL-03)
             if self.config.min_insync_replicas > 1 {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let quorum_ok = tokio::task::block_in_place(|| {
-                        handle.block_on(self.replication.await_isr_quorum(&topic_str, partition_id, last_offset, std::time::Duration::from_secs(5)))
-                    });
-                    if !quorum_ok {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "ISR quorum not reached for min_insync_replicas requirement",
-                        ));
-                    }
+                let quorum_ok = self
+                    .replication
+                    .await_isr_quorum(&topic_str, partition_id, last_offset, std::time::Duration::from_secs(5))
+                    .await;
+                if !quorum_ok {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ISR quorum not reached for min_insync_replicas requirement",
+                    ));
                 }
             }
         }
@@ -414,6 +413,7 @@ impl StorageEngine {
             if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
                 let _ = tx_pm.produce(&record);
             }
+            self.transactions.cleanup_completed_transaction(transaction_id);
         }
         result
     }
@@ -451,12 +451,13 @@ impl StorageEngine {
         vec
     }
 
-    /// Deletes topic partitions and removes disk directory (Sprint 5)
+    /// Deletes topic partitions and removes disk directory (NEW-03)
     pub fn delete_topic(&self, topic: &str) -> IoResult<()> {
         let mut to_remove = Vec::new();
         for entry in self.partitions.iter() {
             let (t, p) = entry.key();
             if t == topic {
+                let _ = entry.value().flush();
                 to_remove.push((t.clone(), *p));
             }
         }
@@ -470,7 +471,9 @@ impl StorageEngine {
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with(&format!("{}-", topic)) {
-                            let _ = std::fs::remove_dir_all(&path);
+                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                                tracing::warn!("delete_topic: remove_dir_all for {:?} returned error: {}", path, e);
+                            }
                         }
                     }
                 }
