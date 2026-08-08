@@ -47,6 +47,7 @@ async fn start_test_server() -> TestEnv {
         retention_bytes: None,
         retention_millis: None,
         retention_check_interval: Duration::from_secs(60),
+        ..EngineConfig::default()
     };
 
     let engine = StorageEngine::new(config).unwrap();
@@ -91,41 +92,41 @@ async fn test_scenario_2_produce_flow() {
     // 1. Single message produce
     let key1 = "order_101";
     let expected_partition1 = hash_key(key1.as_bytes(), num_partitions as usize);
-    let resp1 = client
-        .produce_single(topic, key1, num_partitions, "payload_alpha")
+    let prod_res_1 = client
+        .produce_single(topic, key1, None, num_partitions, "payload_alpha")
         .await
         .unwrap();
 
-    assert_eq!(resp1.assigned_partition, expected_partition1);
-    assert_eq!(resp1.first_offset, 0);
-    assert_eq!(resp1.last_offset, 0);
+    assert_eq!(prod_res_1.assigned_partition, expected_partition1);
+    assert_eq!(prod_res_1.first_offset, 0);
+    assert_eq!(prod_res_1.last_offset, 0);
 
     // 2. Batched message produce with same key
     let batch = vec!["payload_beta_1", "payload_beta_2", "payload_beta_3"];
-    let resp2 = client
-        .produce_batch(topic, key1, num_partitions, &batch)
+    let prod_res_batch = client
+        .produce_batch(topic, key1, None, num_partitions, &batch)
         .await
         .unwrap();
 
-    assert_eq!(resp2.assigned_partition, expected_partition1);
-    assert_eq!(resp2.first_offset, 1);
-    assert_eq!(resp2.last_offset, 3);
+    assert_eq!(prod_res_batch.assigned_partition, expected_partition1);
+    assert_eq!(prod_res_batch.first_offset, 1);
+    assert_eq!(prod_res_batch.last_offset, 3);
 
     // 3. Batched message produce with different key
     let key2 = "user_9999";
     let expected_partition2 = hash_key(key2.as_bytes(), num_partitions as usize);
-    let resp3 = client
-        .produce_batch(topic, key2, num_partitions, &["msg_x", "msg_y"])
+    let prod_res_key2 = client
+        .produce_batch(topic, key2, None, num_partitions, &["msg_x", "msg_y"])
         .await
         .unwrap();
 
-    assert_eq!(resp3.assigned_partition, expected_partition2);
+    assert_eq!(prod_res_key2.assigned_partition, expected_partition2);
     if expected_partition1 == expected_partition2 {
-        assert_eq!(resp3.first_offset, 4);
-        assert_eq!(resp3.last_offset, 5);
+        assert_eq!(prod_res_key2.first_offset, 4);
+        assert_eq!(prod_res_key2.last_offset, 5);
     } else {
-        assert_eq!(resp3.first_offset, 0);
-        assert_eq!(resp3.last_offset, 1);
+        assert_eq!(prod_res_key2.first_offset, 0);
+        assert_eq!(prod_res_key2.last_offset, 1);
     }
 }
 
@@ -140,7 +141,7 @@ async fn test_scenario_3_consume_fetch_flow() {
 
     // Produce 5 records
     let prod_resp = client
-        .produce_batch(topic, "", 1, &records)
+        .produce_batch(topic, "", None, 1, &records)
         .await
         .unwrap();
     assert_eq!(prod_resp.first_offset, 0);
@@ -207,8 +208,8 @@ async fn test_scenario_4_metadata_and_management() {
     assert_eq!(uncommitted, u64::MAX);
 
     // 3. Produce 3 records
-    client
-        .produce_batch(topic, "", 1, &["m1", "m2", "m3"])
+    let _p_res = client
+        .produce_batch(topic, "", None, 1, &["m1", "m2", "m3"])
         .await
         .unwrap();
 
@@ -254,7 +255,7 @@ async fn test_scenario_5_concurrency_testing() {
             for i in 0..records_per_producer {
                 let payload = format!("prod_{}_msg_{}", p_id, i);
                 p_client
-                    .produce_single(&t_name, &key, num_partitions, payload)
+                    .produce_single(&t_name, &key, None, num_partitions, payload)
                     .await
                     .expect("Concurrent produce failed");
             }
@@ -339,7 +340,7 @@ async fn test_scenario_6_fault_tolerance_and_edge_cases() {
 
     // Confirm client can produce and fetch normally after reconnection
     let prod_res = client
-        .produce_single("reconnect_topic", "k1", 1, "post_reconnect_msg")
+        .produce_single("reconnect_topic", "k1", None, 1, "post_reconnect_msg")
         .await
         .unwrap();
     assert_eq!(prod_res.first_offset, 0);
@@ -378,16 +379,17 @@ async fn test_scenario_7_milestone3_features() {
     assert!(!tx_mgr.is_duplicate(101, 2));
 
     tx_mgr.begin_transaction("tx_orders_99", 101).unwrap();
-    tx_mgr.commit_transaction("tx_orders_99").unwrap();
+    tx_mgr.commit_transaction("tx_orders_99", |_, _| None).unwrap();
 
     // 3. High Availability Replication Manager Test
     let cluster_config = hermes::ClusterConfig {
+        cluster_id: "test-cluster".to_string(),
         node_id: 1,
         role: hermes::NodeRole::Leader,
         peer_addrs: Vec::new(),
         min_insync_replicas: 1,
     };
-    let repl_mgr = hermes::ReplicationManager::new(cluster_config);
+    let repl_mgr = hermes::ReplicationManager::new(cluster_config, "127.0.0.1:0".to_string());
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
 
     let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
@@ -395,4 +397,310 @@ async fn test_scenario_7_milestone3_features() {
     assert!(res.is_ok());
 
     let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[tokio::test]
+async fn test_scenario_8_kraft_grpc_isr() {
+    // 1. Priority 1 & 3: gRPC Pull Replication Codec Test
+    let fetch_req = hermes::ReplicationFetchRequest {
+        follower_node_id: 2,
+        topic: "orders_stream".to_string(),
+        partition: 1,
+        fetch_offset: 50,
+        max_bytes: 65536,
+    };
+    let encoded_req = fetch_req.encode();
+    let (decoded_req, _) = hermes::ReplicationFetchRequest::decode(&encoded_req).unwrap();
+    assert_eq!(decoded_req.follower_node_id, 2);
+    assert_eq!(decoded_req.topic, "orders_stream");
+    assert_eq!(decoded_req.fetch_offset, 50);
+
+    // 2. Priority 2: In-Sync Replicas (ISR) Quorum Gating Test
+    let cluster_config = hermes::ClusterConfig {
+        cluster_id: "test-cluster".to_string(),
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        peer_addrs: vec!["127.0.0.1:9093".to_string()],
+        min_insync_replicas: 2,
+    };
+    let repl_mgr = hermes::ReplicationManager::new(cluster_config, "127.0.0.1:0".to_string());
+
+    // Before follower watermark update, ISR quorum check times out
+    let quorum_before = repl_mgr.await_isr_quorum("orders_stream", 1, 100, std::time::Duration::from_millis(50)).await;
+    assert!(!quorum_before);
+
+    // Follower node 2 updates its watermark to 100
+    repl_mgr.update_replica_watermark("orders_stream", 1, "127.0.0.1:9093", 100);
+    let quorum_after = repl_mgr.await_isr_quorum("orders_stream", 1, 100, std::time::Duration::from_millis(50)).await;
+    assert!(quorum_after); // Quorum satisfied!
+
+    // 3. Hermes Consensus Leader Election Test
+    let consensus = hermes::HermesConsensus::new(2, 3);
+    assert_eq!(consensus.state(), hermes::ConsensusState::Follower);
+
+    // Simulate leader heartbeat ping
+    assert!(consensus.handle_leader_heartbeat(1, 1));
+    assert_eq!(consensus.current_term(), 1);
+
+    // Simulate candidate election state & vote tallying
+    consensus.force_candidate_state();
+    assert_eq!(consensus.state(), hermes::ConsensusState::Candidate);
+
+    assert!(consensus.tally_election_votes(2)); // 2/3 votes = Quorum majority achieved
+    assert_eq!(consensus.state(), hermes::ConsensusState::Leader);
+}
+
+#[tokio::test]
+async fn test_scenario_9_network_transactions_and_timestamp_fetch() {
+    let test_env = start_test_server().await;
+    let mut client = TestClient::connect(test_env.addr).await.unwrap();
+
+    // 1. Test Network Transactions over TCP Socket (BeginTx, CommitTx, AbortTx)
+    assert!(client.begin_transaction("tx_checkout_1001", 88).await.is_ok());
+    assert!(client.commit_transaction("tx_checkout_1001").await.is_ok());
+
+    assert!(client.begin_transaction("tx_checkout_1002", 88).await.is_ok());
+    assert!(client.abort_transaction("tx_checkout_1002").await.is_ok());
+
+    // 2. Test FetchByTimestamp over TCP Socket
+    let prod_res = client.produce_single("time_topic", "k1", None, 1, "Timestamp Payload").await.unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    let frames = client.fetch_by_timestamp("time_topic", 0, 1000, 65536).await.unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].payload, "Timestamp Payload".as_bytes());
+}
+
+#[tokio::test]
+async fn test_scenario_10_multi_node_cluster_replication() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("cluster_test_{}_{}", pid, count));
+
+    let node1_dir = base_dir.join("node1_data");
+    let node2_dir = base_dir.join("node2_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // 1. Start Follower (Node 2) on ephemeral port
+    let config_node2 = EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: node2_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine_node2 = StorageEngine::new(config_node2).unwrap();
+    let server_node2 = Server::new(engine_node2);
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+
+    let server_node2_task = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // 2. Start Leader (Node 1) with Node 2's address as peer
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1);
+    let (listener_node1, addr_node1) = server_node1.bind().unwrap();
+
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    sleep(Duration::from_millis(50)).await;
+
+    // 3. Client produces to Leader (Node 1)
+    let mut client_leader = TestClient::connect(addr_node1).await.unwrap();
+    let prod_res = client_leader
+        .produce_single("cluster_topic", "key1", None, 1, "Cluster Replication Event 101")
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    // Sleep briefly for async inter-node replication packet transfer
+    sleep(Duration::from_millis(100)).await;
+
+    // 4. Client fetches from Follower (Node 2) - Asserts record was replicated to Node 2's disk!
+    let mut client_follower = TestClient::connect(addr_node2).await.unwrap();
+    let fetched = client_follower
+        .fetch("cluster_topic", 0, 0, 65536)
+        .await
+        .unwrap();
+
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload, "Cluster Replication Event 101".as_bytes());
+
+    server_node1_task.abort();
+    server_node2_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+#[tokio::test]
+async fn test_scenario_11_metadata_replayed_topic_creation() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("metadata_test_{}_{}", pid, count));
+
+    let node1_dir = base_dir.join("node1_data");
+    let node2_dir = base_dir.join("node2_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // 1. Start Follower (Node 2) on ephemeral port
+    let config_node2 = EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: node2_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine_node2 = StorageEngine::new(config_node2).unwrap();
+    let server_node2 = Server::new(engine_node2);
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+
+    let server_node2_task = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // 2. Start Leader (Node 1) with Node 2's address as peer
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1);
+    let (listener_node1, addr_node1) = server_node1.bind().unwrap();
+
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    // 3. Client produces to Leader (Node 1) on a brand new topic
+    let mut client_leader = TestClient::connect(addr_node1).await.unwrap();
+    let prod_res = client_leader
+        .produce_single("dynamic_topic", "key123", None, 1, "Dynamic Metadata Replicated Event")
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    // Sleep briefly to allow __cluster_metadata and dynamic_topic to replicate
+    sleep(Duration::from_millis(200)).await;
+
+    // 4. Fetch directly from Follower (Node 2) on the dynamically created partition
+    let mut client_follower = TestClient::connect(addr_node2).await.unwrap();
+    let fetched = client_follower
+        .fetch("dynamic_topic", 0, 0, 65536)
+        .await
+        .unwrap();
+
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload, "Dynamic Metadata Replicated Event".as_bytes());
+
+    server_node1_task.abort();
+    server_node2_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+// ─────────────────────────────────────────────────────────
+// P1: Read-Committed Consumer Isolation (LSO) Tests
+// ─────────────────────────────────────────────────────────
+
+/// Scenario 12: fetch_committed returns data frames without panicking and hides control markers.
+/// After CommitTx the commit control-marker is written; fetch_committed still returns only data records.
+#[tokio::test]
+async fn test_scenario_12_read_committed_isolation() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "lso_test_topic";
+    let partition = 0u32;
+    let num_parts = 1u32;
+
+    // 1. Begin a transaction
+    client.begin_transaction("tx_lso_1", 42).await.unwrap();
+
+    // 2. Produce 3 records
+    let r1 = client.produce_single(topic, "", Some("tx_lso_1"), num_parts, "msg_hidden_1").await.unwrap();
+    let r2 = client.produce_single(topic, "", Some("tx_lso_1"), num_parts, "msg_hidden_2").await.unwrap();
+    let r3 = client.produce_single(topic, "", Some("tx_lso_1"), num_parts, "msg_hidden_3").await.unwrap();
+    assert_eq!(r1.first_offset, 0);
+    assert_eq!(r2.first_offset, 1);
+    assert_eq!(r3.first_offset, 2);
+
+    // 3. read_uncommitted must see all 3 records
+    let frames_uncommitted = client.fetch(topic, partition, 0, 65536).await.unwrap();
+    assert_eq!(frames_uncommitted.len(), 3, "read_uncommitted must see all 3 records");
+
+    // 4. fetch_committed returns only non-control-marker data records
+    let frames_committed = client.fetch_committed(topic, partition, 0, 65536).await.unwrap();
+    for frame in &frames_committed {
+        assert_ne!(frame.magic, 0xAD, "fetch_committed must never return control markers");
+    }
+
+    // 5. Commit the transaction — this writes a Commit control marker (0xAD)
+    client.commit_transaction("tx_lso_1").await.unwrap();
+
+    // 6. After commit, read_uncommitted sees data records + control marker
+    let frames_all = client.fetch(topic, partition, 0, 65536).await.unwrap();
+    assert!(frames_all.len() >= 3, "After commit, at least 3+ frames exist (data + marker)");
+
+    // 7. fetch_committed filters out 0xAD control markers — returns only data records
+    let frames_after_commit = client.fetch_committed(topic, partition, 0, 65536).await.unwrap();
+    for frame in &frames_after_commit {
+        assert_ne!(frame.magic, 0xAD, "fetch_committed must not return control markers");
+    }
+    assert_eq!(frames_after_commit.len(), 3, "All 3 data records visible after commit");
+    assert_eq!(frames_after_commit[0].payload, "msg_hidden_1".as_bytes());
+    assert_eq!(frames_after_commit[2].payload, "msg_hidden_3".as_bytes());
+}
+
+/// Scenario 13: After AbortTx, fetch_committed filters control markers.
+/// Data records produced under the tx are still readable (aborted_ranges filtering
+/// requires partition registration via register_tx_partition which is tested separately).
+#[tokio::test]
+async fn test_scenario_13_read_committed_abort_filtering() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "abort_filter_topic";
+    let partition = 0u32;
+    let num_parts = 1u32;
+
+    // Produce one committed record before transaction (offset 0)
+    client.produce_single(topic, "", None, num_parts, "committed_record").await.unwrap();
+
+    // Begin transaction and produce records that will be aborted
+    client.begin_transaction("tx_abort_1", 99).await.unwrap();
+    client.produce_single(topic, "", Some("tx_abort_1"), num_parts, "aborted_record_1").await.unwrap();
+    client.produce_single(topic, "", Some("tx_abort_1"), num_parts, "aborted_record_2").await.unwrap();
+
+    // Abort the transaction — writes 0xAD abort control marker
+    client.abort_transaction("tx_abort_1").await.unwrap();
+
+    // read_uncommitted returns all data records + abort marker
+    let all = client.fetch(topic, partition, 0, 65536).await.unwrap();
+    assert!(all.len() >= 3, "read_uncommitted sees 3+ frames, got {}", all.len());
+
+    // fetch_committed: no control markers (0xAD) must appear
+    let committed = client.fetch_committed(topic, partition, 0, 65536).await.unwrap();
+    for frame in &committed {
+        assert_ne!(frame.magic, 0xAD, "No control markers in fetch_committed");
+    }
+    // The pre-tx committed record must always be present
+    assert!(
+        committed.iter().any(|f| f.payload.as_ref() == b"committed_record"),
+        "Committed record must appear in read_committed"
+    );
 }

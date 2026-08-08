@@ -202,4 +202,48 @@ impl LogSegment {
             .unwrap_or_default()
             .as_millis() as u64)
     }
+
+    /// Windows Kernel Zero-Copy (Tier 3): Streams bytes directly from OS NTFS page cache to Winsock socket via TransmitFile
+    #[cfg(windows)]
+    pub fn transmit_file_zero_copy(
+        &self,
+        socket: &tokio::net::TcpStream,
+        physical_pos: u64,
+        max_bytes: u32,
+    ) -> IoResult<()> {
+        use std::os::windows::io::{AsRawHandle, AsRawSocket};
+        use windows_sys::Win32::Networking::WinSock::TransmitFile;
+
+        let raw_socket = socket.as_raw_socket() as usize;
+        let raw_file_handle = self.file.as_raw_handle() as isize;
+
+        let remaining = if self.physical_size > physical_pos {
+            (self.physical_size - physical_pos) as u32
+        } else {
+            0
+        };
+
+        let bytes_to_send = std::cmp::min(remaining, max_bytes);
+        if bytes_to_send == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            let success = TransmitFile(
+                raw_socket,
+                raw_file_handle,
+                bytes_to_send,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+
+            if success == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
 }

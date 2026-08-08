@@ -30,9 +30,19 @@ impl Server {
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
+
+        // On Windows, setting SO_REUSEADDR allows multiple sockets to forcibly bind to the same port (WinSock port hijacking).
+        // Disabling reuse_address on Windows ensures strict port exclusivity (error 10048 if port is in use).
+        #[cfg(windows)]
+        {
+            socket.set_reuse_address(false)?;
+        }
         #[cfg(not(windows))]
-        socket.set_reuse_port(true)?;
+        {
+            socket.set_reuse_address(true)?;
+            let _ = socket.set_reuse_port(true);
+        }
+
         socket.bind(&addr.into())?;
         socket.listen(1024)?;
         let std_listener: std::net::TcpListener = socket.into();

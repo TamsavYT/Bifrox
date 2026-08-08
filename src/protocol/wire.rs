@@ -14,6 +14,8 @@ pub enum CommandCode {
     CommitTx = 0x08,
     AbortTx = 0x09,
     FetchByTimestamp = 0x0A,
+    /// P1: Read-committed fetch — hides uncommitted and aborted records
+    FetchCommitted = 0x0B,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -31,6 +33,7 @@ impl TryFrom<u8> for CommandCode {
             0x08 => Ok(CommandCode::CommitTx),
             0x09 => Ok(CommandCode::AbortTx),
             0x0A => Ok(CommandCode::FetchByTimestamp),
+            0x0B => Ok(CommandCode::FetchCommitted),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -52,6 +55,7 @@ pub enum RequestPayload {
     ProduceBatch {
         topic: String,
         key: String,
+        transaction_id: String,
         num_partitions: u32,
         records: Vec<Bytes>,
     },
@@ -97,6 +101,13 @@ pub enum RequestPayload {
         target_timestamp: u64,
         max_bytes: u32,
     },
+    /// P1: Same wire shape as Fetch, but triggers read-committed LSO filtering
+    FetchCommitted {
+        topic: String,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +142,7 @@ impl WireRequest {
             CommandCode::ProduceBatch => {
                 let topic = read_pascal_string(&mut payload_buf)?;
                 let key = read_pascal_string(&mut payload_buf)?;
+                let transaction_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 8 {
                     return Err(WireError::Incomplete {
                         needed: 8,
@@ -163,6 +175,7 @@ impl WireRequest {
                 RequestPayload::ProduceBatch {
                     topic,
                     key,
+                    transaction_id,
                     num_partitions,
                     records,
                 }
@@ -283,6 +296,24 @@ impl WireRequest {
                     topic,
                     partition,
                     target_timestamp,
+                    max_bytes,
+                }
+            }
+            CommandCode::FetchCommitted => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 16 {
+                    return Err(WireError::Incomplete {
+                        needed: 16,
+                        available: payload_buf.len(),
+                    });
+                }
+                let partition = payload_buf.get_u32();
+                let offset = payload_buf.get_u64();
+                let max_bytes = payload_buf.get_u32();
+                RequestPayload::FetchCommitted {
+                    topic,
+                    partition,
+                    offset,
                     max_bytes,
                 }
             }

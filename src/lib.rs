@@ -11,7 +11,11 @@ pub use client::{ProduceResult, SeekResult, TestClient};
 pub use config::{EngineConfig, FlushPolicy};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{CommandCode, FrameError, RecordFrame, WireError, WireRequest, WireResponse};
-pub use replication::{ClusterConfig, NodeRole, ReplicationManager};
+pub use replication::{
+    send_grpc_replication_fetch, ClusterConfig, ConsensusState, HermesConsensus, NodeRole,
+    ReplicationFetchRequest, ReplicationFetchResponse, ReplicationManager, GRPC_REPLICATION_MAGIC,
+    MetadataRecord,
+};
 pub use segment::{
     IndexEntry, IndexSegment, LogSegment, MmapLogSegment, SegmentManager, TimeIndexEntry,
     TimeIndexSegment,

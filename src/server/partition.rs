@@ -57,8 +57,8 @@ impl PartitionManager {
         self.high_watermark.load(Ordering::Acquire)
     }
 
-    /// Appends payload to event log stream, updates high watermark atomic, and triggers flush if policy requires
-    pub fn produce(&self, payload: &[u8]) -> IoResult<u64> {
+    /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame
+    pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -75,7 +75,34 @@ impl PartitionManager {
             seg_guard.sync()?;
         }
 
-        Ok(assigned_offset)
+        Ok(frame)
+    }
+
+    /// Appends a control marker to the partition.
+    pub fn produce_control_marker(&self, control_type: u8, producer_id: u64, transaction_id: &str) -> IoResult<RecordFrame> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut seg_guard = self.segment_manager.lock();
+        let frame = seg_guard.append_control_marker(control_type, producer_id, transaction_id, timestamp)?;
+
+        let assigned_offset = frame.offset;
+        self.high_watermark.store(assigned_offset + 1, Ordering::Release);
+
+        let wal_guard = self.wal_engine.lock();
+        if wal_guard.should_flush() {
+            seg_guard.sync()?;
+        }
+
+        Ok(frame)
+    }
+
+    /// Appends payload to event log stream, updates high watermark atomic, and triggers flush if policy requires
+    pub fn produce(&self, payload: &[u8]) -> IoResult<u64> {
+        let frame = self.produce_frame(payload)?;
+        Ok(frame.offset)
     }
 
     /// Reads event records starting from target logical offset

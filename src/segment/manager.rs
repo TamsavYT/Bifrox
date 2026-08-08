@@ -135,6 +135,37 @@ impl SegmentManager {
         Ok(frame)
     }
 
+    /// Append a control marker frame into active segment. Performs segment rotation if size limit reached.
+    pub fn append_control_marker(&mut self, control_type: u8, producer_id: u64, transaction_id: &str, timestamp: u64) -> IoResult<RecordFrame> {
+        let assigned_offset = self.high_watermark;
+        let frame = RecordFrame::create_control_marker(assigned_offset, timestamp, control_type, producer_id, transaction_id);
+        let frame_size = frame.encoded_size() as u64;
+
+        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
+            self.rotate_segment()?;
+        }
+
+        let mut encoded = Vec::with_capacity(frame.encoded_size());
+        frame.encode_into(&mut encoded);
+
+        let physical_pos = self.active.log.append_bytes(&encoded)?;
+
+        if self.bytes_since_last_index >= self.config.index_interval_bytes
+            || self.active.index.entries_count() == 0
+        {
+            self.active
+                .index
+                .append(assigned_offset, physical_pos)?;
+            self.bytes_since_last_index = 0;
+        }
+
+        self.bytes_since_last_index += frame_size;
+        self.high_watermark += 1;
+        self.active.log.next_offset = self.high_watermark;
+
+        Ok(frame)
+    }
+
     /// Rotate active segment to new segment file
     fn rotate_segment(&mut self) -> IoResult<()> {
         let new_base_offset = self.high_watermark;

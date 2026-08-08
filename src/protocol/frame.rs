@@ -3,6 +3,7 @@ use crc32fast::Hasher;
 use thiserror::Error;
 
 pub const MAGIC_BYTE: u8 = 0xAB;
+pub const CONTROL_MAGIC_BYTE: u8 = 0xAD;
 pub const HEADER_SIZE: usize = 1 + 4 + 8 + 8 + 4; // 25 bytes
 
 #[derive(Debug, Error)]
@@ -17,8 +18,8 @@ pub enum FrameError {
     Io(#[from] std::io::Error),
 }
 
-/// Disk binary frame representation for an event log entry:
-/// `[Magic Byte: 1b] | [CRC32 Checksum: 4b] | [Logical Offset: 8b] | [Timestamp: 8b] | [Payload Len: 4b] | [Payload Bytes]`
+/// Disk binary frame representation for an event log entry or control marker:
+/// `[Magic Byte: 1b (0xAB data / 0xAD control)] | [CRC32 Checksum: 4b] | [Logical Offset: 8b] | [Timestamp: 8b] | [Payload Len: 4b] | [Payload Bytes]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordFrame {
     pub magic: u8,
@@ -44,6 +45,57 @@ impl RecordFrame {
             payload_len,
             payload,
         }
+    }
+
+    /// Creates a transaction control marker frame (0x01 = Commit, 0x02 = Abort)
+    pub fn create_control_marker(
+        offset: u64,
+        timestamp: u64,
+        control_type: u8,
+        producer_id: u64,
+        transaction_id: &str,
+    ) -> Self {
+        let mut buf = Vec::new();
+        buf.put_u8(control_type);
+        buf.put_u64(producer_id);
+        crate::protocol::wire::write_pascal_string(&mut buf, transaction_id);
+
+        let payload: Bytes = buf.into();
+        let payload_len = payload.len() as u32;
+        let crc = Self::calculate_crc(offset, timestamp, &payload);
+
+        Self {
+            magic: CONTROL_MAGIC_BYTE,
+            crc,
+            offset,
+            timestamp,
+            payload_len,
+            payload,
+        }
+    }
+
+    /// Returns true if this frame is a transaction control marker (0xAD)
+    pub fn is_control_marker(&self) -> bool {
+        self.magic == CONTROL_MAGIC_BYTE
+    }
+
+    /// Parses control marker payload: returns Option<(control_type: 1b, producer_id: 8b, transaction_id: String)>
+    pub fn parse_control_marker(&self) -> Option<(u8, u64, String)> {
+        if !self.is_control_marker() || self.payload.len() < 11 {
+            return None;
+        }
+        let mut src = &self.payload[..];
+        let control_type = src.get_u8();
+        let producer_id = src.get_u64();
+        if src.len() < 2 {
+            return None;
+        }
+        let len = src.get_u16() as usize;
+        if src.len() < len {
+            return None;
+        }
+        let tx_id = String::from_utf8_lossy(&src[..len]).to_string();
+        Some((control_type, producer_id, tx_id))
     }
 
     /// Computes CRC32 checksum over: [Offset | Timestamp | PayloadLen | Payload]
@@ -82,7 +134,7 @@ impl RecordFrame {
         }
 
         let magic = src.get_u8();
-        if magic != MAGIC_BYTE {
+        if magic != MAGIC_BYTE && magic != CONTROL_MAGIC_BYTE {
             return Err(FrameError::InvalidMagic {
                 expected: MAGIC_BYTE,
                 found: magic,
