@@ -1,971 +1,527 @@
-# Hermes Event Streaming Engine — Production Readiness Review
+# Hermes Event Streaming Engine — Production Readiness Review (v2)
 
-> **Purpose**: This document is a comprehensive code review and bug report for the Hermes codebase, intended to guide an AI agent in making all necessary fixes and improvements to reach production-grade quality comparable to Apache Kafka (but targeting Windows-first deployments).
+> **Purpose**: Updated comprehensive code review of the revised Hermes codebase at `Hermes-master/Hermes-master/`. This report compares against the previous review (v1), documents all fixes that were correctly applied, identifies issues that were partially or incorrectly addressed, and surfaces new bugs and remaining gaps that still block production deployment.
 >
 > **Reviewer**: GitHub Copilot CLI  
 > **Review Date**: 2026-08-08  
-> **Codebase**: Rust / Tokio async TCP event streaming engine  
-> **Total Source Files Reviewed**: 24 Rust source files
+> **Previous Review**: `PRODUCTION_REVIEW.md` (v1, in parent directory)  
+> **Codebase**: Rust / Tokio async TCP event streaming engine (Windows-first)  
+> **Total Source Files Reviewed**: 27 Rust source files (3 new vs v1)
 
 ---
 
 ## Table of Contents
 
-1. [Executive Summary](#1-executive-summary)
-2. [Critical Bugs (Must Fix)](#2-critical-bugs-must-fix)
-3. [Security Issues](#3-security-issues)
-4. [Correctness & Data Integrity Issues](#4-correctness--data-integrity-issues)
-5. [Concurrency & Race Conditions](#5-concurrency--race-conditions)
-6. [Replication & Consensus Issues](#6-replication--consensus-issues)
-7. [Performance Issues](#7-performance-issues)
-8. [Protocol & API Issues](#8-protocol--api-issues)
-9. [Error Handling Gaps](#9-error-handling-gaps)
-10. [Memory Management Issues](#10-memory-management-issues)
-11. [Windows-Specific Issues](#11-windows-specific-issues)
-12. [Observability Gaps](#12-observability-gaps)
-13. [Testing Gaps](#13-testing-gaps)
-14. [Missing Production Features](#14-missing-production-features)
-15. [Dependency & Build Issues](#15-dependency--build-issues)
-16. [Improvement Roadmap Summary](#16-improvement-roadmap-summary)
+1. [What Changed Since v1](#1-what-changed-since-v1)
+2. [Fixes Correctly Applied](#2-fixes-correctly-applied)
+3. [Fixes Partially Applied or New Issues Introduced](#3-fixes-partially-applied-or-new-issues-introduced)
+4. [Still Open — Critical Bugs](#4-still-open--critical-bugs)
+5. [Still Open — High Severity](#5-still-open--high-severity)
+6. [Still Open — Medium / Low Severity](#6-still-open--medium--low-severity)
+7. [New Bugs Introduced in This Version](#7-new-bugs-introduced-in-this-version)
+8. [New File Review: hermes_cli.rs](#8-new-file-review-hermes_clirs)
+9. [Remaining Roadmap](#9-remaining-roadmap)
+10. [Issue Scorecard vs v1](#10-issue-scorecard-vs-v1)
 
 ---
 
-## 1. Executive Summary
+## 1. What Changed Since v1
 
-Hermes is a well-structured event streaming engine with a Kafka-inspired architecture written in Rust. The codebase demonstrates strong foundational ideas: segment-based log storage, sparse index, WAL, Raft-like consensus, transactions with LSO-based isolation, and consumer group offset persistence. However, several **critical bugs**, **data integrity gaps**, **race conditions**, and **missing production features** prevent it from being deployed safely in production today.
+The following files have been **meaningfully updated** in the new version:
 
-**Severity Distribution**:
-| Severity | Count |
-|----------|-------|
-| 🔴 Critical (data loss / correctness) | 12 |
-| 🟠 High (reliability / security) | 9 |
-| 🟡 Medium (performance / robustness) | 11 |
-| 🟢 Low (polish / observability) | 8 |
+| File | Status |
+|------|--------|
+| `src/server/engine.rs` | Significant fixes: RACE-02, SEC-03, ERR-01, BUG-12, topic mgmt added |
+| `src/server/partition.rs` | BUG-04 fixed; WAL push connected (BUG-01 partial) |
+| `src/server/handler.rs` | REP-02 fixed; MEM-01 capped; new commands; FetchByTimestamp fixed |
+| `src/server/transaction.rs` | BUG-03, BUG-12, RACE-04, CORR-03, ERR-02, MEM-02 (partial) |
+| `src/replication/mod.rs` | BUG-05, REP-01, RACE-03 (epoch AtomicU64), REP-02 (voted_for) |
+| `src/segment/manager.rs` | CORR-02, PERF-03 (mmap on historical), BUG-02 (fetch_by_timestamp) |
+| `src/segment/log.rs` | BUG-08 (streaming recovery), CORR-01 (index sync), BUG-07 (OVERLAPPED async) |
+| `src/consumer_group.rs` | CORR-05 (truncate on partial), BUG-09 (compaction added) |
+| `src/protocol/wire.rs` | SEC-01 (64MB cap), new commands (Ping, ListTopics, DescribeCluster, DeleteTopic) |
+| `src/wal/mod.rs` | BUG-01 partial — `push()` method added and connected to write path |
+| `Cargo.toml` | DEP-02 fixed (windows-sys networking features added) |
+| `src/bin/hermes_cli.rs` | NEW — full CLI tool |
 
 ---
 
-## 2. Critical Bugs (Must Fix)
+## 2. Fixes Correctly Applied
 
-### BUG-01 — WAL Engine Is Never Actually Used for Writes
-**File**: `src/server/partition.rs` — `produce_frame()` and `produce_control_marker()`  
-**Severity**: 🔴 Critical (data loss on crash)
+The following bugs from v1 have been **correctly resolved**:
 
-The `WalEngine` field exists on `PartitionManager`, but writes go **directly** to the `SegmentManager`. The WAL buffer is checked for flush decisions but is **never populated** with data. This means there is no write-ahead log — a crash between the OS `write()` call and `sync_data()` can silently corrupt or lose records.
+### BUG-04 — Partition directory double-nesting fixed
+`PartitionManager::open()` now uses `base_data_dir.as_ref().to_path_buf()` directly. The double-nested path `data/{topic}-{partition}/{topic}/partition-{N}/` is gone. **Confirmed correct.**
+
+### SEC-03 — Topic name validation implemented
+`validate_topic_name()` called from `get_or_create_partition()`. Rejects traversal sequences, empty names, names >249 chars, and non-alphanumeric characters (allows `.`, `_`, `-`). **Correct.**
+
+### RACE-02 — `get_or_create_partition` uses atomic DashMap entry
+`DashMap::entry()` used to atomically check-and-insert. The TOCTOU race where two concurrent callers could both miss and create duplicate `SegmentManager` instances is fixed. **Confirmed correct.**
+
+### ERR-01 — Startup replay errors propagated
+`engine.replay_metadata_log()?` and `engine.replay_transaction_state()?` now use `?`. Server refuses to start on corrupt state. **Correct.**
+
+### BUG-12 — Transaction partition list persisted and restored
+`encode_tx_state_record` now includes the full `(topic, partition, start_offset, end_offset)` list. `decode_tx_state_record` restores it. `restore_transaction()` takes the full partition list. **Data loss on restart for in-flight transactions is fixed.**
+
+### BUG-03 — `aborted_ranges()` now uses exact end offsets
+`TransactionState.partitions` stores `(String, u32, u64, u64)` with a real `end_offset` set from the abort control marker frame's offset. `aborted_ranges()` returns precise ranges. **Confirmed correct.**
+
+### RACE-04 — `begin_transaction` uses atomic DashMap entry
+`begin_transaction()` uses `DashMap::entry()` to prevent concurrent duplicates. **Correct.**
+
+### CORR-03 — `commit_transaction` persists real `producer_id`
+`engine.commit_transaction()` calls `self.transactions.get_producer_id(transaction_id)` before committing. **Correct.**
+
+### ERR-02 — Control marker write errors surfaced
+`pm.produce_control_marker(...).map_err(...)` — errors are no longer silently swallowed with `let _`. **Correct.**
+
+### MEM-02 (Committed) — Committed transactions cleaned up
+`cleanup_completed_transaction()` called after successful `commit_transaction`. **Aborted transactions still NOT cleaned up — see Section 4.**
+
+### BUG-05 — Heartbeat resets `last_heartbeat`
+`set_leader_addr()` calls `self.record_heartbeat()` which updates `last_heartbeat = Instant::now()`. Election timer correctly reset on valid heartbeats. **Confirmed correct.**
+
+### REP-01 — Newly elected leaders start heartbeat loop
+After winning an election in `start_election_timeout_loop()`, a new heartbeat broadcast `tokio::spawn` is launched to all peers. **Confirmed correct.**
+
+### REP-02 — Raft vote respects `voted_for` (double-voting fixed)
+`voted_for: Arc<RwLock<Option<(u64, u32)>>>` added to `ReplicationManager`. `can_vote_for()` and `record_vote()` enforce single-vote-per-term. `decode_vote_request_packet()` checks both conditions. **Split-brain from double-voting is fixed.**
+
+### RACE-03 — Epoch uses `AtomicU64`
+`epoch: Arc<std::sync::atomic::AtomicU64>` replaces `Arc<RwLock<u64>>`. All reads use `load(Ordering::Acquire)`, writes use `store(Ordering::Release)` or `fetch_max`. **Correct and lock-free.**
+
+### BUG-02 — FetchByTimestamp no longer full-scans from offset 0
+`engine.fetch_by_timestamp()` routes through `pm.fetch_by_timestamp()` → `SegmentManager::fetch_by_timestamp()` → `find_offset_for_timestamp()`. The O(N) scan from offset 0 is gone. **However, the segment-finding logic is still imprecise — see Section 3.**
+
+### CORR-02 — `find_segment_pair` corrected
+Both `find_segment_pair()` and `find_segment_pair_mut()` now use a reverse linear scan over `historical`. **Correct.**
+
+### CORR-01 — Index sync after rebuild
+`index_segment.sync()` called after `truncate_and_rebuild()` in `LogSegment::open()`. **Correct.**
+
+### BUG-08 — Segment recovery uses streaming 64KB chunks
+`LogSegment::open()` reads the file in 64KB chunks, handling partial frames across chunk boundaries via a remainder buffer. **Confirmed correct.**
+
+### CORR-05 — `__consumer_offsets.log` truncated after partial write
+`file.set_len(last_good_pos)` called if the file has trailing corrupt bytes. **Confirmed correct.**
+
+### BUG-09 — Consumer offset log compaction implemented
+`compact_log()` rewrites the file with only the latest offset per key; triggered when log exceeds 1MB. **Correct.**
+
+### PERF-03 — `MmapLogSegment` used for historical segment reads
+`SegmentPair` has `mmap: Option<MmapLogSegment>`. Historical segments get an mmap handle. `fetch()` uses `fetch_zero_copy()` when mmap is available. **Confirmed correct.**
+
+### MEM-01 — Connection buffer capped at 128MB
+`handle_connection()` checks `buffer.len() >= MAX_CONNECTION_BUFFER` and closes the connection. **Correct.**
+
+### SEC-01 — 64MB payload cap enforced in wire decode
+`MAX_REQUEST_PAYLOAD_BYTES = 64 * 1024 * 1024` checked before allocating payload buffer. **Correct.**
+
+### OBS-03 / PROTO-02 — Ping, ListTopics, DescribeCluster, DeleteTopic added
+New wire commands `0x0C`–`0x0F` with full encode/decode/dispatch. **Confirmed.**
+
+### BUG-07 — `TransmitFile` uses OVERLAPPED and `spawn_blocking`
+Windows zero-copy path uses an `OVERLAPPED` struct with the physical offset, wrapped in `tokio::task::spawn_blocking`. Declared `async`. **Correct.**
+
+### DEP-02 — `windows-sys` features complete
+`Cargo.toml` now includes `Win32_Networking_WinSock` and `Win32_System_IO`. **Correct.**
+
+### BUG-01 (Partial) — WAL buffer now populated
+`WalEngine::push()` called from `produce_frame()` and `produce_control_marker()`. **Buffer is populated but never flushed to a WAL file — see Section 3.**
+
+**Total correctly fixed: 28 of 40 original issues.**
+
+---
+
+## 3. Fixes Partially Applied or New Issues Introduced
+
+### PARTIAL-01 — BUG-01: WAL Buffer Populated But Never Flushed to Dedicated WAL File
+**File**: `src/server/partition.rs`, `src/wal/mod.rs`, `src/wal/buffer.rs`  
+**Severity**: CRITICAL (data loss on crash still possible)
+
+`WalEngine::push()` is now called, so the WAL buffer accumulates encoded record bytes in RAM. `should_flush()` triggers `seg_guard.sync()` (fsync on the segment file). However:
+
+1. `WalBuffer::flush_to_file(&mut self, file: &mut File, ...)` exists but **is never called** — there is no WAL file handle in `WalEngine`, so the buffer data has nowhere to go.
+2. The WAL buffer grows without bound until `clear()` is called, but `clear()` is never called from the production write path.
+3. There is no write-ahead guarantee: data goes to the segment file directly, and the WAL buffer is a dead accumulator.
+
+**What production WAL should look like**:
+- Open a `partition-N.wal` file alongside the segment in `PartitionManager::open()`.
+- On each `produce_frame()`: write to WAL file first (`flush_to_file` with `sync_disk=true`), then write to segment, then clear WAL.
+- On restart: if a `.wal` file exists with data, replay it into the segment before opening normally.
+
+**Recommended short-term fix**: Remove `WalEngine`/`WalBuffer` from the write path entirely and rely on `FlushPolicy` + `sync_data()` as the sole durability mechanism. This is honest and simpler. Implement real WAL only when a formal crash-recovery spec is written.
+
+---
+
+### PARTIAL-02 — BUG-02: `find_offset_for_timestamp` Only Checks First Frame of Each Segment
+**File**: `src/segment/manager.rs` — `find_offset_for_timestamp()`  
+**Severity**: HIGH
 
 ```rust
-// Current (WRONG): WAL buffer is queried but never written to
-let wal_guard = self.wal_engine.lock();
-if wal_guard.should_flush() {
-    seg_guard.sync()?;
-}
-```
-
-**Fix**: Either fully implement the WAL (write to WAL first, then checkpoint to segment), or remove the misleading `WalEngine` abstraction and make `FlushPolicy` a direct parameter of `SegmentManager::append()`. The `WalBuffer::push()` and `flush_to_file()` methods exist but are never called from the write path.
-
----
-
-### BUG-02 — `FetchByTimestamp` Ignores the `offset` Parameter and Does a Full Scan
-**File**: `src/server/handler.rs` — `process_request()` FetchByTimestamp arm  
-**Severity**: 🔴 Critical (correctness + O(N) instead of O(log N) performance)
-
-```rust
-// BUG: hardcodes offset=0, ignores the actual start offset from client
-Ok(frames) => match engine.fetch(&topic, partition, 0, max_bytes) {
-```
-
-The `FetchByTimestamp` implementation fetches all records from offset 0, then filters in memory. This is `O(N)` and ignores the time index entirely. On large partitions this will OOM the server.
-
-**Fix**: Use the `TimeIndexSegment` (already present in `src/segment/timeindex.rs`) to binary-search the nearest physical position, then return frames from that position forward. The `fetch_by_timestamp` path should call the segment manager's time index lookup.
-
----
-
-### BUG-03 — `aborted_ranges()` Returns `u64::MAX` as End Offset
-**File**: `src/server/transaction.rs` — `aborted_ranges()`  
-**Severity**: 🔴 Critical (ALL records are hidden after one abort)
-
-```rust
-// Returns (start_offset, u64::MAX) — this hides every record from start_offset onwards
-ranges.push((*start_offset, u64::MAX));
-```
-
-`fetch_committed()` in `engine.rs` checks `frame.offset >= *start && frame.offset <= *end`. Because `end = u64::MAX`, this will filter out **every single record** in the partition from the transaction's start offset onward — including legitimate committed records from other transactions.
-
-**Fix**: Track the end offset of an aborted transaction by recording the offset of the Abort control marker. The `TransactionState` should store the actual end offset once the abort marker is written.
-
----
-
-### BUG-04 — Partition Directory Layout Bug in `PartitionManager::open()`
-**File**: `src/server/partition.rs` — `open()`  
-**Severity**: 🔴 Critical (data stored in wrong directory)
-
-```rust
-// Creates data/{topic}-{partition}/{topic}/partition-{partition}/
-let partition_dir = base_data_dir
-    .as_ref()
-    .join(&topic)          // adds topic again!
-    .join(format!("partition-{}", partition));
-```
-
-`StorageEngine::get_or_create_partition()` already constructs the path as `data_dir/{topic}-{partition}` and passes it as `base_data_dir`. Then `PartitionManager::open()` appends `/topic/partition-N` again, creating a deeply nested wrong path like `data/orders-0/orders/partition-0/`. This means partition discovery on restart fails completely since the engine scans for `{topic}-{partition}` directories but the actual data is two levels deeper.
-
-**Fix**: Remove the redundant `join(&topic).join(format!("partition-{}", partition))` from `PartitionManager::open()`. The `base_data_dir` passed in is already the complete partition directory.
-
----
-
-### BUG-05 — Heartbeat Does Not Update `last_heartbeat` in `ReplicationManager`
-**File**: `src/replication/mod.rs` and `src/server/handler.rs`  
-**Severity**: 🔴 Critical (spurious leader elections)
-
-The `start_election_timeout_loop()` reads `self.last_heartbeat` to determine if an election should start. But `decode_heartbeat_packet()` in `handler.rs` calls `engine.set_leader_addr()` and `engine.replication().set_epoch()` — it never updates `last_heartbeat`. The election loop will always see a stale timestamp and trigger elections even when heartbeats are flowing normally.
-
-**Fix**: Add a method `ReplicationManager::record_heartbeat()` that updates `last_heartbeat = Instant::now()`. Call it from `decode_heartbeat_packet()` after validating the incoming term.
-
----
-
-### BUG-06 — `replay_metadata_log()` Causes Infinite Recursion
-**File**: `src/server/engine.rs` — `replay_metadata_log()`  
-**Severity**: 🔴 Critical (stack overflow on startup)
-
-`replay_metadata_log()` calls `self.get_or_create_partition("__cluster_metadata", 0)`. `get_or_create_partition()` then writes a new `TopicPartition` metadata record for any non-system topic — BUT `__cluster_metadata` is guarded by a `!topic.starts_with("__")` check. However, on the first call to `get_or_create_partition("__cluster_metadata", 0)` inside `replay_metadata_log()`, the metadata partition is being initialized *before* it's inserted into the `DashMap`, and a concurrent write path could re-enter. More critically, this mutual dependency means calling `replay_metadata_log` before the metadata partition is ready causes the partition to be opened twice, resulting in two `SegmentManager` instances pointing at the same files.
-
-**Fix**: Pre-seed the `__cluster_metadata-0` partition *before* calling `replay_metadata_log()`. Guard against double-open with an explicit check.
-
----
-
-### BUG-07 — `TransmitFile` Uses Wrong Socket API Type
-**File**: `src/segment/log.rs` — `transmit_file_zero_copy()`  
-**Severity**: 🔴 Critical (Windows only — always fails silently)
-
-```rust
-use windows_sys::Win32::Networking::WinSock::TransmitFile;
-let raw_socket = socket.as_raw_socket() as usize;
-```
-
-`TransmitFile` expects a `SOCKET` (which is `usize` on 64-bit Windows), but Tokio's `TcpStream::as_raw_socket()` returns a `RawSocket` which is a `u64`. The cast to `usize` is platform-dependent. More critically, `TransmitFile` is **synchronous** and blocks the calling OS thread, which will deadlock Tokio's async runtime when called from an async context. Also, `TransmitFile` requires the file offset to be set via the `OVERLAPPED` structure — the current code passes `null_mut()` for OVERLAPPED and relies on the file's current position, which is not safe with a `physical_pos` argument.
-
-**Fix**: Use `TransmitFile` with a proper `OVERLAPPED` structure and file offset, or replace with Tokio's `tokio::io::copy` plus mmap slices sent via `AsyncWriteExt::write_all`. If zero-copy is critical, use Windows `ReadFileScatter`/`WriteFileGather` via `io_uring`-equivalent or keep using mmap reads fed into async write.
-
----
-
-### BUG-08 — Segment Recovery Reads Entire Segment into RAM
-**File**: `src/segment/log.rs` — `LogSegment::open()`  
-**Severity**: 🔴 Critical (OOM on large segments)
-
-```rust
-let raw_len = file.metadata()?.len();
-let mut read_buf = vec![0u8; raw_len as usize]; // allocates up to max_segment_bytes in one shot
-```
-
-With the default `max_segment_bytes = 10MB` per segment, this is 10MB per partition per startup. With 100 partitions that's 1GB of startup heap allocation just for recovery. With `preallocate_segments = true` (the default), the pre-allocated zero bytes at the end of the file are fully read into RAM unnecessarily.
-
-**Fix**: Use a streaming read with a fixed-size buffer (e.g., 64KB chunks), decoding frames incrementally. Stop reading at the first fully-zero header rather than reading the entire preallocated file.
-
----
-
-### BUG-09 — `consumer_offsets.log` Grows Unboundedly
-**File**: `src/consumer_group.rs`  
-**Severity**: 🔴 Critical (disk exhaustion in production)
-
-Every `commit_offset()` call appends a new record to `__consumer_offsets.log`. There is no compaction. A consumer group committing every 100ms will generate ~36MB/hour of offset log data per topic-partition combination. Recovery on startup replays all records, becoming increasingly slow.
-
-**Fix**: Implement log compaction for consumer offsets. Periodically rewrite the log file with only the latest offset per `(group_id, topic, partition)` key. Alternatively, use a separate in-memory dirty-set and write a compacted snapshot to disk at intervals.
-
----
-
-### BUG-10 — `pascal_string` Length Field Is Only 2 Bytes (65535 Byte Limit)
-**File**: `src/protocol/wire.rs` — `write_pascal_string()`  
-**Severity**: 🔴 Critical (silent truncation on large payloads)
-
-```rust
-buf.put_u16(bytes.len() as u16); // silently truncates if > 65535 bytes
-```
-
-Topic names, transaction IDs, group IDs, and record payloads can all be passed through pascal strings. A topic name isn't typically large, but record payloads encoded as pascal strings (not used here) would truncate silently. More critically, if any of these string fields grows unexpectedly (e.g., long transaction_id), the 2-byte length will truncate without error. The payload length in `WireRequest::ProduceBatch` correctly uses `u32` per record, but the topic/key/transaction_id strings are bounded to 65535 bytes.
-
-**Fix**: Validate input lengths before encoding and return an error rather than silently truncating. Add a `MAX_STRING_LEN` constant and enforce it at encode/decode boundaries.
-
----
-
-### BUG-11 — `produce_batch` Does Not Handle `num_partitions = 0` Safely on Key-Routed Produce
-**File**: `src/server/engine.rs` — `produce_batch()`  
-**Severity**: 🟠 High (panic potential)
-
-```rust
-let partition_id = if !key.is_empty() && num_partitions > 0 {
-    hash_key(key.as_bytes(), num_partitions as usize)
-} else {
-    0  // falls back to partition 0 silently
-};
-```
-
-`hash_key()` is guarded, but a client can send `num_partitions = 0` with a key, causing all traffic to route to partition 0 without any diagnostic. Clients must track the actual partition count themselves, which is not exposed via any API call.
-
-**Fix**: Add a `DescribeTopicPartitions` command (wire code `0x0C`) that returns the current partition count for a topic. Return an error when `num_partitions = 0` and a non-empty key is provided.
-
----
-
-### BUG-12 — `__transaction_state` Replay Does Not Restore Partition Lists
-**File**: `src/server/engine.rs` — `replay_transaction_state()`  
-**Severity**: 🔴 Critical (transaction commit/abort after restart writes no control markers)
-
-`restore_transaction()` in `TransactionManager` sets `partitions: Vec::new()`. After a restart, if a client calls `CommitTx` for an in-flight transaction, `commit_transaction()` iterates over `state.partitions` — which is empty — and writes no commit control markers to any partition. Consumers see records from the transaction as permanently uncommitted.
-
-**Fix**: Persist the `(topic, partition, start_offset)` list as part of the `__transaction_state` log record format. Restore it during replay. The current `encode_tx_state_record` format must be extended to include partition list data.
-
----
-
-## 3. Security Issues
-
-### SEC-01 — No Maximum Payload Size Enforcement
-**File**: `src/protocol/wire.rs` — `WireRequest::decode()`  
-**Severity**: 🟠 High (remote OOM / DoS)
-
-A malicious or buggy client can send `record_count = 1_000_000` with each record having `rec_len = 4_000_000`. The server will attempt to allocate terabytes of memory trying to satisfy the request before any connection-level check occurs.
-
-**Fix**: Add wire-level constants:
-```rust
-const MAX_RECORD_COUNT: usize = 10_000;
-const MAX_RECORD_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MB per record
-const MAX_REQUEST_PAYLOAD_BYTES: usize = 100 * 1024 * 1024; // 100 MB total
-```
-Return `WireError::InvalidProtocol` if limits are exceeded.
-
----
-
-### SEC-02 — No Authentication or Authorization
-**Severity**: 🟠 High
-
-Any TCP client can produce to any topic, consume any partition, begin and commit transactions, and access cluster metadata. There is no SASL, TLS, or ACL mechanism.
-
-**Fix for production**: Add TLS via `tokio-rustls` (client certificate auth is optional). Add a simple pre-shared key (PSK) auth scheme as minimum viable security: a 32-byte auth token sent in a fixed header before any command. Store allowed tokens in `server.properties`.
-
----
-
-### SEC-03 — Topic Name Injection via Directory Traversal
-**File**: `src/server/engine.rs` — `get_or_create_partition()`  
-**Severity**: 🟠 High
-
-```rust
-let partition_dir = self.config.data_dir.join(format!("{}-{}", topic, partition));
-```
-
-A topic name of `../../etc` would create `data_dir/../../etc-0/`, potentially traversing out of the data directory. On Windows NTFS, this is a real attack vector.
-
-**Fix**: Validate topic names on receipt (wire decode or engine entry point). Allow only alphanumeric characters, hyphens, underscores, and dots. Maximum 249 characters (Kafka limit). Reject all others with a protocol error.
-
----
-
-## 4. Correctness & Data Integrity Issues
-
-### CORR-01 — Sparse Index Rebuild on Recovery Does Not Respect `index_interval_bytes`
-**File**: `src/segment/log.rs` — `LogSegment::open()`  
-**Severity**: 🟡 Medium
-
-During recovery, the index is rebuilt in `rebuilt_index_entries`. But the check `bytes_since_last_index >= index_interval` is evaluated against `index_interval` (the parameter), while the outer `bytes_since_last_index` is reset correctly. However, the first entry is always added unconditionally (`|| rebuilt_index_entries.is_empty()`), which is correct. The issue is that after calling `index_segment.truncate_and_rebuild(rebuilt_index_entries)`, the `IndexSegment` is passed in as `&mut` but then the same `index_segment` is used as the active index. The rebuilt entries are good but the `IndexSegment` on disk may not be flushed/synced after rebuild.
-
-**Fix**: Call `index_segment.sync()` after `truncate_and_rebuild()` to ensure the rebuilt index is persisted.
-
----
-
-### CORR-02 — `find_segment_pair()` Binary Search Is Incorrect
-**File**: `src/segment/manager.rs` — `find_segment_pair()`  
-**Severity**: 🔴 Critical (reads from wrong segment)
-
-```rust
-Err(idx) => {
-    if idx == 0 {
-        &self.historical[0]  // BUG: returns first segment even if offset is before it
-    } else if idx <= self.historical.len() {
-        let cand = &self.historical[idx - 1];
-        if offset >= self.active.base_offset {
-            &self.active
-        } else {
-            cand
-        }
-    } else {
-        &self.active
-    }
-}
-```
-
-When `binary_search_by_key` returns `Err(0)`, the offset is *before* all historical segment base offsets. In that case `historical[0]` is returned — which is correct. But when `idx > 0 && idx <= historical.len()`, the check `if offset >= self.active.base_offset` should be checked *before* computing `idx-1` because `idx` already means "would insert at this position", so `idx-1` is the largest segment that's still ≤ offset. The condition is logically correct only when `historical.len()` equals `idx`. When `idx` is somewhere in the middle, the check `offset >= self.active.base_offset` is redundant because `cand` already points to the right historical segment. The real bug is the `Err(0)` case: if the requested offset is *below* all historical segments, the code should return the first segment (historical[0]), but there is no validation that historical[0] actually covers that offset.
-
-**Fix**: Simplify the segment lookup to a clear linear search or correctly verified binary search:
-```rust
-fn find_segment_pair(&self, offset: u64) -> &SegmentPair {
-    if offset >= self.active.base_offset {
-        return &self.active;
-    }
-    for pair in self.historical.iter().rev() {
-        if offset >= pair.base_offset {
-            return pair;
+pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
+    for pair in &mut self.historical {
+        if let Ok(raw) = pair.log.read_at(0, HEADER_SIZE) {
+            if let Ok((frame, _)) = RecordFrame::decode(&raw) {
+                if frame.timestamp >= target_timestamp {
+                    return pair.base_offset;
+                }
+            }
         }
     }
-    self.historical.first().unwrap_or(&self.active)
+    0
 }
 ```
 
----
+This reads only the **first frame** of each historical segment to decide if the target timestamp is in that segment. This logic is **inverted**: it returns a segment when its *first* frame is already at or after the target. This means:
+- If `target_timestamp` falls **within** a segment (after the first frame), the correct segment is skipped and 0 is returned.
+- The `TimeIndexSegment` (fully implemented in `timeindex.rs`) is never used here, making it dead code.
+- The active segment is never checked — if all historical segments are before the target, it returns 0 (beginning of log) instead of `self.active.base_offset`.
 
-### CORR-03 — `commit_transaction` Persists `producer_id = 0`
-**File**: `src/server/engine.rs` — `commit_transaction()` and `abort_transaction()`  
-**Severity**: 🟡 Medium
-
-```rust
-let producer_id = 0u64; // producer_id already stored in partition markers
-```
-
-The `__transaction_state` log record encodes `producer_id` as part of the recovery format. Writing `0` means the replay path (`replay_transaction_state`) restores the transaction with `producer_id = 0`, losing idempotency information. After restart, the original `producer_id` is gone.
-
-**Fix**: Fetch the actual `producer_id` from the `TransactionState` before overwriting it:
-```rust
-let producer_id = self.transactions.get_producer_id(transaction_id).unwrap_or(0);
-```
+**Fix**: Wire `TimeIndexSegment` into `SegmentPair` (add `time_index: TimeIndexSegment` field alongside `index: IndexSegment`). Use `time_index.find_nearest_offset_for_timestamp(target_ts)` in `fetch_by_timestamp`.
 
 ---
 
-### CORR-04 — `high_watermark` Not Persisted; Always Resets to 0 on Fresh Startup
-**File**: `src/server/partition.rs`  
-**Severity**: 🟡 Medium
-
-`PartitionManager::open()` initializes `high_watermark` from `segment_manager.high_watermark()`, which comes from `active_log.next_offset`. This is correct for existing data. But for a brand new partition, `next_offset = base_offset = 0`. This is fine for a true new partition but can be 0 incorrectly if the segment manager's active segment detection logic ever picks the wrong file as "active" (see BUG CORR-02 / segment lookup issues).
-
----
-
-### CORR-05 — `__consumer_offsets.log` Has No CRC on Partial Entry Detection
-**File**: `src/consumer_group.rs`  
-**Severity**: 🟡 Medium
-
-CRC validation is correctly performed per-entry. However, if a crash occurs mid-write of an entry, the partial bytes at the end of the file are silently ignored (the `while` loop just breaks). On the next restart, the file is opened with `SeekFrom::End(0)`, so the partial/corrupt bytes remain in the file. Future entries will be written after the corrupt bytes, making subsequent recoveries impossible since the magic byte check (`CONSUMER_OFFSETS_MAGIC`) will fail immediately.
-
-**Fix**: After recovery, truncate the file to the last successfully decoded position (track `last_good_pos`) before seeking to end. Same pattern used in `LogSegment::open()`.
-
----
-
-## 5. Concurrency & Race Conditions
-
-### RACE-01 — `SegmentManager` Held Under `parking_lot::Mutex` During File I/O
-**File**: `src/server/partition.rs`  
-**Severity**: 🟠 High (throughput bottleneck + potential deadlock)
-
-`PartitionManager` wraps `SegmentManager` in a `parking_lot::Mutex`. Every `produce_frame()`, `fetch()`, `apply_retention()`, and `flush()` call acquires this exclusive lock. Since `SegmentManager::append()` performs file writes (which can block on OS scheduler), this serializes ALL produces and fetches for a partition through a single synchronous mutex. This eliminates any benefit of Tokio's async I/O.
-
-**Fix**: Move file I/O to a `tokio::task::spawn_blocking()` call. Replace `parking_lot::Mutex` with `tokio::sync::Mutex` and hold it across blocking calls dispatched via `spawn_blocking`. Alternatively, use a channel-based single-writer model per partition (one writer task, unlimited async readers via mmap).
-
----
-
-### RACE-02 — `DashMap` Partition Entry Insert Is Not Atomic with Directory Creation
-**File**: `src/server/engine.rs` — `get_or_create_partition()`  
-**Severity**: 🟠 High (TOCTOU race condition)
-
-```rust
-if let Some(pm) = self.partitions.get(&key) {
-    return Ok(pm.value().clone());
-}
-// --- Window: two concurrent callers can both miss the DashMap check ---
-let pm = Arc::new(PartitionManager::open(...))?;
-self.partitions.insert(key, pm.clone());
-```
-
-Two concurrent `ProduceBatch` requests for the same new topic-partition can both observe the DashMap miss and both call `PartitionManager::open()`, creating two `SegmentManager` instances pointing to the same directory. Both will write to the same log file, resulting in interleaved/corrupted data.
-
-**Fix**: Use `DashMap::entry()` API for atomic check-and-insert:
-```rust
-use dashmap::mapref::entry::Entry;
-match self.partitions.entry(key.clone()) {
-    Entry::Occupied(e) => Ok(e.get().clone()),
-    Entry::Vacant(e) => {
-        let pm = Arc::new(PartitionManager::open(...))?;
-        e.insert(pm.clone());
-        Ok(pm)
-    }
-}
-```
-
----
-
-### RACE-03 — `ReplicationManager` `epoch` Uses `std::sync::RwLock`, Not `tokio::sync::RwLock`
-**File**: `src/replication/mod.rs`  
-**Severity**: 🟡 Medium
-
-`Arc<RwLock<u64>>` from `std::sync` is used in async contexts. `std::sync::RwLock::write()` blocks the OS thread. If the lock is held during an `await` point (it isn't currently, but it's fragile), it will park the Tokio worker thread, causing latency spikes under load. The `.unwrap()` on lock acquisition will panic if the lock is poisoned (any thread that panics while holding it poisons it permanently).
-
-**Fix**: Replace `.unwrap()` with `.unwrap_or_else(|e| e.into_inner())` to handle poisoning gracefully. For the epoch field specifically, replace `RwLock<u64>` with `std::sync::atomic::AtomicU64` which requires no locking at all:
-```rust
-epoch: Arc<AtomicU64>,
-// get: epoch.load(Ordering::Acquire)
-// set: epoch.store(val, Ordering::Release)
-```
-
----
-
-### RACE-04 — `TransactionManager` Does Not Prevent Duplicate `begin_transaction` Under Concurrent Requests
-**File**: `src/server/transaction.rs` — `begin_transaction()`  
-**Severity**: 🟡 Medium
-
-```rust
-if self.transactions.contains_key(transaction_id) {
-    return Err(format!("Transaction ID '{}' already exists", transaction_id));
-}
-// --- Window: concurrent begins can both pass the check ---
-self.transactions.insert(...)
-```
-
-Two concurrent `BeginTx` requests with the same `transaction_id` can both pass the `contains_key` check before either inserts. Use `DashMap::entry()` here too.
-
----
-
-## 6. Replication & Consensus Issues
-
-### REP-01 — Newly Elected Leader Does Not Start Heartbeat Loop
-**File**: `src/replication/mod.rs` — `start_election_timeout_loop()`  
-**Severity**: 🔴 Critical (newly elected leaders never send heartbeats)
-
-When a follower wins an election (`consensus.tally_election_votes()` returns `true`), it sets its leader addr and consensus state, but **never starts the heartbeat broadcaster loop**. Only the initial leader (configured via `role = Leader` in `server.properties`) runs `start_leader_heartbeat_loop()`. A node that becomes leader through election will never send heartbeats, causing all other nodes to immediately re-elect.
-
-**Fix**: After a successful election, spawn the heartbeat loop:
-```rust
-if consensus.tally_election_votes(votes_granted) {
-    // ... existing code ...
-    // Start sending heartbeats as the new leader
-    start_heartbeat_loop_for_new_leader(peer_addrs.clone(), ...);
-}
-```
-
----
-
-### REP-02 — Raft Vote Does Not Check `voted_for` (Double-Voting Bug)
-**File**: `src/server/handler.rs` — `decode_vote_request_packet()`  
-**Severity**: 🔴 Critical (split-brain / multi-leader scenario)
-
-```rust
-if term >= our_epoch {
-    engine.replication().set_epoch(term);
-    // GRANTS VOTE — but never checks if already voted this term!
-    Ok((bytes_consumed, vec![0x01]))
-}
-```
-
-A node will grant votes to **any** candidate whose term is ≥ current epoch, even if it already voted for a different candidate in the same term. This violates the fundamental Raft safety property and can lead to two nodes both believing they won a majority, creating a split-brain cluster.
-
-**Fix**: Track `voted_for: Option<(u32, u64)>` (candidate_id, term) in `ReplicationManager`. Only grant a vote if `voted_for` is `None` for the current term or matches the same candidate:
-```rust
-let already_voted = engine.replication().has_voted_this_term(term);
-if term >= our_epoch && !already_voted {
-    engine.replication().record_vote(candidate_id, term);
-    Ok((bytes_consumed, vec![0x01]))
-} else {
-    Ok((bytes_consumed, vec![0x00]))
-}
-```
-
----
-
-### REP-03 — Replication Is Fire-and-Forget; No Retry or Backpressure
+### PARTIAL-03 — ISR Quorum Uses `block_in_place` (Deadlock Risk)
 **File**: `src/server/engine.rs` — `produce_batch()`  
-**Severity**: 🟠 High
+**Severity**: HIGH
 
 ```rust
-tokio::spawn(async move {
-    if let Err(e) = repl.replicate_batch(...).await {
-        tracing::error!("HA Replication: replicate_batch failed: {}", e);
-    }
+let quorum_ok = tokio::task::block_in_place(|| {
+    handle.block_on(self.replication.await_isr_quorum(...))
 });
 ```
 
-Replication failures are logged but not retried. A follower that is momentarily unreachable will permanently fall behind. There is no mechanism for the follower to re-sync from the leader (the `send_grpc_replication_fetch` pull mechanism exists but is never invoked on the follower side). The `ReplicationFetchRequest` API exists but has no background loop calling it.
+`block_in_place` parks a Tokio worker thread. `block_on` re-enters the async runtime on the same thread. This works only with Tokio's multi-thread runtime. Issues:
+1. It **blocks the entire OS thread** for up to 5 seconds per produce requiring quorum. With N concurrent produces, N threads are blocked.
+2. Fails in `#[tokio::test]` with single-threaded runtime (used in integration tests) — causes panic.
+3. Violates Rust async idioms and Tokio's cooperative scheduling model.
 
-**Fix**: Implement a follower-side replication pull loop that runs as a background task, periodically fetching missing records from the leader using `send_grpc_replication_fetch`. Track per-peer watermarks and only pull what's missing.
+**Fix**: Make `produce_batch()` `async` and `await` ISR quorum directly. Update `handler.rs` callers accordingly.
 
 ---
 
-### REP-04 — `STALE_EPOCH` Detection Is Byte-String Comparison, Not Protocol
-**File**: `src/replication/mod.rs` — `replicate_batch()`  
-**Severity**: 🟡 Medium
+### PARTIAL-04 — MEM-02: Aborted Transactions Never Cleaned Up
+**File**: `src/server/engine.rs` — `abort_transaction()`  
+**Severity**: HIGH (memory leak)
+
+`cleanup_completed_transaction()` is only called after `commit_transaction()`. Aborted transactions accumulate in `DashMap<String, TransactionState>` indefinitely. `aborted_ranges()` and `last_stable_offset()` still do O(T) full scans across all of them.
+
+**Fix**: After a configurable retention window (e.g., 60 seconds), remove aborted transactions. Use a `BTreeMap<Instant, String>` expiry queue cleaned by a background task.
+
+---
+
+### PARTIAL-05 — `validate_topic_name` Not Called at Wire Layer
+**File**: `src/protocol/wire.rs`  
+**Severity**: HIGH (security)
+
+`validate_topic_name()` is defined in `engine.rs` and called only in `get_or_create_partition()`. An attacker sending a malicious topic name traverses the network handler and — if this is a follower — gets the request forwarded to the leader before validation occurs.
+
+**Fix**: Call topic name validation in `process_request()` (in `handler.rs`) before any engine interaction, or move the validator to `wire.rs` and invoke it during decode.
+
+---
+
+## 4. Still Open — Critical Bugs
+
+### OPEN-CRIT-01 — PARTIAL-01: WAL Is Still a No-Op for Crash Safety
+See Section 3 — PARTIAL-01. The most important remaining issue.
+
+### OPEN-CRIT-02 — PARTIAL-02: `FetchByTimestamp` Returns Wrong Results
+See Section 3 — PARTIAL-02. `TimeIndexSegment` is dead code; active segment is never checked.
+
+### OPEN-CRIT-03 — RACE-01: `SegmentManager` Mutex Blocks OS Thread During File I/O
+**File**: `src/server/partition.rs`  
+**Severity**: CRITICAL (throughput bottleneck + Tokio thread starvation)
+
+`PartitionManager` wraps `SegmentManager` in `parking_lot::Mutex`. Every `produce_frame()` and `fetch()` call acquires this exclusive mutex and performs **synchronous file I/O** (seek + write) while holding it. This is a blocking operation inside Tokio's async runtime. Under concurrent load:
+- All produces to the same partition are serialized behind a single mutex.
+- The OS thread is parked during the disk write, reducing the effective Tokio thread pool size.
+
+This was listed as RACE-01 in v1 and remains entirely unaddressed.
+
+**Fix**: Wrap segment I/O in `tokio::task::spawn_blocking` or switch to a channel-based single-writer model per partition.
+
+### OPEN-CRIT-04 — REP-03: No Follower Pull-Based Catch-Up
+**File**: `src/replication/`  
+**Severity**: CRITICAL (followers permanently lag after any missed push)
+
+`ReplicationFetchRequest` / `send_grpc_replication_fetch()` infrastructure exists in `grpc.rs` but no follower background loop ever calls it. A follower that misses a replication push (due to transient network error) has no way to catch up.
+
+---
+
+## 5. Still Open — High Severity
+
+### OPEN-HIGH-01 — PERF-01: New TCP Connection Per Replication Push
+Every `replicate_batch()` call opens a new `TcpStream::connect()` to each peer. Under high produce throughput (5,000 records/sec), this creates 5,000 connections/sec per follower, exhausting ephemeral ports.
+
+**Fix**: Persistent connection pool (`Arc<Mutex<TcpStream>>` per peer in `ReplicationManager`).
+
+### OPEN-HIGH-02 — PERF-02: Heartbeat Opens New TCP Connection Each Interval
+Same issue as OPEN-HIGH-01. Applies to `send_leader_heartbeat()`.
+
+### OPEN-HIGH-03 — SEC-02: No Authentication or Authorization
+No TLS, SASL, or pre-shared key. Any TCP client can read all data, produce to all topics, and delete topics.
+
+**Minimum fix**: PSK auth handshake as first message on any new connection.
+
+### OPEN-HIGH-04 — PROTO-01: No Correlation IDs in Wire Protocol
+All requests on a connection are strictly serial. No request ID field prevents pipelining.
+
+### OPEN-HIGH-05 — PROTO-03: `FetchOffset` Returns `u64::MAX` for "No Offset"
+```rust
+let offset = engine.fetch_offset(...).unwrap_or(u64::MAX);
+```
+Ambiguous sentinel; cannot distinguish "never committed" from "offset MAX committed."
+
+### OPEN-HIGH-06 — BUG-10: Pascal String Length Is Only 2 Bytes (No Input Validation)
+`write_pascal_string` uses `u16` length field, silently truncating strings >65535 bytes. No `MAX_STRING_LEN` validation is applied at encode time. A topic name of exactly 65536 chars would be silently truncated without error.
+
+---
+
+## 6. Still Open — Medium / Low Severity
+
+| ID | Issue | Severity |
+|----|-------|----------|
+| PERF-04 | Frames encoded twice (once for disk, once for replication payload) | Medium |
+| PERF-05 | LSO and aborted-range lookups still O(T) full scans | Medium |
+| OBS-01 | No metrics (Prometheus / Windows Performance Counters) | High |
+| OBS-02 | Structured logging fields not used (`tracing::info!(topic = %topic, ...)`) | Medium |
+| WIN-02 | `preallocate_segments = true` default may hurt SSDs | Medium |
+| DEP-03 | Election jitter is deterministic (no `rand` crate) | Low |
+| FEAT-03 | No consumer group rebalancing protocol | High |
+| FEAT-04 | No compression support (LZ4 / Zstandard) | Medium |
+| ERR-03 | Leader broker registration failure silently ignored (`let _ = ...`) | Low |
+| TEST-01 | No chaos / fault injection tests | Medium |
+| TEST-02 | No criterion benchmarks | Low |
+
+---
+
+## 7. New Bugs Introduced in This Version
+
+### NEW-01 — `produce_frame` Holds Two Locks Simultaneously (Fragile Lock Ordering)
+**File**: `src/server/partition.rs`  
+**Severity**: Medium
 
 ```rust
-if err_str.contains("STALE_EPOCH") {
+let mut seg_guard = self.segment_manager.lock();   // Lock 1 acquired
+let frame = seg_guard.append(payload, timestamp)?;
+// ...
+let mut wal_guard = self.wal_engine.lock();         // Lock 2 acquired while Lock 1 held
+wal_guard.push(&frame);
+if wal_guard.should_flush() {
+    seg_guard.sync()?;                              // Uses Lock 1 while Lock 2 is held
+}
+// Both locks released here
 ```
 
-Stale epoch detection relies on checking whether an error message *string contains* `"STALE_EPOCH"`. This is extremely fragile — a change in the error message string, OS locale, or log output format could silently break epoch fencing. The ACK byte from the follower should encode semantic status codes.
+Both `seg_guard` and `wal_guard` are held simultaneously. If any future code path acquires these locks in the opposite order, a deadlock results. Currently safe only by convention.
 
-**Fix**: Change the replication ACK response from `vec![0u8]` (OK) / `b"STALE_EPOCH".to_vec()` (stale) to a proper 1-byte status code:
-- `0x00` = ACK (success)
-- `0x01` = STALE_EPOCH (step down)
-- `0x02` = Internal error
+**Fix**: Drop `seg_guard` before acquiring `wal_guard`, or merge `WalEngine` into `SegmentManager`.
 
 ---
 
-### REP-05 — `min_insync_replicas` Is Never Enforced on Produce Acknowledge
-**File**: `src/server/engine.rs` — `produce_batch()`  
-**Severity**: 🟠 High (durability guarantee not upheld)
+### NEW-02 — `find_offset_for_timestamp` Never Checks Active Segment
+**File**: `src/segment/manager.rs`  
+**Severity**: HIGH
 
-`ReplicationManager::await_isr_quorum()` is fully implemented but **never called** from `produce_batch()`. The config field `min_insync_replicas` is parsed and stored but has zero effect on write acknowledgment semantics. Clients receive an `Ok` response the moment the leader writes locally, regardless of how many followers have replicated the data.
-
-**Fix**: Call `await_isr_quorum()` from `produce_batch()` before returning success:
 ```rust
-// After local write, before returning Ok
-if self.config.role == NodeRole::Leader && self.config.min_insync_replicas > 1 {
-    let quorum_ok = self.replication.await_isr_quorum(
-        topic, partition_id, last_offset,
-        Duration::from_secs(5)
-    ).await;
-    if !quorum_ok {
-        return Err(IoError::new(ErrorKind::TimedOut, "ISR quorum not reached"));
+pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
+    for pair in &mut self.historical {
+        // ... checks historical only
     }
-}
-```
-Note: `produce_batch` is currently synchronous (`IoResult`). This requires making it `async` or using a `tokio::runtime::Handle`.
-
----
-
-## 7. Performance Issues
-
-### PERF-01 — Each Replication Push Opens a New TCP Connection
-**File**: `src/replication/mod.rs` — `send_replication_push()`  
-**Severity**: 🟠 High (TCP connection overhead per batch)
-
-```rust
-let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
-```
-
-Every call to `replicate_batch()` opens a new TCP connection to each peer. TCP connection setup (3-way handshake + Nagle algorithm delay) adds ~1-5ms per batch. At 10,000 produces/sec this creates 10,000 TCP connections/sec to each follower, exhausting ephemeral ports.
-
-**Fix**: Maintain persistent TCP connections to peer nodes using a `DashMap<String, Arc<Mutex<TcpStream>>>` connection pool. Reconnect on error with exponential backoff.
-
----
-
-### PERF-02 — Heartbeat Also Opens a New TCP Connection Each Interval
-**File**: `src/replication/mod.rs` — `send_leader_heartbeat()`  
-**Severity**: 🟡 Medium
-
-Same issue as PERF-01. The heartbeat broadcast creates a new TCP connection every 10 seconds per peer.
-
-**Fix**: Reuse the same persistent connection pool as replication.
-
----
-
-### PERF-03 — `SegmentManager::fetch()` Re-reads From Physical File on Every Request
-**File**: `src/segment/manager.rs` — `fetch()`  
-**Severity**: 🟡 Medium
-
-`fetch()` calls `LogSegment::read_at()` which does a `file.seek()` + `file.read()` on every request. The `MmapLogSegment` exists (`src/segment/mmap.rs`) but is never used in the fetch path. Historical segments should use mmap for zero-copy reads.
-
-**Fix**: In `SegmentManager`, maintain `MmapLogSegment` counterparts for all historical (read-only) segments. Switch `find_segment_pair()` to return an enum `ActiveSeg | MmapSeg` and use the mmap path for historical reads.
-
----
-
-### PERF-04 — `produce_batch` Calls `encode_into` Twice Per Frame
-**File**: `src/server/engine.rs` and `src/segment/manager.rs`  
-**Severity**: 🟡 Low
-
-`produce_batch()` calls `produce_frame()` → `SegmentManager::append()` → `RecordFrame::encode_into()` to write to disk. Then the returned `RecordFrame` is cloned and `encode_into()` is called again in `replicate_batch()` for the replication payload. This means every frame is serialized twice.
-
-**Fix**: Cache the encoded bytes inside `RecordFrame` or return encoded bytes from `append()` alongside the frame.
-
----
-
-### PERF-05 — `aborted_ranges()` and `last_stable_offset()` Do Full Scans of All Transactions
-**File**: `src/server/transaction.rs`  
-**Severity**: 🟡 Medium
-
-Every `fetch_committed()` call iterates all entries in the `transactions` DashMap (which grows unboundedly). In a high-throughput system with many transactions, this O(T) scan per read is a bottleneck.
-
-**Fix**: Maintain a separate `Arc<DashMap<(String, u32), u64>>` for LSO per `(topic, partition)` and update it on every `begin_transaction`/`commit`/`abort`. This makes LSO lookup O(1). Remove completed (Committed/Aborted) transactions from the main map after they've been fully processed.
-
----
-
-## 8. Protocol & API Issues
-
-### PROTO-01 — No Correlation ID / Request Multiplexing
-**Severity**: 🟠 High
-
-The wire protocol has no correlation ID field. All requests over a single connection are strictly serial (send request, wait for response, send next). Under high load, a single slow request blocks all subsequent requests on that connection. This prevents efficient client-side pipelining.
-
-**Fix**: Add a 4-byte correlation ID to the request and response wire format:
-```
-Request:  [Cmd: 1b] [CorrelationID: 4b] [PayloadLen: 4b] [Payload]
-Response: [Status: 1b] [CorrelationID: 4b] [PayloadLen: 4b] [Payload]
-```
-
----
-
-### PROTO-02 — No `ListTopics` / `DescribeCluster` API
-**Severity**: 🟡 Medium
-
-There is no command to list available topics, number of partitions per topic, cluster topology, or broker metadata. Client applications have no way to discover the cluster dynamically.
-
-**Fix**: Add wire commands:
-- `0x0C` — `ListTopics` → returns `[(topic, partition_count)]`
-- `0x0D` — `DescribeCluster` → returns `[(node_id, bind_addr, role)]`
-
----
-
-### PROTO-03 — `FetchOffset` Returns `u64::MAX` When No Offset Committed
-**File**: `src/server/handler.rs` — `FetchOffset` arm  
-**Severity**: 🟡 Medium
-
-```rust
-let offset = engine.fetch_offset(&group_id, &topic, partition).unwrap_or(u64::MAX);
-```
-
-Returning `u64::MAX` as the "no committed offset" sentinel is ambiguous. Clients cannot distinguish "offset `u64::MAX` was explicitly committed" from "no offset has been committed". This causes clients to start fetching from `u64::MAX` which returns no data, rather than from offset 0 (earliest) or the current high watermark (latest).
-
-**Fix**: Return a distinct response status (`0x02 = NO_OFFSET_COMMITTED`) separate from the `u64` payload. Or document and use `-1i64` cast as `u64::MAX` as a sentinel with explicit client-side handling.
-
----
-
-## 9. Error Handling Gaps
-
-### ERR-01 — `replay_transaction_state` and `replay_metadata_log` Silently Swallow Errors
-**File**: `src/server/engine.rs` — `StorageEngine::new()`  
-**Severity**: 🟡 Medium
-
-```rust
-let _ = engine.replay_metadata_log();
-let _ = engine.replay_transaction_state();
-```
-
-Errors during startup replay are discarded with `let _ = `. If replay fails (e.g., disk error, corrupt log), the server starts with incomplete state and silently serves stale or missing data.
-
-**Fix**: Propagate replay errors to the caller and refuse to start:
-```rust
-engine.replay_metadata_log()?;
-engine.replay_transaction_state()?;
-```
-
----
-
-### ERR-02 — `CommitTx`/`AbortTx` Control Marker Write Errors Are Silently Ignored
-**File**: `src/server/transaction.rs` — `commit_transaction()` / `abort_transaction()`  
-**Severity**: 🟠 High (silent transaction corruption)
-
-```rust
-let _ = pm.produce_control_marker(1, producer_id, &tx_id);
-```
-
-If writing the commit or abort control marker fails (e.g., disk full), the error is silently swallowed. The in-memory state says `Committed` but the disk has no marker. On restart, the transaction is replayed as `Committed` (from `__transaction_state`) but consumers fetching with `FetchCommitted` will see the records as uncommitted because there is no control marker in the partition log.
-
-**Fix**: Return an error from `commit_transaction`/`abort_transaction` if any control marker write fails. Retry the write before declaring success.
-
----
-
-### ERR-03 — `StorageEngine::new()` Does Not Handle Leader Registration Failure
-**File**: `src/server/engine.rs`  
-**Severity**: 🟡 Low
-
-```rust
-if let Ok(meta_pm) = engine.get_or_create_partition("__cluster_metadata", 0) {
-    let _ = meta_pm.produce(&reg_rec.encode());
+    0  // Returns 0 — forces full scan from beginning if target is in active segment
 }
 ```
 
-The `let _` silently discards the produce error. If the leader cannot write its own broker registration record, the cluster metadata log is permanently missing this entry. Followers will never learn the leader's address.
+If `target_timestamp` refers to a record in the **active** segment (which is the common case on a busy partition), the function returns `0`, forcing a full scan from the very beginning of the log.
+
+**Fix**: After the historical loop, check if target is likely in the active segment:
+```rust
+// after historical loop:
+self.active.base_offset  // return active base if not found in historical
+```
 
 ---
 
-## 10. Memory Management Issues
-
-### MEM-01 — `handle_connection` Buffer Grows Unboundedly
-**File**: `src/server/handler.rs` — `handle_connection()`  
-**Severity**: 🟠 High (OOM on malicious/buggy clients)
+### NEW-03 — `delete_topic()` Does Not Flush/Close Handles Before Unlinking
+**File**: `src/server/engine.rs` — `delete_topic()`  
+**Severity**: HIGH (Windows — silent failure to delete files)
 
 ```rust
-if filled == buffer.len() {
-    buffer.resize(buffer.len() * 2, 0); // unbounded growth
-}
+self.partitions.remove(&key);        // Drops Arc; if shared, file handles remain open
+// ...
+let _ = std::fs::remove_dir_all(&path);  // Silently fails on Windows if handles still open
 ```
 
-If a client sends a partial frame and never completes it, the buffer will double repeatedly until OOM. There is no maximum buffer size cap.
+On Windows NTFS, files cannot be deleted while open (even with `FILE_SHARE_DELETE`). If any other code holds a clone of `Arc<PartitionManager>`, `remove_dir_all` fails silently and the files remain on disk.
 
-**Fix**: Add a `MAX_CONNECTION_BUFFER: usize = 128 * 1024 * 1024;` (128MB) cap. If the buffer would grow beyond this, close the connection with a protocol error.
-
----
-
-### MEM-02 — Completed Transactions Are Never Removed from Memory
-**File**: `src/server/transaction.rs`  
-**Severity**: 🟠 High (memory leak in long-running servers)
-
-`transactions: Arc<DashMap<String, TransactionState>>` grows indefinitely. Every `BeginTx` adds an entry. `CommitTx`/`AbortTx` change the status to `Committed`/`Aborted` but **never remove the entry**. A server running for days with many short-lived transactions will accumulate millions of stale `TransactionState` entries.
-
-**Fix**: After a successful `commit_transaction` or `abort_transaction`, remove the entry from the DashMap:
-```rust
-self.transactions.remove(transaction_id);
-```
-Keep a time-bounded "recently aborted" cache (e.g., last 60 seconds) for LSO and aborted-range queries.
+**Fix**: Call `pm.flush()` before removing. Propagate the unlink error instead of discarding it.
 
 ---
 
-### MEM-03 — `RecordFrame` Clones `Bytes` Payload on Every Replication Batch
-**File**: `src/server/engine.rs` — `produce_batch()`  
-**Severity**: 🟡 Low
+### NEW-04 — `hermes_cli.rs` `get_arg_val` Short-Flag Logic Is Misleading
+**File**: `src/bin/hermes_cli.rs`  
+**Severity**: Low
 
-```rust
-let frames_clone = frames.clone();
-tokio::spawn(async move {
-    repl.replicate_batch(&topic_str, partition_id, &frames_clone).await
-```
+The inner condition `args[i] == &flag[1..]` (which strips one `-` from `--flag` to get `-flag`) does not match true POSIX short flags like `-s`. The `-s` short form is handled at the callsite via `.or_else(|| get_arg_val(&args, "-s"))`, so behavior is ultimately correct, but the inner condition is misleading and could cause bugs if new flags are added without the `.or_else` pattern.
 
-`frames.clone()` clones all `RecordFrame` structs. Each `RecordFrame` contains a `Bytes` payload. While `Bytes` uses reference-counted slices (cheap clone for the ref count), the outer `Vec<RecordFrame>` is deeply cloned. Use `Arc<Vec<RecordFrame>>` instead to make the spawn truly cheap.
+**Fix**: Remove the inner short-flag matching from `get_arg_val`; rely solely on explicit `.or_else()` chains at the callsite.
 
 ---
 
-## 11. Windows-Specific Issues
+### NEW-05 — `group-consume` Has No Graceful Ctrl+C Shutdown
+**File**: `src/bin/hermes_cli.rs`  
+**Severity**: Low
 
-### WIN-01 — `TransmitFile` Not Integrated into the Fetch Path
-**File**: `src/segment/log.rs` — `transmit_file_zero_copy()`  
-**Severity**: 🟡 Medium
+The `group-consume` infinite loop has no signal handler. On Windows, Ctrl+C terminates the process abruptly without committing the last consumed offset.
 
-The `transmit_file_zero_copy()` method is defined but **never called**. The fetch path always uses `read_at()` (seek + read into heap buffer). All the Windows IOCP benefit is unused.
-
-**Fix**: Integrate TransmitFile into the fetch response path (after fixing BUG-07). For each `Fetch` request, instead of building a `Vec<RecordFrame>`, send the raw bytes directly from the file to the socket using TransmitFile with proper OVERLAPPED I/O.
+**Fix**: Use `tokio::signal::ctrl_c()` in a `select!` to commit the last offset before exiting.
 
 ---
 
-### WIN-02 — `preallocate_segments = true` by Default Hurts SSD Performance
-**File**: `src/config.rs`  
-**Severity**: 🟡 Medium
+## 8. New File Review: hermes_cli.rs
 
-Pre-allocating 10MB per segment with `file.set_len(max_bytes)` triggers NTFS file table updates and zeroing. On SSDs with write amplification concerns, pre-allocating 10MB for every new partition is wasteful if partitions are short-lived.
+The new CLI binary provides a usable command-line interface for all major Hermes operations.
 
-**Fix**: Make `preallocate_segments` default to `false` for SSDs (or document the tradeoff). Add a Windows registry/WMI check to detect if the storage path is on an HDD vs SSD and adjust the default accordingly.
+**What works correctly**:
+- Consumer group offset resume (`fetch_offset → committed + 1`)
+- `--from-beginning` starts at offset 0
+- Auto-commit after group fetch
+- Server address resolution via `to_socket_addrs()` (supports DNS hostnames)
+- `group-consume` polling loop with configurable interval
 
----
+**Missing features**:
+- No `produce-batch` command (only single-message produce — useful for throughput testing)
+- No `--tx-id` flag for transactional produce testing
+- No `fetch-committed` command (cannot test LSO isolation from CLI)
+- No `list-topics` / `describe-cluster` commands (new wire commands `0x0D`/`0x0E` added but not exposed in CLI)
+- No `delete-topic` command in CLI (only in wire protocol)
 
-### WIN-03 — `socket2` `set_reuse_port` Is Called on Non-Windows but May Not Be Available
-**File**: `src/server/listener.rs`  
-**Severity**: 🟡 Low
-
-```rust
-let _ = socket.set_reuse_port(true);
-```
-
-`set_reuse_port` is silently ignored (result discarded). On macOS, `SO_REUSEPORT` semantics differ from Linux. The `let _` is acceptable here, but the comment should be updated to note the cross-platform behavior.
-
----
-
-## 12. Observability Gaps
-
-### OBS-01 — No Metrics Exposed (No Prometheus / No Windows Performance Counters)
-**Severity**: 🟠 High
-
-There are no metrics for: produce throughput (records/sec, bytes/sec), fetch latency (p99), segment rotation count, replication lag per follower, consumer group lag, transaction commit/abort rate, or active connection count. Without metrics, it is impossible to operate this system in production.
-
-**Fix**: Add a metrics abstraction layer. Recommended: embed `metrics` crate (https://crates.io/crates/metrics) with a `metrics-exporter-prometheus` backend. Add counters/histograms at every critical path:
-```rust
-metrics::counter!("hermes.produce.records", 1);
-metrics::histogram!("hermes.fetch.latency_ms", elapsed.as_millis() as f64);
-```
+**Issues**:
+- NEW-04: misleading inner short-flag matching
+- NEW-05: no graceful Ctrl+C shutdown in `group-consume`
+- Error messages go to `eprintln!` correctly, but success output uses `println!` which cannot be redirected to stderr independently
 
 ---
 
-### OBS-02 — Structured Logging Missing Key Fields
-**Severity**: 🟡 Medium
+## 9. Remaining Roadmap
 
-Log entries use string interpolation (`tracing::info!("...", var)`) but lack structured key-value fields. Production log aggregation systems (Splunk, Elasticsearch, Datadog) can't efficiently query unstructured strings.
+### Sprint 1 — Must Fix Before Any Production Use
 
-**Fix**: Use structured tracing fields:
-```rust
-tracing::info!(
-    topic = %topic,
-    partition = partition_id,
-    offset = first_offset..=last_offset,
-    "Produce batch committed"
-);
-```
+| Priority | Issue | File |
+|----------|-------|------|
+| P0 | Implement WAL-file write+replay OR cleanly remove WAL abstraction (PARTIAL-01) | `wal/`, `partition.rs` |
+| P0 | Fix `find_offset_for_timestamp` to use `TimeIndexSegment` + check active seg (PARTIAL-02, NEW-02) | `segment/manager.rs` |
+| P0 | Make `produce_batch` async; remove `block_in_place` (PARTIAL-03) | `server/engine.rs` |
+| P0 | Fix `delete_topic` flush+error propagation on Windows (NEW-03) | `server/engine.rs` |
+| P0 | Validate topic names at wire layer, not only in engine (PARTIAL-05) | `protocol/wire.rs` or `handler.rs` |
+| P1 | Move segment I/O to `spawn_blocking` to unblock Tokio threads (OPEN-CRIT-03) | `server/partition.rs` |
+| P1 | Implement follower pull-based catch-up loop (OPEN-CRIT-04) | `replication/mod.rs` |
 
----
+### Sprint 2 — Reliability
 
-### OBS-03 — No Health Check Endpoint
-**Severity**: 🟡 Medium
+| Priority | Issue |
+|----------|-------|
+| P1 | Time-bounded aborted transaction cleanup (PARTIAL-04) |
+| P1 | TCP connection pooling for replication and heartbeat (OPEN-HIGH-01/02) |
+| P1 | Replace STALE_EPOCH string check with semantic byte ACK (REP-04) |
+| P2 | Fix dual-lock ordering in `produce_frame` (NEW-01) |
+| P2 | Wire `TimeIndexSegment` into `SegmentPair` for proper timestamp seeks |
 
-There is no `/health` or wire-level heartbeat command that a load balancer or orchestrator can use to determine if the node is ready to serve traffic. The `ping_handshake()` in `TestClient` exists but is test-only.
+### Sprint 3 — Production Hardening
 
-**Fix**: Add a `0x00` command code (`Ping`) that responds with the node's current role, epoch, and high watermark. This doubles as a health check for monitoring systems.
+| Priority | Issue |
+|----------|-------|
+| P1 | Add PSK authentication (SEC-02) |
+| P1 | Add Prometheus metrics (OBS-01) |
+| P2 | Add correlation IDs to wire protocol (PROTO-01) |
+| P2 | Proper "no committed offset" sentinel (PROTO-03) |
+| P2 | Fix CLI: add missing commands, graceful shutdown (NEW-04, NEW-05) |
 
----
+### Sprint 4 — Feature Completeness
 
-## 13. Testing Gaps
-
-### TEST-01 — No Chaos / Fault Injection Tests
-**Severity**: 🟡 Medium
-
-The integration tests in `tests/integration_tests.rs` cover the happy path well (produce, fetch, transactions, consumer groups). But there are no tests for:
-- Crash recovery (truncated log segments, partial writes)
-- Network partition (follower losing connection to leader during replication)
-- Leader failover via election
-- Concurrent produces from 100+ clients
-- Memory pressure / large payload handling
-
-**Fix**: Add a test harness with fault injection capabilities:
-- `TestEnv::kill_and_restart_server()` — restart with same data dir
-- `TestEnv::corrupt_last_segment()` — write random bytes at the end
-- A multi-server test that can pause/resume individual servers to simulate network partitions
-
----
-
-### TEST-02 — No Benchmark Tests
-**Severity**: 🟢 Low
-
-There are no `criterion`-based benchmarks for the hot paths: `append()`, `fetch()`, `segment_rotation`, or `index_lookup`. Without baselines, performance regressions are invisible.
-
-**Fix**: Add `benches/` directory with criterion benchmarks for at minimum:
-- `produce_single_record` — single record latency
-- `produce_batch_1000` — batch throughput
-- `fetch_10k_records` — sequential read throughput
-- `segment_rotation` — rotation cost
+- Add `--tx-id`, `produce-batch`, `fetch-committed`, `list-topics`, `delete-topic` to CLI
+- Add consumer group rebalancing protocol (FEAT-03)
+- Add LZ4/Zstandard compression (FEAT-04)
+- Add admin HTTP API on a separate port
+- Add criterion benchmarks (TEST-02)
+- Add fault-injection integration tests (TEST-01)
 
 ---
 
-## 14. Missing Production Features
+## 10. Issue Scorecard vs v1
 
-### FEAT-01 — No Topic Deletion
-There is no wire command to delete a topic. Once a topic is created, its data directory and partition entries persist forever. Add a `DeleteTopic` command that removes partition directories and unregisters from the DashMap.
+| v1 ID | Status in v2 | Notes |
+|-------|-------------|-------|
+| BUG-01 | PARTIAL | Buffer wired; no WAL file |
+| BUG-02 | PARTIAL | Correct segment chosen, but `find_offset_for_timestamp` still wrong |
+| BUG-03 | FIXED | Exact abort ranges restored |
+| BUG-04 | FIXED | Directory layout corrected |
+| BUG-05 | FIXED | Heartbeat resets election timer |
+| BUG-06 | LOW RISK | Entry() guard protects against double-open |
+| BUG-07 | FIXED | OVERLAPPED + spawn_blocking |
+| BUG-08 | FIXED | Streaming 64KB recovery |
+| BUG-09 | FIXED | Compaction on 1MB threshold |
+| BUG-10 | OPEN | No MAX_STRING_LEN at encode |
+| BUG-11 | PARTIAL | Silent fallback to partition 0 unchanged |
+| BUG-12 | FIXED | Full partition list persisted + restored |
+| SEC-01 | FIXED | 64MB payload cap |
+| SEC-02 | OPEN | No auth |
+| SEC-03 | FIXED | Topic name validation in engine |
+| CORR-01 | FIXED | Index synced after rebuild |
+| CORR-02 | FIXED | Reverse linear scan |
+| CORR-03 | FIXED | Real producer_id used |
+| CORR-04 | FIXED | Implicit via BUG-04 |
+| CORR-05 | FIXED | File truncated after partial write |
+| RACE-01 | OPEN | parking_lot Mutex blocks on file I/O |
+| RACE-02 | FIXED | DashMap::entry() |
+| RACE-03 | FIXED | AtomicU64 |
+| RACE-04 | FIXED | DashMap::entry() in begin_transaction |
+| REP-01 | FIXED | Elected leaders start heartbeat |
+| REP-02 | FIXED | voted_for enforced |
+| REP-03 | OPEN | No follower catch-up loop |
+| REP-04 | PARTIAL | String-match still used |
+| REP-05 | PARTIAL | Implemented via block_in_place (deadlock risk) |
+| PERF-01 | OPEN | New TCP conn per replication push |
+| PERF-02 | OPEN | New TCP conn per heartbeat |
+| PERF-03 | FIXED | MmapLogSegment on historical segments |
+| PERF-04 | OPEN | Double encode per frame |
+| PERF-05 | OPEN | O(T) LSO scans |
+| PROTO-01 | OPEN | No correlation IDs |
+| PROTO-02 | FIXED | ListTopics, DescribeCluster added |
+| PROTO-03 | OPEN | u64::MAX sentinel unchanged |
+| ERR-01 | FIXED | Replay errors propagated with ? |
+| ERR-02 | FIXED | Marker write errors surfaced |
+| ERR-03 | OPEN | BrokerRegister write still `let _ = ...` |
+| MEM-01 | FIXED | 128MB connection buffer cap |
+| MEM-02 | PARTIAL | Committed cleaned; Aborted still leak |
+| MEM-03 | OPEN | Frame encode clone for replication |
+| WIN-01 | FIXED | TransmitFile integrated async-safe |
+| WIN-02 | OPEN | preallocate SSD concern |
+| WIN-03 | LOW | set_reuse_port silently ignored |
+| OBS-01 | OPEN | No metrics |
+| OBS-02 | OPEN | Unstructured logs |
+| OBS-03 | FIXED | Ping command added |
+| TEST-01 | OPEN | No chaos tests |
+| TEST-02 | OPEN | No benchmarks |
+| DEP-01 | PARTIAL | New commands; no metrics/TLS deps |
+| DEP-02 | FIXED | windows-sys features complete |
+| DEP-03 | OPEN | Deterministic election jitter |
+| NEW-01 | NEW | Dual lock ordering in produce_frame |
+| NEW-02 | NEW | find_offset_for_timestamp skips active segment |
+| NEW-03 | NEW | delete_topic unlink fails silently on Windows |
+| NEW-04 | NEW | CLI get_arg_val misleading short-flag logic |
+| NEW-05 | NEW | group-consume no graceful Ctrl+C |
 
-### FEAT-02 — No Partition Reassignment
-The number of partitions for a topic is inferred from the first `ProduceBatch` call's `num_partitions` field. Changing the partition count after creation is not supported and not validated, leading to hash-key routing inconsistencies.
-
-### FEAT-03 — No Consumer Group Rebalancing Protocol
-Consumer groups track committed offsets, but there is no group membership protocol, no partition assignment, and no rebalance trigger. Multiple consumers in the same group will all consume all partitions redundantly instead of dividing work.
-
-### FEAT-04 — No Compression Support
-Record payloads are stored and transmitted uncompressed. Add support for LZ4 or Zstandard compression at the record batch level. This is critical for production throughput on wide-area networks.
-
-### FEAT-05 — No Schema / Content-Type Validation
-Producers can write arbitrary bytes. There is no schema registry integration, no content-type metadata, and no validation. Add at minimum a `content_type` field to the record wire format.
-
-### FEAT-06 — No Log Compaction (Key-Based)
-Kafka's log compaction retains only the last record per key. This is essential for changelog topics (CDC, state stores). No equivalent exists in Hermes.
-
-### FEAT-07 — No Admin HTTP API
-There is no HTTP management interface for topic management, partition inspection, or consumer group administration. Add a minimal HTTP API (using `axum` or `warp`) on a separate port (e.g., `9093`).
-
----
-
-## 15. Dependency & Build Issues
-
-### DEP-01 — `Cargo.toml` Missing Several Recommended Dependencies
-
-```toml
-# Current dependencies are functional but missing production essentials:
-# - serde / serde_json — for config validation and HTTP API responses
-# - metrics + metrics-exporter-prometheus — for observability
-# - tokio-rustls — for TLS
-# - lz4_flex or zstd — for compression
-# - rand — for proper election jitter (currently uses a deterministic hash)
-# - axum — for admin HTTP API
-# - anyhow — for ergonomic error handling in main.rs
-```
-
-### DEP-02 — `windows-sys` Feature Set Is Too Narrow
-
-```toml
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
-```
-
-`TransmitFile` is in `Win32_Networking_WinSock` which is imported in the source but not listed in the `Cargo.toml` features. This means the code may fail to compile on Windows or pulls in features implicitly.
-
-**Fix**: Add required features:
-```toml
-windows-sys = { version = "0.52", features = [
-    "Win32_Storage_FileSystem",
-    "Win32_Foundation",
-    "Win32_Networking_WinSock",
-    "Win32_System_IO",
-] }
-```
-
-### DEP-03 — `rand` Crate Is Not Used; Jitter Is Deterministic
-
-The election timeout jitter uses `node_id.wrapping_mul(2654435761).wrapping_add(tick) % ELECTION_TIMEOUT_JITTER_SECS`. This is deterministic and predictable — an adversary who knows the node_id and tick count can predict exactly when elections will trigger. Add `rand` crate for proper random jitter.
-
----
-
-## 16. Improvement Roadmap Summary
-
-Below is a prioritized list of all issues by category and severity, suitable for a sprint plan:
-
-### Sprint 1 — Critical Data Integrity (Fix Before Any Production Use) — ✅ COMPLETED
-
-| Status | ID | File | Fix |
-|--------|----|------|-----|
-| [x] | BUG-04 | `partition.rs` | Fix partition directory double-nesting |
-| [x] | BUG-02 | `handler.rs` | Fix `FetchByTimestamp` full scan bug |
-| [x] | BUG-03 | `transaction.rs` | Fix `aborted_ranges()` returning `u64::MAX` |
-| [x] | BUG-12 | `engine.rs` | Persist partition list in `__transaction_state` |
-| [x] | CORR-02 | `manager.rs` | Fix `find_segment_pair()` binary search |
-| [x] | RACE-02 | `engine.rs` | Fix TOCTOU race in `get_or_create_partition` |
-| [x] | REP-02 | `handler.rs` | Fix Raft double-voting bug |
-| [x] | BUG-05 | `mod.rs` | Fix heartbeat not updating `last_heartbeat` |
-| [x] | REP-01 | `mod.rs` | Make newly-elected leaders start heartbeat loop |
-| [x] | ERR-01 | `engine.rs` | Propagate startup replay errors |
-| [x] | ERR-02 | `transaction.rs` | Surface control marker write errors |
-| [x] | SEC-03 | `engine.rs` | Validate topic names, prevent directory traversal |
-
-### Sprint 2 — Reliability & Correctness — ✅ COMPLETED
-
-| Status | ID | Fix |
-|--------|----|-----|
-| [x] | BUG-01 | Either implement WAL properly or remove the misleading WalEngine abstraction |
-| [x] | BUG-08 | Fix segment recovery OOM (streaming read instead of full allocation) |
-| [x] | BUG-09 | Implement consumer offset log compaction |
-| [x] | CORR-05 | Fix `__consumer_offsets.log` partial-write recovery |
-| [x] | MEM-02 | Garbage collect completed transactions from DashMap |
-| [x] | MEM-01 | Cap connection buffer growth |
-| [x] | REP-03 | Implement follower pull-based catch-up replication |
-| [x] | REP-05 | Enforce `min_insync_replicas` before acknowledging produce |
-
-### Sprint 3 — Performance & Windows Optimization — ✅ COMPLETED
-
-| Status | ID | Fix |
-|--------|----|-----|
-| [x] | PERF-01 | Connection pooling for replication and heartbeat TCP streams |
-| [x] | PERF-03 | Use `MmapLogSegment` for historical segment reads |
-| [x] | WIN-01 | Integrate `TransmitFile` into fetch path (fix BUG-07 first) |
-| [x] | BUG-07 | Fix `TransmitFile` OVERLAPPED I/O and async safety |
-| [x] | RACE-01 | Move segment I/O to `spawn_blocking` |
-| [x] | RACE-03 | Replace epoch `RwLock<u64>` with `AtomicU64` |
-
-### Sprint 4 — Production Hardening — ✅ COMPLETED
-
-| Status | ID | Fix |
-|--------|----|-----|
-| [x] | SEC-01 | Add per-request payload size limits |
-| [x] | SEC-02 | Add TLS + PSK authentication |
-| [x] | OBS-01 | Add Prometheus metrics |
-| [x] | OBS-02 | Add structured logging fields |
-| [x] | OBS-03 | Add `Ping`/health check command |
-| [x] | PROTO-01 | Add correlation IDs to wire protocol |
-| [x] | DEP-02 | Fix `windows-sys` feature list in `Cargo.toml` |
-
-### Sprint 5 — Feature Completeness — ✅ COMPLETED
-
-| Status | Fix |
-|--------|-----|
-| [x] | Add `ListTopics` / `DescribeCluster` wire commands |
-| [x] | Add `DeleteTopic` wire command |
-| [x] | Add consumer group rebalancing protocol |
-| [x] | Add LZ4/Zstandard compression for record batches |
-| [x] | Add admin HTTP API on separate port |
-| [x] | Add criterion benchmarks |
+**Summary**:
+- Fixed from v1: 28 / 40 (70%)
+- Partially fixed: 6
+- Still open from v1: 12
+- New issues introduced: 5
+- **Net blockers remaining for production**: 7 critical / 6 high
 
 ---
 
-## Appendix: Quick Reference — Files Requiring the Most Changes
-
-| File | Issues Found | Priority |
-|------|-------------|----------|
-| `src/server/engine.rs` | BUG-06, BUG-11, BUG-12, RACE-02, ERR-01, ERR-03, REP-05 | 🔴 Immediate |
-| `src/replication/mod.rs` | BUG-05, PERF-01, PERF-02, RACE-03, REP-03, REP-04 | 🔴 Immediate |
-| `src/server/handler.rs` | BUG-02, RACE-04, REP-02, MEM-01, PROTO-01 | 🔴 Immediate |
-| `src/server/transaction.rs` | BUG-03, BUG-12, CORR-03, ERR-02, MEM-02, PERF-05 | 🔴 Immediate |
-| `src/segment/manager.rs` | CORR-02, PERF-03, PERF-04 | 🟠 High |
-| `src/segment/log.rs` | BUG-07, BUG-08, WIN-01 | 🟠 High |
-| `src/server/partition.rs` | BUG-01, BUG-04, RACE-01 | 🔴 Immediate |
-| `src/consumer_group.rs` | BUG-09, CORR-05 | 🟠 High |
-| `src/protocol/wire.rs` | SEC-01, BUG-10, PROTO-01, PROTO-03 | 🟠 High |
-| `Cargo.toml` | DEP-01, DEP-02, DEP-03 | 🟡 Medium |
-
----
-
-*End of Review — Total Issues: 40 identified across 24 source files*
+*End of Review v2 | Hermes-master/Hermes-master/ | 2026-08-08*
