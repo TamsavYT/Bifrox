@@ -2,6 +2,7 @@ use crate::config::EngineConfig;
 use crate::protocol::{RecordFrame, HEADER_SIZE};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
+use crate::segment::timeindex::TimeIndexSegment;
 use std::fs;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ pub struct SegmentPair {
     pub base_offset: u64,
     pub log: LogSegment,
     pub index: IndexSegment,
+    pub time_index: TimeIndexSegment,
     pub mmap: Option<crate::segment::mmap::MmapLogSegment>,
 }
 
@@ -57,6 +59,8 @@ impl SegmentManager {
         for &base in &base_offsets[..base_offsets.len() - 1] {
             let index_path = dir.join(format!("{}.index", format_segment_filename(base)));
             let mut index = IndexSegment::open(index_path, base)?;
+            let time_index_path = dir.join(format!("{}.timeindex", format_segment_filename(base)));
+            let time_index = TimeIndexSegment::open(time_index_path, base)?;
             let log = LogSegment::open(
                 &dir,
                 base,
@@ -70,12 +74,15 @@ impl SegmentManager {
                 base_offset: base,
                 log,
                 index,
+                time_index,
                 mmap,
             });
         }
 
         let active_index_path = dir.join(format!("{}.index", format_segment_filename(active_base)));
         let mut active_index = IndexSegment::open(active_index_path, active_base)?;
+        let active_time_index_path = dir.join(format!("{}.timeindex", format_segment_filename(active_base)));
+        let active_time_index = TimeIndexSegment::open(active_time_index_path, active_base)?;
         let active_log = LogSegment::open(
             &dir,
             active_base,
@@ -94,6 +101,7 @@ impl SegmentManager {
                 base_offset: active_base,
                 log: active_log,
                 index: active_index,
+                time_index: active_time_index,
                 mmap: None,
             },
             historical,
@@ -129,6 +137,7 @@ impl SegmentManager {
             self.active
                 .index
                 .append(assigned_offset, physical_pos)?;
+            let _ = self.active.time_index.append(timestamp, assigned_offset);
             self.bytes_since_last_index = 0;
         }
 
@@ -160,6 +169,7 @@ impl SegmentManager {
             self.active
                 .index
                 .append(assigned_offset, physical_pos)?;
+            let _ = self.active.time_index.append(timestamp, assigned_offset);
             self.bytes_since_last_index = 0;
         }
 
@@ -181,11 +191,16 @@ impl SegmentManager {
 
         self.active.log.finalize()?;
         self.active.index.sync()?;
+        let _ = self.active.time_index.sync();
 
         let new_index_path = self
             .dir
             .join(format!("{}.index", format_segment_filename(new_base_offset)));
         let mut new_index = IndexSegment::open(new_index_path, new_base_offset)?;
+        let new_time_index_path = self
+            .dir
+            .join(format!("{}.timeindex", format_segment_filename(new_base_offset)));
+        let new_time_index = TimeIndexSegment::open(new_time_index_path, new_base_offset)?;
         let new_log = LogSegment::open(
             &self.dir,
             new_base_offset,
@@ -199,6 +214,7 @@ impl SegmentManager {
             base_offset: new_base_offset,
             log: new_log,
             index: new_index,
+            time_index: new_time_index,
             mmap: None,
         };
 
@@ -288,6 +304,7 @@ impl SegmentManager {
                 let pair_to_remove = self.historical.remove(i);
                 let log_path = pair_to_remove.log.path.clone();
                 let index_path = pair_to_remove.index.path().to_path_buf();
+                let time_index_path = pair_to_remove.time_index.path().to_path_buf();
 
                 tracing::info!(
                     "Garbage Collector: Unlinking expired log segment {} and index {}",
@@ -300,6 +317,7 @@ impl SegmentManager {
 
                 let _ = fs::remove_file(&log_path);
                 let _ = fs::remove_file(&index_path);
+                let _ = fs::remove_file(&time_index_path);
                 removed_count += 1;
             } else {
                 i += 1;
@@ -318,27 +336,16 @@ impl SegmentManager {
 
     /// Finds nearest base_offset for target_timestamp (PARTIAL-02 & NEW-02)
     pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
-        for i in 0..self.historical.len() {
-            let pair = &mut self.historical[i];
-            if let Ok(raw) = pair.log.read_at(0, HEADER_SIZE) {
-                if let Ok((frame, _)) = RecordFrame::decode(&raw) {
-                    if frame.timestamp >= target_timestamp {
-                        return if i > 0 { self.historical[i - 1].base_offset } else { pair.base_offset };
-                    }
-                }
+        for pair in &self.historical {
+            if let Some(offset) = pair.time_index.find_offset_for_timestamp(target_timestamp) {
+                return offset;
             }
         }
-        if !self.historical.is_empty() {
-            let last_idx = self.historical.len() - 1;
-            let last_hist_base = self.historical[last_idx].base_offset;
-            if let Ok(raw) = self.active.log.read_at(0, HEADER_SIZE) {
-                if let Ok((active_first_frame, _)) = RecordFrame::decode(&raw) {
-                    if active_first_frame.timestamp > target_timestamp {
-                        return last_hist_base;
-                    }
-                }
-            }
+
+        if let Some(offset) = self.active.time_index.find_offset_for_timestamp(target_timestamp) {
+            return offset;
         }
+
         self.active.base_offset
     }
 

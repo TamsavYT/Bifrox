@@ -462,6 +462,7 @@ impl StorageEngine {
             }
         }
         for key in to_remove {
+            // Remove from map to drop the Arc<PartitionManager>
             self.partitions.remove(&key);
         }
 
@@ -471,9 +472,7 @@ impl StorageEngine {
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with(&format!("{}-", topic)) {
-                            if let Err(e) = std::fs::remove_dir_all(&path) {
-                                tracing::warn!("delete_topic: remove_dir_all for {:?} returned error: {}", path, e);
-                            }
+                            std::fs::remove_dir_all(&path)?;
                         }
                     }
                 }

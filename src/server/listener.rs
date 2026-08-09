@@ -40,7 +40,7 @@ impl Server {
         #[cfg(not(windows))]
         {
             socket.set_reuse_address(true)?;
-            let _ = socket.set_reuse_port(true);
+            // let _ = socket.set_reuse_port(true);
         }
 
         socket.bind(&addr.into())?;

@@ -5,7 +5,6 @@ pub mod protocol;
 pub mod replication;
 pub mod segment;
 pub mod server;
-pub mod wal;
 
 pub use client::{ProduceResult, SeekResult, TestClient};
 pub use config::{EngineConfig, FlushPolicy};
@@ -24,4 +23,3 @@ pub use server::{
     hash_key, PartitionManager, Server, StorageEngine, TransactionManager, TransactionState,
     TxStatus,
 };
-pub use wal::{WalBuffer, WalEngine};
