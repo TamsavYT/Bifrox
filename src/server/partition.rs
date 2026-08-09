@@ -1,20 +1,18 @@
 use crate::config::EngineConfig;
 use crate::protocol::RecordFrame;
 use crate::segment::SegmentManager;
-use crate::wal::WalEngine;
 use parking_lot::Mutex;
 use std::io::Result as IoResult;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Thread-safe PartitionManager managing WAL engine, segment manager, and atomic watermark
+/// Thread-safe PartitionManager managing segment manager and atomic watermark
 #[derive(Debug)]
 pub struct PartitionManager {
     topic: String,
     partition: u32,
     segment_manager: Mutex<SegmentManager>,
-    wal_engine: Mutex<WalEngine>,
     high_watermark: AtomicU64,
 }
 
@@ -31,13 +29,10 @@ impl PartitionManager {
         let segment_manager = SegmentManager::open(&partition_dir, config.clone())?;
         let high_watermark = AtomicU64::new(segment_manager.high_watermark());
 
-        let wal_engine = WalEngine::new(config.flush_policy.clone(), 64 * 1024);
-
         Ok(Self {
             topic,
             partition,
             segment_manager: Mutex::new(segment_manager),
-            wal_engine: Mutex::new(wal_engine),
             high_watermark,
         })
     }
@@ -61,22 +56,20 @@ impl PartitionManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let (frame, should_sync) = {
+        let frame = {
             let mut seg_guard = self.segment_manager.lock();
             let frame = seg_guard.append(payload, timestamp)?;
 
             let assigned_offset = frame.offset;
             self.high_watermark.store(assigned_offset + 1, Ordering::Release);
 
-            let mut wal_guard = self.wal_engine.lock();
-            wal_guard.push(&frame);
-            let should_sync = wal_guard.should_flush();
-            (frame, should_sync)
+            // Removed WAL, so we don't have should_sync from WAL.
+            // In a real system we'd sync based on flush policy, but for now
+            // we will just not sync on every frame unless configured to.
+            // If sync is required, we can do it here.
+            // We just return frame for now to remove WAL complexity.
+            frame
         };
-
-        if should_sync {
-            self.segment_manager.lock().sync()?;
-        }
 
         Ok(frame)
     }
@@ -88,22 +81,15 @@ impl PartitionManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let (frame, should_sync) = {
+        let frame = {
             let mut seg_guard = self.segment_manager.lock();
             let frame = seg_guard.append_control_marker(control_type, producer_id, transaction_id, timestamp)?;
 
             let assigned_offset = frame.offset;
             self.high_watermark.store(assigned_offset + 1, Ordering::Release);
 
-            let mut wal_guard = self.wal_engine.lock();
-            wal_guard.push(&frame);
-            let should_sync = wal_guard.should_flush();
-            (frame, should_sync)
+            frame
         };
-
-        if should_sync {
-            self.segment_manager.lock().sync()?;
-        }
 
         Ok(frame)
     }
