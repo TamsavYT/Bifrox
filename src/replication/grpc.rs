@@ -6,6 +6,9 @@ use tokio::net::TcpStream;
 
 pub const GRPC_REPLICATION_MAGIC: u8 = 0xBB; // gRPC HTTP/2 Streaming Magic
 
+/// Maximum allowed gRPC replication response size (CRIT-04): prevents OOM from a bad/malicious leader.
+const MAX_GRPC_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
+
 /// gRPC Replication Pull Request sent by Followers to Leader node
 #[derive(Debug, Clone)]
 pub struct ReplicationFetchRequest {
@@ -133,6 +136,18 @@ pub async fn send_grpc_replication_fetch(
     let mut resp_header = [0u8; 4];
     stream.read_exact(&mut resp_header).await?;
     let resp_len = u32::from_be_bytes(resp_header) as usize;
+
+    // CRIT-04: Cap response length to prevent OOM when the leader (or an attacker posing as leader)
+    // sends a crafted response header with resp_len = u32::MAX (~4GB allocation).
+    if resp_len > MAX_GRPC_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "gRPC replication response length {} exceeds maximum {} bytes",
+                resp_len, MAX_GRPC_RESPONSE_BYTES
+            ),
+        ));
+    }
 
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf).await?;

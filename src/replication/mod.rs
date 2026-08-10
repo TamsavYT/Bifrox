@@ -410,6 +410,7 @@ impl ReplicationManager {
     /// Streams produced record batch to all follower peer nodes over TCP.
     /// Called from a tokio::spawn task in engine.rs — replicates concurrently to all peers.
     /// P3: If a peer returns a stale-epoch ACK (0x01), triggers leader step-down.
+    /// CRIT-01: cluster_id is now included in the wire packet so followers can authenticate the sender.
     pub async fn replicate_batch(
         &self,
         topic: &str,
@@ -422,6 +423,7 @@ impl ReplicationManager {
 
         let last_offset = frames.last().unwrap().offset;
         let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let cluster_id = self.config.cluster_id.clone();
 
         // Replicate to each peer concurrently
         let mut handles = Vec::with_capacity(self.config.peer_addrs.len());
@@ -429,8 +431,10 @@ impl ReplicationManager {
             let peer_addr = peer.clone();
             let topic_name = topic.to_string();
             let frames_vec = frames.to_vec();
+            let cid = cluster_id.clone();
             handles.push(tokio::spawn(async move {
-                let result = send_replication_push(&peer_addr, &topic_name, partition, epoch, &frames_vec).await;
+                // CRIT-01: pass cluster_id so the follower can authenticate this replication push.
+                let result = send_replication_push(&peer_addr, &cid, &topic_name, partition, epoch, &frames_vec).await;
                 (peer_addr, result)
             }));
         }
@@ -519,9 +523,13 @@ pub async fn send_leader_heartbeat(
 
 /// Streams replication batch frames to a peer follower node over TCP (0xAA protocol).
 ///
-/// Wire format: `[0xAA] [Topic: pascal] [Partition: 4b] [Epoch: 8b] [Count: 4b] [RecordFrame...]`
+/// Wire format: `[0xAA] [ClusterId: pascal] [Topic: pascal] [Partition: 4b] [Epoch: 8b] [Count: 4b] [RecordFrame...]`
+///
+/// CRIT-01: cluster_id is prepended immediately after the magic byte so followers can authenticate
+/// the sender before touching any partition state.
 pub async fn send_replication_push(
     peer_addr: &str,
+    cluster_id: &str,
     topic: &str,
     partition: u32,
     epoch: u64,
@@ -548,6 +556,8 @@ pub async fn send_replication_push(
 
     let mut buf = Vec::with_capacity(256);
     buf.put_u8(0xAA);
+    // CRIT-01: cluster_id is the first field so the follower can reject unknown senders immediately.
+    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
     crate::protocol::wire::write_pascal_string(&mut buf, topic);
     buf.put_u32(partition);
     buf.put_u64(epoch);

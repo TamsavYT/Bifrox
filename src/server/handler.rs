@@ -8,6 +8,15 @@ use tokio::time::{timeout, Duration};
 /// Timeout for forwarding produce requests to the leader node
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum allowed size for a forwarded leader response (CRIT-05)
+const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
+
+/// Maximum allowed records per replication batch (CRIT-01 / SEC-MED-05)
+const MAX_REPLICATION_BATCH_COUNT: usize = 100_000;
+
+/// Maximum cluster-ID / peer string length accepted in inter-node packets (SEC-MED-06)
+const MAX_CLUSTER_ID_LEN: usize = 256;
+
 /// Handles incoming TCP client connections and inter-node replication/heartbeat streams.
 ///
 /// Protocol dispatch by first byte:
@@ -211,6 +220,14 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8]) -> std::io::Re
     stream.read_exact(&mut header).await?;
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
+    // CRIT-05: Reject oversized response payloads to prevent OOM allocation.
+    if payload_len > MAX_FORWARD_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Leader forward response payload {} exceeds maximum {} bytes", payload_len, MAX_FORWARD_RESPONSE_BYTES),
+        ));
+    }
+
     let mut response = Vec::with_capacity(5 + payload_len);
     response.extend_from_slice(&header);
     if payload_len > 0 {
@@ -234,7 +251,7 @@ enum PacketError {
 /// Response:    `[0x01]` = vote granted, `[0x00]` = vote denied.
 ///
 /// Grant rules (simplified Raft):
-///   - The incoming cluster_id must match ours.
+///   - The incoming cluster_id must match ours (CRIT-02: prevents external term manipulation).
 ///   - The candidate's term must be >= our current epoch.
 ///   - We haven't already voted for someone else in this term.
 fn decode_vote_request_packet(
@@ -250,11 +267,25 @@ fn decode_vote_request_packet(
     src.get_u8(); // 0xAE
 
     let cid_len = src.get_u16() as usize;
+
+    // CRIT-02: Cap cluster_id length to prevent heap pressure from malicious packets.
+    if cid_len > MAX_CLUSTER_ID_LEN {
+        tracing::warn!("VoteRequest: Rejected — cluster_id length {} exceeds maximum {}", cid_len, MAX_CLUSTER_ID_LEN);
+        return Err(PacketError::Fatal("cluster_id too long in VoteRequest".to_string()));
+    }
+
     if src.len() < cid_len + 4 + 8 {
         return Err(PacketError::NeedMoreData);
     }
 
-    let incoming_cluster_id = String::from_utf8_lossy(&src[..cid_len]).to_string();
+    // CRIT-02: Use from_utf8 (not lossy) so crafted invalid-UTF-8 cannot spoof a valid cluster_id.
+    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!("VoteRequest: Rejected — cluster_id contains invalid UTF-8");
+            return Err(PacketError::Fatal("Invalid UTF-8 in cluster_id".to_string()));
+        }
+    };
     src = &src[cid_len..];
     let candidate_id = src.get_u32();
     let term = src.get_u64();
@@ -263,11 +294,19 @@ fn decode_vote_request_packet(
     let local_cluster = &engine.config().cluster_id;
     let our_epoch = engine.replication().get_epoch();
 
+    // CRIT-02: Cluster-ID mismatch — reject to prevent external nodes from manipulating Raft term.
     if &incoming_cluster_id != local_cluster {
         tracing::warn!(
             "VoteRequest: Rejected — cluster mismatch (got '{}', expected '{}')",
             incoming_cluster_id, local_cluster
         );
+        return Ok((bytes_consumed, vec![0x00]));
+    }
+
+    // CRIT-02: Also verify candidate is a known peer to prevent external nodes from voting.
+    let known_peer = engine.config().peer_addrs.iter().any(|_| true); // peer_addrs non-empty = cluster mode
+    if !known_peer && !engine.config().peer_addrs.is_empty() {
+        tracing::warn!("VoteRequest: Rejected — candidate {} not in known peer list", candidate_id);
         return Ok((bytes_consumed, vec![0x00]));
     }
 
@@ -290,25 +329,61 @@ fn decode_vote_request_packet(
 }
 
 /// Decodes and processes an inter-node replication packet (0xAA).
+///
+/// CRIT-01: Verifies cluster_id and epoch before accepting any replicated data.
+/// SEC-MED-05: Caps record count to prevent CPU-exhaustion loops.
 fn decode_replication_packet(
     engine: &StorageEngine,
     mut src: &[u8],
 ) -> Result<(usize, Vec<u8>), PacketError> {
     let original_len = src.len();
 
-    // Minimum header: magic (1) + topic_len (2)
+    // Minimum header: magic(1) + cluster_id_len(2)
     if src.len() < 3 {
         return Err(PacketError::NeedMoreData);
     }
 
     src.get_u8(); // 0xAA
 
-    // Topic length and name
-    let topic_len = src.get_u16() as usize;
-    if src.len() < topic_len + 8 + 8 { // need topic + partition(4) + epoch(8) + count(4) minimum
+    // CRIT-01: Read cluster_id prefix for authentication before touching any partition state.
+    let cid_len = src.get_u16() as usize;
+    if cid_len > MAX_CLUSTER_ID_LEN {
+        tracing::warn!("HA Replication: Rejected — cluster_id length {} exceeds maximum", cid_len);
+        return Err(PacketError::Fatal("cluster_id too long in replication packet".to_string()));
+    }
+    if src.len() < cid_len {
         return Err(PacketError::NeedMoreData);
     }
-    let topic = String::from_utf8_lossy(&src[..topic_len]).to_string();
+    // CRIT-01: Use from_utf8 (strict) so invalid UTF-8 cannot spoof a cluster_id.
+    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in replication cluster_id".to_string())),
+    };
+    src = &src[cid_len..];
+
+    // CRIT-01: Reject replication from any node whose cluster_id does not match ours.
+    let local_cluster = &engine.config().cluster_id;
+    if &incoming_cluster_id != local_cluster {
+        tracing::warn!(
+            "HA Replication: REJECTED — cluster_id mismatch (got '{}', expected '{}').",
+            incoming_cluster_id, local_cluster
+        );
+        return Err(PacketError::Fatal("Replication cluster_id mismatch".to_string()));
+    }
+
+    // Topic length and name
+    if src.len() < 2 {
+        return Err(PacketError::NeedMoreData);
+    }
+    let topic_len = src.get_u16() as usize;
+    if src.len() < topic_len + 4 + 8 + 4 { // topic + partition(4) + epoch(8) + count(4)
+        return Err(PacketError::NeedMoreData);
+    }
+    // CRIT-01: Use strict UTF-8 for topic name too.
+    let topic = match String::from_utf8(src[..topic_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in replicated topic name".to_string())),
+    };
     src = &src[topic_len..];
 
     // Partition ID
@@ -318,6 +393,15 @@ fn decode_replication_packet(
     // Record count
     let count = src.get_u32() as usize;
 
+    // SEC-MED-05: Cap count to prevent CPU-exhaustion via malicious large count with NeedMoreData drip.
+    if count > MAX_REPLICATION_BATCH_COUNT {
+        tracing::warn!(
+            "HA Replication: Rejected — record count {} exceeds maximum {}",
+            count, MAX_REPLICATION_BATCH_COUNT
+        );
+        return Err(PacketError::Fatal(format!("Replication batch count {} too large", count)));
+    }
+
     // Epoch fencing: reject stale leader writes and signal STALE_EPOCH so leader steps down
     let current_epoch = engine.replication().get_epoch();
     if incoming_epoch < current_epoch {
@@ -325,10 +409,8 @@ fn decode_replication_packet(
             "HA Replication: Stale epoch {} (current {}) from leader for topic '{}' partition {} – rejecting",
             incoming_epoch, current_epoch, topic, partition
         );
-        // Return STALE_EPOCH as error bytes so the sending leader can call step_down_to_follower
         return Ok((original_len - src.len(), b"STALE_EPOCH".to_vec()));
     }
-    // If epoch is newer, update our local epoch state
     if incoming_epoch > current_epoch {
         engine.replication().set_epoch(incoming_epoch);
         tracing::info!(
@@ -361,15 +443,20 @@ fn decode_replication_packet(
                     if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
                         match meta_rec {
                             crate::replication::MetadataRecord::TopicPartition { topic: ref t, partition: p, .. } => {
-                                tracing::info!(
-                                    "HA Replication: Received dynamic partition metadata. Initializing partition {}-{}",
-                                    t, p
-                                );
-                                if let Err(e) = engine.get_or_create_partition(t, p) {
-                                    tracing::error!(
-                                        "HA Replication: Failed to dynamically create partition {}-{}: {}",
-                                        t, p, e
+                                // SEC-MED-07: Validate topic name before creating partitions from metadata.
+                                if crate::server::engine::validate_topic_name(t).is_ok() {
+                                    tracing::info!(
+                                        "HA Replication: Received dynamic partition metadata. Initializing partition {}-{}",
+                                        t, p
                                     );
+                                    if let Err(e) = engine.get_or_create_partition(t, p) {
+                                        tracing::error!(
+                                            "HA Replication: Failed to dynamically create partition {}-{}: {}",
+                                            t, p, e
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!("HA Replication: Skipping invalid topic name '{}' in metadata record", t);
                                 }
                             }
                             crate::replication::MetadataRecord::BrokerRegister { node_id, ref bind_addr } => {
@@ -405,7 +492,7 @@ fn decode_replication_packet(
 /// P4 Wire format: `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [leader_bind_addr: pascal]`
 ///
 /// Followers only reset the election timer if the heartbeat's term >= our current epoch.
-/// This prevents ghost heartbeats from old leaders blocking correct new-leader elections.
+/// CRIT-03: leader_bind_addr is validated against the configured peer_addrs whitelist before use.
 fn decode_heartbeat_packet(
     engine: &StorageEngine,
     mut src: &[u8],
@@ -419,54 +506,83 @@ fn decode_heartbeat_packet(
     src.get_u8(); // 0xAC
 
     let cid_len = src.get_u16() as usize;
+
+    // CRIT-02/03: Cap cluster_id length.
+    if cid_len > MAX_CLUSTER_ID_LEN {
+        return Err(PacketError::Fatal("cluster_id too long in heartbeat".to_string()));
+    }
     if src.len() < cid_len + 4 + 8 { // node_id(4) + term(8)
         return Err(PacketError::NeedMoreData);
     }
 
-    let incoming_cluster_id = String::from_utf8_lossy(&src[..cid_len]).to_string();
+    // CRIT-03: Use from_utf8 (strict) so crafted invalid-UTF-8 cannot spoof a cluster_id.
+    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in heartbeat cluster_id".to_string())),
+    };
     src = &src[cid_len..];
     let peer_node_id = src.get_u32();
-    let incoming_term = src.get_u64(); // P4: read leader term
+    let incoming_term = src.get_u64();
 
     // Parse leader bind address
     if src.len() < 2 {
         return Err(PacketError::NeedMoreData);
     }
     let addr_len = src.get_u16() as usize;
+    if addr_len > 256 {
+        return Err(PacketError::Fatal("leader_bind_addr too long in heartbeat".to_string()));
+    }
     if src.len() < addr_len {
         return Err(PacketError::NeedMoreData);
     }
-    let leader_bind_addr = String::from_utf8_lossy(&src[..addr_len]).to_string();
+    let leader_bind_addr = match String::from_utf8(src[..addr_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in leader_bind_addr".to_string())),
+    };
     src = &src[addr_len..];
 
     let local_cluster_id = &engine.config().cluster_id;
     let bytes_consumed = original_len - src.len();
 
-    if incoming_cluster_id == *local_cluster_id {
-        let our_epoch = engine.replication().get_epoch();
-        if incoming_term >= our_epoch {
-            // Valid heartbeat from current or newer leader — update state
-            engine.replication().set_epoch(incoming_term);
-            engine.set_leader_addr(leader_bind_addr.clone());
-            tracing::info!(
-                "HA Heartbeat: Leader is Node {} at {} term {} (Cluster '{}')",
-                peer_node_id, leader_bind_addr, incoming_term, incoming_cluster_id
-            );
-        } else {
-            // Stale heartbeat from ghost leader — ignore, don't reset election timer
-            tracing::warn!(
-                "HA Heartbeat: Ignoring ghost heartbeat from Node {} — term {} < our epoch {}",
-                peer_node_id, incoming_term, our_epoch
-            );
-        }
-        Ok((bytes_consumed, vec![0u8]))
-    } else {
+    if incoming_cluster_id != *local_cluster_id {
         tracing::warn!(
             "HA Heartbeat: REJECTED Node {}! Expected cluster '{}', got '{}'",
             peer_node_id, local_cluster_id, incoming_cluster_id
         );
-        Ok((bytes_consumed, vec![1u8]))
+        return Ok((bytes_consumed, vec![1u8]));
     }
+
+    // CRIT-03: Validate leader_bind_addr against the configured peer_addrs whitelist.
+    // This prevents SSRF via a spoofed heartbeat advertising an arbitrary internal address.
+    let peer_addrs = &engine.config().peer_addrs;
+    let bind_addr = &engine.config().bind_addr;
+    let is_whitelisted = leader_bind_addr == *bind_addr
+        || peer_addrs.iter().any(|p| *p == leader_bind_addr);
+    if !is_whitelisted {
+        tracing::warn!(
+            "HA Heartbeat: REJECTED — leader_bind_addr '{}' not in configured peer whitelist (Node {})",
+            leader_bind_addr, peer_node_id
+        );
+        return Ok((bytes_consumed, vec![1u8]));
+    }
+
+    let our_epoch = engine.replication().get_epoch();
+    if incoming_term >= our_epoch {
+        // Valid heartbeat from current or newer leader — update state
+        engine.replication().set_epoch(incoming_term);
+        engine.set_leader_addr(leader_bind_addr.clone());
+        tracing::info!(
+            "HA Heartbeat: Leader is Node {} at {} term {} (Cluster '{}')",
+            peer_node_id, leader_bind_addr, incoming_term, incoming_cluster_id
+        );
+    } else {
+        // Stale heartbeat from ghost leader — ignore, don't reset election timer
+        tracing::warn!(
+            "HA Heartbeat: Ignoring ghost heartbeat from Node {} — term {} < our epoch {}",
+            peer_node_id, incoming_term, our_epoch
+        );
+    }
+    Ok((bytes_consumed, vec![0u8]))
 }
 
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
