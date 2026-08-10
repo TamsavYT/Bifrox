@@ -235,7 +235,7 @@ segment. Post-filter removes them all so the client silently receives zero recor
 
 ### M12 — Client Panics on Short Server Responses
 **File:** `src/client.rs:110, 159, 256, 291, 327`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 Multiple response-parsing paths index fixed-offset slices without verifying `payload_len`
 is sufficient. A server sending `status=0` with a short or empty payload crashes the client
@@ -245,7 +245,7 @@ process via out-of-bounds `unwrap()`.
 
 ### M13 — compact_log Non-Atomic — Crash Destroys All Committed Offsets
 **File:** `src/consumer_group.rs:182`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 `compact_log` calls `file.set_len(0)` then `write_all`. A crash or write failure between
 these two operations leaves the consumer-offsets file permanently empty with no recovery.
@@ -254,7 +254,7 @@ these two operations leaves the consumer-offsets file permanently empty with no 
 
 ### M14 — delete_topic Prefix Match Deletes Sibling Topics
 **File:** `src/server/engine.rs:471`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 `name.starts_with(&format!("{}-", topic))` incorrectly matches other topics sharing a
 name prefix. Deleting topic `"logs"` also removes directories for `"logs-archive"`.
@@ -263,7 +263,7 @@ name prefix. Deleting topic `"logs"` also removes directories for `"logs-archive
 
 ### M15 — Consumer-Offsets Recovery: No Size Cap, OOM Risk
 **File:** `src/consumer_group.rs:41`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 `vec![0u8; raw_len]` allocates the entire consumer-offsets file into RAM at startup with
 no upper bound. A multi-GB file causes OOM before the server becomes available.
@@ -272,7 +272,7 @@ no upper bound. A multi-GB file causes OOM before the server becomes available.
 
 ### M16 — TOCTOU Race in delete_topic vs get_or_create_partition
 **File:** `src/server/engine.rs:455`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 Between DashMap removal and `remove_dir_all`, a concurrent `get_or_create_partition` call
 re-inserts the partition into the map before the directory is deleted, leaving an in-memory
@@ -282,7 +282,7 @@ re-inserts the partition into the map before the directory is deleted, leaving a
 
 ### M17 — producer_sequences DashMap Grows Without Bound
 **File:** `src/server/transaction.rs:57`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 `cleanup_completed_transaction` removes the transaction entry but not the sequence entry.
 Any client that calls `BeginTx` with unique `producer_id` values per request causes

@@ -18,6 +18,7 @@ pub struct ConsumerGroupManager {
     /// In-memory state: (group_id, topic, partition) -> committed_offset
     offsets: Arc<DashMap<(String, String, u32), u64>>,
     log_file: Arc<Mutex<File>>,
+    log_path: Arc<std::path::PathBuf>,
 }
 
 impl ConsumerGroupManager {
@@ -34,78 +35,88 @@ impl ConsumerGroupManager {
 
         let mut file = options.open(&log_path)?;
         let offsets = Arc::new(DashMap::new());
+        let log_path_arc = Arc::new(log_path);
 
         // Recover state from existing system log
         file.seek(SeekFrom::Start(0))?;
-        let raw_len = file.metadata()?.len() as usize;
+        let raw_len = file.metadata()?.len() as u64;
         if raw_len > 0 {
-            let mut buf = vec![0u8; raw_len];
-            file.read_exact(&mut buf)?;
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut last_good_pos = 0u64;
+            let mut is_corrupt = false;
 
-            let mut cursor = 0usize;
-            while cursor < raw_len {
-                if buf[cursor] != CONSUMER_OFFSETS_MAGIC {
+            loop {
+                let n = file.read(&mut chunk)?;
+                if n == 0 {
                     break;
                 }
-                cursor += 1; // Magic 1b
+                buf.extend_from_slice(&chunk[..n]);
 
-                if cursor + 2 > raw_len {
-                    break;
+                let mut cursor = 0usize;
+                while cursor < buf.len() {
+                    let mut temp_cursor = cursor;
+                    
+                    if buf[temp_cursor] != CONSUMER_OFFSETS_MAGIC {
+                        is_corrupt = true;
+                        break;
+                    }
+                    temp_cursor += 1;
+
+                    if temp_cursor + 2 > buf.len() { break; }
+                    let group_len = u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap()) as usize;
+                    temp_cursor += 2;
+
+                    if temp_cursor + group_len > buf.len() { break; }
+                    let group_id = match String::from_utf8(buf[temp_cursor..temp_cursor + group_len].to_vec()) {
+                        Ok(s) => s,
+                        Err(_) => { is_corrupt = true; break; }
+                    };
+                    temp_cursor += group_len;
+
+                    if temp_cursor + 2 > buf.len() { break; }
+                    let topic_len = u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap()) as usize;
+                    temp_cursor += 2;
+
+                    if temp_cursor + topic_len > buf.len() { break; }
+                    let topic = match String::from_utf8(buf[temp_cursor..temp_cursor + topic_len].to_vec()) {
+                        Ok(s) => s,
+                        Err(_) => { is_corrupt = true; break; }
+                    };
+                    temp_cursor += topic_len;
+
+                    if temp_cursor + 12 > buf.len() { break; }
+                    let partition = u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
+                    temp_cursor += 4;
+                    let offset = u64::from_be_bytes(buf[temp_cursor..temp_cursor + 8].try_into().unwrap());
+                    temp_cursor += 8;
+
+                    if temp_cursor + 4 > buf.len() { break; }
+                    let crc = u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
+                    temp_cursor += 4;
+
+                    let computed_crc = Self::compute_crc(&group_id, &topic, partition, offset);
+                    if crc == computed_crc {
+                        offsets.insert((group_id, topic, partition), offset);
+                        cursor = temp_cursor;
+                    } else {
+                        tracing::warn!("Corrupt consumer offset entry encountered during recovery.");
+                        is_corrupt = true;
+                        break;
+                    }
                 }
-                let group_len = u16::from_be_bytes(buf[cursor..cursor + 2].try_into().unwrap()) as usize;
-                cursor += 2;
 
-                if cursor + group_len > raw_len {
-                    break;
+                if cursor > 0 {
+                    buf.drain(..cursor);
+                    last_good_pos += cursor as u64;
                 }
-                let group_id = match String::from_utf8(buf[cursor..cursor + group_len].to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                cursor += group_len;
 
-                if cursor + 2 > raw_len {
-                    break;
-                }
-                let topic_len = u16::from_be_bytes(buf[cursor..cursor + 2].try_into().unwrap()) as usize;
-                cursor += 2;
-
-                if cursor + topic_len > raw_len {
-                    break;
-                }
-                let topic = match String::from_utf8(buf[cursor..cursor + topic_len].to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                cursor += topic_len;
-
-                if cursor + 12 > raw_len { // 4b partition + 8b offset
-                    break;
-                }
-                let partition = u32::from_be_bytes(buf[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                let offset = u64::from_be_bytes(buf[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
-
-                if cursor + 4 > raw_len { // 4b CRC32
-                    break;
-                }
-                let crc = u32::from_be_bytes(buf[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-
-                // Validate CRC32
-                let computed_crc = Self::compute_crc(&group_id, &topic, partition, offset);
-                if crc == computed_crc {
-                    offsets.insert((group_id, topic, partition), offset);
-                } else {
-                    tracing::warn!("Corrupt consumer offset entry encountered during recovery.");
+                if is_corrupt {
                     break;
                 }
             }
 
-            // Truncate trailing partial/corrupt bytes (CORR-05)
-            let last_good_pos = cursor as u64;
-            if (last_good_pos as usize) < raw_len {
+            if last_good_pos < raw_len {
                 tracing::warn!("Truncating __consumer_offsets.log from {} to last valid position {}", raw_len, last_good_pos);
                 file.set_len(last_good_pos)?;
             }
@@ -117,6 +128,7 @@ impl ConsumerGroupManager {
         Ok(Self {
             offsets,
             log_file: Arc::new(Mutex::new(file)),
+            log_path: log_path_arc,
         })
     }
 
@@ -179,11 +191,29 @@ impl ConsumerGroupManager {
             entry_bytes.put_u32(crc);
         }
 
+        let tmp_path = self.log_path.with_extension("log.tmp");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        options.share_mode(7);
+        
+        let mut tmp_file = options.open(&tmp_path)?;
+        tmp_file.write_all(&entry_bytes)?;
+        tmp_file.sync_data()?;
+
         let mut lock = self.log_file.lock();
-        lock.seek(SeekFrom::Start(0))?;
-        lock.set_len(0)?;
-        lock.write_all(&entry_bytes)?;
-        lock.sync_data()?;
+        
+        std::fs::rename(&tmp_path, &*self.log_path)?;
+        
+        let mut open_opts = OpenOptions::new();
+        open_opts.read(true).write(true).create(true);
+        #[cfg(windows)]
+        open_opts.share_mode(7);
+        
+        let mut new_file = open_opts.open(&*self.log_path)?;
+        new_file.seek(SeekFrom::End(0))?;
+        *lock = new_file;
+        
         Ok(())
     }
 

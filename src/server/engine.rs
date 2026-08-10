@@ -6,7 +6,7 @@ use crate::replication::{ClusterConfig, NodeRole, ReplicationManager};
 use crate::server::partition::PartitionManager;
 use crate::server::transaction::{decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus};
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::io::Result as IoResult;
 use std::sync::Arc;
 
@@ -41,6 +41,7 @@ pub fn validate_topic_name(topic: &str) -> IoResult<()> {
 pub struct StorageEngine {
     config: EngineConfig,
     partitions: Arc<DashMap<(String, u32), Arc<PartitionManager>>>,
+    deleting_topics: Arc<DashSet<String>>,
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
     replication: ReplicationManager,
@@ -62,6 +63,7 @@ impl StorageEngine {
         let engine = Self {
             config,
             partitions: Arc::new(DashMap::new()),
+            deleting_topics: Arc::new(DashSet::new()),
             consumer_groups,
             transactions,
             replication,
@@ -145,6 +147,13 @@ impl StorageEngine {
         partition: u32,
     ) -> IoResult<Arc<PartitionManager>> {
         validate_topic_name(topic)?;
+
+        if self.deleting_topics.contains(topic) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Topic {} is currently being deleted", topic),
+            ));
+        }
 
         let key = (topic.to_string(), partition);
         use dashmap::mapref::entry::Entry;
@@ -460,6 +469,8 @@ impl StorageEngine {
 
     /// Deletes topic partitions and removes disk directory (NEW-03)
     pub fn delete_topic(&self, topic: &str) -> IoResult<()> {
+        self.deleting_topics.insert(topic.to_string());
+
         let mut to_remove = Vec::new();
         for entry in self.partitions.iter() {
             let (t, p) = entry.key();
@@ -473,17 +484,30 @@ impl StorageEngine {
             self.partitions.remove(&key);
         }
 
+        let mut err = None;
         if let Ok(entries) = std::fs::read_dir(&self.config.data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with(&format!("{}-", topic)) {
-                            std::fs::remove_dir_all(&path)?;
+                            let suffix = &name[topic.len() + 1..];
+                            if suffix.parse::<u32>().is_ok() {
+                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+
+        self.deleting_topics.remove(topic);
+
+        if let Some(e) = err {
+            return Err(e);
         }
         Ok(())
     }

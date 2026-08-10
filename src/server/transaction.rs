@@ -56,6 +56,9 @@ impl TransactionManager {
     /// Records sequence number for idempotent producer
     pub fn record_sequence(&self, producer_id: u64, seq_num: u32) {
         if producer_id > 0 {
+            if self.producer_sequences.len() >= 100_000 && !self.producer_sequences.contains_key(&producer_id) {
+                self.producer_sequences.clear();
+            }
             self.producer_sequences.insert(producer_id, seq_num);
         }
     }

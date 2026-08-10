@@ -107,6 +107,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 20 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let assigned_partition = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap());
             let first_offset = u64::from_be_bytes(resp_payload[4..12].try_into().unwrap());
             let last_offset = u64::from_be_bytes(resp_payload[12..20].try_into().unwrap());
@@ -156,6 +162,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
             let mut frames = Vec::with_capacity(count);
             let mut cursor = 4usize;
@@ -253,6 +265,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let offset = u64::from_be_bytes(resp_payload[0..8].try_into().unwrap());
             Ok(offset)
         } else {
@@ -288,6 +306,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let watermark = u64::from_be_bytes(resp_payload[0..8].try_into().unwrap());
             Ok(watermark)
         } else {
@@ -324,6 +348,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 16 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let base_offset = u64::from_be_bytes(resp_payload[0..8].try_into().unwrap());
             let physical_position = u64::from_be_bytes(resp_payload[8..16].try_into().unwrap());
             Ok(SeekResult {
@@ -471,6 +501,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
             let mut frames = Vec::with_capacity(count);
             let mut cursor = 4usize;
@@ -530,6 +566,12 @@ impl TestClient {
         stream.read_exact(&mut resp_payload).await?;
 
         if status == 0 {
+            if resp_payload.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
+            }
             let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
             let mut frames = Vec::with_capacity(count);
             let mut cursor = 4usize;
