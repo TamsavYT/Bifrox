@@ -230,11 +230,18 @@ impl StorageEngine {
                 }
                 for frame in &frames {
                     if let Some((status, producer_id, tx_id, partitions)) = decode_tx_state_record(&frame.payload) {
-                        self.transactions.restore_transaction(&tx_id, producer_id, status, partitions);
-                        tracing::info!(
-                            "TxReplay: Restored transaction '{}' producer={} status={:?}",
-                            tx_id, producer_id, status
-                        );
+                        // N7: Only restore Ongoing transactions.  Committed/Aborted entries
+                        // have no runtime effect — their data is already baked into the
+                        // partition logs.  Restoring them would permanently block reuse of
+                        // the same transaction ID (begin_transaction returns Err on Occupied)
+                        // and cause aborted_ranges to return stale ranges for unrelated producers.
+                        if status == crate::server::transaction::TxStatus::Ongoing {
+                            self.transactions.restore_transaction(&tx_id, producer_id, status, partitions);
+                            tracing::info!(
+                                "TxReplay: Restored in-flight transaction '{}' producer={}",
+                                tx_id, producer_id
+                            );
+                        }
                     }
                     offset = frame.offset + 1;
                 }

@@ -342,14 +342,28 @@ impl ReplicationManager {
                     // Reset heartbeat timestamp so we don't re-trigger election.
                     *last_heartbeat.write().unwrap() = std::time::Instant::now();
 
-                    // REP-01: Newly elected leader starts heartbeat loop to peers
+                    // REP-01 / H10: Newly elected leader starts heartbeat loop to peers.
+                    // Each election win previously spawned a permanent loop with no
+                    // cancellation token, so repeated Follower→Leader transitions
+                    // accumulated unbounded tasks.  Now the loop checks the consensus
+                    // state on every iteration and exits as soon as this node is no
+                    // longer the Leader (step_down_to_follower sets state=Follower),
+                    // so at most one active heartbeat loop exists per node at any time.
                     if !peer_addrs.is_empty() {
                         let peer_addrs_c = peer_addrs.clone();
                         let cluster_id_c = cluster_id.clone();
                         let bind_addr_c = bind_addr.clone();
                         let epoch_c = epoch.clone();
+                        let consensus_c = consensus.clone();
                         tokio::spawn(async move {
                             loop {
+                                if consensus_c.state() != ConsensusState::Leader {
+                                    tracing::info!(
+                                        "HA Heartbeat: Node {} is no longer Leader — stopping heartbeat loop",
+                                        node_id
+                                    );
+                                    break;
+                                }
                                 let current_term = epoch_c.load(std::sync::atomic::Ordering::Acquire);
                                 for peer in &peer_addrs_c {
                                     let _ = send_leader_heartbeat(peer, &cluster_id_c, node_id, current_term, &bind_addr_c).await;
@@ -583,6 +597,10 @@ pub async fn send_replication_push(
             frames.len(), first_offset, last_offset, topic, partition, peer_addr
         );
         Ok(())
+    } else if ack[0] == 0x02 {
+        // H5: Follower returned STALE_EPOCH sentinel — our epoch is behind the cluster.
+        tracing::warn!("HA Replication: Peer {} rejected with STALE_EPOCH (0x02)", peer_addr);
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "STALE_EPOCH: peer epoch is higher"))
     } else {
         tracing::warn!("HA Replication: Peer {} returned error ACK 0x{:02X}", peer_addr, ack[0]);
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Replication ACK failed"))

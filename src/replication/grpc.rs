@@ -3,6 +3,10 @@ use bytes::{Buf, BufMut};
 use std::io::Result as IoResult;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+
+/// Connect timeout for gRPC replication fetch — mirrors PEER_CONNECT_TIMEOUT in mod.rs
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub const GRPC_REPLICATION_MAGIC: u8 = 0xBB; // gRPC HTTP/2 Streaming Magic
 
@@ -124,7 +128,17 @@ pub async fn send_grpc_replication_fetch(
     leader_addr: &str,
     req: &ReplicationFetchRequest,
 ) -> IoResult<ReplicationFetchResponse> {
-    let mut stream = TcpStream::connect(leader_addr).await?;
+    // H11: The push path (send_replication_push) already wraps connect in a timeout;
+    // the pull path was missing this, blocking the Tokio task for the OS TCP SYN
+    // timeout (~127s on Linux) whenever the leader is unreachable.
+    let mut stream = match timeout(GRPC_CONNECT_TIMEOUT, TcpStream::connect(leader_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("gRPC replication connection to {} timed out", leader_addr),
+        )),
+    };
     let payload = req.encode();
 
     let mut frame_buf = Vec::with_capacity(4 + payload.len());

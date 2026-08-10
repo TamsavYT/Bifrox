@@ -60,6 +60,9 @@ pub struct EngineConfig {
     pub retention_millis: Option<u64>,
     /// Interval for running background retention garbage collector
     pub retention_check_interval: Duration,
+    /// Shared-secret token required from client connections (None = no auth check).
+    /// Inter-node peers identified by `peer_addrs` are exempt from this check.
+    pub auth_token: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -80,6 +83,7 @@ impl Default for EngineConfig {
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),      // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
+            auth_token: None,
         }
     }
 }
@@ -157,6 +161,11 @@ impl EngineConfig {
                     "retention.millis" | "log.retention.ms" => {
                         if let Ok(v) = value.parse() {
                             config.retention_millis = Some(v);
+                        }
+                    }
+                    "auth.token" => {
+                        if !value.is_empty() {
+                            config.auth_token = Some(value.to_string());
                         }
                     }
                     _ => {}

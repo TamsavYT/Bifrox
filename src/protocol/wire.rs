@@ -384,6 +384,15 @@ fn read_pascal_string(buf: &mut &[u8]) -> Result<String, WireError> {
 /// Helper function to write pascal-style strings: `[Len: 2b] | [UTF-8 bytes]`
 pub fn write_pascal_string(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
+    // H9: Guard against silent u16 wrap-around.  Strings in this protocol (topic
+    // names, cluster IDs, addresses) are always short; exceeding 65535 bytes is a
+    // programming error, not a runtime condition.
+    assert!(
+        bytes.len() <= u16::MAX as usize,
+        "write_pascal_string: string too long ({} bytes, max {})",
+        bytes.len(),
+        u16::MAX
+    );
     buf.put_u16(bytes.len() as u16);
     buf.put_slice(bytes);
 }

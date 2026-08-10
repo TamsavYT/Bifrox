@@ -32,6 +32,31 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
 
+    // C4: Shared-secret authentication for client connections.
+    // Inter-node peers (addresses in peer_addrs) are exempt; they authenticate
+    // via cluster_id in every packet.  If auth_token is not configured the check
+    // is skipped entirely (backward-compatible default).
+    if let Some(ref token) = engine.config().auth_token {
+        let peer_ip = peer_addr.split(':').next().unwrap_or("");
+        let is_known_peer = engine.config().peer_addrs.iter().any(|p| {
+            p.split(':').next().unwrap_or("") == peer_ip
+        });
+        if !is_known_peer {
+            // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
+            const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
+            let token_bytes = token.as_bytes();
+            let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
+            let ok = socket.read_exact(&mut auth_buf).await.is_ok()
+                && auth_buf.starts_with(AUTH_MAGIC)
+                && &auth_buf[AUTH_MAGIC.len()..] == token_bytes;
+            if !ok {
+                tracing::warn!("Authentication failed from {} — closing connection", peer_addr);
+                let _ = socket.write_all(b"AUTH_FAILED\n").await;
+                return;
+            }
+        }
+    }
+
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
 
@@ -128,7 +153,7 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                                             peer_addr,
                                             leader
                                         );
-                                        match forward_to_leader(&leader, &raw_request).await {
+                                        match forward_to_leader(&leader, &raw_request, engine.config().auth_token.as_deref()).await {
                                             Ok(bytes) => bytes,
                                             Err(e) => {
                                                 tracing::error!(
@@ -197,7 +222,7 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
 }
 
 /// Forwards raw produce request bytes to the leader node and returns the raw response bytes.
-async fn forward_to_leader(leader_addr: &str, raw_request: &[u8]) -> std::io::Result<Vec<u8>> {
+async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Option<&str>) -> std::io::Result<Vec<u8>> {
     let mut stream = match timeout(
         FORWARD_TIMEOUT,
         TcpStream::connect(leader_addr),
@@ -212,12 +237,30 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8]) -> std::io::Re
         }
     };
 
+    // N8: Send auth handshake before the request when auth_token is configured.
+    // The leader's handle_connection expects the magic + token prefix from every
+    // non-peer client; followers are exempt by IP but must still authenticate when
+    // the exempt-by-IP check doesn't cover the loopback/forwarded-IP case.
+    if let Some(token) = auth_token {
+        const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
+        stream.write_all(AUTH_MAGIC).await?;
+        stream.write_all(token.as_bytes()).await?;
+    }
+
     // Send the raw WireRequest to leader
     stream.write_all(raw_request).await?;
 
-    // Read the WireResponse: [status: 1b] [payload_len: 4b] [payload_bytes]
+    // H7: Wrap both reads in FORWARD_TIMEOUT so a stalled leader cannot pin this
+    // Tokio task indefinitely.  Previously only the connect() was wrapped.
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header).await?;
+    match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut header)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Timed out reading response header from leader {}", leader_addr),
+        )),
+    }
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
     // CRIT-05: Reject oversized response payloads to prevent OOM allocation.
@@ -232,7 +275,14 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8]) -> std::io::Re
     response.extend_from_slice(&header);
     if payload_len > 0 {
         let mut payload = vec![0u8; payload_len];
-        stream.read_exact(&mut payload).await?;
+        match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Timed out reading response payload from leader {}", leader_addr),
+            )),
+        }
         response.extend_from_slice(&payload);
     }
 
@@ -303,10 +353,13 @@ fn decode_vote_request_packet(
         return Ok((bytes_consumed, vec![0x00]));
     }
 
-    // CRIT-02: Also verify candidate is a known peer to prevent external nodes from voting.
-    let known_peer = engine.config().peer_addrs.iter().any(|_| true); // peer_addrs non-empty = cluster mode
-    if !known_peer && !engine.config().peer_addrs.is_empty() {
-        tracing::warn!("VoteRequest: Rejected — candidate {} not in known peer list", candidate_id);
+    // C2: In standalone mode (no peers configured) this node is not part of a multi-node
+    // cluster and should never grant Raft votes to external candidates.
+    if engine.config().peer_addrs.is_empty() {
+        tracing::warn!(
+            "VoteRequest: Rejected — standalone mode, candidate {} denied",
+            candidate_id
+        );
         return Ok((bytes_consumed, vec![0x00]));
     }
 
@@ -409,7 +462,12 @@ fn decode_replication_packet(
             "HA Replication: Stale epoch {} (current {}) from leader for topic '{}' partition {} – rejecting",
             incoming_epoch, current_epoch, topic, partition
         );
-        return Ok((original_len - src.len(), b"STALE_EPOCH".to_vec()));
+        // H5: Return a single-byte STALE_EPOCH sentinel (0x02) so the leader reads
+        // exactly 1 byte (matching its read_exact(&mut [0u8;1])) and can distinguish
+        // this from a generic NACK (0x01).  Previously returned 11-byte "STALE_EPOCH"
+        // literal which the leader read as 0x53 ('S') — a plain error, never triggering
+        // step-down.
+        return Ok((original_len - src.len(), vec![0x02]));
     }
     if incoming_epoch > current_epoch {
         engine.replication().set_epoch(incoming_epoch);
@@ -423,51 +481,26 @@ fn decode_replication_packet(
         .get_or_create_partition(&topic, partition)
         .map_err(|e| PacketError::Fatal(format!("Partition create error: {}", e)))?;
 
-    for i in 0..count {
+    // C3: Two-pass replication decode — parse ALL frames before writing any.
+    // Previously, frames were written inside the parse loop.  If the TCP stream
+    // delivered the packet in multiple segments, NeedMoreData was returned mid-batch
+    // without advancing `consumed`, causing already-written frames to be replayed on
+    // the next call and permanently duplicated in the partition log.
+    //
+    // Now: first pass collects payloads (no writes); only after the entire batch is
+    // confirmed present do we commit writes.  NeedMoreData can therefore only be
+    // returned when zero bytes have been written.
+    let is_cluster_meta = topic == "__cluster_metadata";
+    let mut parsed_payloads: Vec<bytes::Bytes> = Vec::with_capacity(count);
+
+    for _ in 0..count {
         if src.len() < HEADER_SIZE {
             return Err(PacketError::NeedMoreData);
         }
         match RecordFrame::decode(src) {
             Ok((frame, frame_bytes)) => {
                 src = &src[frame_bytes..];
-                if let Err(e) = pm.produce_frame(&frame.payload) {
-                    tracing::error!(
-                        "HA Replication: Failed to persist record {}/{} on '{}' P{}: {}",
-                        i + 1, count, topic, partition, e
-                    );
-                }
-
-                // If this node is a Follower and receives a __cluster_metadata replication,
-                // decode it and dynamically initialize partitions locally.
-                if topic == "__cluster_metadata" {
-                    if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
-                        match meta_rec {
-                            crate::replication::MetadataRecord::TopicPartition { topic: ref t, partition: p, .. } => {
-                                // SEC-MED-07: Validate topic name before creating partitions from metadata.
-                                if crate::server::engine::validate_topic_name(t).is_ok() {
-                                    tracing::info!(
-                                        "HA Replication: Received dynamic partition metadata. Initializing partition {}-{}",
-                                        t, p
-                                    );
-                                    if let Err(e) = engine.get_or_create_partition(t, p) {
-                                        tracing::error!(
-                                            "HA Replication: Failed to dynamically create partition {}-{}: {}",
-                                            t, p, e
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!("HA Replication: Skipping invalid topic name '{}' in metadata record", t);
-                                }
-                            }
-                            crate::replication::MetadataRecord::BrokerRegister { node_id, ref bind_addr } => {
-                                tracing::info!(
-                                    "HA Replication: Broker register metadata record parsed. Node {} is at {}",
-                                    node_id, bind_addr
-                                );
-                            }
-                        }
-                    }
-                }
+                parsed_payloads.push(frame.payload);
             }
             Err(crate::protocol::FrameError::BufferTooShort { .. }) => {
                 return Err(PacketError::NeedMoreData);
@@ -478,12 +511,65 @@ fn decode_replication_packet(
         }
     }
 
+    // All frames parsed — compute consumed bytes before the write pass.
     let bytes_consumed = original_len - src.len();
+
+    // C1: Track write failures and NACK the leader so it can remove this node from ISR.
+    // Previously, disk errors were logged and silently swallowed; the function returned
+    // a success ACK regardless, causing the leader to falsely count this follower as
+    // in-sync for data it never persisted.
+    let mut write_failed = false;
+    for (i, payload) in parsed_payloads.iter().enumerate() {
+        if let Err(e) = pm.produce_frame(payload) {
+            tracing::error!(
+                "HA Replication: Failed to persist record {}/{} on '{}' P{}: {}",
+                i + 1, count, topic, partition, e
+            );
+            write_failed = true;
+        }
+
+        // If this node is a Follower and receives a __cluster_metadata replication,
+        // decode it and dynamically initialize partitions locally.
+        if is_cluster_meta {
+            if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(payload) {
+                match meta_rec {
+                    crate::replication::MetadataRecord::TopicPartition { topic: ref t, partition: p, .. } => {
+                        // SEC-MED-07: Validate topic name before creating partitions from metadata.
+                        if crate::server::engine::validate_topic_name(t).is_ok() {
+                            tracing::info!(
+                                "HA Replication: Received dynamic partition metadata. Initializing partition {}-{}",
+                                t, p
+                            );
+                            if let Err(e) = engine.get_or_create_partition(t, p) {
+                                tracing::error!(
+                                    "HA Replication: Failed to dynamically create partition {}-{}: {}",
+                                    t, p, e
+                                );
+                            }
+                        } else {
+                            tracing::warn!("HA Replication: Skipping invalid topic name '{}' in metadata record", t);
+                        }
+                    }
+                    crate::replication::MetadataRecord::BrokerRegister { node_id, ref bind_addr } => {
+                        tracing::info!(
+                            "HA Replication: Broker register metadata record parsed. Node {} is at {}",
+                            node_id, bind_addr
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(
         "HA Replication: Follower persisted {} replicated record(s) on Topic '{}' Partition {}",
         count, topic, partition
     );
 
+    if write_failed {
+        // Signal NACK so the leader retries or removes this follower from ISR.
+        return Ok((bytes_consumed, vec![1u8]));
+    }
     Ok((bytes_consumed, vec![0u8]))
 }
 
@@ -552,12 +638,14 @@ fn decode_heartbeat_packet(
         return Ok((bytes_consumed, vec![1u8]));
     }
 
-    // CRIT-03: Validate leader_bind_addr against the configured peer_addrs whitelist.
-    // This prevents SSRF via a spoofed heartbeat advertising an arbitrary internal address.
+    // CRIT-03 / H6: Validate leader_bind_addr against peer_addrs only.
+    // Previously also matched against this node's own bind_addr, which allowed two
+    // exploits when all nodes share "0.0.0.0:port": (1) any peer could advertise our
+    // own address as the leader, causing forwarded produces to loop back; (2) the
+    // wildcard match made the whitelist entirely ineffective.  The leader's address
+    // must be a known peer, never this node's own address.
     let peer_addrs = &engine.config().peer_addrs;
-    let bind_addr = &engine.config().bind_addr;
-    let is_whitelisted = leader_bind_addr == *bind_addr
-        || peer_addrs.iter().any(|p| *p == leader_bind_addr);
+    let is_whitelisted = peer_addrs.iter().any(|p| *p == leader_bind_addr);
     if !is_whitelisted {
         tracing::warn!(
             "HA Heartbeat: REJECTED — leader_bind_addr '{}' not in configured peer whitelist (Node {})",
@@ -754,9 +842,17 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             buf.put_u8(role_byte);
             WireResponse::ok(buf)
         }
-        RequestPayload::DeleteTopic { topic } => match engine.delete_topic(&topic) {
-            Ok(()) => WireResponse::ok(Vec::new()),
-            Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
-        },
+        RequestPayload::DeleteTopic { topic } => {
+            // H8: Validate topic name before deletion — ProduceBatch already does this
+            // but DeleteTopic previously skipped it, allowing anonymous clients to
+            // target system partitions like __transaction_state via remove_dir_all.
+            if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
+                return WireResponse::error(&format!("Invalid topic name: {}", e));
+            }
+            match engine.delete_topic(&topic) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
+            }
+        }
     }
 }
