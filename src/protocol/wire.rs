@@ -580,7 +580,7 @@ impl WireRequest {
                 let partition = payload_buf.get_u32();
                 let offset = payload_buf.get_u64();
                 let metadata = if !payload_buf.is_empty() {
-                    read_pascal_string(&mut payload_buf).unwrap_or_default()
+                    read_pascal_string(&mut payload_buf)?
                 } else {
                     String::new()
                 };
@@ -651,14 +651,27 @@ pub struct DescribedGroupMember {
     pub assigned_partitions: Vec<(String, u32)>,
 }
 
-/// Encodes DescribeTopic binary payload: `[Topic: pascal] | [NumPartitions: 4b] | { [PartitionID: 4b] | [HighWatermark: 8b] }...`
-pub fn encode_describe_topic_response(topic: &str, partitions: &[(u32, u64)]) -> Vec<u8> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedPartition {
+    pub partition_id: u32,
+    pub high_watermark: u64,
+    pub leader_id: u32,
+    pub replicas: Vec<u32>,
+}
+
+/// Encodes DescribeTopic binary payload: `[Topic: pascal] | [NumPartitions: 4b] | { [PartitionID: 4b] | [HighWatermark: 8b] | [LeaderID: 4b] | [ReplicasLen: 4b] | [Replicas...] }...`
+pub fn encode_describe_topic_response(topic: &str, partitions: &[DescribedPartition]) -> Vec<u8> {
     let mut buf = Vec::new();
     write_pascal_string(&mut buf, topic);
     buf.put_u32(partitions.len() as u32);
-    for (partition_id, high_watermark) in partitions {
-        buf.put_u32(*partition_id);
-        buf.put_u64(*high_watermark);
+    for p in partitions {
+        buf.put_u32(p.partition_id);
+        buf.put_u64(p.high_watermark);
+        buf.put_u32(p.leader_id);
+        buf.put_u32(p.replicas.len() as u32);
+        for &r in &p.replicas {
+            buf.put_u32(r);
+        }
     }
     buf
 }

@@ -203,7 +203,7 @@ follower catch-up for minutes per cycle. The push path already does this correct
 
 ### N5 — Corruption Recovery Truncates at Chunk Boundary, Not Corruption Point
 **File:** `src/segment/log.rs:155–163`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 When corruption is detected inside the inner parse loop, `pos` is overwritten to `buf_len`
 (the full 64 KB read-chunk size) before `file_offset += pos`. This advances `physical_size`
@@ -218,7 +218,7 @@ value for the `file_offset` advancement.
 
 ### N6 — `find_offset_for_timestamp` Always Returns From Oldest Segment
 **File:** `src/segment/manager.rs:339`
-**Status:** Open
+**Status:** Fixed (2026-08-10)
 
 `TimeIndexSegment::find_offset_for_timestamp` returns `Some(entries[0].logical_offset)`
 even when `target_timestamp` is before the segment's first entry (the `Err(0)` arm of

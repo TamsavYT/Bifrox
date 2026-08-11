@@ -192,7 +192,7 @@ impl ConsumerGroupManager {
         // Trigger log compaction if log file size exceeds 1MB (BUG-09)
         if lock.metadata()?.len() > 1024 * 1024 {
             drop(lock);
-            let _ = self.compact_log();
+            self.compact_log()?;
         }
 
         Ok(())
@@ -235,10 +235,18 @@ impl ConsumerGroupManager {
         tmp_file.write_all(&entry_bytes)?;
         tmp_file.sync_data()?;
 
-        let mut lock = self.log_file.lock();
-        
+        let lock = self.log_file.lock();
+        // Windows cannot atomically rename over an existing destination path.
+        // Explicitly remove the destination before rename while holding the log lock.
+        drop(lock);
+        match std::fs::remove_file(&*self.log_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         std::fs::rename(&tmp_path, &*self.log_path)?;
-        
+        let mut lock = self.log_file.lock();
+
         let mut open_opts = OpenOptions::new();
         open_opts.read(true).write(true).create(true);
         #[cfg(windows)]

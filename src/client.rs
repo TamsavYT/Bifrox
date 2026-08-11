@@ -1,9 +1,11 @@
 use crate::protocol::{CommandCode, RecordFrame, WireResponse};
 use bytes::{Buf, BufMut};
 use std::io::Result as IoResult;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+const MAX_CLIENT_RESPONSE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProduceResult {
@@ -39,6 +41,14 @@ pub struct SeekResult {
     pub physical_position: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClusterDescription {
+    pub cluster_id: String,
+    pub node_id: u32,
+    pub is_leader: bool,
+    pub brokers: Vec<(u32, String)>,
+}
+
 /// Helper client for testing protocol commands over TCP
 #[derive(Debug)]
 pub struct TestClient {
@@ -47,6 +57,28 @@ pub struct TestClient {
 }
 
 impl TestClient {
+    async fn read_wire_response(stream: &mut TcpStream) -> IoResult<WireResponse> {
+        let mut resp_header = [0u8; 5];
+        stream.read_exact(&mut resp_header).await?;
+        let status = resp_header[0];
+        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
+        if payload_len > MAX_CLIENT_RESPONSE_PAYLOAD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Response payload {} exceeds maximum {} bytes",
+                    payload_len, MAX_CLIENT_RESPONSE_PAYLOAD_BYTES
+                ),
+            ));
+        }
+        let mut resp_payload = vec![0u8; payload_len];
+        stream.read_exact(&mut resp_payload).await?;
+        Ok(WireResponse {
+            status,
+            payload: resp_payload,
+        })
+    }
+
     pub async fn connect(addr: SocketAddr) -> IoResult<Self> {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self {
@@ -137,13 +169,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 20 {
@@ -191,13 +219,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 4 {
@@ -253,13 +277,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -292,13 +312,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 8 {
@@ -316,7 +332,7 @@ impl TestClient {
         }
     }
 
-    pub async fn describe_topic(&mut self, topic: &str) -> IoResult<(String, Vec<(u32, u64)>)> {
+    pub async fn describe_topic(&mut self, topic: &str) -> IoResult<(String, Vec<crate::protocol::wire::DescribedPartition>)> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::DescribeTopic as u8);
 
@@ -331,13 +347,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             use bytes::Buf;
@@ -348,9 +360,20 @@ impl TestClient {
             let count = cursor.get_u32() as usize;
             let mut partitions = Vec::with_capacity(count);
             for _ in 0..count {
-                let p_id = cursor.get_u32();
-                let hw = cursor.get_u64();
-                partitions.push((p_id, hw));
+                let partition_id = cursor.get_u32();
+                let high_watermark = cursor.get_u64();
+                let leader_id = cursor.get_u32();
+                let rep_len = cursor.get_u32() as usize;
+                let mut replicas = Vec::with_capacity(rep_len);
+                for _ in 0..rep_len {
+                    replicas.push(cursor.get_u32());
+                }
+                partitions.push(crate::protocol::wire::DescribedPartition {
+                    partition_id,
+                    high_watermark,
+                    leader_id,
+                    replicas,
+                });
             }
             Ok((res_topic, partitions))
         } else {
@@ -375,13 +398,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             use bytes::Buf;
@@ -433,13 +452,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 8 {
@@ -474,13 +489,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 16 {
@@ -518,13 +529,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -550,13 +557,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -582,13 +585,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -614,13 +613,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 10 {
@@ -661,13 +656,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -696,13 +687,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             Ok(())
@@ -737,13 +724,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 4 {
@@ -801,13 +784,9 @@ impl TestClient {
         })?;
 
         stream.write_all(&req_buf).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let status = resp.status;
+        let resp_payload = resp.payload;
 
         if status == 0 {
             if resp_payload.len() < 4 {
@@ -854,18 +833,7 @@ impl TestClient {
         })?;
 
         stream.write_all(raw).await?;
-
-        let mut resp_header = [0u8; 5];
-        stream.read_exact(&mut resp_header).await?;
-        let status = resp_header[0];
-        let payload_len = u32::from_be_bytes(resp_header[1..5].try_into().unwrap()) as usize;
-        let mut resp_payload = vec![0u8; payload_len];
-        stream.read_exact(&mut resp_payload).await?;
-
-        Ok(WireResponse {
-            status,
-            payload: resp_payload,
-        })
+        Self::read_wire_response(stream).await
     }
 
     pub async fn ping(&mut self) -> IoResult<bool> {
@@ -874,6 +842,60 @@ impl TestClient {
         req_buf.put_u32(0);
         let resp = self.send_raw_bytes(&req_buf).await?;
         Ok(resp.status == 0 && resp.payload == b"PONG")
+    }
+
+    pub async fn describe_cluster(&mut self) -> IoResult<ClusterDescription> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::DescribeCluster as u8);
+        req_buf.put_u32(0);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other("DescribeCluster failed"));
+        }
+
+        let mut payload = &resp.payload[..];
+        if payload.len() < 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "DescribeCluster payload too short",
+            ));
+        }
+        let cluster_len = payload.get_u16() as usize;
+        if payload.len() < cluster_len + 5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "DescribeCluster payload incomplete",
+            ));
+        }
+        let cluster_id = String::from_utf8_lossy(&payload[..cluster_len]).to_string();
+        payload = &payload[cluster_len..];
+        let node_id = payload.get_u32();
+        let is_leader = payload.get_u8() != 0;
+
+        let mut brokers = Vec::new();
+        if payload.len() >= 4 {
+            let broker_count = payload.get_u32() as usize;
+            for _ in 0..broker_count {
+                if payload.len() < 6 {
+                    break;
+                }
+                let b_id = payload.get_u32();
+                let len = payload.get_u16() as usize;
+                if payload.len() < len {
+                    break;
+                }
+                let addr = String::from_utf8_lossy(&payload[..len]).to_string();
+                payload = &payload[len..];
+                brokers.push((b_id, addr));
+            }
+        }
+
+        Ok(ClusterDescription {
+            cluster_id,
+            node_id,
+            is_leader,
+            brokers,
+        })
     }
 
     pub async fn list_topics(&mut self) -> IoResult<Vec<String>> {
@@ -1071,5 +1093,129 @@ impl TestClient {
         } else {
             Err(std::io::Error::other("OffsetFetch failed"))
         }
+    }
+}
+
+/// Smart client supporting cluster metadata discovery, partition leadership resolution, and connection pooling
+#[derive(Debug)]
+pub struct RoutedClient {
+    bootstrap_addr: SocketAddr,
+    auth_token: Option<String>,
+    connections: std::collections::HashMap<u32, TestClient>,
+    broker_addrs: std::collections::HashMap<u32, SocketAddr>,
+    topic_metadata: std::collections::HashMap<String, Vec<crate::protocol::wire::DescribedPartition>>,
+}
+
+impl RoutedClient {
+    pub async fn connect(bootstrap_addr: SocketAddr) -> IoResult<Self> {
+        let bootstrap_client = TestClient::connect(bootstrap_addr).await?;
+        let mut connections = std::collections::HashMap::new();
+        connections.insert(1, bootstrap_client);
+
+        let mut client = Self {
+            bootstrap_addr,
+            auth_token: None,
+            connections,
+            broker_addrs: std::collections::HashMap::new(),
+            topic_metadata: std::collections::HashMap::new(),
+        };
+
+        client.broker_addrs.insert(1, bootstrap_addr);
+        Ok(client)
+    }
+
+    pub fn with_auth(mut self, auth_token: String) -> Self {
+        self.auth_token = Some(auth_token);
+        self
+    }
+
+    /// Refresh metadata for target topic via DescribeTopic
+    pub async fn refresh_metadata(&mut self, topic: &str) -> IoResult<()> {
+        let client = self.connections.get_mut(&1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Bootstrap client not connected")
+        })?;
+
+        if let Ok(cluster) = client.describe_cluster().await {
+            for (node_id, addr) in cluster.brokers {
+                if let Ok(mut addrs) = addr.to_socket_addrs() {
+                    if let Some(sock) = addrs.next() {
+                        self.broker_addrs.insert(node_id, sock);
+                    }
+                }
+            }
+        }
+
+        if let Ok((res_topic, partitions)) = client.describe_topic(topic).await {
+            self.topic_metadata.insert(res_topic, partitions);
+        }
+        Ok(())
+    }
+
+    /// Register a broker node address for client routing
+    pub fn register_broker(&mut self, node_id: u32, addr: SocketAddr) {
+        self.broker_addrs.insert(node_id, addr);
+    }
+
+    /// Ensures connection to target broker node ID
+    pub async fn ensure_connection(&mut self, node_id: u32) -> IoResult<&mut TestClient> {
+        if !self.connections.contains_key(&node_id) {
+            let addr = self.broker_addrs.get(&node_id).copied().unwrap_or(self.bootstrap_addr);
+            let client = TestClient::connect(addr).await?;
+            self.connections.insert(node_id, client);
+        }
+        Ok(self.connections.get_mut(&node_id).unwrap())
+    }
+
+    /// Smart produce: resolves target partition leader and sends ProduceBatch directly to leader IP
+    pub async fn produce_smart(
+        &mut self,
+        topic: &str,
+        key: &str,
+        transaction_id: Option<&str>,
+        num_partitions: u32,
+        records: &[bytes::Bytes],
+    ) -> IoResult<ProduceResult> {
+        self.refresh_metadata(topic).await?;
+
+        let target_partition = if !key.is_empty() && num_partitions > 0 {
+            crate::server::hash_key(key.as_bytes(), num_partitions as usize)
+        } else {
+            0
+        };
+
+        let leader_id = self
+            .topic_metadata
+            .get(topic)
+            .and_then(|parts| parts.iter().find(|p| p.partition_id == target_partition))
+            .map(|p| p.leader_id)
+            .unwrap_or(1);
+
+        let client = self.ensure_connection(leader_id).await?;
+        client
+            .produce_batch(topic, key, transaction_id, num_partitions, records)
+            .await
+    }
+
+    /// Smart fetch: resolves partition leader and fetches directly
+    pub async fn fetch_smart(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Vec<RecordFrame>> {
+        if !self.topic_metadata.contains_key(topic) {
+            let _ = self.refresh_metadata(topic).await;
+        }
+
+        let leader_id = self
+            .topic_metadata
+            .get(topic)
+            .and_then(|parts| parts.iter().find(|p| p.partition_id == partition))
+            .map(|p| p.leader_id)
+            .unwrap_or(1);
+
+        let client = self.ensure_connection(leader_id).await?;
+        client.fetch(topic, partition, offset, max_bytes).await
     }
 }

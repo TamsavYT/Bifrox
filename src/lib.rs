@@ -6,7 +6,7 @@ pub mod replication;
 pub mod segment;
 pub mod server;
 
-pub use client::{ProduceResult, SeekResult, TestClient};
+pub use client::{ProduceResult, RoutedClient, SeekResult, TestClient};
 pub use config::{EngineConfig, FlushPolicy};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{CommandCode, FrameError, RecordFrame, WireError, WireRequest, WireResponse};

@@ -21,6 +21,13 @@ pub enum MetadataRecord {
     TopicDeleted {
         topic: String,
     },
+    PartitionLeadershipChange {
+        topic: String,
+        partition: u32,
+        leader_id: u32,
+        leader_epoch: u32,
+        isr: Vec<u32>,
+    },
 }
 
 impl MetadataRecord {
@@ -51,6 +58,17 @@ impl MetadataRecord {
             MetadataRecord::TopicDeleted { topic } => {
                 buf.put_u8(0x04); // record type
                 crate::protocol::wire::write_pascal_string(&mut buf, topic);
+            }
+            MetadataRecord::PartitionLeadershipChange { topic, partition, leader_id, leader_epoch, isr } => {
+                buf.put_u8(0x05); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, topic);
+                buf.put_u32(*partition);
+                buf.put_u32(*leader_id);
+                buf.put_u32(*leader_epoch);
+                buf.put_u32(isr.len() as u32);
+                for &id in isr {
+                    buf.put_u32(id);
+                }
             }
         }
         buf
@@ -111,6 +129,30 @@ impl MetadataRecord {
             0x04 => {
                 let topic = read_pascal_string_io(&mut src)?;
                 Ok(MetadataRecord::TopicDeleted { topic })
+            }
+            0x05 => {
+                let topic = read_pascal_string_io(&mut src)?;
+                if src.len() < 16 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete PartitionLeadershipChange metadata"));
+                }
+                let partition = src.get_u32();
+                let leader_id = src.get_u32();
+                let leader_epoch = src.get_u32();
+                let isr_len = src.get_u32() as usize;
+                if src.len() < isr_len * 4 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete ISR list"));
+                }
+                let mut isr = Vec::with_capacity(isr_len);
+                for _ in 0..isr_len {
+                    isr.push(src.get_u32());
+                }
+                Ok(MetadataRecord::PartitionLeadershipChange {
+                    topic,
+                    partition,
+                    leader_id,
+                    leader_epoch,
+                    isr,
+                })
             }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("Unknown metadata record type: 0x{:02X}", record_type))),
         }

@@ -64,6 +64,8 @@ pub struct ReplicationManager {
     last_heartbeat: Arc<RwLock<std::time::Instant>>,
     /// REP-02: Tracks (term, candidate_id) for which this node voted in the current term
     voted_for: Arc<RwLock<Option<(u64, u32)>>>,
+    /// Active per-partition follower fetcher tasks: (topic, partition) -> JoinHandle
+    fetchers: Arc<DashMap<(String, u32), tokio::task::JoinHandle<()>>>,
 }
 
 impl ReplicationManager {
@@ -94,6 +96,7 @@ impl ReplicationManager {
             leader_addr,
             last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
             voted_for: Arc::new(RwLock::new(None)),
+            fetchers: Arc::new(DashMap::new()),
         };
 
         // Leader: start heartbeat broadcaster to all followers
@@ -101,9 +104,8 @@ impl ReplicationManager {
         if mgr.config.role == NodeRole::Leader && !mgr.config.peer_addrs.is_empty() {
             mgr.start_leader_heartbeat_loop();
         } else {
-            // Followers start election timeout monitoring and replication pull loop (REP-03)
+            // Followers start election timeout monitoring
             mgr.start_election_timeout_loop();
-            mgr.start_follower_pull_loop();
         }
 
         mgr
@@ -230,28 +232,76 @@ impl ReplicationManager {
         });
     }
 
-    /// Follower background loop: periodically checks if follower is behind leader and fetches missing records (REP-03)
-    fn start_follower_pull_loop(&self) {
-        let leader_addr = self.leader_addr.clone();
+    /// Starts background per-partition follower fetch loops (Phase 3)
+    pub fn start_per_partition_fetcher_manager(&self, engine: crate::server::StorageEngine) {
+        let fetchers = self.fetchers.clone();
         let node_id = self.config.node_id;
+
         tokio::spawn(async move {
             loop {
-                sleep(Duration::from_secs(5)).await;
-                let maybe_leader = leader_addr.read().unwrap().clone();
-                if let Some(leader) = maybe_leader {
-                    let req = ReplicationFetchRequest {
-                        follower_node_id: node_id,
-                        topic: "__cluster_metadata".to_string(),
-                        partition: 0,
-                        fetch_offset: 0,
-                        max_bytes: 64 * 1024,
-                    };
-                    if let Ok(resp) = send_grpc_replication_fetch(&leader, &req).await {
-                        tracing::debug!(
-                            "HA Replication Catch-Up: Follower pulled {} frame(s) from Leader {}",
-                            resp.frames.len(),
-                            leader
-                        );
+                sleep(Duration::from_millis(100)).await;
+
+                let topics = engine.list_topics();
+                let mut active_partition_keys = std::collections::HashSet::new();
+
+                for topic in &topics {
+                    if let Some(partitions) = engine.describe_topic(topic) {
+                        for part in partitions {
+                            let p_id = part.partition_id;
+                            let leader_id = part.leader_id;
+
+                            if leader_id != node_id && part.replicas.contains(&node_id) {
+                                active_partition_keys.insert((topic.clone(), p_id));
+
+                                if !fetchers.contains_key(&(topic.clone(), p_id)) {
+                                    let engine_c = engine.clone();
+                                    let topic_c = topic.clone();
+                                    let handle = tokio::spawn(async move {
+                                        loop {
+                                            let last_offset = match engine_c.get_or_create_partition(&topic_c, p_id) {
+                                                Ok(pm) => pm.latest_offset(),
+                                                Err(_) => 0,
+                                            };
+
+                                            let req = ReplicationFetchRequest {
+                                                follower_node_id: node_id,
+                                                topic: topic_c.clone(),
+                                                partition: p_id,
+                                                fetch_offset: last_offset,
+                                                max_bytes: 64 * 1024,
+                                            };
+
+                                            if let Some(leader_addr) = engine_c.get_broker_address(leader_id) {
+                                                if let Ok(resp) = send_grpc_replication_fetch(&leader_addr, &req).await {
+                                                    if let Ok(pm) = engine_c.get_or_create_partition(&topic_c, p_id) {
+                                                        for frame in resp.frames {
+                                                            let _ = pm.produce_frame_eos(&frame.payload, 0, 0, 0);
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            sleep(Duration::from_millis(50)).await;
+                                        }
+                                    });
+
+                                    fetchers.insert((topic.clone(), p_id), handle);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Cleanup fetchers for partitions where this node is no longer a follower
+                let to_remove: Vec<_> = fetchers
+                    .iter()
+                    .filter(|entry| !active_partition_keys.contains(entry.key()))
+                    .map(|entry| entry.key().clone())
+                    .collect();
+
+                for key in to_remove {
+                    if let Some((_, handle)) = fetchers.remove(&key) {
+                        handle.abort();
                     }
                 }
             }

@@ -9,6 +9,7 @@ use tokio::time::sleep;
 pub struct TestEnv {
     pub addr: SocketAddr,
     pub data_dir: std::path::PathBuf,
+    pub engine: StorageEngine,
 }
 
 impl Drop for TestEnv {
@@ -51,14 +52,14 @@ async fn start_test_server() -> TestEnv {
     };
 
     let engine = StorageEngine::new(config).unwrap();
-    let server = Server::new(engine);
+    let server = Server::new(engine.clone());
     let (listener, addr) = server.bind().unwrap();
 
     tokio::spawn(async move {
         let _ = server.run_with_listener(listener).await;
     });
 
-    TestEnv { addr, data_dir }
+    TestEnv { addr, data_dir, engine }
 }
 
 #[tokio::test]
@@ -881,10 +882,12 @@ async fn test_scenario_17_durable_metadata_catalog() {
     // 2. DescribeTopic should report 3 partitions with high watermark 0 even before messages are produced
     let (desc_topic, desc_parts) = client.describe_topic("meta_topic").await.expect("DescribeTopic failed");
     assert_eq!(desc_topic, "meta_topic");
-    assert_eq!(desc_parts.len(), 3, "Should report 3 partitions");
-    assert_eq!(desc_parts[0], (0, 0));
-    assert_eq!(desc_parts[1], (1, 0));
-    assert_eq!(desc_parts[2], (2, 0));
+    assert_eq!(desc_parts[0].partition_id, 0);
+    assert_eq!(desc_parts[0].high_watermark, 0);
+    assert_eq!(desc_parts[1].partition_id, 1);
+    assert_eq!(desc_parts[1].high_watermark, 0);
+    assert_eq!(desc_parts[2].partition_id, 2);
+    assert_eq!(desc_parts[2].high_watermark, 0);
 
     // 3. Verify ListTopics includes "meta_topic"
     let topics = client.list_topics().await.unwrap();
@@ -1000,5 +1003,127 @@ async fn test_scenario_19_relative_index_and_txnindex() {
     assert_eq!(txn_meta.len(), 24, ".txnindex file must contain exactly 1 entry of 24 bytes");
 
     let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[tokio::test]
+async fn test_scenario_20_partition_level_leadership() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "leader_partition_topic";
+
+    // 1. Create topic with 2 partitions
+    client.create_topic(topic, 2).await.expect("CreateTopic failed");
+
+    // 2. DescribeTopic should report leader_id = 1 for both partitions on single-node setup
+    let (desc_topic, desc_parts) = client.describe_topic(topic).await.expect("DescribeTopic failed");
+    assert_eq!(desc_topic, topic);
+    assert_eq!(desc_parts.len(), 2);
+    assert_eq!(desc_parts[0].leader_id, 1);
+    assert_eq!(desc_parts[1].leader_id, 1);
+
+    // 3. Produce to partition 0 succeeds on leader node 1
+    client.produce_single(topic, "", None, 2, "msg_part_0").await.expect("Produce to part 0 failed");
+
+    // 4. Update leadership of partition 1 to Node 2 (simulating reassignment to node 2 only)
+    if let Ok(pm) = env.engine.get_or_create_partition(topic, 1) {
+        pm.update_leadership(2, 1, vec![2], vec![2]);
+    }
+
+    // 5. Fetch/Produce directly to partition 1 on Node 1 must now be rejected with NotLeaderForPartition
+    assert!(env.engine.is_partition_leader(topic, 0));
+    assert!(!env.engine.is_partition_leader(topic, 1), "Node 1 is no longer leader for partition 1");
+
+    let fetch_resp = client.fetch(topic, 1, 0, 1024).await;
+    assert!(fetch_resp.is_err(), "Fetch on non-leader partition must fail");
+    let err_msg = fetch_resp.unwrap_err().to_string();
+    assert!(err_msg.contains("NotLeaderForPartition"), "Error message should contain NotLeaderForPartition: {}", err_msg);
+}
+
+#[tokio::test]
+async fn test_scenario_21_per_partition_replication_and_client_routing() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("smart_cluster_test_{}_{}", pid, count));
+
+    let node1_dir = base_dir.join("node1_data");
+    let node2_dir = base_dir.join("node2_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // 1. Start Node 2 (Node ID: 2)
+    let config_node2 = EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: node2_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine_node2 = StorageEngine::new(config_node2).unwrap();
+    let server_node2 = Server::new(engine_node2.clone());
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+
+    let server_node2_task = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // 2. Start Node 1 (Node ID: 1)
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1.clone());
+    let (listener_node1, addr_node1) = server_node1.bind().unwrap();
+
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    sleep(Duration::from_millis(50)).await;
+
+    // Register broker socket addresses on engines
+    engine_node1.register_broker_address(1, addr_node1.to_string());
+    engine_node1.register_broker_address(2, addr_node2.to_string());
+    engine_node2.register_broker_address(1, addr_node1.to_string());
+    engine_node2.register_broker_address(2, addr_node2.to_string());
+
+    // 3. Connect RoutedClient to Node 1 (Bootstrap) and register Node 2
+    let mut smart_client = hermes::RoutedClient::connect(addr_node1).await.expect("RoutedClient connect failed");
+    smart_client.register_broker(2, addr_node2);
+
+    let topic = "smart_routed_topic";
+
+    // 4. Create topic on Node 1 & assign Node 2 as leader of Partition 1
+    let mut setup_client = TestClient::connect(addr_node1).await.unwrap();
+    setup_client.create_topic(topic, 2).await.unwrap();
+
+    if let Ok(pm1) = engine_node1.get_or_create_partition(topic, 1) {
+        pm1.update_leadership(2, 1, vec![2, 1], vec![2, 1]);
+    }
+    if let Ok(pm2) = engine_node2.get_or_create_partition(topic, 1) {
+        pm2.update_leadership(2, 1, vec![2, 1], vec![2, 1]);
+    }
+
+    // 5. Produce via RoutedClient (routes Partition 1 directly to Node 2!)
+    let records = vec![bytes::Bytes::from("smart_payload_1"), bytes::Bytes::from("smart_payload_2")];
+    let prod_res = smart_client.produce_smart(topic, "routing_key_1", None, 2, &records).await.expect("produce_smart failed");
+    assert_eq!(prod_res.first_offset, 0);
+
+    // 6. Sleep briefly to allow Node 1's PartitionFetcherManager to pull Partition 1 from Node 2 over gRPC!
+    sleep(Duration::from_millis(200)).await;
+
+    // 7. Verify Node 1 (Follower for Partition 1) has fetched the records from Node 2!
+    let fetched = smart_client.fetch_smart(topic, 1, 0, 65536).await.expect("fetch_smart failed");
+    assert_eq!(fetched.len(), 2);
+    assert_eq!(fetched[0].payload.as_ref(), b"smart_payload_1");
+    assert_eq!(fetched[1].payload.as_ref(), b"smart_payload_2");
+
+    server_node1_task.abort();
+    server_node2_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
 }
 

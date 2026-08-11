@@ -1,10 +1,10 @@
 use crate::config::EngineConfig;
 use crate::protocol::RecordFrame;
 use crate::segment::SegmentManager;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::io::Result as IoResult;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -77,7 +77,9 @@ impl ProducerStateManager {
     }
 }
 
-/// Thread-safe PartitionManager managing segment manager and atomic watermark
+
+
+/// Thread-safe PartitionManager managing segment manager, atomic watermark, and granular leadership state
 #[derive(Debug)]
 pub struct PartitionManager {
     topic: String,
@@ -85,6 +87,10 @@ pub struct PartitionManager {
     segment_manager: Mutex<SegmentManager>,
     high_watermark: AtomicU64,
     producer_state_manager: Mutex<ProducerStateManager>,
+    leader_id: AtomicU32,
+    leader_epoch: AtomicU32,
+    replicas: RwLock<Vec<u32>>,
+    isr: RwLock<Vec<u32>>,
 }
 
 impl PartitionManager {
@@ -108,6 +114,10 @@ impl PartitionManager {
             segment_manager: Mutex::new(segment_manager),
             high_watermark,
             producer_state_manager: Mutex::new(producer_state_manager),
+            leader_id: AtomicU32::new(config.node_id),
+            leader_epoch: AtomicU32::new(0),
+            replicas: RwLock::new(vec![config.node_id]),
+            isr: RwLock::new(vec![config.node_id]),
         })
     }
 
@@ -117,6 +127,33 @@ impl PartitionManager {
 
     pub fn partition(&self) -> u32 {
         self.partition
+    }
+
+    pub fn is_leader(&self, self_node_id: u32) -> bool {
+        self.leader_id.load(Ordering::Acquire) == self_node_id
+    }
+
+    pub fn update_leadership(&self, leader_id: u32, leader_epoch: u32, replicas: Vec<u32>, isr: Vec<u32>) {
+        self.leader_id.store(leader_id, Ordering::Release);
+        self.leader_epoch.store(leader_epoch, Ordering::Release);
+        *self.replicas.write() = replicas;
+        *self.isr.write() = isr;
+    }
+
+    pub fn leader_id(&self) -> u32 {
+        self.leader_id.load(Ordering::Acquire)
+    }
+
+    pub fn leader_epoch(&self) -> u32 {
+        self.leader_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn replicas(&self) -> Vec<u32> {
+        self.replicas.read().clone()
+    }
+
+    pub fn isr(&self) -> Vec<u32> {
+        self.isr.read().clone()
     }
 
     pub fn latest_offset(&self) -> u64 {

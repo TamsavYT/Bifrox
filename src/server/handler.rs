@@ -5,17 +5,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
-/// Timeout for forwarding produce requests to the leader node
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum allowed size for a forwarded leader response (CRIT-05)
-const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
+
 
 /// Maximum allowed records per replication batch (CRIT-01 / SEC-MED-05)
 const MAX_REPLICATION_BATCH_COUNT: usize = 100_000;
 
 /// Maximum cluster-ID / peer string length accepted in inter-node packets (SEC-MED-06)
 const MAX_CLUSTER_ID_LEN: usize = 256;
+/// Timeout for reading client auth handshake bytes.
+const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for forwarding produce requests to the leader node.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum allowed size for a forwarded leader response (prevents OOM from a malicious/buggy leader).
+const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
 
 /// Handles incoming TCP client connections and inter-node replication/heartbeat streams.
 ///
@@ -46,9 +51,12 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
             const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
             let token_bytes = token.as_bytes();
             let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
-            let ok = socket.read_exact(&mut auth_buf).await.is_ok()
-                && auth_buf.starts_with(AUTH_MAGIC)
-                && &auth_buf[AUTH_MAGIC.len()..] == token_bytes;
+            let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
+                Ok(Ok(_)) => auth_buf.starts_with(AUTH_MAGIC)
+                    && &auth_buf[AUTH_MAGIC.len()..] == token_bytes,
+                Ok(Err(_)) => false,
+                Err(_) => false,
+            };
             if !ok {
                 tracing::warn!("Authentication failed from {} — closing connection", peer_addr);
                 let _ = socket.write_all(b"AUTH_FAILED\n").await;
@@ -137,12 +145,15 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                 _ => {
                     match WireRequest::decode(slice) {
                         Ok((req, bytes_used)) => {
-                            // Check if this is a ProduceBatch and we're NOT the leader
+                            // Produce Forwarding: if this node is a Follower and the request is a
+                            // ProduceBatch, transparently proxy the raw request bytes to the current
+                            // Leader and relay its response, rather than making the client discover
+                            // the leader itself.  This restores Kafka's "connect to any broker"
+                            // client experience for non-leader brokers.
                             let is_produce = matches!(req.payload, RequestPayload::ProduceBatch { .. });
                             let is_leader = engine.is_leader();
 
                             if is_produce && !is_leader {
-                                // Forward to leader: capture raw request bytes before advancing
                                 let raw_request = slice[..bytes_used].to_vec();
                                 consumed += bytes_used;
 
@@ -183,7 +194,6 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                                     return;
                                 }
                             } else {
-                                // Process locally (leader for produce, or any node for fetch/offset/etc)
                                 consumed += bytes_used;
                                 let response = process_request(&engine, req).await;
                                 if let Err(e) = socket.write_all(&response.encode()).await {
@@ -222,11 +232,12 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
 }
 
 /// Forwards raw produce request bytes to the leader node and returns the raw response bytes.
+///
+/// Used by follower brokers to transparently proxy `ProduceBatch` requests to the current
+/// cluster leader, so Kafka-style clients can "connect to any broker" without needing to
+/// discover partition leadership themselves.
 async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Option<&str>) -> std::io::Result<Vec<u8>> {
-    let mut stream = match timeout(
-        FORWARD_TIMEOUT,
-        TcpStream::connect(leader_addr),
-    ).await {
+    let mut stream = match timeout(FORWARD_TIMEOUT, TcpStream::connect(leader_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -237,37 +248,38 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Op
         }
     };
 
-    // N8: Send auth handshake before the request when auth_token is configured.
-    // The leader's handle_connection expects the magic + token prefix from every
-    // non-peer client; followers are exempt by IP but must still authenticate when
-    // the exempt-by-IP check doesn't cover the loopback/forwarded-IP case.
+    // If auth_token is configured, send the auth handshake before the request so the
+    // leader's handle_connection accepts this as an authenticated client rather than
+    // rejecting it (the forwarding follower is not necessarily in the leader's peer_addrs
+    // exemption list, e.g. when NAT/port-forwarding changes the observed source IP).
     if let Some(token) = auth_token {
         const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
         stream.write_all(AUTH_MAGIC).await?;
         stream.write_all(token.as_bytes()).await?;
     }
 
-    // Send the raw WireRequest to leader
     stream.write_all(raw_request).await?;
 
-    // H7: Wrap both reads in FORWARD_TIMEOUT so a stalled leader cannot pin this
-    // Tokio task indefinitely.  Previously only the connect() was wrapped.
     let mut header = [0u8; 5];
     match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut header)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("Timed out reading response header from leader {}", leader_addr),
-        )),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Timed out reading response header from leader {}", leader_addr),
+            ))
+        }
     }
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
-    // CRIT-05: Reject oversized response payloads to prevent OOM allocation.
     if payload_len > MAX_FORWARD_RESPONSE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Leader forward response payload {} exceeds maximum {} bytes", payload_len, MAX_FORWARD_RESPONSE_BYTES),
+            format!(
+                "Leader forward response payload {} exceeds maximum {} bytes",
+                payload_len, MAX_FORWARD_RESPONSE_BYTES
+            ),
         ));
     }
 
@@ -278,10 +290,12 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Op
         match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut payload)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Timed out reading response payload from leader {}", leader_addr),
-            )),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Timed out reading response payload from leader {}", leader_addr),
+                ))
+            }
         }
         response.extend_from_slice(&payload);
     }
@@ -551,6 +565,7 @@ fn decode_replication_packet(
                         }
                     }
                     crate::replication::MetadataRecord::BrokerRegister { node_id, ref bind_addr } => {
+                        engine.register_broker_address(node_id, bind_addr.clone());
                         tracing::info!(
                             "HA Replication: Broker register metadata record parsed. Node {} is at {}",
                             node_id, bind_addr
@@ -561,6 +576,12 @@ fn decode_replication_packet(
                     }
                     crate::replication::MetadataRecord::TopicDeleted { topic: ref t } => {
                         let _ = engine.delete_topic(t);
+                    }
+                    crate::replication::MetadataRecord::PartitionLeadershipChange { topic: ref t, partition, leader_id, leader_epoch, isr } => {
+                        let replicas = isr.clone();
+                        if let Ok(pm) = engine.get_or_create_partition(t, partition) {
+                            pm.update_leadership(leader_id, leader_epoch, replicas, isr);
+                        }
                     }
                 }
             }
@@ -695,6 +716,14 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
                 return WireResponse::error(&format!("Invalid topic name: {}", e));
             }
+            let target_partition = if !key.is_empty() && num_partitions > 0 {
+                crate::server::hash_key(key.as_bytes(), num_partitions as usize)
+            } else {
+                0
+            };
+            if !engine.is_partition_leader(&topic, target_partition) {
+                return WireResponse::error("NotLeaderForPartition");
+            }
             match engine
                 .produce_batch(crate::server::engine::ProduceBatchParams {
                     topic: &topic,
@@ -727,16 +756,42 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             partition,
             offset,
             max_bytes,
-        } => match engine.fetch(&topic, partition, offset, max_bytes) {
-            Ok(frames) => {
-                let mut buf = Vec::new();
-                buf.put_u32(frames.len() as u32);
-                for frame in frames {
-                    frame.encode_into(&mut buf);
-                }
-                WireResponse::ok(buf)
+        } => {
+            if !engine.is_partition_replica(&topic, partition) {
+                return WireResponse::error("NotLeaderForPartition");
             }
-            Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
+            match engine.fetch(&topic, partition, offset, max_bytes) {
+                Ok(frames) => {
+                    let mut buf = Vec::new();
+                    buf.put_u32(frames.len() as u32);
+                    for frame in frames {
+                        frame.encode_into(&mut buf);
+                    }
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
+            }
+        },
+        RequestPayload::FetchCommitted {
+            topic,
+            partition,
+            offset,
+            max_bytes,
+        } => {
+            if !engine.is_partition_replica(&topic, partition) {
+                return WireResponse::error("NotLeaderForPartition");
+            }
+            match engine.fetch_committed(&topic, partition, offset, max_bytes) {
+                Ok(frames) => {
+                    let mut buf = Vec::new();
+                    buf.put_u32(frames.len() as u32);
+                    for frame in frames {
+                        frame.encode_into(&mut buf);
+                    }
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
+            }
         },
         RequestPayload::CommitOffset {
             group_id,
@@ -861,23 +916,6 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             }
             Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
         },
-        // P1: Read-committed fetch — hides uncommitted and aborted records via LSO
-        RequestPayload::FetchCommitted {
-            topic,
-            partition,
-            offset,
-            max_bytes,
-        } => match engine.fetch_committed(&topic, partition, offset, max_bytes) {
-            Ok(frames) => {
-                let mut buf = Vec::new();
-                buf.put_u32(frames.len() as u32);
-                for frame in frames {
-                    frame.encode_into(&mut buf);
-                }
-                WireResponse::ok(buf)
-            }
-            Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
-        },
         RequestPayload::Ping => WireResponse::ok(b"PONG".to_vec()),
         RequestPayload::ListTopics => {
             let topics = engine.list_topics();
@@ -895,6 +933,12 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             buf.put_u32(config.node_id);
             let role_byte = if engine.is_leader() { 1u8 } else { 0u8 };
             buf.put_u8(role_byte);
+            let brokers = engine.broker_endpoints();
+            buf.put_u32(brokers.len() as u32);
+            for (node_id, addr) in brokers {
+                buf.put_u32(node_id);
+                crate::protocol::wire::write_pascal_string(&mut buf, &addr);
+            }
             WireResponse::ok(buf)
         }
         RequestPayload::DeleteTopic { topic } => {

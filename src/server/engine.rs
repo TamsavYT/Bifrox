@@ -50,10 +50,20 @@ pub struct ProduceBatchParams<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionAssignment {
+    pub partition: u32,
+    pub leader_id: u32,
+    pub leader_epoch: u32,
+    pub replicas: Vec<u32>,
+    pub isr: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicConfig {
     pub topic: String,
     pub num_partitions: u32,
     pub replication_factor: u16,
+    pub partitions: std::collections::HashMap<u32, PartitionAssignment>,
 }
 
 pub type TopicRegistry = DashMap<String, TopicConfig>;
@@ -69,6 +79,7 @@ pub struct StorageEngine {
     transactions: TransactionManager,
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
+    broker_addrs: Arc<DashMap<u32, String>>,
 }
 
 impl StorageEngine {
@@ -93,7 +104,10 @@ impl StorageEngine {
             transactions,
             replication,
             group_coordinator: Arc::new(GroupCoordinator::new()),
+            broker_addrs: Arc::new(DashMap::new()),
         };
+
+        engine.broker_addrs.insert(engine.config.node_id, engine.config.bind_addr.clone());
 
         // 1. Scan data_dir and load existing partitions
         if engine.config.data_dir.exists() {
@@ -134,6 +148,8 @@ impl StorageEngine {
                 let _ = meta_pm.produce(&reg_rec.encode());
             }
         }
+
+        engine.replication.start_per_partition_fetcher_manager(engine.clone());
 
         Ok(engine)
     }
@@ -205,21 +221,13 @@ impl StorageEngine {
                     self.config.clone(),
                 )?);
 
-                e.insert(pm.clone());
-
-                if self.is_leader() && topic != "__cluster_metadata" && !topic.starts_with("__") {
-                    let meta_record = crate::replication::MetadataRecord::TopicPartition {
-                        topic: topic.to_string(),
-                        partition,
-                        leader_id: self.config.node_id,
-                        replicas: vec![self.config.node_id],
-                    };
-                    let payload = meta_record.encode();
-                    if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-                        let _ = meta_pm.produce(&payload);
+                if let Some(cfg) = self.topic_registry.get(topic) {
+                    if let Some(assign) = cfg.partitions.get(&partition) {
+                        pm.update_leadership(assign.leader_id, assign.leader_epoch, assign.replicas.clone(), assign.isr.clone());
                     }
                 }
 
+                e.insert(pm.clone());
                 Ok(pm)
             }
         }
@@ -250,12 +258,31 @@ impl StorageEngine {
                                     topic,
                                     num_partitions,
                                     replication_factor,
+                                    partitions: std::collections::HashMap::new(),
                                 });
+                            }
+                            crate::replication::MetadataRecord::PartitionLeadershipChange { topic, partition, leader_id, leader_epoch, isr } => {
+                                let replicas = isr.clone();
+                                let assignment = PartitionAssignment {
+                                    partition,
+                                    leader_id,
+                                    leader_epoch,
+                                    replicas: replicas.clone(),
+                                    isr: isr.clone(),
+                                };
+                                if let Some(mut cfg) = self.topic_registry.get_mut(&topic) {
+                                    cfg.partitions.insert(partition, assignment);
+                                }
+                                if let Ok(pm) = self.get_or_create_partition(&topic, partition) {
+                                    pm.update_leadership(leader_id, leader_epoch, replicas, isr);
+                                }
+                            }
+                            crate::replication::MetadataRecord::BrokerRegister { node_id, bind_addr } => {
+                                self.broker_addrs.insert(node_id, bind_addr);
                             }
                             crate::replication::MetadataRecord::TopicDeleted { topic } => {
                                 self.topic_registry.remove(&topic);
                             }
-                            _ => {}
                         }
                     }
                     offset = frame.offset + 1;
@@ -581,14 +608,61 @@ impl StorageEngine {
             return Err(std::io::Error::other(format!("Topic {} is currently being deleted", topic)));
         }
 
+        let broker_ids = self.available_broker_ids();
+        if broker_ids.is_empty() {
+            return Err(std::io::Error::other("No brokers available for topic assignment"));
+        }
+        let replication_factor = std::cmp::min(
+            self.config.default_replication_factor.max(1),
+            broker_ids.len() as u16,
+        );
+
         let record = crate::replication::MetadataRecord::TopicCreated {
             topic: topic.to_string(),
             num_partitions,
-            replication_factor: 1,
+            replication_factor,
         };
 
         if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
             let _ = meta_pm.produce(&record.encode());
+        }
+
+        let mut partitions = std::collections::HashMap::new();
+        let total_nodes = broker_ids.len();
+        let rf_usize = replication_factor as usize;
+
+        for p in 0..num_partitions {
+            let leader_idx = (p as usize) % total_nodes;
+            let leader_id = broker_ids[leader_idx];
+
+            let mut replicas = Vec::with_capacity(rf_usize);
+            for i in 0..rf_usize {
+                let idx = (leader_idx + i) % total_nodes;
+                replicas.push(broker_ids[idx]);
+            }
+            let isr = replicas.clone();
+
+            let plc_record = crate::replication::MetadataRecord::PartitionLeadershipChange {
+                topic: topic.to_string(),
+                partition: p,
+                leader_id,
+                leader_epoch: 0,
+                isr: isr.clone(),
+            };
+
+            if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+                let _ = meta_pm.produce(&plc_record.encode());
+            }
+
+            let assignment = PartitionAssignment {
+                partition: p,
+                leader_id,
+                leader_epoch: 0,
+                replicas,
+                isr,
+            };
+
+            partitions.insert(p, assignment);
         }
 
         self.topic_registry.insert(
@@ -596,12 +670,14 @@ impl StorageEngine {
             TopicConfig {
                 topic: topic.to_string(),
                 num_partitions,
-                replication_factor: 1,
+                replication_factor,
+                partitions: partitions.clone(),
             },
         );
 
-        for p in 0..num_partitions {
-            let _ = self.get_or_create_partition(topic, p)?;
+        for (p, assignment) in partitions {
+            let pm = self.get_or_create_partition(topic, p)?;
+            pm.update_leadership(assignment.leader_id, assignment.leader_epoch, assignment.replicas, assignment.isr);
         }
 
         Ok(())
@@ -630,8 +706,57 @@ impl StorageEngine {
         vec
     }
 
+    /// Returns true if this broker node is the active leader for the specified partition
+    pub fn is_partition_leader(&self, topic: &str, partition: u32) -> bool {
+        if let Ok(pm) = self.get_or_create_partition(topic, partition) {
+            pm.is_leader(self.config.node_id)
+        } else {
+            false
+        }
+    }
+
+    /// Registers a broker socket address mapping (node_id -> bind_addr)
+    pub fn register_broker_address(&self, node_id: u32, bind_addr: String) {
+        self.broker_addrs.insert(node_id, bind_addr);
+    }
+
+    /// Returns the active bind address for a broker node ID
+    pub fn get_broker_address(&self, node_id: u32) -> Option<String> {
+        self.broker_addrs.get(&node_id).map(|v| v.clone())
+    }
+
+    /// Returns all known broker endpoints sorted by node_id.
+    pub fn broker_endpoints(&self) -> Vec<(u32, String)> {
+        let mut brokers: Vec<(u32, String)> = self
+            .broker_addrs
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        brokers.sort_by_key(|(id, _)| *id);
+        brokers
+    }
+
+    fn available_broker_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.broker_addrs.iter().map(|entry| *entry.key()).collect();
+        if !ids.contains(&self.config.node_id) {
+            ids.push(self.config.node_id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Returns true if this broker node is a leader or registered replica hosting the specified partition (KIP-392 Follower Fetch)
+    pub fn is_partition_replica(&self, topic: &str, partition: u32) -> bool {
+        if let Ok(pm) = self.get_or_create_partition(topic, partition) {
+            pm.is_leader(self.config.node_id) || pm.replicas().contains(&self.config.node_id)
+        } else {
+            false
+        }
+    }
+
     /// Returns metadata and initialized partition high watermarks for a topic
-    pub fn describe_topic(&self, topic: &str) -> Option<Vec<(u32, u64)>> {
+    pub fn describe_topic(&self, topic: &str) -> Option<Vec<crate::protocol::wire::DescribedPartition>> {
         if self.deleting_topics.contains(topic) {
             return None;
         }
@@ -643,7 +768,9 @@ impl StorageEngine {
             let (t, p) = entry.key();
             if t == topic {
                 let hw = entry.value().latest_offset();
-                partitions_map.insert(*p, hw);
+                let leader_id = entry.value().leader_id();
+                let replicas = entry.value().replicas();
+                partitions_map.insert(*p, (hw, leader_id, replicas));
             }
         }
 
@@ -659,8 +786,23 @@ impl StorageEngine {
 
         let mut partitions_info = Vec::with_capacity(num_partitions as usize);
         for p in 0..num_partitions {
-            let hw = partitions_map.get(&p).copied().unwrap_or(0);
-            partitions_info.push((p, hw));
+            let (hw, leader_id, replicas) = if let Some((hw, leader_id, replicas)) = partitions_map.get(&p) {
+                (*hw, *leader_id, replicas.clone())
+            } else if let Some(ref cfg) = reg_config {
+                if let Some(assign) = cfg.partitions.get(&p) {
+                    (0, assign.leader_id, assign.replicas.clone())
+                } else {
+                    (0, self.config.node_id, vec![self.config.node_id])
+                }
+            } else {
+                (0, self.config.node_id, vec![self.config.node_id])
+            };
+            partitions_info.push(crate::protocol::wire::DescribedPartition {
+                partition_id: p,
+                high_watermark: hw,
+                leader_id,
+                replicas,
+            });
         }
 
         Some(partitions_info)

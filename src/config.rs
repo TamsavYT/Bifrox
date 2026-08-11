@@ -54,6 +54,8 @@ pub struct EngineConfig {
     pub peer_addrs: Vec<String>,
     /// Minimum In-Sync Replicas required for write commits
     pub min_insync_replicas: usize,
+    /// Default replication factor for newly created topics (Kafka default.replication.factor)
+    pub default_replication_factor: u16,
     /// Log Retention threshold in total bytes per partition (optional)
     pub retention_bytes: Option<u64>,
     /// Log Retention threshold in milliseconds (optional, e.g. 24 hours)
@@ -80,6 +82,7 @@ impl Default for EngineConfig {
             bind_addr: "127.0.0.1:9092".to_string(),
             peer_addrs: Vec::new(),
             min_insync_replicas: 1,
+            default_replication_factor: 1,
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),      // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
@@ -151,6 +154,11 @@ impl EngineConfig {
                     "min.insync.replicas" => {
                         if let Ok(v) = value.parse() {
                             config.min_insync_replicas = v;
+                        }
+                    }
+                    "default.replication.factor" => {
+                        if let Ok(v) = value.parse::<u16>() {
+                            config.default_replication_factor = v.max(1);
                         }
                     }
                     "retention.bytes" | "log.retention.bytes" => {
