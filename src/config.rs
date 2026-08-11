@@ -163,11 +163,10 @@ impl EngineConfig {
                             config.retention_millis = Some(v);
                         }
                     }
-                    "auth.token" => {
-                        if !value.is_empty() {
+                    "auth.token"
+                        if !value.is_empty() => {
                             config.auth_token = Some(value.to_string());
                         }
-                    }
                     _ => {}
                 }
             }

@@ -600,10 +600,10 @@ pub async fn send_replication_push(
     } else if ack[0] == 0x02 {
         // H5: Follower returned STALE_EPOCH sentinel — our epoch is behind the cluster.
         tracing::warn!("HA Replication: Peer {} rejected with STALE_EPOCH (0x02)", peer_addr);
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "STALE_EPOCH: peer epoch is higher"))
+        Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
     } else {
         tracing::warn!("HA Replication: Peer {} returned error ACK 0x{:02X}", peer_addr, ack[0]);
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "Replication ACK failed"))
+        Err(std::io::Error::other("Replication ACK failed"))
     }
 }
 

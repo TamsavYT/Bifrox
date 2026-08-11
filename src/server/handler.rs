@@ -556,6 +556,12 @@ fn decode_replication_packet(
                             node_id, bind_addr
                         );
                     }
+                    crate::replication::MetadataRecord::TopicCreated { topic: ref t, num_partitions, .. } => {
+                        let _ = engine.create_topic(t, num_partitions);
+                    }
+                    crate::replication::MetadataRecord::TopicDeleted { topic: ref t } => {
+                        let _ = engine.delete_topic(t);
+                    }
                 }
             }
         }
@@ -645,7 +651,7 @@ fn decode_heartbeat_packet(
     // wildcard match made the whitelist entirely ineffective.  The leader's address
     // must be a known peer, never this node's own address.
     let peer_addrs = &engine.config().peer_addrs;
-    let is_whitelisted = peer_addrs.iter().any(|p| *p == leader_bind_addr);
+    let is_whitelisted = peer_addrs.contains(&leader_bind_addr);
     if !is_whitelisted {
         tracing::warn!(
             "HA Heartbeat: REJECTED — leader_bind_addr '{}' not in configured peer whitelist (Node {})",
@@ -681,23 +687,29 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             key,
             transaction_id,
             num_partitions,
+            producer_id,
+            producer_epoch,
+            base_sequence,
             records,
         } => {
             if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
                 return WireResponse::error(&format!("Invalid topic name: {}", e));
             }
             match engine
-                .produce_batch(
-                    &topic,
-                    &key,
-                    if transaction_id.is_empty() {
+                .produce_batch(crate::server::engine::ProduceBatchParams {
+                    topic: &topic,
+                    key: &key,
+                    transaction_id: if transaction_id.is_empty() {
                         None
                     } else {
                         Some(&transaction_id)
                     },
                     num_partitions,
-                    &records,
-                )
+                    producer_id,
+                    producer_epoch,
+                    base_sequence,
+                    records: &records,
+                })
                 .await
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
@@ -790,6 +802,49 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Err(e) => WireResponse::error(&format!("AbortTx failed: {}", e)),
             }
         }
+        RequestPayload::InitProducerId { transactional_id: _transactional_id } => {
+            let pid = engine.transactions().generate_producer_id();
+            let mut buf = Vec::with_capacity(10);
+            buf.put_u64(pid);
+            buf.put_i16(0); // Epoch 0
+            WireResponse::ok(buf)
+        }
+        RequestPayload::AddPartitionsToTxn {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            topics,
+        } => {
+            let result = engine.add_partitions_to_txn(
+                &transactional_id,
+                producer_id,
+                producer_epoch,
+                &topics,
+            );
+            if result.is_ok() {
+                WireResponse::ok(Vec::new())
+            } else {
+                WireResponse::error("AddPartitionsToTxn failed")
+            }
+        }
+        RequestPayload::EndTxn {
+            transactional_id,
+            producer_id: _producer_id,
+            producer_epoch: _producer_epoch,
+            committed,
+        } => {
+            // Validate epoch and PID in engine if needed, but for now we just commit or abort.
+            let result = if committed {
+                engine.commit_transaction(&transactional_id)
+            } else {
+                engine.abort_transaction(&transactional_id)
+            };
+            if result.is_ok() {
+                WireResponse::ok(Vec::new())
+            } else {
+                WireResponse::error("EndTxn failed")
+            }
+        }
         RequestPayload::FetchByTimestamp {
             topic,
             partition,
@@ -852,6 +907,79 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             match engine.delete_topic(&topic) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
+            }
+        }
+        RequestPayload::JoinGroup { group_id, member_id, protocols } => {
+            match engine.group_coordinator().join_group(&group_id, &member_id, protocols) {
+                Ok(m_id) => {
+                    let mut buf = Vec::new();
+                    crate::protocol::wire::write_pascal_string(&mut buf, &m_id);
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&e),
+            }
+        }
+        RequestPayload::SyncGroup { group_id, generation_id, member_id, assignments } => {
+            match engine.group_coordinator().sync_group(&group_id, generation_id, &member_id, assignments) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&e),
+            }
+        }
+        RequestPayload::Heartbeat { group_id, generation_id, member_id } => {
+            match engine.group_coordinator().heartbeat(&group_id, generation_id, &member_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&e),
+            }
+        }
+        RequestPayload::LeaveGroup { group_id, member_id } => {
+            match engine.group_coordinator().leave_group(&group_id, &member_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&e),
+            }
+        }
+        RequestPayload::CreateTopic { topic, partitions } => {
+            match engine.create_topic(&topic, partitions) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(err) => WireResponse::error(&format!("CreateTopic failed: {}", err)),
+            }
+        }
+        RequestPayload::DescribeTopic { topic } => {
+            if let Some(partitions) = engine.describe_topic(&topic) {
+                let payload = crate::protocol::wire::encode_describe_topic_response(&topic, &partitions);
+                WireResponse::ok(payload)
+            } else {
+                WireResponse::error("Topic not found")
+            }
+        }
+        RequestPayload::ListGroups => {
+            let groups = engine.group_coordinator().list_groups();
+            let mut buf = Vec::new();
+            buf.put_u32(groups.len() as u32);
+            for g in groups {
+                crate::protocol::wire::write_pascal_string(&mut buf, &g);
+            }
+            WireResponse::ok(buf)
+        }
+        RequestPayload::DescribeGroup { group_id } => {
+            if let Some(desc) = engine.group_coordinator().describe_group(&group_id) {
+                let payload = crate::protocol::wire::encode_describe_group_response(&desc.state_str, &desc.members);
+                WireResponse::ok(payload)
+            } else {
+                WireResponse::error("Group not found")
+            }
+        }
+        RequestPayload::OffsetCommit { group_id, topic, partition, offset, metadata } => {
+            match engine.commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("OffsetCommit failed: {}", e)),
+            }
+        }
+        RequestPayload::OffsetFetch { group_id, topic, partition } => {
+            if let Some(entry) = engine.fetch_offset_with_metadata(&group_id, &topic, partition) {
+                let payload = crate::protocol::wire::encode_offset_fetch_response(entry.offset, &entry.metadata);
+                WireResponse::ok(payload)
+            } else {
+                WireResponse::error("Offset not found")
             }
         }
     }

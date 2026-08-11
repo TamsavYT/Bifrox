@@ -379,7 +379,8 @@ async fn test_scenario_7_milestone3_features() {
     assert!(!tx_mgr.is_duplicate(101, 2));
 
     tx_mgr.begin_transaction("tx_orders_99", 101).unwrap();
-    tx_mgr.commit_transaction("tx_orders_99", |_, _| None).unwrap();
+    tx_mgr.prepare_commit("tx_orders_99").unwrap();
+    tx_mgr.complete_commit("tx_orders_99").unwrap();
 
     // 3. High Availability Replication Manager Test
     let cluster_config = hermes::ClusterConfig {
@@ -729,3 +730,275 @@ async fn test_scenario_14_ping_list_describe_delete() {
     assert!(!topics_after.contains(&"topic_alpha".to_string()));
     assert!(topics_after.contains(&"topic_beta".to_string()));
 }
+
+#[tokio::test]
+async fn test_scenario_15_admin_apis_and_consumer_groups() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    // 1. Create Topic via Admin API
+    client.create_topic("admin_topic", 4).await.expect("Failed to create topic via Admin API");
+
+    // Produce one message to force initialization check if needed
+    let _ = client.produce_single("admin_topic", "key1", None, 4, "hello admin").await.unwrap();
+
+    let topics = client.list_topics().await.unwrap();
+    assert!(topics.contains(&"admin_topic".to_string()));
+
+    // 2. Consumer Group Join & Sync
+    let group_id = "test_group";
+    let member_id_1 = "member-1";
+    let protocols = vec!["roundrobin"];
+    
+    // Member 1 joins
+    client.join_group(group_id, member_id_1, &protocols).await.expect("Failed to join group");
+
+    // Member 1 syncs (leader assigning partitions)
+    let assignments = vec![
+        hermes::protocol::wire::MemberAssignment {
+            member_id: member_id_1.to_string(),
+            topic: "admin_topic".to_string(),
+            partitions: vec![0, 1, 2, 3],
+        }
+    ];
+    client.sync_group(group_id, 1, member_id_1, &assignments).await.expect("Failed to sync group");
+
+    // 3. Heartbeat
+    client.heartbeat(group_id, 1, member_id_1).await.expect("Failed to send heartbeat");
+
+    // 4. List Groups via Admin API
+    let mut list_groups_req = Vec::new();
+    list_groups_req.push(hermes::protocol::wire::CommandCode::ListGroups as u8);
+    list_groups_req.extend_from_slice(&0u32.to_be_bytes());
+    let resp = client.send_raw_bytes(&list_groups_req).await.unwrap();
+    assert_eq!(resp.status, 0);
+    // Parse groups
+    let mut payload = &resp.payload[..];
+    use bytes::Buf;
+    if payload.len() >= 4 {
+        let count = payload.get_u32() as usize;
+        let mut groups = Vec::new();
+        for _ in 0..count {
+            let len = payload.get_u16() as usize;
+            let g = String::from_utf8_lossy(&payload[..len]).to_string();
+            payload = &payload[len..];
+            groups.push(g);
+        }
+        assert!(groups.contains(&group_id.to_string()));
+    }
+
+    // 5. Describe Topic via Admin API
+    let (desc_topic, desc_parts) = client.describe_topic("admin_topic").await.expect("Failed to describe topic");
+    assert_eq!(desc_topic, "admin_topic");
+    assert_eq!(desc_parts.len(), 4, "Should report 4 initialized partitions");
+
+    // 6. Describe Group via Admin API
+    let (group_state, members) = client.describe_group(group_id).await.expect("Failed to describe group");
+    assert_eq!(group_state, "Stable");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].member_id, member_id_1);
+    assert_eq!(members[0].assigned_partitions.len(), 4);
+
+    // 7. Leave Group
+    client.leave_group(group_id, member_id_1).await.expect("Failed to leave group");
+}
+
+#[tokio::test]
+async fn test_scenario_16_eos_idempotence() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "eos_topic";
+    let transactional_id = "tx-eos-test-1";
+
+    // 1. InitProducerId
+    let (pid, epoch) = client.init_producer_id(transactional_id).await.expect("InitProducerId failed");
+    assert!(pid > 0, "Producer ID should be > 0");
+    assert_eq!(epoch, 0, "Initial epoch should be 0");
+
+    // 2. AddPartitionsToTxn
+    let parts = vec![0];
+    let topics = vec![(topic, parts.as_slice())];
+    client.add_partitions_to_txn(transactional_id, pid, epoch, &topics).await.expect("AddPartitionsToTxn failed");
+
+    // 3. Produce with sequence 0
+    let records = vec![b"record1".as_slice()];
+    let _res1 = client.produce_batch_eos(topic, "k1", Some(transactional_id), 1, pid, epoch, 0, &records).await.expect("Produce seq 0 failed");
+
+    // 4. Produce with sequence 0 again (Duplicate)
+    let _res2 = client.produce_batch_eos(topic, "k1", Some(transactional_id), 1, pid, epoch, 0, &records).await.expect("Produce duplicate seq 0 failed");
+    
+    // Duplicate produce returns `Ok` with dummy offsets since they were not generated.
+    // We expect the first one to be 0 or 1, the second one might just be whatever we returned. Let's just not assert on res2's offsets.
+
+    // 5. Produce with sequence 1
+    let records2 = vec![b"record2".as_slice()];
+    let _res3 = client.produce_batch_eos(topic, "k1", Some(transactional_id), 1, pid, epoch, 1, &records2).await.expect("Produce seq 1 failed");
+
+    // 6. EndTxn
+    client.end_txn(transactional_id, pid, epoch, true).await.expect("EndTxn failed");
+
+    // Verify records
+    let committed = client.fetch_committed(topic, 0, 0, 1024).await.unwrap();
+    
+    // Only two records should be present: "record1" and "record2". The duplicate "record1" should be dropped.
+    assert_eq!(committed.len(), 2, "Should only have 2 committed records (duplicate dropped)");
+    assert_eq!(committed[0].payload.as_ref(), b"record1");
+    assert_eq!(committed[1].payload.as_ref(), b"record2");
+}
+
+#[tokio::test]
+async fn test_scenario_17_durable_metadata_catalog() {
+    let test_dir = std::env::temp_dir().join(format!("hermes_test_meta_catalog_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let mut config = hermes::EngineConfig::default();
+    config.data_dir = test_dir.clone();
+    config.bind_addr = "127.0.0.1:0".to_string();
+
+    let engine = std::sync::Arc::new(hermes::StorageEngine::new(config.clone()).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let engine_clone = engine.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((socket, _)) = listener.accept().await {
+                let eng = engine_clone.clone();
+                tokio::spawn(async move {
+                    let _ = hermes::server::handler::handle_connection(socket, (*eng).clone()).await;
+                });
+            }
+        }
+    });
+
+    let mut client = TestClient::connect(addr).await.unwrap();
+
+    // 1. Create topic via Admin API with 3 partitions
+    client.create_topic("meta_topic", 3).await.expect("CreateTopic failed");
+
+    // 2. DescribeTopic should report 3 partitions with high watermark 0 even before messages are produced
+    let (desc_topic, desc_parts) = client.describe_topic("meta_topic").await.expect("DescribeTopic failed");
+    assert_eq!(desc_topic, "meta_topic");
+    assert_eq!(desc_parts.len(), 3, "Should report 3 partitions");
+    assert_eq!(desc_parts[0], (0, 0));
+    assert_eq!(desc_parts[1], (1, 0));
+    assert_eq!(desc_parts[2], (2, 0));
+
+    // 3. Verify ListTopics includes "meta_topic"
+    let topics = client.list_topics().await.unwrap();
+    assert!(topics.contains(&"meta_topic".to_string()));
+
+    // 4. Simulate server restart and verify metadata log replay restores topic
+    drop(engine);
+    let restarted_engine = hermes::StorageEngine::new(config.clone()).unwrap();
+    let restarted_parts = restarted_engine.describe_topic("meta_topic").expect("DescribeTopic after restart failed");
+    assert_eq!(restarted_parts.len(), 3, "Restored topic should still report 3 partitions");
+
+    // 5. Delete topic and verify removal from registry and describe
+    restarted_engine.delete_topic("meta_topic").expect("DeleteTopic failed");
+    assert!(restarted_engine.describe_topic("meta_topic").is_none());
+    assert!(!restarted_engine.list_topics().contains(&"meta_topic".to_string()));
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[tokio::test]
+async fn test_scenario_18_durable_consumer_offsets() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let group_id = "test-group-offsets";
+    let topic = "test-offset-topic";
+    let partition = 0u32;
+    let commit_offset = 125u64;
+    let metadata = "committed-by-integration-test";
+
+    // 1. Commit offset with metadata via Opcode 0x1B
+    client.offset_commit(group_id, topic, partition, commit_offset, metadata).await.expect("OffsetCommit failed");
+
+    // 2. Fetch offset via Opcode 0x1C
+    let (fetched_offset, fetched_metadata) = client.offset_fetch(group_id, topic, partition).await.expect("OffsetFetch failed");
+    assert_eq!(fetched_offset, commit_offset);
+    assert_eq!(fetched_metadata, metadata);
+
+    // 3. Overwrite offset to test updated values
+    let new_offset = 200u64;
+    let new_metadata = "updated-metadata-v2";
+    client.offset_commit(group_id, topic, partition, new_offset, new_metadata).await.expect("OffsetCommit v2 failed");
+
+    let (re_fetched_offset, re_fetched_metadata) = client.offset_fetch(group_id, topic, partition).await.expect("OffsetFetch v2 failed");
+    assert_eq!(re_fetched_offset, new_offset);
+    assert_eq!(re_fetched_metadata, new_metadata);
+}
+
+#[tokio::test]
+async fn test_scenario_19_relative_index_and_txnindex() {
+    let test_dir = std::env::temp_dir().join(format!("hermes_test_txn_index_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let mut config = hermes::EngineConfig::default();
+    config.data_dir = test_dir.clone();
+    config.index_interval_bytes = 10;
+
+    let engine = hermes::StorageEngine::new(config).unwrap();
+    let topic = "txn_idx_topic";
+
+    // 1. Produce 5 records in a transaction
+    let (tx_id, pid) = ("tx-idx-1", 9999u64);
+    engine.begin_transaction(tx_id, pid).unwrap();
+    engine.add_partitions_to_txn(tx_id, pid, 0, &[(topic.to_string(), vec![0])]).unwrap();
+
+    let records = vec![bytes::Bytes::from("msg1"), bytes::Bytes::from("msg2"), bytes::Bytes::from("msg3")];
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: Some(tx_id),
+        num_partitions: 1,
+        producer_id: pid,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records,
+    };
+    engine.produce_batch(params).await.unwrap();
+
+    // 2. Abort transaction -> populates .txnindex
+    engine.abort_transaction(tx_id).unwrap();
+
+    // 3. Produce another non-transactional record
+    let records_ok = vec![bytes::Bytes::from("good_msg")];
+    let params_ok = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records_ok,
+    };
+    engine.produce_batch(params_ok).await.unwrap();
+
+    // 4. Verify fetch_committed drops the aborted messages via .txnindex
+    let frames = engine.fetch_committed(topic, 0, 0, 1024 * 1024).unwrap();
+    assert_eq!(frames.len(), 1, "Should only contain good_msg (aborted batch filtered via .txnindex)");
+    assert_eq!(frames[0].payload.as_ref(), b"good_msg");
+
+    // 5. Verify .index file size mathematically matches 8 bytes per index entry
+    let index_file = test_dir.join(format!("{}-0/00000000000000000000.index", topic));
+    if index_file.exists() {
+        let meta = std::fs::metadata(&index_file).unwrap();
+        assert_eq!(meta.len() % 8, 0, "Index file size must be a multiple of 8 bytes");
+    }
+
+    // 6. Verify .txnindex file exists and size matches 24 bytes per entry
+    let txn_index_file = test_dir.join(format!("{}-0/00000000000000000000.txnindex", topic));
+    assert!(txn_index_file.exists(), ".txnindex file must be created on transaction abort");
+    let txn_meta = std::fs::metadata(&txn_index_file).unwrap();
+    assert_eq!(txn_meta.len(), 24, ".txnindex file must contain exactly 1 entry of 24 bytes");
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+

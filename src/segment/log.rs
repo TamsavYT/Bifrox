@@ -89,7 +89,6 @@ impl LogSegment {
                                 base_offset
                             );
                             encountered_corruption = true;
-                            pos = buf_len;
                             break;
                         }
                     }
@@ -105,8 +104,8 @@ impl LogSegment {
                             let phys_pos = file_offset + pos as u64;
                             if bytes_since_last_index >= index_interval || rebuilt_index_entries.is_empty() {
                                 rebuilt_index_entries.push(IndexEntry {
-                                    logical_offset: frame.offset,
-                                    physical_position: phys_pos,
+                                    relative_offset: (frame.offset.saturating_sub(base_offset)) as u32,
+                                    physical_position: phys_pos as u32,
                                 });
                                 bytes_since_last_index = 0;
                             }
@@ -130,7 +129,6 @@ impl LogSegment {
                                     base_offset
                                 );
                                 encountered_corruption = true;
-                                pos = buf_len;
                                 break;
                             }
                         }
@@ -147,7 +145,6 @@ impl LogSegment {
                                 err
                             );
                             encountered_corruption = true;
-                            pos = buf_len;
                             break;
                         }
                     }
@@ -283,6 +280,6 @@ impl LogSegment {
             }
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
     }
 }

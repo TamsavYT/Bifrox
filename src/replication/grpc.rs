@@ -35,6 +35,7 @@ impl ReplicationFetchRequest {
         buf
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn decode(mut src: &[u8]) -> Result<(Self, usize), ()> {
         if src.len() < 1 + 4 + 2 {
             return Err(());
@@ -93,6 +94,7 @@ impl ReplicationFetchResponse {
         buf
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn decode(mut src: &[u8]) -> Result<Self, ()> {
         if src.len() < 16 {
             return Err(());

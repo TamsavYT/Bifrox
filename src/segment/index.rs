@@ -5,28 +5,28 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-pub const INDEX_ENTRY_SIZE: usize = 16; // 8b logical offset + 8b physical pos
+pub const INDEX_ENTRY_SIZE: usize = 8; // 4b relative offset + 4b physical pos
 
-/// Sparse Index Entry mapping Logical Offset -> Physical Byte Offset in log file
+/// Sparse Index Entry mapping Relative Offset -> Physical Byte Offset in log file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexEntry {
-    pub logical_offset: u64,
-    pub physical_position: u64,
+    pub relative_offset: u32,
+    pub physical_position: u32,
 }
 
 impl IndexEntry {
     pub fn encode(&self) -> [u8; INDEX_ENTRY_SIZE] {
         let mut buf = [0u8; INDEX_ENTRY_SIZE];
-        buf[0..8].copy_from_slice(&self.logical_offset.to_be_bytes());
-        buf[8..16].copy_from_slice(&self.physical_position.to_be_bytes());
+        buf[0..4].copy_from_slice(&self.relative_offset.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.physical_position.to_be_bytes());
         buf
     }
 
     pub fn decode(buf: &[u8; INDEX_ENTRY_SIZE]) -> Self {
-        let logical_offset = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-        let physical_position = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+        let relative_offset = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        let physical_position = u32::from_be_bytes(buf[4..8].try_into().unwrap());
         Self {
-            logical_offset,
+            relative_offset,
             physical_position,
         }
     }
@@ -88,9 +88,10 @@ impl IndexSegment {
 
     /// Append a new index entry to both RAM vector and physical disk
     pub fn append(&mut self, logical_offset: u64, physical_position: u64) -> IoResult<()> {
+        let relative_offset = logical_offset.saturating_sub(self.base_offset) as u32;
         let entry = IndexEntry {
-            logical_offset,
-            physical_position,
+            relative_offset,
+            physical_position: physical_position as u32,
         };
         let encoded = entry.encode();
         self.file.seek(SeekFrom::End(0))?;
@@ -111,9 +112,11 @@ impl IndexSegment {
             return None;
         }
 
+        let rel_target = target_offset.saturating_sub(self.base_offset) as u32;
+
         match self
             .entries
-            .binary_search_by_key(&target_offset, |e| e.logical_offset)
+            .binary_search_by_key(&rel_target, |e| e.relative_offset)
         {
             Ok(idx) => Some(self.entries[idx]),
             Err(idx) => {

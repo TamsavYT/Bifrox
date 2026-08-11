@@ -5,6 +5,7 @@ use crate::protocol::RecordFrame;
 use crate::replication::{ClusterConfig, NodeRole, ReplicationManager};
 use crate::server::partition::PartitionManager;
 use crate::server::transaction::{decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus};
+use crate::server::coordinator::GroupCoordinator;
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use std::io::Result as IoResult;
@@ -36,15 +37,38 @@ pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct ProduceBatchParams<'a> {
+    pub topic: &'a str,
+    pub key: &'a str,
+    pub transaction_id: Option<&'a str>,
+    pub num_partitions: u32,
+    pub producer_id: u64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+    pub records: &'a [Bytes],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicConfig {
+    pub topic: String,
+    pub num_partitions: u32,
+    pub replication_factor: u16,
+}
+
+pub type TopicRegistry = DashMap<String, TopicConfig>;
+
 /// StorageEngine maintaining multi-topic concurrent partition routing, consumer group offsets, and transactions
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
     config: EngineConfig,
     partitions: Arc<DashMap<(String, u32), Arc<PartitionManager>>>,
     deleting_topics: Arc<DashSet<String>>,
+    topic_registry: Arc<TopicRegistry>,
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
     replication: ReplicationManager,
+    group_coordinator: Arc<GroupCoordinator>,
 }
 
 impl StorageEngine {
@@ -64,9 +88,11 @@ impl StorageEngine {
             config,
             partitions: Arc::new(DashMap::new()),
             deleting_topics: Arc::new(DashSet::new()),
+            topic_registry: Arc::new(DashMap::new()),
             consumer_groups,
             transactions,
             replication,
+            group_coordinator: Arc::new(GroupCoordinator::new()),
         };
 
         // 1. Scan data_dir and load existing partitions
@@ -95,6 +121,9 @@ impl StorageEngine {
         // 3. P2: Replay __transaction_state log to restore in-flight transactions (ERR-01)
         engine.replay_transaction_state()?;
 
+        // Unconditionally initialize system partition __consumer_offsets-0
+        let _ = engine.get_or_create_partition("__consumer_offsets", 0);
+
         // 4. If Leader, register broker in the metadata log
         if engine.is_leader() {
             let reg_rec = crate::replication::MetadataRecord::BrokerRegister {
@@ -115,6 +144,10 @@ impl StorageEngine {
 
     pub fn consumer_groups(&self) -> &ConsumerGroupManager {
         &self.consumer_groups
+    }
+
+    pub fn group_coordinator(&self) -> Arc<GroupCoordinator> {
+        self.group_coordinator.clone()
     }
 
     pub fn transactions(&self) -> &TransactionManager {
@@ -149,8 +182,7 @@ impl StorageEngine {
         validate_topic_name(topic)?;
 
         if self.deleting_topics.contains(topic) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("Topic {} is currently being deleted", topic),
             ));
         }
@@ -208,10 +240,20 @@ impl StorageEngine {
                     break;
                 }
                 for frame in &frames {
-                    if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
-                        match meta_rec {
+                    if let Ok(rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
+                        match rec {
                             crate::replication::MetadataRecord::TopicPartition { topic, partition, .. } => {
                                 let _ = self.get_or_create_partition(&topic, partition);
+                            }
+                            crate::replication::MetadataRecord::TopicCreated { topic, num_partitions, replication_factor } => {
+                                self.topic_registry.insert(topic.clone(), TopicConfig {
+                                    topic,
+                                    num_partitions,
+                                    replication_factor,
+                                });
+                            }
+                            crate::replication::MetadataRecord::TopicDeleted { topic } => {
+                                self.topic_registry.remove(&topic);
                             }
                             _ => {}
                         }
@@ -262,12 +304,16 @@ impl StorageEngine {
     /// Produce a batch of records to a routed partition (PARTIAL-03 async).
     pub async fn produce_batch(
         &self,
-        topic: &str,
-        key: &str,
-        transaction_id: Option<&str>,
-        num_partitions: u32,
-        records: &[Bytes],
+        params: ProduceBatchParams<'_>,
     ) -> IoResult<(u32, u64, u64)> {
+        let topic = params.topic;
+        let key = params.key;
+        let transaction_id = params.transaction_id;
+        let num_partitions = params.num_partitions;
+        let producer_id = params.producer_id;
+        let producer_epoch = params.producer_epoch;
+        let base_sequence = params.base_sequence;
+        let records = params.records;
         let partition_id = if !key.is_empty() && num_partitions > 0 {
             hash_key(key.as_bytes(), num_partitions as usize)
         } else {
@@ -279,13 +325,26 @@ impl StorageEngine {
         let mut last_offset = 0u64;
         let mut frames = Vec::with_capacity(records.len());
 
+        let mut current_seq = base_sequence;
         for (idx, record) in records.iter().enumerate() {
-            let frame = pm.produce_frame(record)?;
-            if idx == 0 {
-                first_offset = frame.offset;
+            match pm.produce_frame_eos(record, producer_id, producer_epoch, current_seq)? {
+                Ok(frame) => {
+                    if idx == 0 {
+                        first_offset = frame.offset;
+                    }
+                    last_offset = frame.offset;
+                    frames.push(frame);
+                }
+                Err(dup_last_offset) => {
+                    if idx == 0 {
+                        last_offset = dup_last_offset;
+                        first_offset = last_offset.saturating_sub(records.len() as u64 - 1);
+                    }
+                }
             }
-            last_offset = frame.offset;
-            frames.push(frame);
+            if producer_id != 0 {
+                current_seq += 1;
+            }
         }
 
         if let Some(tx_id) = transaction_id {
@@ -345,6 +404,7 @@ impl StorageEngine {
         offset: u64,
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
+        let pm = self.get_or_create_partition(topic, partition)?;
         let lso = self.transactions.last_stable_offset(topic, partition);
         let aborted = self.transactions.aborted_ranges(topic, partition);
         let all_frames = self.fetch(topic, partition, offset, max_bytes)?;
@@ -356,6 +416,9 @@ impl StorageEngine {
                     return false;
                 }
                 if frame.offset >= lso {
+                    return false;
+                }
+                if pm.is_offset_aborted(frame.offset) {
                     return false;
                 }
                 for (start, end) in &aborted {
@@ -384,8 +447,16 @@ impl StorageEngine {
         self.consumer_groups.commit_offset(group_id, topic, partition, offset)
     }
 
+    pub fn commit_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32, offset: u64, metadata: &str) -> IoResult<()> {
+        self.consumer_groups.commit_offset_with_metadata(group_id, topic, partition, offset, metadata)
+    }
+
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: u32) -> Option<u64> {
         self.consumer_groups.fetch_offset(group_id, topic, partition)
+    }
+
+    pub fn fetch_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32) -> Option<crate::consumer_group::OffsetEntry> {
+        self.consumer_groups.fetch_offset_with_metadata(group_id, topic, partition)
     }
 
     pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
@@ -400,38 +471,88 @@ impl StorageEngine {
         result
     }
 
-    pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        let partitions_ref = self.partitions.clone();
-        let producer_id = self.transactions.get_producer_id(transaction_id);
-        let result = self.transactions.commit_transaction(transaction_id, |topic, partition| {
-            partitions_ref.get(&(topic.to_string(), partition)).map(|e| e.value().clone())
-        });
+    pub fn add_partitions_to_txn(
+        &self,
+        transaction_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+        topics: &[(String, Vec<u32>)],
+    ) -> Result<(), String> {
+        let result = self.transactions.add_partitions_to_txn(transaction_id, producer_id, producer_epoch, topics);
         if result.is_ok() {
             let parts = self.transactions.get_partitions(transaction_id);
-            let record = encode_tx_state_record(TxStatus::Committed, producer_id, transaction_id, &parts);
+            let record = encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
             if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
                 let _ = tx_pm.produce(&record);
             }
-            self.transactions.cleanup_completed_transaction(transaction_id);
         }
         result
     }
 
-    pub fn abort_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        let partitions_ref = self.partitions.clone();
-        let producer_id = self.transactions.get_producer_id(transaction_id);
-        let result = self.transactions.abort_transaction(transaction_id, |topic, partition| {
-            partitions_ref.get(&(topic.to_string(), partition)).map(|e| e.value().clone())
-        });
-        if result.is_ok() {
-            let parts = self.transactions.get_partitions(transaction_id);
-            let record = encode_tx_state_record(TxStatus::Aborted, producer_id, transaction_id, &parts);
-            if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-                let _ = tx_pm.produce(&record);
-            }
-            self.transactions.cleanup_completed_transaction(transaction_id);
+    pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
+        // Step 1: Transition memory state to PrepareCommit
+        let (producer_id, partitions) = self.transactions.prepare_commit(transaction_id)?;
+
+        // Step 2: Write PrepareCommit record to __transaction_state
+        let prep_record = encode_tx_state_record(TxStatus::PrepareCommit, producer_id, transaction_id, &partitions);
+        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
+            let _ = tx_pm.produce(&prep_record);
         }
-        result
+
+        // Step 3: Write CTRL_COMMIT control markers to all involved data partitions
+        for (topic, partition, _, _) in &partitions {
+            let pm = self.get_or_create_partition(topic, *partition)
+                .map_err(|e| format!("Failed to get/create partition {}-{}: {}", topic, partition, e))?;
+            pm.produce_control_marker(crate::server::transaction::CTRL_COMMIT, producer_id, transaction_id)
+                .map_err(|e| format!("Failed to write commit marker to {}-{}: {}", topic, partition, e))?;
+            tracing::info!("EOS 2PC: Commit marker written to '{}' partition {}", topic, partition);
+        }
+
+        // Step 4: Transition memory state to Committed & write CompleteCommit to __transaction_state
+        self.transactions.complete_commit(transaction_id)?;
+        let commit_record = encode_tx_state_record(TxStatus::Committed, producer_id, transaction_id, &partitions);
+        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
+            let _ = tx_pm.produce(&commit_record);
+        }
+
+        // Step 5: Clean up memory
+        self.transactions.cleanup_completed_transaction(transaction_id);
+        Ok(())
+    }
+
+    pub fn abort_transaction(&self, transaction_id: &str) -> Result<(), String> {
+        // Step 1: Transition memory state to PrepareAbort
+        let (producer_id, partitions) = self.transactions.prepare_abort(transaction_id)?;
+
+        // Step 2: Write PrepareAbort record to __transaction_state
+        let prep_record = encode_tx_state_record(TxStatus::PrepareAbort, producer_id, transaction_id, &partitions);
+        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
+            let _ = tx_pm.produce(&prep_record);
+        }
+
+        // Step 3: Write CTRL_ABORT control markers to all involved data partitions
+        let mut end_offsets = Vec::new();
+        for (topic, partition, first_offset, _) in &partitions {
+            let pm = self.get_or_create_partition(topic, *partition)
+                .map_err(|e| format!("Failed to get/create partition {}-{}: {}", topic, partition, e))?;
+            let frame = pm.produce_control_marker(crate::server::transaction::CTRL_ABORT, producer_id, transaction_id)
+                .map_err(|e| format!("Failed to write abort marker to {}-{}: {}", topic, partition, e))?;
+            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.offset);
+            end_offsets.push((topic.clone(), *partition, frame.offset));
+            tracing::info!("EOS 2PC: Abort marker written to '{}' partition {}", topic, partition);
+        }
+
+        // Step 4: Transition memory state to Aborted & write CompleteAbort to __transaction_state
+        self.transactions.complete_abort(transaction_id, &end_offsets)?;
+        let updated_partitions = self.transactions.get_partitions(transaction_id);
+        let abort_record = encode_tx_state_record(TxStatus::Aborted, producer_id, transaction_id, &updated_partitions);
+        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
+            let _ = tx_pm.produce(&abort_record);
+        }
+
+        // Step 5: Clean up memory
+        self.transactions.cleanup_completed_transaction(transaction_id);
+        Ok(())
     }
 
     pub fn register_tx_partition(&self, transaction_id: &str, topic: &str, partition: u32, start_offset: u64) {
@@ -453,23 +574,111 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Creates a topic by writing a TopicCreated record to __cluster_metadata and populating registry
+    pub fn create_topic(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
+        validate_topic_name(topic)?;
+        if self.deleting_topics.contains(topic) {
+            return Err(std::io::Error::other(format!("Topic {} is currently being deleted", topic)));
+        }
+
+        let record = crate::replication::MetadataRecord::TopicCreated {
+            topic: topic.to_string(),
+            num_partitions,
+            replication_factor: 1,
+        };
+
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+
+        self.topic_registry.insert(
+            topic.to_string(),
+            TopicConfig {
+                topic: topic.to_string(),
+                num_partitions,
+                replication_factor: 1,
+            },
+        );
+
+        for p in 0..num_partitions {
+            let _ = self.get_or_create_partition(topic, p)?;
+        }
+
+        Ok(())
+    }
+
     /// Returns list of all active non-system topics (Sprint 5)
     pub fn list_topics(&self) -> Vec<String> {
         let mut topics = std::collections::HashSet::new();
-        for entry in self.partitions.iter() {
-            let (topic, _) = entry.key();
-            if !topic.starts_with("__") {
+
+        for entry in self.topic_registry.iter() {
+            let topic = entry.key();
+            if !topic.starts_with("__") && !self.deleting_topics.contains(topic) {
                 topics.insert(topic.clone());
             }
         }
+
+        for entry in self.partitions.iter() {
+            let (topic, _) = entry.key();
+            if !topic.starts_with("__") && !self.deleting_topics.contains(topic) {
+                topics.insert(topic.clone());
+            }
+        }
+
         let mut vec: Vec<_> = topics.into_iter().collect();
         vec.sort();
         vec
     }
 
+    /// Returns metadata and initialized partition high watermarks for a topic
+    pub fn describe_topic(&self, topic: &str) -> Option<Vec<(u32, u64)>> {
+        if self.deleting_topics.contains(topic) {
+            return None;
+        }
+
+        let reg_config = self.topic_registry.get(topic).map(|r| r.value().clone());
+        let mut partitions_map = std::collections::HashMap::new();
+
+        for entry in self.partitions.iter() {
+            let (t, p) = entry.key();
+            if t == topic {
+                let hw = entry.value().latest_offset();
+                partitions_map.insert(*p, hw);
+            }
+        }
+
+        if reg_config.is_none() && partitions_map.is_empty() {
+            return None;
+        }
+
+        let num_partitions = if let Some(ref cfg) = reg_config {
+            cfg.num_partitions.max(partitions_map.len() as u32)
+        } else {
+            partitions_map.len() as u32
+        };
+
+        let mut partitions_info = Vec::with_capacity(num_partitions as usize);
+        for p in 0..num_partitions {
+            let hw = partitions_map.get(&p).copied().unwrap_or(0);
+            partitions_info.push((p, hw));
+        }
+
+        Some(partitions_info)
+    }
+
     /// Deletes topic partitions and removes disk directory (NEW-03)
     pub fn delete_topic(&self, topic: &str) -> IoResult<()> {
         self.deleting_topics.insert(topic.to_string());
+
+        let record = crate::replication::MetadataRecord::TopicDeleted {
+            topic: topic.to_string(),
+        };
+
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+
+        self.topic_registry.remove(topic);
 
         let mut to_remove = Vec::new();
         for entry in self.partitions.iter() {

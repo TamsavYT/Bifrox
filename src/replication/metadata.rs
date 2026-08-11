@@ -13,6 +13,14 @@ pub enum MetadataRecord {
         node_id: u32,
         bind_addr: String,
     },
+    TopicCreated {
+        topic: String,
+        num_partitions: u32,
+        replication_factor: u16,
+    },
+    TopicDeleted {
+        topic: String,
+    },
 }
 
 impl MetadataRecord {
@@ -34,12 +42,22 @@ impl MetadataRecord {
                 buf.put_u32(*node_id);
                 crate::protocol::wire::write_pascal_string(&mut buf, bind_addr);
             }
+            MetadataRecord::TopicCreated { topic, num_partitions, replication_factor } => {
+                buf.put_u8(0x03); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, topic);
+                buf.put_u32(*num_partitions);
+                buf.put_u16(*replication_factor);
+            }
+            MetadataRecord::TopicDeleted { topic } => {
+                buf.put_u8(0x04); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, topic);
+            }
         }
         buf
     }
 
     pub fn decode(mut src: &[u8]) -> IoResult<Self> {
-        if src.len() < 1 {
+        if src.is_empty() {
             return Err(Error::new(ErrorKind::UnexpectedEof, "Empty metadata record"));
         }
         let record_type = src.get_u8();
@@ -76,6 +94,23 @@ impl MetadataRecord {
                     node_id,
                     bind_addr,
                 })
+            }
+            0x03 => {
+                let topic = read_pascal_string_io(&mut src)?;
+                if src.len() < 6 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete TopicCreated metadata"));
+                }
+                let num_partitions = src.get_u32();
+                let replication_factor = src.get_u16();
+                Ok(MetadataRecord::TopicCreated {
+                    topic,
+                    num_partitions,
+                    replication_factor,
+                })
+            }
+            0x04 => {
+                let topic = read_pascal_string_io(&mut src)?;
+                Ok(MetadataRecord::TopicDeleted { topic })
             }
             _ => Err(Error::new(ErrorKind::InvalidData, format!("Unknown metadata record type: 0x{:02X}", record_type))),
         }

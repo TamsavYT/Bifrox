@@ -3,6 +3,7 @@ pub mod handler;
 pub mod listener;
 pub mod partition;
 pub mod transaction;
+pub mod coordinator;
 
 pub use engine::{hash_key, StorageEngine};
 pub use listener::Server;

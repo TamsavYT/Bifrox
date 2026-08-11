@@ -7,6 +7,8 @@ use std::fs;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 
+use crate::segment::txnindex::TxnIndexSegment;
+
 /// Segment pair holding associated log segment and index segment
 #[derive(Debug)]
 pub struct SegmentPair {
@@ -14,6 +16,7 @@ pub struct SegmentPair {
     pub log: LogSegment,
     pub index: IndexSegment,
     pub time_index: TimeIndexSegment,
+    pub txn_index: TxnIndexSegment,
     pub mmap: Option<crate::segment::mmap::MmapLogSegment>,
 }
 
@@ -38,7 +41,7 @@ impl SegmentManager {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "log") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "log") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Ok(base_offset) = stem.parse::<u64>() {
                         base_offsets.push(base_offset);
@@ -61,6 +64,8 @@ impl SegmentManager {
             let mut index = IndexSegment::open(index_path, base)?;
             let time_index_path = dir.join(format!("{}.timeindex", format_segment_filename(base)));
             let time_index = TimeIndexSegment::open(time_index_path, base)?;
+            let txn_index_path = dir.join(format!("{}.txnindex", format_segment_filename(base)));
+            let txn_index = TxnIndexSegment::open(txn_index_path)?;
             let log = LogSegment::open(
                 &dir,
                 base,
@@ -75,6 +80,7 @@ impl SegmentManager {
                 log,
                 index,
                 time_index,
+                txn_index,
                 mmap,
             });
         }
@@ -83,6 +89,8 @@ impl SegmentManager {
         let mut active_index = IndexSegment::open(active_index_path, active_base)?;
         let active_time_index_path = dir.join(format!("{}.timeindex", format_segment_filename(active_base)));
         let active_time_index = TimeIndexSegment::open(active_time_index_path, active_base)?;
+        let active_txn_index_path = dir.join(format!("{}.txnindex", format_segment_filename(active_base)));
+        let active_txn_index = TxnIndexSegment::open(active_txn_index_path)?;
         let active_log = LogSegment::open(
             &dir,
             active_base,
@@ -102,6 +110,7 @@ impl SegmentManager {
                 log: active_log,
                 index: active_index,
                 time_index: active_time_index,
+                txn_index: active_txn_index,
                 mmap: None,
             },
             historical,
@@ -112,6 +121,10 @@ impl SegmentManager {
 
     pub fn high_watermark(&self) -> u64 {
         self.high_watermark
+    }
+
+    pub fn active_base_offset(&self) -> u64 {
+        self.active.base_offset
     }
 
     /// Append record frames into active segment. Performs segment rotation if size limit reached.
@@ -201,6 +214,10 @@ impl SegmentManager {
             .dir
             .join(format!("{}.timeindex", format_segment_filename(new_base_offset)));
         let new_time_index = TimeIndexSegment::open(new_time_index_path, new_base_offset)?;
+        let new_txn_index_path = self
+            .dir
+            .join(format!("{}.txnindex", format_segment_filename(new_base_offset)));
+        let new_txn_index = TxnIndexSegment::open(new_txn_index_path)?;
         let new_log = LogSegment::open(
             &self.dir,
             new_base_offset,
@@ -215,6 +232,7 @@ impl SegmentManager {
             log: new_log,
             index: new_index,
             time_index: new_time_index,
+            txn_index: new_txn_index,
             mmap: None,
         };
 
@@ -226,11 +244,30 @@ impl SegmentManager {
         Ok(())
     }
 
+    /// Appends an aborted transaction range to the segment manager's transaction index
+    pub fn append_aborted_txn(&mut self, producer_id: u64, first_offset: u64, last_offset: u64) -> IoResult<()> {
+        let pair = self.find_segment_pair_mut(first_offset);
+        pair.txn_index.append(producer_id, first_offset, last_offset)
+    }
+
+    /// Checks if a given offset belongs to an aborted transaction
+    pub fn is_offset_aborted(&self, offset: u64) -> bool {
+        if self.active.txn_index.is_aborted(offset) {
+            return true;
+        }
+        for pair in &self.historical {
+            if pair.txn_index.is_aborted(offset) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
     pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
         let segment_pair = self.find_segment_pair_mut(start_offset);
         let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
-        let start_pos = seek_entry.map_or(0, |e| e.physical_position);
+        let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
 
         if let Some(ref mmap) = segment_pair.mmap {
             return Ok(mmap.fetch_zero_copy(start_pos, start_offset, max_bytes));
@@ -265,7 +302,7 @@ impl SegmentManager {
         let pair = self.find_segment_pair(target_offset);
         pair.index
             .find_nearest_physical_pos(target_offset)
-            .map(|e| (pair.base_offset, e.physical_position))
+            .map(|e| (pair.base_offset + e.relative_offset as u64, e.physical_position as u64))
     }
 
     /// Garbage collector: unlinks closed segments exceeding configured size or time retention limits
@@ -336,7 +373,7 @@ impl SegmentManager {
 
     /// Finds nearest base_offset for target_timestamp (PARTIAL-02 & NEW-02)
     pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
-        for pair in &self.historical {
+        for pair in self.historical.iter().rev() {
             if let Some(offset) = pair.time_index.find_offset_for_timestamp(target_timestamp) {
                 return offset;
             }

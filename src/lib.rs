@@ -17,7 +17,7 @@ pub use replication::{
 };
 pub use segment::{
     IndexEntry, IndexSegment, LogSegment, MmapLogSegment, SegmentManager, TimeIndexEntry,
-    TimeIndexSegment,
+    TimeIndexSegment, TxnIndexEntry, TxnIndexSegment,
 };
 pub use server::{
     hash_key, PartitionManager, Server, StorageEngine, TransactionManager, TransactionState,

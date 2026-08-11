@@ -110,7 +110,7 @@ impl TimeIndexSegment {
             Ok(idx) => Some(self.entries[idx].logical_offset),
             Err(idx) => {
                 if idx == 0 {
-                    Some(self.entries[0].logical_offset)
+                    None // target is before this segment's range
                 } else {
                     Some(self.entries[idx - 1].logical_offset)
                 }

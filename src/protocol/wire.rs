@@ -20,6 +20,19 @@ pub enum CommandCode {
     ListTopics = 0x0D,
     DescribeCluster = 0x0E,
     DeleteTopic = 0x0F,
+    JoinGroup = 0x10,
+    SyncGroup = 0x11,
+    Heartbeat = 0x12,
+    LeaveGroup = 0x13,
+    CreateTopic = 0x14,
+    DescribeTopic = 0x15,
+    ListGroups = 0x16,
+    DescribeGroup = 0x17,
+    InitProducerId = 0x18,
+    AddPartitionsToTxn = 0x19,
+    EndTxn = 0x1A,
+    OffsetCommit = 0x1B,
+    OffsetFetch = 0x1C,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -42,6 +55,19 @@ impl TryFrom<u8> for CommandCode {
             0x0D => Ok(CommandCode::ListTopics),
             0x0E => Ok(CommandCode::DescribeCluster),
             0x0F => Ok(CommandCode::DeleteTopic),
+            0x10 => Ok(CommandCode::JoinGroup),
+            0x11 => Ok(CommandCode::SyncGroup),
+            0x12 => Ok(CommandCode::Heartbeat),
+            0x13 => Ok(CommandCode::LeaveGroup),
+            0x14 => Ok(CommandCode::CreateTopic),
+            0x15 => Ok(CommandCode::DescribeTopic),
+            0x16 => Ok(CommandCode::ListGroups),
+            0x17 => Ok(CommandCode::DescribeGroup),
+            0x18 => Ok(CommandCode::InitProducerId),
+            0x19 => Ok(CommandCode::AddPartitionsToTxn),
+            0x1A => Ok(CommandCode::EndTxn),
+            0x1B => Ok(CommandCode::OffsetCommit),
+            0x1C => Ok(CommandCode::OffsetFetch),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -67,6 +93,9 @@ pub enum RequestPayload {
         key: String,
         transaction_id: String,
         num_partitions: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
         records: Vec<Bytes>,
     },
     Fetch {
@@ -124,6 +153,71 @@ pub enum RequestPayload {
     DeleteTopic {
         topic: String,
     },
+    JoinGroup {
+        group_id: String,
+        member_id: String,
+        protocols: Vec<String>,
+    },
+    SyncGroup {
+        group_id: String,
+        generation_id: u32,
+        member_id: String,
+        assignments: Vec<MemberAssignment>,
+    },
+    Heartbeat {
+        group_id: String,
+        generation_id: u32,
+        member_id: String,
+    },
+    LeaveGroup {
+        group_id: String,
+        member_id: String,
+    },
+    CreateTopic {
+        topic: String,
+        partitions: u32,
+    },
+    DescribeTopic {
+        topic: String,
+    },
+    ListGroups,
+    DescribeGroup {
+        group_id: String,
+    },
+    InitProducerId {
+        transactional_id: String,
+    },
+    AddPartitionsToTxn {
+        transactional_id: String,
+        producer_id: u64,
+        producer_epoch: i16,
+        topics: Vec<(String, Vec<u32>)>,
+    },
+    EndTxn {
+        transactional_id: String,
+        producer_id: u64,
+        producer_epoch: i16,
+        committed: bool,
+    },
+    OffsetCommit {
+        group_id: String,
+        topic: String,
+        partition: u32,
+        offset: u64,
+        metadata: String,
+    },
+    OffsetFetch {
+        group_id: String,
+        topic: String,
+        partition: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberAssignment {
+    pub member_id: String,
+    pub topic: String,
+    pub partitions: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,13 +260,16 @@ impl WireRequest {
                 let topic = read_pascal_string(&mut payload_buf)?;
                 let key = read_pascal_string(&mut payload_buf)?;
                 let transaction_id = read_pascal_string(&mut payload_buf)?;
-                if payload_buf.len() < 8 {
+                if payload_buf.len() < 22 {
                     return Err(WireError::Incomplete {
-                        needed: 8,
+                        needed: 22,
                         available: payload_buf.len(),
                     });
                 }
                 let num_partitions = payload_buf.get_u32();
+                let producer_id = payload_buf.get_u64();
+                let producer_epoch = payload_buf.get_i16();
+                let base_sequence = payload_buf.get_i32();
                 let record_count = payload_buf.get_u32() as usize;
 
                 let mut records = Vec::with_capacity(record_count);
@@ -200,6 +297,9 @@ impl WireRequest {
                     key,
                     transaction_id,
                     num_partitions,
+                    producer_id,
+                    producer_epoch,
+                    base_sequence,
                     records,
                 }
             }
@@ -347,6 +447,154 @@ impl WireRequest {
                 let topic = read_pascal_string(&mut payload_buf)?;
                 RequestPayload::DeleteTopic { topic }
             }
+            CommandCode::JoinGroup => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let proto_count = payload_buf.get_u32() as usize;
+                let mut protocols = Vec::with_capacity(proto_count);
+                for _ in 0..proto_count {
+                    protocols.push(read_pascal_string(&mut payload_buf)?);
+                }
+                RequestPayload::JoinGroup { group_id, member_id, protocols }
+            }
+            CommandCode::SyncGroup => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let generation_id = payload_buf.get_u32();
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let assign_count = payload_buf.get_u32() as usize;
+                let mut assignments = Vec::with_capacity(assign_count);
+                for _ in 0..assign_count {
+                    let a_member_id = read_pascal_string(&mut payload_buf)?;
+                    let a_topic = read_pascal_string(&mut payload_buf)?;
+                    if payload_buf.len() < 4 {
+                        return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    }
+                    let p_count = payload_buf.get_u32() as usize;
+                    if payload_buf.len() < p_count * 4 {
+                        return Err(WireError::Incomplete { needed: p_count * 4, available: payload_buf.len() });
+                    }
+                    let mut partitions = Vec::with_capacity(p_count);
+                    for _ in 0..p_count {
+                        partitions.push(payload_buf.get_u32());
+                    }
+                    assignments.push(MemberAssignment {
+                        member_id: a_member_id,
+                        topic: a_topic,
+                        partitions,
+                    });
+                }
+                RequestPayload::SyncGroup { group_id, generation_id, member_id, assignments }
+            }
+            CommandCode::Heartbeat => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let generation_id = payload_buf.get_u32();
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::Heartbeat { group_id, generation_id, member_id }
+            }
+            CommandCode::LeaveGroup => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::LeaveGroup { group_id, member_id }
+            }
+            CommandCode::CreateTopic => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let partitions = payload_buf.get_u32();
+                RequestPayload::CreateTopic { topic, partitions }
+            }
+            CommandCode::DescribeTopic => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DescribeTopic { topic }
+            }
+            CommandCode::ListGroups => RequestPayload::ListGroups,
+            CommandCode::DescribeGroup => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DescribeGroup { group_id }
+            }
+            CommandCode::InitProducerId => {
+                let transactional_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::InitProducerId { transactional_id }
+            }
+            CommandCode::AddPartitionsToTxn => {
+                let transactional_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 10 {
+                    return Err(WireError::Incomplete { needed: 10, available: payload_buf.len() });
+                }
+                let producer_id = payload_buf.get_u64();
+                let producer_epoch = payload_buf.get_i16();
+                
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let topic_count = payload_buf.get_u32() as usize;
+                let mut topics = Vec::with_capacity(topic_count);
+                
+                for _ in 0..topic_count {
+                    let t_name = read_pascal_string(&mut payload_buf)?;
+                    if payload_buf.len() < 4 {
+                        return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    }
+                    let p_count = payload_buf.get_u32() as usize;
+                    if payload_buf.len() < p_count * 4 {
+                        return Err(WireError::Incomplete { needed: p_count * 4, available: payload_buf.len() });
+                    }
+                    let mut parts = Vec::with_capacity(p_count);
+                    for _ in 0..p_count {
+                        parts.push(payload_buf.get_u32());
+                    }
+                    topics.push((t_name, parts));
+                }
+                RequestPayload::AddPartitionsToTxn { transactional_id, producer_id, producer_epoch, topics }
+            }
+            CommandCode::EndTxn => {
+                let transactional_id = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 11 {
+                    return Err(WireError::Incomplete { needed: 11, available: payload_buf.len() });
+                }
+                let producer_id = payload_buf.get_u64();
+                let producer_epoch = payload_buf.get_i16();
+                let committed = payload_buf.get_u8() != 0;
+                RequestPayload::EndTxn { transactional_id, producer_id, producer_epoch, committed }
+            }
+            CommandCode::OffsetCommit => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 12 {
+                    return Err(WireError::Incomplete { needed: 12, available: payload_buf.len() });
+                }
+                let partition = payload_buf.get_u32();
+                let offset = payload_buf.get_u64();
+                let metadata = if !payload_buf.is_empty() {
+                    read_pascal_string(&mut payload_buf).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                RequestPayload::OffsetCommit { group_id, topic, partition, offset, metadata }
+            }
+            CommandCode::OffsetFetch => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                }
+                let partition = payload_buf.get_u32();
+                RequestPayload::OffsetFetch { group_id, topic, partition }
+            }
         };
 
         let total_consumed = 5 + payload_len;
@@ -395,6 +643,48 @@ pub fn write_pascal_string(buf: &mut Vec<u8>, s: &str) {
     );
     buf.put_u16(bytes.len() as u16);
     buf.put_slice(bytes);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedGroupMember {
+    pub member_id: String,
+    pub assigned_partitions: Vec<(String, u32)>,
+}
+
+/// Encodes DescribeTopic binary payload: `[Topic: pascal] | [NumPartitions: 4b] | { [PartitionID: 4b] | [HighWatermark: 8b] }...`
+pub fn encode_describe_topic_response(topic: &str, partitions: &[(u32, u64)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_pascal_string(&mut buf, topic);
+    buf.put_u32(partitions.len() as u32);
+    for (partition_id, high_watermark) in partitions {
+        buf.put_u32(*partition_id);
+        buf.put_u64(*high_watermark);
+    }
+    buf
+}
+
+/// Encodes DescribeGroup binary payload: `[GroupState: pascal] | [MemberCount: 4b] | { [MemberID: pascal] | [NumAssignments: 4b] | { [Topic: pascal] | [Partition: 4b] }... }...`
+pub fn encode_describe_group_response(state: &str, members: &[DescribedGroupMember]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_pascal_string(&mut buf, state);
+    buf.put_u32(members.len() as u32);
+    for member in members {
+        write_pascal_string(&mut buf, &member.member_id);
+        buf.put_u32(member.assigned_partitions.len() as u32);
+        for (topic, partition) in &member.assigned_partitions {
+            write_pascal_string(&mut buf, topic);
+            buf.put_u32(*partition);
+        }
+    }
+    buf
+}
+
+/// Encodes OffsetFetch binary payload: `[Offset: 8b] | [Metadata: pascal]`
+pub fn encode_offset_fetch_response(offset: u64, metadata: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10 + metadata.len());
+    buf.put_u64(offset);
+    write_pascal_string(&mut buf, metadata);
+    buf
 }
 
 /// Binary response returned to clients over TCP: `[Status Code: 1b] | [Payload Len: 4b] | [Payload]`
