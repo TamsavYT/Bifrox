@@ -12,7 +12,9 @@ pub enum FrameError {
     BufferTooShort { required: usize, found: usize },
     #[error("Invalid magic byte: expected 0x{expected:02X}, got 0x{found:02X}")]
     InvalidMagic { expected: u8, found: u8 },
-    #[error("CRC32 checksum corruption: record CRC 0x{expected:08X} != computed 0x{calculated:08X}")]
+    #[error(
+        "CRC32 checksum corruption: record CRC 0x{expected:08X} != computed 0x{calculated:08X}"
+    )]
     CrcMismatch { expected: u32, calculated: u32 },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

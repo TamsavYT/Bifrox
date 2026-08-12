@@ -11,15 +11,15 @@ pub use config::{EngineConfig, FlushPolicy};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{CommandCode, FrameError, RecordFrame, WireError, WireRequest, WireResponse};
 pub use replication::{
-    send_grpc_replication_fetch, ClusterConfig, ConsensusState, HermesConsensus, NodeRole,
-    ReplicationFetchRequest, ReplicationFetchResponse, ReplicationManager, GRPC_REPLICATION_MAGIC,
-    MetadataRecord,
+    send_grpc_replication_fetch, ClusterConfig, ConsensusState, HermesConsensus, MetadataRecord,
+    NodeRole, ReplicationFetchRequest, ReplicationFetchResponse, ReplicationManager,
+    GRPC_REPLICATION_MAGIC,
 };
 pub use segment::{
     IndexEntry, IndexSegment, LogSegment, MmapLogSegment, SegmentManager, TimeIndexEntry,
     TimeIndexSegment, TxnIndexEntry, TxnIndexSegment,
 };
 pub use server::{
-    hash_key, PartitionManager, Server, StorageEngine, TransactionManager, TransactionState,
-    TxStatus,
+    hash_key, PartitionManager, QuotaManager, Server, StorageEngine, TransactionManager,
+    TransactionState, TxStatus,
 };

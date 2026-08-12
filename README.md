@@ -81,6 +81,10 @@ logs.dir=./logs_node1
 max.segment.bytes=10485760
 replica.peer.addresses=127.0.0.1:9093,127.0.0.1:9094
 min.insync.replicas=1
+# Optional per-client (source IP) byte-rate quotas — unset means unlimited.
+# Exceeding requests are delayed (not rejected), matching Kafka's throttling model.
+quota.producer.default.bytes.per.second=10485760
+quota.consumer.default.bytes.per.second=10485760
 ```
 
 ### Running the Broker Server

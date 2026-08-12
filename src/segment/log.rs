@@ -94,7 +94,11 @@ impl LogSegment {
                     }
 
                     let slice = &read_buf[pos..];
-                    if slice[0] == 0 && slice[1..std::cmp::min(HEADER_SIZE, slice.len())].iter().all(|&b| b == 0) {
+                    if slice[0] == 0
+                        && slice[1..std::cmp::min(HEADER_SIZE, slice.len())]
+                            .iter()
+                            .all(|&b| b == 0)
+                    {
                         pos = buf_len;
                         break;
                     }
@@ -102,9 +106,12 @@ impl LogSegment {
                     match RecordFrame::decode(slice) {
                         Ok((frame, frame_len)) => {
                             let phys_pos = file_offset + pos as u64;
-                            if bytes_since_last_index >= index_interval || rebuilt_index_entries.is_empty() {
+                            if bytes_since_last_index >= index_interval
+                                || rebuilt_index_entries.is_empty()
+                            {
                                 rebuilt_index_entries.push(IndexEntry {
-                                    relative_offset: (frame.offset.saturating_sub(base_offset)) as u32,
+                                    relative_offset: (frame.offset.saturating_sub(base_offset))
+                                        as u32,
                                     physical_position: phys_pos as u32,
                                 });
                                 bytes_since_last_index = 0;

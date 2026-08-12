@@ -24,7 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Err(e) => {
-            eprintln!("Error: Could not resolve server address '{}': {}", server_str, e);
+            eprintln!(
+                "Error: Could not resolve server address '{}': {}",
+                server_str, e
+            );
             return Ok(());
         }
     };
@@ -40,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = match TestClient::connect(server_addr).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error: Could not connect to Hermes server at {}: {}", server_addr, e);
+            eprintln!(
+                "Error: Could not connect to Hermes server at {}: {}",
+                server_addr, e
+            );
             eprintln!("Make sure the server is running on {} (run: cargo run --bin hermes -- config/server-node1.properties)", server_addr);
             return Ok(());
         }
@@ -48,9 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match command.as_str() {
         "produce" => {
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let key = get_arg_val(&args, "--key").unwrap_or_default();
-            let msg = get_arg_val(&args, "--message").unwrap_or_else(|| "Sample Hermes Event Payload".to_string());
+            let msg = get_arg_val(&args, "--message")
+                .unwrap_or_else(|| "Sample Hermes Event Payload".to_string());
             let num_partitions: u32 = get_arg_val(&args, "--partitions")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
@@ -66,14 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Logical Offset:     {}", res.first_offset);
         }
         "fetch" | "consume" => {
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let group_opt = get_arg_val(&args, "--group");
             let from_beginning = has_flag(&args, "--from-beginning");
 
-            let start_offset: u64 = if let Some(explicit_off) = get_arg_val(&args, "--offset").and_then(|s| s.parse().ok()) {
+            let start_offset: u64 = if let Some(explicit_off) =
+                get_arg_val(&args, "--offset").and_then(|s| s.parse().ok())
+            {
                 explicit_off
             } else if from_beginning {
                 0
@@ -92,7 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64 * 1024);
 
-            let frames = client.fetch(&topic, partition, start_offset, max_bytes).await?;
+            let frames = client
+                .fetch(&topic, partition, start_offset, max_bytes)
+                .await?;
 
             if let Some(ref group_id) = group_opt {
                 println!(
@@ -102,7 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!(
                     "📥 Fetched {} record frame(s) from Server {} [Topic '{}' Partition {}]:",
-                    frames.len(), server_addr, topic, partition
+                    frames.len(),
+                    server_addr,
+                    topic,
+                    partition
                 );
             }
             println!("------------------------------------------------------------------");
@@ -119,14 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref group_id) = group_opt {
                 if let Some(last_frame) = frames.last() {
                     let commit_off = last_frame.offset;
-                    client.commit_offset(group_id, &topic, partition, commit_off).await?;
-                    println!("\n  📌 Auto-committed Offset {} for Group '{}' to __consumer_offsets.log", commit_off, group_id);
+                    client
+                        .commit_offset(group_id, &topic, partition, commit_off)
+                        .await?;
+                    println!(
+                        "\n  📌 Auto-committed Offset {} for Group '{}' to __consumer_offsets.log",
+                        commit_off, group_id
+                    );
                 }
             }
         }
         "group-consume" => {
-            let group_id = get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let group_id =
+                get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
@@ -186,17 +209,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "latest-offset" | "watermark" => {
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
 
             let offset = client.latest_offset(&topic, partition).await?;
-            println!("📊 Topic '{}' Partition {} High Watermark Offset: {}", topic, partition, offset);
+            println!(
+                "📊 Topic '{}' Partition {} High Watermark Offset: {}",
+                topic, partition, offset
+            );
         }
         "commit-offset" => {
-            let group_id = get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let group_id =
+                get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
@@ -204,28 +233,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
 
-            client.commit_offset(&group_id, &topic, partition, offset).await?;
+            client
+                .commit_offset(&group_id, &topic, partition, offset)
+                .await?;
             println!(
                 "✅ Committed Offset {} for Consumer Group '{}' on Topic '{}' Partition {} (persisted to __consumer_offsets.log)",
                 offset, group_id, topic, partition
             );
         }
         "fetch-offset" => {
-            let group_id = get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let group_id =
+                get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
 
             let offset = client.fetch_offset(&group_id, &topic, partition).await?;
             if offset == u64::MAX {
-                println!("⚠️ No committed offset found for Group '{}' on Topic '{}' Partition {}", group_id, topic, partition);
+                println!(
+                    "⚠️ No committed offset found for Group '{}' on Topic '{}' Partition {}",
+                    group_id, topic, partition
+                );
             } else {
-                println!("📌 Group '{}' Committed Offset on Topic '{}' Partition {}: {}", group_id, topic, partition, offset);
+                println!(
+                    "📌 Group '{}' Committed Offset on Topic '{}' Partition {}: {}",
+                    group_id, topic, partition, offset
+                );
             }
         }
         "seek" => {
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let partition: u32 = get_arg_val(&args, "--partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
@@ -255,7 +295,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "delete-topic" => {
-            let topic = get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             client.delete_topic(&topic).await?;
             println!("🗑️ Topic '{}' deleted successfully.", topic);
         }
@@ -290,10 +331,16 @@ fn print_usage() {
     println!("Commands:");
     println!("  produce         Produce an event payload to a topic");
     println!("                  --topic <NAME> --message <MSG> [--key <KEY>] [--partitions <N>]");
-    println!("  fetch / consume Kafka-style fetch (supports consumer group tracking & --from-beginning)");
+    println!(
+        "  fetch / consume Kafka-style fetch (supports consumer group tracking & --from-beginning)"
+    );
     println!("                  --topic <NAME> [--group <GROUP>] [--partition <ID>] [--offset <N>] [--from-beginning]");
-    println!("  group-consume   Kafka-style Consumer Group continuous loop (auto-fetches & commits)");
-    println!("                  --group <GROUP> --topic <NAME> [--partition <ID>] [--interval <MS>]");
+    println!(
+        "  group-consume   Kafka-style Consumer Group continuous loop (auto-fetches & commits)"
+    );
+    println!(
+        "                  --group <GROUP> --topic <NAME> [--partition <ID>] [--interval <MS>]"
+    );
     println!("  latest-offset   Get partition high watermark offset");
     println!("                  --topic <NAME> [--partition <ID>]");
     println!("  commit-offset   Commit consumer group offset");

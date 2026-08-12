@@ -3,11 +3,11 @@ pub mod grpc;
 pub mod metadata;
 
 pub use consensus::{ConsensusState, HermesConsensus};
-pub use metadata::MetadataRecord;
 pub use grpc::{
     send_grpc_replication_fetch, ReplicationFetchRequest, ReplicationFetchResponse,
     GRPC_REPLICATION_MAGIC,
 };
+pub use metadata::MetadataRecord;
 
 use crate::protocol::RecordFrame;
 use bytes::BufMut;
@@ -66,10 +66,20 @@ pub struct ReplicationManager {
     voted_for: Arc<RwLock<Option<(u64, u32)>>>,
     /// Active per-partition follower fetcher tasks: (topic, partition) -> JoinHandle
     fetchers: Arc<DashMap<(String, u32), tokio::task::JoinHandle<()>>>,
+    /// Shared broker address registry (node_id -> bind_addr), also used by StorageEngine
+    /// for partition-leader routing.  Populated locally on startup, from replicated
+    /// BrokerRegister metadata records, and — importantly — from the follower identity
+    /// each peer returns in its heartbeat ACK, so a Raft Leader learns every follower's
+    /// bind address even though only the Leader can write to `__cluster_metadata`.
+    broker_addrs: Arc<DashMap<u32, String>>,
 }
 
 impl ReplicationManager {
-    pub fn new(config: ClusterConfig, bind_addr: String) -> Self {
+    pub fn new(
+        config: ClusterConfig,
+        bind_addr: String,
+        broker_addrs: Arc<DashMap<u32, String>>,
+    ) -> Self {
         let cluster_size = config.peer_addrs.len() + 1;
         // Bootstrap consensus state from configured role so config-declared
         // leaders start immediately accepting writes without running an election.
@@ -78,7 +88,8 @@ impl ReplicationManager {
         } else {
             ConsensusState::Follower
         };
-        let consensus = HermesConsensus::new_with_state(config.node_id, cluster_size, initial_consensus_state);
+        let consensus =
+            HermesConsensus::new_with_state(config.node_id, cluster_size, initial_consensus_state);
 
         let leader_addr = if config.role == NodeRole::Leader {
             // Leader knows its own address
@@ -97,6 +108,7 @@ impl ReplicationManager {
             last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
             voted_for: Arc::new(RwLock::new(None)),
             fetchers: Arc::new(DashMap::new()),
+            broker_addrs,
         };
 
         // Leader: start heartbeat broadcaster to all followers
@@ -145,7 +157,8 @@ impl ReplicationManager {
 
     /// Sets the current epoch (term). Used when this node becomes leader (RACE-03 atomic).
     pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, std::sync::atomic::Ordering::Release);
+        self.epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
     }
 
     /// Called by followers when they receive a heartbeat from the leader.
@@ -184,9 +197,17 @@ impl ReplicationManager {
         *guard = Some((term, candidate_id));
     }
 
-    pub fn update_replica_watermark(&self, topic: &str, partition: u32, peer_addr: &str, offset: u64) {
-        self.replica_watermarks
-            .insert((topic.to_string(), partition, peer_addr.to_string()), offset);
+    pub fn update_replica_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        peer_addr: &str,
+        offset: u64,
+    ) {
+        self.replica_watermarks.insert(
+            (topic.to_string(), partition, peer_addr.to_string()),
+            offset,
+        );
     }
 
     /// Leader heartbeat broadcaster: sends periodic heartbeats to all follower peers,
@@ -197,6 +218,7 @@ impl ReplicationManager {
         let node_id = self.config.node_id;
         let bind_addr = self.bind_addr.clone();
         let epoch = self.epoch.clone(); // share epoch for heartbeat term
+        let broker_addrs = self.broker_addrs.clone();
 
         tokio::spawn(async move {
             tracing::info!(
@@ -209,8 +231,20 @@ impl ReplicationManager {
             loop {
                 let current_term = epoch.load(std::sync::atomic::Ordering::Acquire);
                 for peer in &peer_addrs {
-                    match send_leader_heartbeat(peer, &cluster_id, node_id, current_term, &bind_addr).await {
-                        Ok(()) => {
+                    match send_leader_heartbeat(
+                        peer,
+                        &cluster_id,
+                        node_id,
+                        current_term,
+                        &bind_addr,
+                    )
+                    .await
+                    {
+                        Ok((follower_id, follower_addr)) => {
+                            // Learn the follower's own identity from its heartbeat ACK so this
+                            // leader's broker_addrs registry stays complete even without any
+                            // manual registration step (fixes real-cluster broker discovery).
+                            broker_addrs.insert(follower_id, follower_addr);
                             tracing::info!(
                                 "HA Cluster [{}]: Heartbeat OK — peer {} acknowledged leader",
                                 cluster_id,
@@ -258,7 +292,9 @@ impl ReplicationManager {
                                     let topic_c = topic.clone();
                                     let handle = tokio::spawn(async move {
                                         loop {
-                                            let last_offset = match engine_c.get_or_create_partition(&topic_c, p_id) {
+                                            let last_offset = match engine_c
+                                                .get_or_create_partition(&topic_c, p_id)
+                                            {
                                                 Ok(pm) => pm.latest_offset(),
                                                 Err(_) => 0,
                                             };
@@ -271,11 +307,23 @@ impl ReplicationManager {
                                                 max_bytes: 64 * 1024,
                                             };
 
-                                            if let Some(leader_addr) = engine_c.get_broker_address(leader_id) {
-                                                if let Ok(resp) = send_grpc_replication_fetch(&leader_addr, &req).await {
-                                                    if let Ok(pm) = engine_c.get_or_create_partition(&topic_c, p_id) {
+                                            if let Some(leader_addr) =
+                                                engine_c.get_broker_address(leader_id)
+                                            {
+                                                if let Ok(resp) =
+                                                    send_grpc_replication_fetch(&leader_addr, &req)
+                                                        .await
+                                                {
+                                                    if let Ok(pm) = engine_c
+                                                        .get_or_create_partition(&topic_c, p_id)
+                                                    {
                                                         for frame in resp.frames {
-                                                            let _ = pm.produce_frame_eos(&frame.payload, 0, 0, 0);
+                                                            let _ = pm.produce_frame_eos(
+                                                                &frame.payload,
+                                                                0,
+                                                                0,
+                                                                0,
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -320,6 +368,7 @@ impl ReplicationManager {
         let epoch = self.epoch.clone();
         let leader_addr = self.leader_addr.clone();
         let bind_addr = self.bind_addr.clone();
+        let broker_addrs = self.broker_addrs.clone();
 
         tokio::spawn(async move {
             let mut tick: u64 = 0;
@@ -329,7 +378,8 @@ impl ReplicationManager {
 
                 // Derive jitter: mix node_id with tick using a simple multiplicative hash.
                 // This ensures different nodes time out at different moments.
-                let jitter = (node_id as u64).wrapping_mul(2654435761).wrapping_add(tick) % ELECTION_TIMEOUT_JITTER_SECS;
+                let jitter = (node_id as u64).wrapping_mul(2654435761).wrapping_add(tick)
+                    % ELECTION_TIMEOUT_JITTER_SECS;
                 let timeout_duration = Duration::from_secs(ELECTION_TIMEOUT_BASE_SECS + jitter);
 
                 let last = *last_heartbeat.read().unwrap();
@@ -359,19 +409,23 @@ impl ReplicationManager {
                             votes_granted += 1;
                             tracing::info!(
                                 "Hermes Election: Vote GRANTED by {} (term {})",
-                                peer, new_term
+                                peer,
+                                new_term
                             );
                         }
                         Ok(false) => {
                             tracing::info!(
                                 "Hermes Election: Vote DENIED by {} (term {})",
-                                peer, new_term
+                                peer,
+                                new_term
                             );
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "Hermes Election: No response from {} (term {}): {}",
-                                peer, new_term, e
+                                peer,
+                                new_term,
+                                e
                             );
                         }
                     }
@@ -387,7 +441,10 @@ impl ReplicationManager {
                     }
                     tracing::info!(
                         "Hermes Election: Node {} is now LEADER for term {} with {}/{} votes.",
-                        node_id, new_term, votes_granted, peer_addrs.len() + 1
+                        node_id,
+                        new_term,
+                        votes_granted,
+                        peer_addrs.len() + 1
                     );
                     // Reset heartbeat timestamp so we don't re-trigger election.
                     *last_heartbeat.write().unwrap() = std::time::Instant::now();
@@ -405,6 +462,7 @@ impl ReplicationManager {
                         let bind_addr_c = bind_addr.clone();
                         let epoch_c = epoch.clone();
                         let consensus_c = consensus.clone();
+                        let broker_addrs_c = broker_addrs.clone();
                         tokio::spawn(async move {
                             loop {
                                 if consensus_c.state() != ConsensusState::Leader {
@@ -414,9 +472,20 @@ impl ReplicationManager {
                                     );
                                     break;
                                 }
-                                let current_term = epoch_c.load(std::sync::atomic::Ordering::Acquire);
+                                let current_term =
+                                    epoch_c.load(std::sync::atomic::Ordering::Acquire);
                                 for peer in &peer_addrs_c {
-                                    let _ = send_leader_heartbeat(peer, &cluster_id_c, node_id, current_term, &bind_addr_c).await;
+                                    if let Ok((follower_id, follower_addr)) = send_leader_heartbeat(
+                                        peer,
+                                        &cluster_id_c,
+                                        node_id,
+                                        current_term,
+                                        &bind_addr_c,
+                                    )
+                                    .await
+                                    {
+                                        broker_addrs_c.insert(follower_id, follower_addr);
+                                    }
                                 }
                                 sleep(HEARTBEAT_INTERVAL).await;
                             }
@@ -425,7 +494,9 @@ impl ReplicationManager {
                 } else {
                     tracing::warn!(
                         "Hermes Election: Node {} failed to reach quorum ({} votes) for term {}.",
-                        node_id, votes_granted, new_term
+                        node_id,
+                        votes_granted,
+                        new_term
                     );
                 }
             }
@@ -451,9 +522,9 @@ impl ReplicationManager {
         while start.elapsed() < quorum_timeout {
             let mut acked = 1usize; // Count self (leader) as 1
             for peer in &self.config.peer_addrs {
-                if let Some(w) = self
-                    .replica_watermarks
-                    .get(&(topic.to_string(), partition, peer.clone()))
+                if let Some(w) =
+                    self.replica_watermarks
+                        .get(&(topic.to_string(), partition, peer.clone()))
                 {
                     if *w.value() >= target_offset {
                         acked += 1;
@@ -498,7 +569,15 @@ impl ReplicationManager {
             let cid = cluster_id.clone();
             handles.push(tokio::spawn(async move {
                 // CRIT-01: pass cluster_id so the follower can authenticate this replication push.
-                let result = send_replication_push(&peer_addr, &cid, &topic_name, partition, epoch, &frames_vec).await;
+                let result = send_replication_push(
+                    &peer_addr,
+                    &cid,
+                    &topic_name,
+                    partition,
+                    epoch,
+                    &frames_vec,
+                )
+                .await;
                 (peer_addr, result)
             }));
         }
@@ -506,10 +585,8 @@ impl ReplicationManager {
         for handle in handles {
             match handle.await {
                 Ok((peer_addr, Ok(()))) => {
-                    self.replica_watermarks.insert(
-                        (topic.to_string(), partition, peer_addr),
-                        last_offset,
-                    );
+                    self.replica_watermarks
+                        .insert((topic.to_string(), partition, peer_addr), last_offset);
                 }
                 Ok((peer_addr, Err(e))) => {
                     // Check if the error string indicates a stale-epoch rejection
@@ -545,14 +622,21 @@ impl ReplicationManager {
 
 /// Sends a leader heartbeat packet (0xAC) including the leader's bind address and current term.
 ///
-/// Wire format: `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [bind_addr: pascal]`
+/// Wire format (request):  `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [bind_addr: pascal]`
+/// Wire format (response): `[0x00] [follower_node_id: 4b] [follower_bind_addr: pascal]` on success,
+///                          `[0x01]` on rejection (cluster mismatch / not whitelisted).
+///
+/// Returning the follower's own node_id + bind_addr lets the Leader populate its broker
+/// address registry purely from the existing heartbeat round-trip, without requiring any
+/// out-of-band broker registration step — followers are otherwise unable to publish their
+/// own address since only the partition leader for `__cluster_metadata` may write to it.
 pub async fn send_leader_heartbeat(
     peer_addr: &str,
     cluster_id: &str,
     node_id: u32,
     term: u64,
     leader_bind_addr: &str,
-) -> IoResult<()> {
+) -> IoResult<(u32, String)> {
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
@@ -568,21 +652,32 @@ pub async fn send_leader_heartbeat(
     buf.put_u8(0xAC); // Heartbeat Magic
     crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
     buf.put_u32(node_id);
-    buf.put_u64(term);  // P4: include current term
+    buf.put_u64(term); // P4: include current term
     crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
 
     stream.write_all(&buf).await?;
 
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await?;
-    if ack[0] == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status).await?;
+    if status[0] != 0 {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
-        ))
+        ));
     }
+
+    let mut id_buf = [0u8; 4];
+    stream.read_exact(&mut id_buf).await?;
+    let follower_node_id = u32::from_be_bytes(id_buf);
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let addr_len = u16::from_be_bytes(len_buf) as usize;
+    let mut addr_buf = vec![0u8; addr_len];
+    stream.read_exact(&mut addr_buf).await?;
+    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
+
+    Ok((follower_node_id, follower_bind_addr))
 }
 
 /// Streams replication batch frames to a peer follower node over TCP (0xAA protocol).
@@ -602,7 +697,11 @@ pub async fn send_replication_push(
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::warn!("HA Replication: Could not connect to peer {}: {}", peer_addr, e);
+            tracing::warn!(
+                "HA Replication: Could not connect to peer {}: {}",
+                peer_addr,
+                e
+            );
             return Err(e);
         }
         Err(_) => {
@@ -649,10 +748,17 @@ pub async fn send_replication_push(
         Ok(())
     } else if ack[0] == 0x02 {
         // H5: Follower returned STALE_EPOCH sentinel — our epoch is behind the cluster.
-        tracing::warn!("HA Replication: Peer {} rejected with STALE_EPOCH (0x02)", peer_addr);
+        tracing::warn!(
+            "HA Replication: Peer {} rejected with STALE_EPOCH (0x02)",
+            peer_addr
+        );
         Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
     } else {
-        tracing::warn!("HA Replication: Peer {} returned error ACK 0x{:02X}", peer_addr, ack[0]);
+        tracing::warn!(
+            "HA Replication: Peer {} returned error ACK 0x{:02X}",
+            peer_addr,
+            ack[0]
+        );
         Err(std::io::Error::other("Replication ACK failed"))
     }
 }
@@ -670,7 +776,11 @@ pub async fn send_vote_request(
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::warn!("Hermes Election: Cannot connect to {} for VoteRequest: {}", peer_addr, e);
+            tracing::warn!(
+                "Hermes Election: Cannot connect to {} for VoteRequest: {}",
+                peer_addr,
+                e
+            );
             return Err(e);
         }
         Err(_) => {

@@ -21,8 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = if let Some(config_path) = config_path_opt {
         EngineConfig::from_properties_file(config_path)?
     } else {
-        let bind_addr = env::var("HERMES_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
-        let data_dir_path = env::var("HERMES_DATA_DIR").unwrap_or_else(|_| "./data_store".to_string());
+        let bind_addr =
+            env::var("HERMES_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+        let data_dir_path =
+            env::var("HERMES_DATA_DIR").unwrap_or_else(|_| "./data_store".to_string());
         let log_file_dir_path = env::var("HERMES_LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
         EngineConfig {
             data_dir: PathBuf::from(data_dir_path),
@@ -41,7 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up dual subscriber: Log to both stdout (console) and log file (log_file_dir/hermes-server.log)
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking_file))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(non_blocking_file),
+        )
         .try_init();
 
     tracing::info!("============================================================");

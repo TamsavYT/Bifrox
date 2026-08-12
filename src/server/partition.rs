@@ -2,13 +2,13 @@ use crate::config::EngineConfig;
 use crate::protocol::RecordFrame;
 use crate::segment::SegmentManager;
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::Result as IoResult;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProducerStateEntry {
@@ -37,13 +37,28 @@ impl ProducerStateManager {
                 let last_sequence = i32::from_be_bytes(cursor[10..14].try_into().unwrap());
                 let last_offset = u64::from_be_bytes(cursor[14..22].try_into().unwrap());
                 cursor = &cursor[22..];
-                states.insert(producer_id, ProducerStateEntry { epoch, last_sequence, last_offset });
+                states.insert(
+                    producer_id,
+                    ProducerStateEntry {
+                        epoch,
+                        last_sequence,
+                        last_offset,
+                    },
+                );
             }
         }
-        Ok(Self { states, snapshot_path: path })
+        Ok(Self {
+            states,
+            snapshot_path: path,
+        })
     }
 
-    pub fn validate_sequence(&self, producer_id: u64, epoch: i16, base_sequence: i32) -> Result<(), (bool, u64)> {
+    pub fn validate_sequence(
+        &self,
+        producer_id: u64,
+        epoch: i16,
+        base_sequence: i32,
+    ) -> Result<(), (bool, u64)> {
         if let Some(entry) = self.states.get(&producer_id) {
             if epoch < entry.epoch {
                 return Err((false, 0)); // Fenced
@@ -61,11 +76,22 @@ impl ProducerStateManager {
     }
 
     pub fn update(&mut self, producer_id: u64, epoch: i16, last_sequence: i32, last_offset: u64) {
-        self.states.insert(producer_id, ProducerStateEntry { epoch, last_sequence, last_offset });
+        self.states.insert(
+            producer_id,
+            ProducerStateEntry {
+                epoch,
+                last_sequence,
+                last_offset,
+            },
+        );
     }
 
     pub fn take_snapshot(&self) -> IoResult<()> {
-        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&self.snapshot_path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.snapshot_path)?;
         for (pid, state) in &self.states {
             file.write_all(&pid.to_be_bytes())?;
             file.write_all(&state.epoch.to_be_bytes())?;
@@ -76,8 +102,6 @@ impl ProducerStateManager {
         Ok(())
     }
 }
-
-
 
 /// Thread-safe PartitionManager managing segment manager, atomic watermark, and granular leadership state
 #[derive(Debug)]
@@ -133,7 +157,13 @@ impl PartitionManager {
         self.leader_id.load(Ordering::Acquire) == self_node_id
     }
 
-    pub fn update_leadership(&self, leader_id: u32, leader_epoch: u32, replicas: Vec<u32>, isr: Vec<u32>) {
+    pub fn update_leadership(
+        &self,
+        leader_id: u32,
+        leader_epoch: u32,
+        replicas: Vec<u32>,
+        isr: Vec<u32>,
+    ) {
         self.leader_id.store(leader_id, Ordering::Release);
         self.leader_epoch.store(leader_epoch, Ordering::Release);
         *self.replicas.write() = replicas;
@@ -161,14 +191,25 @@ impl PartitionManager {
     }
 
     /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame
-    pub fn produce_frame_eos(&self, payload: &[u8], producer_id: u64, epoch: i16, sequence: i32) -> IoResult<Result<RecordFrame, u64>> {
+    pub fn produce_frame_eos(
+        &self,
+        payload: &[u8],
+        producer_id: u64,
+        epoch: i16,
+        sequence: i32,
+    ) -> IoResult<Result<RecordFrame, u64>> {
         let mut psm = self.producer_state_manager.lock();
         if producer_id != 0 {
-            if let Err((is_duplicate, last_offset)) = psm.validate_sequence(producer_id, epoch, sequence) {
+            if let Err((is_duplicate, last_offset)) =
+                psm.validate_sequence(producer_id, epoch, sequence)
+            {
                 if is_duplicate {
                     return Ok(Err(last_offset));
                 } else {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Out of order sequence"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Out of order sequence",
+                    ));
                 }
             }
         }
@@ -185,7 +226,8 @@ impl PartitionManager {
             let base_after = seg_guard.active_base_offset();
 
             let assigned_offset = frame.offset;
-            self.high_watermark.store(assigned_offset + 1, Ordering::Release);
+            self.high_watermark
+                .store(assigned_offset + 1, Ordering::Release);
 
             (frame, base_before != base_after)
         };
@@ -207,7 +249,12 @@ impl PartitionManager {
     }
 
     /// Appends a control marker to the partition.
-    pub fn produce_control_marker(&self, control_type: u8, producer_id: u64, transaction_id: &str) -> IoResult<RecordFrame> {
+    pub fn produce_control_marker(
+        &self,
+        control_type: u8,
+        producer_id: u64,
+        transaction_id: &str,
+    ) -> IoResult<RecordFrame> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -215,10 +262,16 @@ impl PartitionManager {
 
         let frame = {
             let mut seg_guard = self.segment_manager.lock();
-            let frame = seg_guard.append_control_marker(control_type, producer_id, transaction_id, timestamp)?;
+            let frame = seg_guard.append_control_marker(
+                control_type,
+                producer_id,
+                transaction_id,
+                timestamp,
+            )?;
 
             let assigned_offset = frame.offset;
-            self.high_watermark.store(assigned_offset + 1, Ordering::Release);
+            self.high_watermark
+                .store(assigned_offset + 1, Ordering::Release);
 
             frame
         };
@@ -239,7 +292,11 @@ impl PartitionManager {
     }
 
     /// Reads event records starting from target timestamp
-    pub fn fetch_by_timestamp(&self, target_timestamp: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
+    pub fn fetch_by_timestamp(
+        &self,
+        target_timestamp: u64,
+        max_bytes: u32,
+    ) -> IoResult<Vec<RecordFrame>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch_by_timestamp(target_timestamp, max_bytes as usize)
     }
@@ -266,7 +323,12 @@ impl PartitionManager {
     }
 
     /// Appends an aborted transaction range to the partition's transaction index
-    pub fn append_aborted_txn(&self, producer_id: u64, first_offset: u64, last_offset: u64) -> IoResult<()> {
+    pub fn append_aborted_txn(
+        &self,
+        producer_id: u64,
+        first_offset: u64,
+        last_offset: u64,
+    ) -> IoResult<()> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.append_aborted_txn(producer_id, first_offset, last_offset)
     }

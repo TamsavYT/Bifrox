@@ -87,9 +87,13 @@ impl SegmentManager {
 
         let active_index_path = dir.join(format!("{}.index", format_segment_filename(active_base)));
         let mut active_index = IndexSegment::open(active_index_path, active_base)?;
-        let active_time_index_path = dir.join(format!("{}.timeindex", format_segment_filename(active_base)));
+        let active_time_index_path = dir.join(format!(
+            "{}.timeindex",
+            format_segment_filename(active_base)
+        ));
         let active_time_index = TimeIndexSegment::open(active_time_index_path, active_base)?;
-        let active_txn_index_path = dir.join(format!("{}.txnindex", format_segment_filename(active_base)));
+        let active_txn_index_path =
+            dir.join(format!("{}.txnindex", format_segment_filename(active_base)));
         let active_txn_index = TxnIndexSegment::open(active_txn_index_path)?;
         let active_log = LogSegment::open(
             &dir,
@@ -147,9 +151,7 @@ impl SegmentManager {
         if self.bytes_since_last_index >= self.config.index_interval_bytes
             || self.active.index.entries_count() == 0
         {
-            self.active
-                .index
-                .append(assigned_offset, physical_pos)?;
+            self.active.index.append(assigned_offset, physical_pos)?;
             let _ = self.active.time_index.append(timestamp, assigned_offset);
             self.bytes_since_last_index = 0;
         }
@@ -162,9 +164,21 @@ impl SegmentManager {
     }
 
     /// Append a control marker frame into active segment. Performs segment rotation if size limit reached.
-    pub fn append_control_marker(&mut self, control_type: u8, producer_id: u64, transaction_id: &str, timestamp: u64) -> IoResult<RecordFrame> {
+    pub fn append_control_marker(
+        &mut self,
+        control_type: u8,
+        producer_id: u64,
+        transaction_id: &str,
+        timestamp: u64,
+    ) -> IoResult<RecordFrame> {
         let assigned_offset = self.high_watermark;
-        let frame = RecordFrame::create_control_marker(assigned_offset, timestamp, control_type, producer_id, transaction_id);
+        let frame = RecordFrame::create_control_marker(
+            assigned_offset,
+            timestamp,
+            control_type,
+            producer_id,
+            transaction_id,
+        );
         let frame_size = frame.encoded_size() as u64;
 
         if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
@@ -179,9 +193,7 @@ impl SegmentManager {
         if self.bytes_since_last_index >= self.config.index_interval_bytes
             || self.active.index.entries_count() == 0
         {
-            self.active
-                .index
-                .append(assigned_offset, physical_pos)?;
+            self.active.index.append(assigned_offset, physical_pos)?;
             let _ = self.active.time_index.append(timestamp, assigned_offset);
             self.bytes_since_last_index = 0;
         }
@@ -206,17 +218,20 @@ impl SegmentManager {
         self.active.index.sync()?;
         let _ = self.active.time_index.sync();
 
-        let new_index_path = self
-            .dir
-            .join(format!("{}.index", format_segment_filename(new_base_offset)));
+        let new_index_path = self.dir.join(format!(
+            "{}.index",
+            format_segment_filename(new_base_offset)
+        ));
         let mut new_index = IndexSegment::open(new_index_path, new_base_offset)?;
-        let new_time_index_path = self
-            .dir
-            .join(format!("{}.timeindex", format_segment_filename(new_base_offset)));
+        let new_time_index_path = self.dir.join(format!(
+            "{}.timeindex",
+            format_segment_filename(new_base_offset)
+        ));
         let new_time_index = TimeIndexSegment::open(new_time_index_path, new_base_offset)?;
-        let new_txn_index_path = self
-            .dir
-            .join(format!("{}.txnindex", format_segment_filename(new_base_offset)));
+        let new_txn_index_path = self.dir.join(format!(
+            "{}.txnindex",
+            format_segment_filename(new_base_offset)
+        ));
         let new_txn_index = TxnIndexSegment::open(new_txn_index_path)?;
         let new_log = LogSegment::open(
             &self.dir,
@@ -237,7 +252,11 @@ impl SegmentManager {
         };
 
         let mut old_active = std::mem::replace(&mut self.active, new_active);
-        old_active.mmap = crate::segment::mmap::MmapLogSegment::open(&old_active.log.path, old_active.base_offset).ok();
+        old_active.mmap = crate::segment::mmap::MmapLogSegment::open(
+            &old_active.log.path,
+            old_active.base_offset,
+        )
+        .ok();
         self.historical.push(old_active);
         self.bytes_since_last_index = 0;
 
@@ -245,9 +264,15 @@ impl SegmentManager {
     }
 
     /// Appends an aborted transaction range to the segment manager's transaction index
-    pub fn append_aborted_txn(&mut self, producer_id: u64, first_offset: u64, last_offset: u64) -> IoResult<()> {
+    pub fn append_aborted_txn(
+        &mut self,
+        producer_id: u64,
+        first_offset: u64,
+        last_offset: u64,
+    ) -> IoResult<()> {
         let pair = self.find_segment_pair_mut(first_offset);
-        pair.txn_index.append(producer_id, first_offset, last_offset)
+        pair.txn_index
+            .append(producer_id, first_offset, last_offset)
     }
 
     /// Checks if a given offset belongs to an aborted transaction
@@ -302,7 +327,12 @@ impl SegmentManager {
         let pair = self.find_segment_pair(target_offset);
         pair.index
             .find_nearest_physical_pos(target_offset)
-            .map(|e| (pair.base_offset + e.relative_offset as u64, e.physical_position as u64))
+            .map(|e| {
+                (
+                    pair.base_offset + e.relative_offset as u64,
+                    e.physical_position as u64,
+                )
+            })
     }
 
     /// Garbage collector: unlinks closed segments exceeding configured size or time retention limits
@@ -330,7 +360,11 @@ impl SegmentManager {
             }
 
             if let Some(max_bytes) = retention_bytes {
-                let total_bytes: u64 = self.historical.iter().map(|p| p.log.physical_size).sum::<u64>()
+                let total_bytes: u64 = self
+                    .historical
+                    .iter()
+                    .map(|p| p.log.physical_size)
+                    .sum::<u64>()
                     + self.active.log.physical_size;
                 if total_bytes > max_bytes {
                     remove = true;
@@ -365,10 +399,17 @@ impl SegmentManager {
     }
 
     /// Read records starting at target timestamp (BUG-02)
-    pub fn fetch_by_timestamp(&mut self, target_timestamp: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
+    pub fn fetch_by_timestamp(
+        &mut self,
+        target_timestamp: u64,
+        max_bytes: usize,
+    ) -> IoResult<Vec<RecordFrame>> {
         let start_offset = self.find_offset_for_timestamp(target_timestamp);
         let frames = self.fetch(start_offset, max_bytes)?;
-        Ok(frames.into_iter().filter(|f| f.timestamp >= target_timestamp).collect())
+        Ok(frames
+            .into_iter()
+            .filter(|f| f.timestamp >= target_timestamp)
+            .collect())
     }
 
     /// Finds nearest base_offset for target_timestamp (PARTIAL-02 & NEW-02)
@@ -379,7 +420,11 @@ impl SegmentManager {
             }
         }
 
-        if let Some(offset) = self.active.time_index.find_offset_for_timestamp(target_timestamp) {
+        if let Some(offset) = self
+            .active
+            .time_index
+            .find_offset_for_timestamp(target_timestamp)
+        {
             return offset;
         }
 

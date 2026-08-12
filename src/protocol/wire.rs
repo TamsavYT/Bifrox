@@ -451,25 +451,38 @@ impl WireRequest {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 let member_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let proto_count = payload_buf.get_u32() as usize;
                 let mut protocols = Vec::with_capacity(proto_count);
                 for _ in 0..proto_count {
                     protocols.push(read_pascal_string(&mut payload_buf)?);
                 }
-                RequestPayload::JoinGroup { group_id, member_id, protocols }
+                RequestPayload::JoinGroup {
+                    group_id,
+                    member_id,
+                    protocols,
+                }
             }
             CommandCode::SyncGroup => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let generation_id = payload_buf.get_u32();
                 let member_id = read_pascal_string(&mut payload_buf)?;
-                
+
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let assign_count = payload_buf.get_u32() as usize;
                 let mut assignments = Vec::with_capacity(assign_count);
@@ -477,11 +490,17 @@ impl WireRequest {
                     let a_member_id = read_pascal_string(&mut payload_buf)?;
                     let a_topic = read_pascal_string(&mut payload_buf)?;
                     if payload_buf.len() < 4 {
-                        return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                        return Err(WireError::Incomplete {
+                            needed: 4,
+                            available: payload_buf.len(),
+                        });
                     }
                     let p_count = payload_buf.get_u32() as usize;
                     if payload_buf.len() < p_count * 4 {
-                        return Err(WireError::Incomplete { needed: p_count * 4, available: payload_buf.len() });
+                        return Err(WireError::Incomplete {
+                            needed: p_count * 4,
+                            available: payload_buf.len(),
+                        });
                     }
                     let mut partitions = Vec::with_capacity(p_count);
                     for _ in 0..p_count {
@@ -493,26 +512,44 @@ impl WireRequest {
                         partitions,
                     });
                 }
-                RequestPayload::SyncGroup { group_id, generation_id, member_id, assignments }
+                RequestPayload::SyncGroup {
+                    group_id,
+                    generation_id,
+                    member_id,
+                    assignments,
+                }
             }
             CommandCode::Heartbeat => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let generation_id = payload_buf.get_u32();
                 let member_id = read_pascal_string(&mut payload_buf)?;
-                RequestPayload::Heartbeat { group_id, generation_id, member_id }
+                RequestPayload::Heartbeat {
+                    group_id,
+                    generation_id,
+                    member_id,
+                }
             }
             CommandCode::LeaveGroup => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 let member_id = read_pascal_string(&mut payload_buf)?;
-                RequestPayload::LeaveGroup { group_id, member_id }
+                RequestPayload::LeaveGroup {
+                    group_id,
+                    member_id,
+                }
             }
             CommandCode::CreateTopic => {
                 let topic = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let partitions = payload_buf.get_u32();
                 RequestPayload::CreateTopic { topic, partitions }
@@ -533,25 +570,37 @@ impl WireRequest {
             CommandCode::AddPartitionsToTxn => {
                 let transactional_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 10 {
-                    return Err(WireError::Incomplete { needed: 10, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 10,
+                        available: payload_buf.len(),
+                    });
                 }
                 let producer_id = payload_buf.get_u64();
                 let producer_epoch = payload_buf.get_i16();
-                
+
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let topic_count = payload_buf.get_u32() as usize;
                 let mut topics = Vec::with_capacity(topic_count);
-                
+
                 for _ in 0..topic_count {
                     let t_name = read_pascal_string(&mut payload_buf)?;
                     if payload_buf.len() < 4 {
-                        return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                        return Err(WireError::Incomplete {
+                            needed: 4,
+                            available: payload_buf.len(),
+                        });
                     }
                     let p_count = payload_buf.get_u32() as usize;
                     if payload_buf.len() < p_count * 4 {
-                        return Err(WireError::Incomplete { needed: p_count * 4, available: payload_buf.len() });
+                        return Err(WireError::Incomplete {
+                            needed: p_count * 4,
+                            available: payload_buf.len(),
+                        });
                     }
                     let mut parts = Vec::with_capacity(p_count);
                     for _ in 0..p_count {
@@ -559,23 +608,39 @@ impl WireRequest {
                     }
                     topics.push((t_name, parts));
                 }
-                RequestPayload::AddPartitionsToTxn { transactional_id, producer_id, producer_epoch, topics }
+                RequestPayload::AddPartitionsToTxn {
+                    transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    topics,
+                }
             }
             CommandCode::EndTxn => {
                 let transactional_id = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 11 {
-                    return Err(WireError::Incomplete { needed: 11, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 11,
+                        available: payload_buf.len(),
+                    });
                 }
                 let producer_id = payload_buf.get_u64();
                 let producer_epoch = payload_buf.get_i16();
                 let committed = payload_buf.get_u8() != 0;
-                RequestPayload::EndTxn { transactional_id, producer_id, producer_epoch, committed }
+                RequestPayload::EndTxn {
+                    transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    committed,
+                }
             }
             CommandCode::OffsetCommit => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 let topic = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 12 {
-                    return Err(WireError::Incomplete { needed: 12, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 12,
+                        available: payload_buf.len(),
+                    });
                 }
                 let partition = payload_buf.get_u32();
                 let offset = payload_buf.get_u64();
@@ -584,16 +649,29 @@ impl WireRequest {
                 } else {
                     String::new()
                 };
-                RequestPayload::OffsetCommit { group_id, topic, partition, offset, metadata }
+                RequestPayload::OffsetCommit {
+                    group_id,
+                    topic,
+                    partition,
+                    offset,
+                    metadata,
+                }
             }
             CommandCode::OffsetFetch => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 let topic = read_pascal_string(&mut payload_buf)?;
                 if payload_buf.len() < 4 {
-                    return Err(WireError::Incomplete { needed: 4, available: payload_buf.len() });
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
                 }
                 let partition = payload_buf.get_u32();
-                RequestPayload::OffsetFetch { group_id, topic, partition }
+                RequestPayload::OffsetFetch {
+                    group_id,
+                    topic,
+                    partition,
+                }
             }
         };
 

@@ -48,7 +48,8 @@ impl ReplicationFetchRequest {
 
         let follower_node_id = src.get_u32();
         let topic_len = src.get_u16() as usize;
-        if src.len() < topic_len + 16 { // Topic + Partition(4) + Offset(8) + MaxBytes(4)
+        if src.len() < topic_len + 16 {
+            // Topic + Partition(4) + Offset(8) + MaxBytes(4)
             return Err(());
         }
 
@@ -136,10 +137,12 @@ pub async fn send_grpc_replication_fetch(
     let mut stream = match timeout(GRPC_CONNECT_TIMEOUT, TcpStream::connect(leader_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("gRPC replication connection to {} timed out", leader_addr),
-        )),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("gRPC replication connection to {} timed out", leader_addr),
+            ))
+        }
     };
     let payload = req.encode();
 
@@ -168,6 +171,10 @@ pub async fn send_grpc_replication_fetch(
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf).await?;
 
-    ReplicationFetchResponse::decode(&resp_buf)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid gRPC replication response"))
+    ReplicationFetchResponse::decode(&resp_buf).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid gRPC replication response",
+        )
+    })
 }

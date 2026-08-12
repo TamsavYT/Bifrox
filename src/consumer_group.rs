@@ -62,62 +62,108 @@ impl ConsumerGroupManager {
                 let mut cursor = 0usize;
                 while cursor < buf.len() {
                     let mut temp_cursor = cursor;
-                    
+
                     if buf[temp_cursor] != CONSUMER_OFFSETS_MAGIC {
                         is_corrupt = true;
                         break;
                     }
                     temp_cursor += 1;
 
-                    if temp_cursor + 2 > buf.len() { break; }
-                    let group_len = u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap()) as usize;
+                    if temp_cursor + 2 > buf.len() {
+                        break;
+                    }
+                    let group_len =
+                        u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap())
+                            as usize;
                     temp_cursor += 2;
 
-                    if temp_cursor + group_len > buf.len() { break; }
-                    let group_id = match String::from_utf8(buf[temp_cursor..temp_cursor + group_len].to_vec()) {
-                        Ok(s) => s,
-                        Err(_) => { is_corrupt = true; break; }
-                    };
+                    if temp_cursor + group_len > buf.len() {
+                        break;
+                    }
+                    let group_id =
+                        match String::from_utf8(buf[temp_cursor..temp_cursor + group_len].to_vec())
+                        {
+                            Ok(s) => s,
+                            Err(_) => {
+                                is_corrupt = true;
+                                break;
+                            }
+                        };
                     temp_cursor += group_len;
 
-                    if temp_cursor + 2 > buf.len() { break; }
-                    let topic_len = u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap()) as usize;
+                    if temp_cursor + 2 > buf.len() {
+                        break;
+                    }
+                    let topic_len =
+                        u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap())
+                            as usize;
                     temp_cursor += 2;
 
-                    if temp_cursor + topic_len > buf.len() { break; }
-                    let topic = match String::from_utf8(buf[temp_cursor..temp_cursor + topic_len].to_vec()) {
-                        Ok(s) => s,
-                        Err(_) => { is_corrupt = true; break; }
-                    };
+                    if temp_cursor + topic_len > buf.len() {
+                        break;
+                    }
+                    let topic =
+                        match String::from_utf8(buf[temp_cursor..temp_cursor + topic_len].to_vec())
+                        {
+                            Ok(s) => s,
+                            Err(_) => {
+                                is_corrupt = true;
+                                break;
+                            }
+                        };
                     temp_cursor += topic_len;
 
-                    if temp_cursor + 12 > buf.len() { break; }
-                    let partition = u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
+                    if temp_cursor + 12 > buf.len() {
+                        break;
+                    }
+                    let partition =
+                        u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
                     temp_cursor += 4;
-                    let offset = u64::from_be_bytes(buf[temp_cursor..temp_cursor + 8].try_into().unwrap());
+                    let offset =
+                        u64::from_be_bytes(buf[temp_cursor..temp_cursor + 8].try_into().unwrap());
                     temp_cursor += 8;
 
-                    if temp_cursor + 2 > buf.len() { break; }
-                    let meta_len = u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap()) as usize;
+                    if temp_cursor + 2 > buf.len() {
+                        break;
+                    }
+                    let meta_len =
+                        u16::from_be_bytes(buf[temp_cursor..temp_cursor + 2].try_into().unwrap())
+                            as usize;
                     temp_cursor += 2;
 
-                    if temp_cursor + meta_len > buf.len() { break; }
-                    let metadata = match String::from_utf8(buf[temp_cursor..temp_cursor + meta_len].to_vec()) {
+                    if temp_cursor + meta_len > buf.len() {
+                        break;
+                    }
+                    let metadata = match String::from_utf8(
+                        buf[temp_cursor..temp_cursor + meta_len].to_vec(),
+                    ) {
                         Ok(s) => s,
-                        Err(_) => { is_corrupt = true; break; }
+                        Err(_) => {
+                            is_corrupt = true;
+                            break;
+                        }
                     };
                     temp_cursor += meta_len;
 
-                    if temp_cursor + 4 > buf.len() { break; }
-                    let crc = u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
+                    if temp_cursor + 4 > buf.len() {
+                        break;
+                    }
+                    let crc =
+                        u32::from_be_bytes(buf[temp_cursor..temp_cursor + 4].try_into().unwrap());
                     temp_cursor += 4;
 
-                    let computed_crc = Self::compute_crc(&group_id, &topic, partition, offset, &metadata);
+                    let computed_crc =
+                        Self::compute_crc(&group_id, &topic, partition, offset, &metadata);
                     if crc == computed_crc {
-                        offsets.insert((group_id, topic, partition), OffsetEntry { offset, metadata });
+                        offsets.insert(
+                            (group_id, topic, partition),
+                            OffsetEntry { offset, metadata },
+                        );
                         cursor = temp_cursor;
                     } else {
-                        tracing::warn!("Corrupt consumer offset entry encountered during recovery.");
+                        tracing::warn!(
+                            "Corrupt consumer offset entry encountered during recovery."
+                        );
                         is_corrupt = true;
                         break;
                     }
@@ -134,7 +180,11 @@ impl ConsumerGroupManager {
             }
 
             if last_good_pos < raw_len {
-                tracing::warn!("Truncating __consumer_offsets.log from {} to last valid position {}", raw_len, last_good_pos);
+                tracing::warn!(
+                    "Truncating __consumer_offsets.log from {} to last valid position {}",
+                    raw_len,
+                    last_good_pos
+                );
                 file.set_len(last_good_pos)?;
             }
             file.seek(SeekFrom::Start(last_good_pos))?;
@@ -150,12 +200,25 @@ impl ConsumerGroupManager {
     }
 
     /// Commits a consumer group offset to both RAM state and physical system log
-    pub fn commit_offset(&self, group_id: &str, topic: &str, partition: u32, offset: u64) -> IoResult<()> {
+    pub fn commit_offset(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> IoResult<()> {
         self.commit_offset_with_metadata(group_id, topic, partition, offset, "")
     }
 
     /// Commits a consumer group offset with metadata to both RAM state and physical system log
-    pub fn commit_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32, offset: u64, metadata: &str) -> IoResult<()> {
+    pub fn commit_offset_with_metadata(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        metadata: &str,
+    ) -> IoResult<()> {
         let key = (group_id.to_string(), topic.to_string(), partition);
         let entry_obj = OffsetEntry {
             offset,
@@ -221,7 +284,13 @@ impl ConsumerGroupManager {
             entry_bytes.put_u16(m_bytes.len() as u16);
             entry_bytes.put_slice(m_bytes);
 
-            let crc = Self::compute_crc(group_id, topic, *partition, entry_obj.offset, &entry_obj.metadata);
+            let crc = Self::compute_crc(
+                group_id,
+                topic,
+                *partition,
+                entry_obj.offset,
+                &entry_obj.metadata,
+            );
             entry_bytes.put_u32(crc);
         }
 
@@ -230,7 +299,7 @@ impl ConsumerGroupManager {
         options.write(true).create(true).truncate(true);
         #[cfg(windows)]
         options.share_mode(7);
-        
+
         let mut tmp_file = options.open(&tmp_path)?;
         tmp_file.write_all(&entry_bytes)?;
         tmp_file.sync_data()?;
@@ -251,11 +320,11 @@ impl ConsumerGroupManager {
         open_opts.read(true).write(true).create(true);
         #[cfg(windows)]
         open_opts.share_mode(7);
-        
+
         let mut new_file = open_opts.open(&*self.log_path)?;
         new_file.seek(SeekFrom::End(0))?;
         *lock = new_file;
-        
+
         Ok(())
     }
 
@@ -266,12 +335,23 @@ impl ConsumerGroupManager {
     }
 
     /// Fetches the last committed offset with metadata for a consumer group
-    pub fn fetch_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32) -> Option<OffsetEntry> {
+    pub fn fetch_offset_with_metadata(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Option<OffsetEntry> {
         let key = (group_id.to_string(), topic.to_string(), partition);
         self.offsets.get(&key).map(|v| v.value().clone())
     }
 
-    fn compute_crc(group_id: &str, topic: &str, partition: u32, offset: u64, metadata: &str) -> u32 {
+    fn compute_crc(
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        metadata: &str,
+    ) -> u32 {
         let mut hasher = Hasher::new();
         hasher.update(group_id.as_bytes());
         hasher.update(topic.as_bytes());

@@ -3,9 +3,12 @@ use crate::consumer_group::ConsumerGroupManager;
 use crate::protocol::frame::CONTROL_MAGIC_BYTE;
 use crate::protocol::RecordFrame;
 use crate::replication::{ClusterConfig, NodeRole, ReplicationManager};
-use crate::server::partition::PartitionManager;
-use crate::server::transaction::{decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus};
 use crate::server::coordinator::GroupCoordinator;
+use crate::server::partition::PartitionManager;
+use crate::server::quota::QuotaManager;
+use crate::server::transaction::{
+    decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus,
+};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use std::io::Result as IoResult;
@@ -22,13 +25,23 @@ pub fn hash_key(key: &[u8], num_partitions: usize) -> u32 {
 
 /// Validates topic names to prevent directory traversal and invalid paths (SEC-03)
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
-    if topic.is_empty() || topic.len() > 249 || topic == "." || topic == ".." || topic.contains('/') || topic.contains('\\') || topic.contains("..") {
+    if topic.is_empty()
+        || topic.len() > 249
+        || topic == "."
+        || topic == ".."
+        || topic.contains('/')
+        || topic.contains('\\')
+        || topic.contains("..")
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid topic name: '{}'", topic),
         ));
     }
-    if !topic.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-') {
+    if !topic
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Topic name contains illegal characters: '{}'", topic),
@@ -80,6 +93,7 @@ pub struct StorageEngine {
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
     broker_addrs: Arc<DashMap<u32, String>>,
+    quota: Arc<QuotaManager>,
 }
 
 impl StorageEngine {
@@ -93,7 +107,20 @@ impl StorageEngine {
             peer_addrs: config.peer_addrs.clone(),
             min_insync_replicas: config.min_insync_replicas,
         };
-        let replication = ReplicationManager::new(cluster_config, config.bind_addr.clone());
+        // Shared between StorageEngine and ReplicationManager so that broker addresses
+        // learned via the heartbeat round-trip (see send_leader_heartbeat) are visible
+        // to both partition-leader routing (StorageEngine) and heartbeat broadcasting
+        // (ReplicationManager) without a second, out-of-sync copy of the registry.
+        let broker_addrs: Arc<DashMap<u32, String>> = Arc::new(DashMap::new());
+        let replication = ReplicationManager::new(
+            cluster_config,
+            config.bind_addr.clone(),
+            broker_addrs.clone(),
+        );
+        let quota = Arc::new(QuotaManager::new(
+            config.produce_quota_bytes_per_sec,
+            config.fetch_quota_bytes_per_sec,
+        ));
 
         let engine = Self {
             config,
@@ -104,10 +131,13 @@ impl StorageEngine {
             transactions,
             replication,
             group_coordinator: Arc::new(GroupCoordinator::new()),
-            broker_addrs: Arc::new(DashMap::new()),
+            broker_addrs,
+            quota,
         };
 
-        engine.broker_addrs.insert(engine.config.node_id, engine.config.bind_addr.clone());
+        engine
+            .broker_addrs
+            .insert(engine.config.node_id, engine.config.bind_addr.clone());
 
         // 1. Scan data_dir and load existing partitions
         if engine.config.data_dir.exists() {
@@ -149,7 +179,9 @@ impl StorageEngine {
             }
         }
 
-        engine.replication.start_per_partition_fetcher_manager(engine.clone());
+        engine
+            .replication
+            .start_per_partition_fetcher_manager(engine.clone());
 
         Ok(engine)
     }
@@ -172,6 +204,19 @@ impl StorageEngine {
 
     pub fn replication(&self) -> &ReplicationManager {
         &self.replication
+    }
+
+    /// Accounts `bytes` of produced data for `client_key` (typically the connecting
+    /// client's source IP) and delays as needed to enforce `produce_quota_bytes_per_sec`.
+    /// No-op when no produce quota is configured.
+    pub async fn throttle_produce(&self, client_key: &str, bytes: u64) {
+        self.quota.throttle_produce(client_key, bytes).await;
+    }
+
+    /// Accounts `bytes` of fetched data for `client_key` and delays as needed to
+    /// enforce `fetch_quota_bytes_per_sec`. No-op when no fetch quota is configured.
+    pub async fn throttle_fetch(&self, client_key: &str, bytes: u64) {
+        self.quota.throttle_fetch(client_key, bytes).await;
     }
 
     /// Returns true if this node is the cluster Leader (handles produces + replicates)
@@ -198,9 +243,10 @@ impl StorageEngine {
         validate_topic_name(topic)?;
 
         if self.deleting_topics.contains(topic) {
-            return Err(std::io::Error::other(
-                format!("Topic {} is currently being deleted", topic),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Topic {} is currently being deleted",
+                topic
+            )));
         }
 
         let key = (topic.to_string(), partition);
@@ -223,7 +269,12 @@ impl StorageEngine {
 
                 if let Some(cfg) = self.topic_registry.get(topic) {
                     if let Some(assign) = cfg.partitions.get(&partition) {
-                        pm.update_leadership(assign.leader_id, assign.leader_epoch, assign.replicas.clone(), assign.isr.clone());
+                        pm.update_leadership(
+                            assign.leader_id,
+                            assign.leader_epoch,
+                            assign.replicas.clone(),
+                            assign.isr.clone(),
+                        );
                     }
                 }
 
@@ -250,18 +301,35 @@ impl StorageEngine {
                 for frame in &frames {
                     if let Ok(rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
                         match rec {
-                            crate::replication::MetadataRecord::TopicPartition { topic, partition, .. } => {
+                            crate::replication::MetadataRecord::TopicPartition {
+                                topic,
+                                partition,
+                                ..
+                            } => {
                                 let _ = self.get_or_create_partition(&topic, partition);
                             }
-                            crate::replication::MetadataRecord::TopicCreated { topic, num_partitions, replication_factor } => {
-                                self.topic_registry.insert(topic.clone(), TopicConfig {
-                                    topic,
-                                    num_partitions,
-                                    replication_factor,
-                                    partitions: std::collections::HashMap::new(),
-                                });
+                            crate::replication::MetadataRecord::TopicCreated {
+                                topic,
+                                num_partitions,
+                                replication_factor,
+                            } => {
+                                self.topic_registry.insert(
+                                    topic.clone(),
+                                    TopicConfig {
+                                        topic,
+                                        num_partitions,
+                                        replication_factor,
+                                        partitions: std::collections::HashMap::new(),
+                                    },
+                                );
                             }
-                            crate::replication::MetadataRecord::PartitionLeadershipChange { topic, partition, leader_id, leader_epoch, isr } => {
+                            crate::replication::MetadataRecord::PartitionLeadershipChange {
+                                topic,
+                                partition,
+                                leader_id,
+                                leader_epoch,
+                                isr,
+                            } => {
                                 let replicas = isr.clone();
                                 let assignment = PartitionAssignment {
                                     partition,
@@ -277,7 +345,10 @@ impl StorageEngine {
                                     pm.update_leadership(leader_id, leader_epoch, replicas, isr);
                                 }
                             }
-                            crate::replication::MetadataRecord::BrokerRegister { node_id, bind_addr } => {
+                            crate::replication::MetadataRecord::BrokerRegister {
+                                node_id,
+                                bind_addr,
+                            } => {
                                 self.broker_addrs.insert(node_id, bind_addr);
                             }
                             crate::replication::MetadataRecord::TopicDeleted { topic } => {
@@ -307,17 +378,25 @@ impl StorageEngine {
                     break;
                 }
                 for frame in &frames {
-                    if let Some((status, producer_id, tx_id, partitions)) = decode_tx_state_record(&frame.payload) {
+                    if let Some((status, producer_id, tx_id, partitions)) =
+                        decode_tx_state_record(&frame.payload)
+                    {
                         // N7: Only restore Ongoing transactions.  Committed/Aborted entries
                         // have no runtime effect — their data is already baked into the
                         // partition logs.  Restoring them would permanently block reuse of
                         // the same transaction ID (begin_transaction returns Err on Occupied)
                         // and cause aborted_ranges to return stale ranges for unrelated producers.
                         if status == crate::server::transaction::TxStatus::Ongoing {
-                            self.transactions.restore_transaction(&tx_id, producer_id, status, partitions);
+                            self.transactions.restore_transaction(
+                                &tx_id,
+                                producer_id,
+                                status,
+                                partitions,
+                            );
                             tracing::info!(
                                 "TxReplay: Restored in-flight transaction '{}' producer={}",
-                                tx_id, producer_id
+                                tx_id,
+                                producer_id
                             );
                         }
                     }
@@ -329,10 +408,7 @@ impl StorageEngine {
     }
 
     /// Produce a batch of records to a routed partition (PARTIAL-03 async).
-    pub async fn produce_batch(
-        &self,
-        params: ProduceBatchParams<'_>,
-    ) -> IoResult<(u32, u64, u64)> {
+    pub async fn produce_batch(&self, params: ProduceBatchParams<'_>) -> IoResult<(u32, u64, u64)> {
         let topic = params.topic;
         let key = params.key;
         let transaction_id = params.transaction_id;
@@ -384,7 +460,10 @@ impl StorageEngine {
             let topic_for_spawn = topic_str.clone();
             let frames_clone = frames.clone();
             tokio::spawn(async move {
-                if let Err(e) = repl.replicate_batch(&topic_for_spawn, partition_id, &frames_clone).await {
+                if let Err(e) = repl
+                    .replicate_batch(&topic_for_spawn, partition_id, &frames_clone)
+                    .await
+                {
                     tracing::error!("HA Replication: replicate_batch failed: {}", e);
                 }
             });
@@ -393,7 +472,12 @@ impl StorageEngine {
             if self.config.min_insync_replicas > 1 {
                 let quorum_ok = self
                     .replication
-                    .await_isr_quorum(&topic_str, partition_id, last_offset, std::time::Duration::from_secs(5))
+                    .await_isr_quorum(
+                        &topic_str,
+                        partition_id,
+                        last_offset,
+                        std::time::Duration::from_secs(5),
+                    )
                     .await;
                 if !quorum_ok {
                     return Err(std::io::Error::new(
@@ -407,7 +491,13 @@ impl StorageEngine {
         Ok((partition_id, first_offset, last_offset))
     }
 
-    pub fn fetch(&self, topic: &str, partition: u32, offset: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
+    pub fn fetch(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Vec<RecordFrame>> {
         let pm = self.get_or_create_partition(topic, partition)?;
         pm.fetch(offset, max_bytes)
     }
@@ -470,27 +560,52 @@ impl StorageEngine {
         Ok(pm.latest_offset())
     }
 
-    pub fn commit_offset(&self, group_id: &str, topic: &str, partition: u32, offset: u64) -> IoResult<()> {
-        self.consumer_groups.commit_offset(group_id, topic, partition, offset)
+    pub fn commit_offset(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> IoResult<()> {
+        self.consumer_groups
+            .commit_offset(group_id, topic, partition, offset)
     }
 
-    pub fn commit_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32, offset: u64, metadata: &str) -> IoResult<()> {
-        self.consumer_groups.commit_offset_with_metadata(group_id, topic, partition, offset, metadata)
+    pub fn commit_offset_with_metadata(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        metadata: &str,
+    ) -> IoResult<()> {
+        self.consumer_groups
+            .commit_offset_with_metadata(group_id, topic, partition, offset, metadata)
     }
 
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: u32) -> Option<u64> {
-        self.consumer_groups.fetch_offset(group_id, topic, partition)
+        self.consumer_groups
+            .fetch_offset(group_id, topic, partition)
     }
 
-    pub fn fetch_offset_with_metadata(&self, group_id: &str, topic: &str, partition: u32) -> Option<crate::consumer_group::OffsetEntry> {
-        self.consumer_groups.fetch_offset_with_metadata(group_id, topic, partition)
+    pub fn fetch_offset_with_metadata(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Option<crate::consumer_group::OffsetEntry> {
+        self.consumer_groups
+            .fetch_offset_with_metadata(group_id, topic, partition)
     }
 
     pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
-        let result = self.transactions.begin_transaction(transaction_id, producer_id);
+        let result = self
+            .transactions
+            .begin_transaction(transaction_id, producer_id);
         if result.is_ok() {
             let parts = self.transactions.get_partitions(transaction_id);
-            let record = encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
+            let record =
+                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
             if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
                 let _ = tx_pm.produce(&record);
             }
@@ -505,10 +620,16 @@ impl StorageEngine {
         producer_epoch: i16,
         topics: &[(String, Vec<u32>)],
     ) -> Result<(), String> {
-        let result = self.transactions.add_partitions_to_txn(transaction_id, producer_id, producer_epoch, topics);
+        let result = self.transactions.add_partitions_to_txn(
+            transaction_id,
+            producer_id,
+            producer_epoch,
+            topics,
+        );
         if result.is_ok() {
             let parts = self.transactions.get_partitions(transaction_id);
-            let record = encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
+            let record =
+                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
             if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
                 let _ = tx_pm.produce(&record);
             }
@@ -521,29 +642,59 @@ impl StorageEngine {
         let (producer_id, partitions) = self.transactions.prepare_commit(transaction_id)?;
 
         // Step 2: Write PrepareCommit record to __transaction_state
-        let prep_record = encode_tx_state_record(TxStatus::PrepareCommit, producer_id, transaction_id, &partitions);
+        let prep_record = encode_tx_state_record(
+            TxStatus::PrepareCommit,
+            producer_id,
+            transaction_id,
+            &partitions,
+        );
         if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
             let _ = tx_pm.produce(&prep_record);
         }
 
         // Step 3: Write CTRL_COMMIT control markers to all involved data partitions
         for (topic, partition, _, _) in &partitions {
-            let pm = self.get_or_create_partition(topic, *partition)
-                .map_err(|e| format!("Failed to get/create partition {}-{}: {}", topic, partition, e))?;
-            pm.produce_control_marker(crate::server::transaction::CTRL_COMMIT, producer_id, transaction_id)
-                .map_err(|e| format!("Failed to write commit marker to {}-{}: {}", topic, partition, e))?;
-            tracing::info!("EOS 2PC: Commit marker written to '{}' partition {}", topic, partition);
+            let pm = self
+                .get_or_create_partition(topic, *partition)
+                .map_err(|e| {
+                    format!(
+                        "Failed to get/create partition {}-{}: {}",
+                        topic, partition, e
+                    )
+                })?;
+            pm.produce_control_marker(
+                crate::server::transaction::CTRL_COMMIT,
+                producer_id,
+                transaction_id,
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to write commit marker to {}-{}: {}",
+                    topic, partition, e
+                )
+            })?;
+            tracing::info!(
+                "EOS 2PC: Commit marker written to '{}' partition {}",
+                topic,
+                partition
+            );
         }
 
         // Step 4: Transition memory state to Committed & write CompleteCommit to __transaction_state
         self.transactions.complete_commit(transaction_id)?;
-        let commit_record = encode_tx_state_record(TxStatus::Committed, producer_id, transaction_id, &partitions);
+        let commit_record = encode_tx_state_record(
+            TxStatus::Committed,
+            producer_id,
+            transaction_id,
+            &partitions,
+        );
         if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
             let _ = tx_pm.produce(&commit_record);
         }
 
         // Step 5: Clean up memory
-        self.transactions.cleanup_completed_transaction(transaction_id);
+        self.transactions
+            .cleanup_completed_transaction(transaction_id);
         Ok(())
     }
 
@@ -552,7 +703,12 @@ impl StorageEngine {
         let (producer_id, partitions) = self.transactions.prepare_abort(transaction_id)?;
 
         // Step 2: Write PrepareAbort record to __transaction_state
-        let prep_record = encode_tx_state_record(TxStatus::PrepareAbort, producer_id, transaction_id, &partitions);
+        let prep_record = encode_tx_state_record(
+            TxStatus::PrepareAbort,
+            producer_id,
+            transaction_id,
+            &partitions,
+        );
         if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
             let _ = tx_pm.produce(&prep_record);
         }
@@ -560,30 +716,64 @@ impl StorageEngine {
         // Step 3: Write CTRL_ABORT control markers to all involved data partitions
         let mut end_offsets = Vec::new();
         for (topic, partition, first_offset, _) in &partitions {
-            let pm = self.get_or_create_partition(topic, *partition)
-                .map_err(|e| format!("Failed to get/create partition {}-{}: {}", topic, partition, e))?;
-            let frame = pm.produce_control_marker(crate::server::transaction::CTRL_ABORT, producer_id, transaction_id)
-                .map_err(|e| format!("Failed to write abort marker to {}-{}: {}", topic, partition, e))?;
+            let pm = self
+                .get_or_create_partition(topic, *partition)
+                .map_err(|e| {
+                    format!(
+                        "Failed to get/create partition {}-{}: {}",
+                        topic, partition, e
+                    )
+                })?;
+            let frame = pm
+                .produce_control_marker(
+                    crate::server::transaction::CTRL_ABORT,
+                    producer_id,
+                    transaction_id,
+                )
+                .map_err(|e| {
+                    format!(
+                        "Failed to write abort marker to {}-{}: {}",
+                        topic, partition, e
+                    )
+                })?;
             let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.offset);
             end_offsets.push((topic.clone(), *partition, frame.offset));
-            tracing::info!("EOS 2PC: Abort marker written to '{}' partition {}", topic, partition);
+            tracing::info!(
+                "EOS 2PC: Abort marker written to '{}' partition {}",
+                topic,
+                partition
+            );
         }
 
         // Step 4: Transition memory state to Aborted & write CompleteAbort to __transaction_state
-        self.transactions.complete_abort(transaction_id, &end_offsets)?;
+        self.transactions
+            .complete_abort(transaction_id, &end_offsets)?;
         let updated_partitions = self.transactions.get_partitions(transaction_id);
-        let abort_record = encode_tx_state_record(TxStatus::Aborted, producer_id, transaction_id, &updated_partitions);
+        let abort_record = encode_tx_state_record(
+            TxStatus::Aborted,
+            producer_id,
+            transaction_id,
+            &updated_partitions,
+        );
         if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
             let _ = tx_pm.produce(&abort_record);
         }
 
         // Step 5: Clean up memory
-        self.transactions.cleanup_completed_transaction(transaction_id);
+        self.transactions
+            .cleanup_completed_transaction(transaction_id);
         Ok(())
     }
 
-    pub fn register_tx_partition(&self, transaction_id: &str, topic: &str, partition: u32, start_offset: u64) {
-        self.transactions.register_partition(transaction_id, topic, partition, start_offset);
+    pub fn register_tx_partition(
+        &self,
+        transaction_id: &str,
+        topic: &str,
+        partition: u32,
+        start_offset: u64,
+    ) {
+        self.transactions
+            .register_partition(transaction_id, topic, partition, start_offset);
     }
 
     pub fn apply_retention_all(&self) -> IoResult<usize> {
@@ -605,12 +795,17 @@ impl StorageEngine {
     pub fn create_topic(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
         validate_topic_name(topic)?;
         if self.deleting_topics.contains(topic) {
-            return Err(std::io::Error::other(format!("Topic {} is currently being deleted", topic)));
+            return Err(std::io::Error::other(format!(
+                "Topic {} is currently being deleted",
+                topic
+            )));
         }
 
         let broker_ids = self.available_broker_ids();
         if broker_ids.is_empty() {
-            return Err(std::io::Error::other("No brokers available for topic assignment"));
+            return Err(std::io::Error::other(
+                "No brokers available for topic assignment",
+            ));
         }
         let replication_factor = std::cmp::min(
             self.config.default_replication_factor.max(1),
@@ -677,7 +872,12 @@ impl StorageEngine {
 
         for (p, assignment) in partitions {
             let pm = self.get_or_create_partition(topic, p)?;
-            pm.update_leadership(assignment.leader_id, assignment.leader_epoch, assignment.replicas, assignment.isr);
+            pm.update_leadership(
+                assignment.leader_id,
+                assignment.leader_epoch,
+                assignment.replicas,
+                assignment.isr,
+            );
         }
 
         Ok(())
@@ -713,6 +913,14 @@ impl StorageEngine {
         } else {
             false
         }
+    }
+
+    /// Returns the node_id currently registered as leader for the specified partition,
+    /// if the partition has been initialized locally.
+    pub fn partition_leader_id(&self, topic: &str, partition: u32) -> Option<u32> {
+        self.get_or_create_partition(topic, partition)
+            .ok()
+            .map(|pm| pm.leader_id())
     }
 
     /// Registers a broker socket address mapping (node_id -> bind_addr)
@@ -756,7 +964,10 @@ impl StorageEngine {
     }
 
     /// Returns metadata and initialized partition high watermarks for a topic
-    pub fn describe_topic(&self, topic: &str) -> Option<Vec<crate::protocol::wire::DescribedPartition>> {
+    pub fn describe_topic(
+        &self,
+        topic: &str,
+    ) -> Option<Vec<crate::protocol::wire::DescribedPartition>> {
         if self.deleting_topics.contains(topic) {
             return None;
         }
@@ -786,17 +997,18 @@ impl StorageEngine {
 
         let mut partitions_info = Vec::with_capacity(num_partitions as usize);
         for p in 0..num_partitions {
-            let (hw, leader_id, replicas) = if let Some((hw, leader_id, replicas)) = partitions_map.get(&p) {
-                (*hw, *leader_id, replicas.clone())
-            } else if let Some(ref cfg) = reg_config {
-                if let Some(assign) = cfg.partitions.get(&p) {
-                    (0, assign.leader_id, assign.replicas.clone())
+            let (hw, leader_id, replicas) =
+                if let Some((hw, leader_id, replicas)) = partitions_map.get(&p) {
+                    (*hw, *leader_id, replicas.clone())
+                } else if let Some(ref cfg) = reg_config {
+                    if let Some(assign) = cfg.partitions.get(&p) {
+                        (0, assign.leader_id, assign.replicas.clone())
+                    } else {
+                        (0, self.config.node_id, vec![self.config.node_id])
+                    }
                 } else {
                     (0, self.config.node_id, vec![self.config.node_id])
-                }
-            } else {
-                (0, self.config.node_id, vec![self.config.node_id])
-            };
+                };
             partitions_info.push(crate::protocol::wire::DescribedPartition {
                 partition_id: p,
                 high_watermark: hw,

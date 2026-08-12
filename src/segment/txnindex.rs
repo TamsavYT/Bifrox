@@ -83,7 +83,12 @@ impl TxnIndexSegment {
         &self.entries
     }
 
-    pub fn append(&mut self, producer_id: u64, first_offset: u64, last_offset: u64) -> IoResult<()> {
+    pub fn append(
+        &mut self,
+        producer_id: u64,
+        first_offset: u64,
+        last_offset: u64,
+    ) -> IoResult<()> {
         let entry = TxnIndexEntry {
             producer_id,
             first_offset,
@@ -98,6 +103,8 @@ impl TxnIndexSegment {
     }
 
     pub fn is_aborted(&self, offset: u64) -> bool {
-        self.entries.iter().any(|e| offset >= e.first_offset && offset <= e.last_offset)
+        self.entries
+            .iter()
+            .any(|e| offset >= e.first_offset && offset <= e.last_offset)
     }
 }

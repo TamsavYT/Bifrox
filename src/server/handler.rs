@@ -1,12 +1,11 @@
-use crate::protocol::{RecordFrame, RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE};
+use crate::protocol::{
+    RecordFrame, RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE,
+};
 use crate::server::engine::StorageEngine;
 use bytes::{Buf, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
-
-
-
 
 /// Maximum allowed records per replication batch (CRIT-01 / SEC-MED-05)
 const MAX_REPLICATION_BATCH_COUNT: usize = 100_000;
@@ -37,28 +36,44 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
 
+    // Quota client identity: the source IP address is the finest-grained identity
+    // available without a wire-protocol change to carry an explicit Kafka-style
+    // `client.id`. This means quotas are per-source-IP rather than per logical
+    // client/user; documented as a known simplification vs. Kafka's full quota model.
+    let client_key = peer_addr
+        .split(':')
+        .next()
+        .unwrap_or(&peer_addr)
+        .to_string();
+
     // C4: Shared-secret authentication for client connections.
     // Inter-node peers (addresses in peer_addrs) are exempt; they authenticate
     // via cluster_id in every packet.  If auth_token is not configured the check
     // is skipped entirely (backward-compatible default).
     if let Some(ref token) = engine.config().auth_token {
         let peer_ip = peer_addr.split(':').next().unwrap_or("");
-        let is_known_peer = engine.config().peer_addrs.iter().any(|p| {
-            p.split(':').next().unwrap_or("") == peer_ip
-        });
+        let is_known_peer = engine
+            .config()
+            .peer_addrs
+            .iter()
+            .any(|p| p.split(':').next().unwrap_or("") == peer_ip);
         if !is_known_peer {
             // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
             const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
             let token_bytes = token.as_bytes();
             let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
             let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
-                Ok(Ok(_)) => auth_buf.starts_with(AUTH_MAGIC)
-                    && &auth_buf[AUTH_MAGIC.len()..] == token_bytes,
+                Ok(Ok(_)) => {
+                    auth_buf.starts_with(AUTH_MAGIC) && &auth_buf[AUTH_MAGIC.len()..] == token_bytes
+                }
                 Ok(Err(_)) => false,
                 Err(_) => false,
             };
             if !ok {
-                tracing::warn!("Authentication failed from {} — closing connection", peer_addr);
+                tracing::warn!(
+                    "Authentication failed from {} — closing connection",
+                    peer_addr
+                );
                 let _ = socket.write_all(b"AUTH_FAILED\n").await;
                 return;
             }
@@ -94,110 +109,169 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
 
             match first_byte {
                 // Inter-node replication batch (0xAA)
-                0xAA => {
-                    match decode_replication_packet(&engine, slice) {
-                        Ok((bytes_used, response)) => {
-                            consumed += bytes_used;
-                            if let Err(e) = socket.write_all(&response).await {
-                                tracing::error!("Failed to send replication ACK to {}: {}", peer_addr, e);
-                                return;
-                            }
-                        }
-                        Err(PacketError::NeedMoreData) => break,
-                        Err(PacketError::Fatal(msg)) => {
-                            tracing::warn!("Malformed replication packet from {}: {}", peer_addr, msg);
+                0xAA => match decode_replication_packet(&engine, slice) {
+                    Ok((bytes_used, response)) => {
+                        consumed += bytes_used;
+                        if let Err(e) = socket.write_all(&response).await {
+                            tracing::error!(
+                                "Failed to send replication ACK to {}: {}",
+                                peer_addr,
+                                e
+                            );
                             return;
                         }
                     }
-                }
+                    Err(PacketError::NeedMoreData) => break,
+                    Err(PacketError::Fatal(msg)) => {
+                        tracing::warn!("Malformed replication packet from {}: {}", peer_addr, msg);
+                        return;
+                    }
+                },
 
                 // Inter-node heartbeat PING (0xAC)
-                0xAC => {
-                    match decode_heartbeat_packet(&engine, slice) {
-                        Ok((bytes_used, response)) => {
-                            consumed += bytes_used;
-                            let _ = socket.write_all(&response).await;
-                        }
-                        Err(PacketError::NeedMoreData) => break,
-                        Err(PacketError::Fatal(msg)) => {
-                            tracing::warn!("Malformed heartbeat from {}: {}", peer_addr, msg);
-                            return;
-                        }
+                0xAC => match decode_heartbeat_packet(&engine, slice) {
+                    Ok((bytes_used, response)) => {
+                        consumed += bytes_used;
+                        let _ = socket.write_all(&response).await;
                     }
-                }
+                    Err(PacketError::NeedMoreData) => break,
+                    Err(PacketError::Fatal(msg)) => {
+                        tracing::warn!("Malformed heartbeat from {}: {}", peer_addr, msg);
+                        return;
+                    }
+                },
 
                 // Inter-node VoteRequest RPC (0xAE) — Raft leader election
-                0xAE => {
-                    match decode_vote_request_packet(&engine, slice) {
-                        Ok((bytes_used, response)) => {
-                            consumed += bytes_used;
-                            let _ = socket.write_all(&response).await;
-                        }
-                        Err(PacketError::NeedMoreData) => break,
-                        Err(PacketError::Fatal(msg)) => {
-                            tracing::warn!("Malformed VoteRequest from {}: {}", peer_addr, msg);
-                            return;
-                        }
+                0xAE => match decode_vote_request_packet(&engine, slice) {
+                    Ok((bytes_used, response)) => {
+                        consumed += bytes_used;
+                        let _ = socket.write_all(&response).await;
                     }
-                }
+                    Err(PacketError::NeedMoreData) => break,
+                    Err(PacketError::Fatal(msg)) => {
+                        tracing::warn!("Malformed VoteRequest from {}: {}", peer_addr, msg);
+                        return;
+                    }
+                },
 
                 // Client wire protocol commands (0x01..0x0A)
                 _ => {
                     match WireRequest::decode(slice) {
                         Ok((req, bytes_used)) => {
-                            // Produce Forwarding: if this node is a Follower and the request is a
-                            // ProduceBatch, transparently proxy the raw request bytes to the current
-                            // Leader and relay its response, rather than making the client discover
-                            // the leader itself.  This restores Kafka's "connect to any broker"
-                            // client experience for non-leader brokers.
-                            let is_produce = matches!(req.payload, RequestPayload::ProduceBatch { .. });
-                            let is_leader = engine.is_leader();
+                            // Produce Forwarding: if this node is not the leader for the target
+                            // partition, transparently proxy the raw request bytes to the actual
+                            // partition leader broker and relay its response, rather than making
+                            // the client discover the leader itself.  This restores Kafka's
+                            // "connect to any broker" client experience for non-leader brokers.
+                            //
+                            // IMPORTANT: this must check *partition*-level leadership
+                            // (`is_partition_leader`), not cluster-level Raft leadership
+                            // (`engine.is_leader()`).  A node can be a Raft Follower yet still be
+                            // the assigned leader for a specific partition under KIP-392-style
+                            // per-partition leader assignment; forwarding based on Raft role alone
+                            // would incorrectly proxy those produces away from the correct broker.
+                            let target_partition = match &req.payload {
+                                RequestPayload::ProduceBatch {
+                                    topic,
+                                    key,
+                                    num_partitions,
+                                    ..
+                                } => Some((
+                                    topic.clone(),
+                                    if !key.is_empty() && *num_partitions > 0 {
+                                        crate::server::hash_key(
+                                            key.as_bytes(),
+                                            *num_partitions as usize,
+                                        )
+                                    } else {
+                                        0
+                                    },
+                                )),
+                                _ => None,
+                            };
 
-                            if is_produce && !is_leader {
-                                let raw_request = slice[..bytes_used].to_vec();
-                                consumed += bytes_used;
+                            if let Some((topic, partition)) = target_partition {
+                                if !engine.is_partition_leader(&topic, partition) {
+                                    let raw_request = slice[..bytes_used].to_vec();
+                                    consumed += bytes_used;
 
-                                let response_bytes = match engine.leader_addr() {
-                                    Some(leader) => {
-                                        tracing::info!(
-                                            "Produce Forwarding: Proxying produce from {} to leader at {}",
-                                            peer_addr,
-                                            leader
-                                        );
-                                        match forward_to_leader(&leader, &raw_request, engine.config().auth_token.as_deref()).await {
-                                            Ok(bytes) => bytes,
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Produce Forwarding: Failed to forward to leader {}: {}",
-                                                    leader,
-                                                    e
-                                                );
-                                                WireResponse::error(
-                                                    &format!("Failed to forward produce to leader: {}", e)
-                                                ).encode()
+                                    // Prefer the actual assigned leader for this partition; fall
+                                    // back to the cluster Raft leader address if the partition
+                                    // leader's broker address isn't known (e.g. not yet announced).
+                                    let target_addr = engine
+                                        .partition_leader_id(&topic, partition)
+                                        .and_then(|leader_id| engine.get_broker_address(leader_id))
+                                        .or_else(|| engine.leader_addr());
+
+                                    let response_bytes = match target_addr {
+                                        Some(leader) => {
+                                            tracing::info!(
+                                                "Produce Forwarding: Proxying produce from {} to partition leader at {}",
+                                                peer_addr,
+                                                leader
+                                            );
+                                            match forward_to_leader(
+                                                &leader,
+                                                &raw_request,
+                                                engine.config().auth_token.as_deref(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Produce Forwarding: Failed to forward to leader {}: {}",
+                                                        leader,
+                                                        e
+                                                    );
+                                                    WireResponse::error(&format!(
+                                                        "Failed to forward produce to leader: {}",
+                                                        e
+                                                    ))
+                                                    .encode()
+                                                }
                                             }
                                         }
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            "Produce Forwarding: No leader known yet, rejecting produce from {}",
-                                            peer_addr
-                                        );
-                                        WireResponse::error(
-                                            "NOT_LEADER: No leader elected for this cluster. Retry later."
-                                        ).encode()
-                                    }
-                                };
+                                        None => {
+                                            tracing::warn!(
+                                                "Produce Forwarding: No leader known yet, rejecting produce from {}",
+                                                peer_addr
+                                            );
+                                            WireResponse::error(
+                                                "NOT_LEADER: No leader elected for this partition. Retry later."
+                                            ).encode()
+                                        }
+                                    };
 
-                                if let Err(e) = socket.write_all(&response_bytes).await {
-                                    tracing::error!("Failed to relay leader response to {}: {}", peer_addr, e);
-                                    return;
+                                    if let Err(e) = socket.write_all(&response_bytes).await {
+                                        tracing::error!(
+                                            "Failed to relay leader response to {}: {}",
+                                            peer_addr,
+                                            e
+                                        );
+                                        return;
+                                    }
+                                } else {
+                                    consumed += bytes_used;
+                                    let response = process_request(&engine, req, &client_key).await;
+                                    if let Err(e) = socket.write_all(&response.encode()).await {
+                                        tracing::error!(
+                                            "Failed to send response to {}: {}",
+                                            peer_addr,
+                                            e
+                                        );
+                                        return;
+                                    }
                                 }
                             } else {
                                 consumed += bytes_used;
-                                let response = process_request(&engine, req).await;
+                                let response = process_request(&engine, req, &client_key).await;
                                 if let Err(e) = socket.write_all(&response.encode()).await {
-                                    tracing::error!("Failed to send response to {}: {}", peer_addr, e);
+                                    tracing::error!(
+                                        "Failed to send response to {}: {}",
+                                        peer_addr,
+                                        e
+                                    );
                                     return;
                                 }
                             }
@@ -222,7 +296,10 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
         if filled == buffer.len() {
             const MAX_CONNECTION_BUFFER: usize = 128 * 1024 * 1024;
             if buffer.len() >= MAX_CONNECTION_BUFFER {
-                tracing::error!("Connection buffer max limit reached (128MB) for {}. Closing.", peer_addr);
+                tracing::error!(
+                    "Connection buffer max limit reached (128MB) for {}. Closing.",
+                    peer_addr
+                );
                 return;
             }
             let new_size = std::cmp::min(buffer.len() * 2, MAX_CONNECTION_BUFFER);
@@ -236,7 +313,11 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
 /// Used by follower brokers to transparently proxy `ProduceBatch` requests to the current
 /// cluster leader, so Kafka-style clients can "connect to any broker" without needing to
 /// discover partition leadership themselves.
-async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Option<&str>) -> std::io::Result<Vec<u8>> {
+async fn forward_to_leader(
+    leader_addr: &str,
+    raw_request: &[u8],
+    auth_token: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
     let mut stream = match timeout(FORWARD_TIMEOUT, TcpStream::connect(leader_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
@@ -267,7 +348,10 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Op
         Err(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("Timed out reading response header from leader {}", leader_addr),
+                format!(
+                    "Timed out reading response header from leader {}",
+                    leader_addr
+                ),
             ))
         }
     }
@@ -293,7 +377,10 @@ async fn forward_to_leader(leader_addr: &str, raw_request: &[u8], auth_token: Op
             Err(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("Timed out reading response payload from leader {}", leader_addr),
+                    format!(
+                        "Timed out reading response payload from leader {}",
+                        leader_addr
+                    ),
                 ))
             }
         }
@@ -334,8 +421,14 @@ fn decode_vote_request_packet(
 
     // CRIT-02: Cap cluster_id length to prevent heap pressure from malicious packets.
     if cid_len > MAX_CLUSTER_ID_LEN {
-        tracing::warn!("VoteRequest: Rejected — cluster_id length {} exceeds maximum {}", cid_len, MAX_CLUSTER_ID_LEN);
-        return Err(PacketError::Fatal("cluster_id too long in VoteRequest".to_string()));
+        tracing::warn!(
+            "VoteRequest: Rejected — cluster_id length {} exceeds maximum {}",
+            cid_len,
+            MAX_CLUSTER_ID_LEN
+        );
+        return Err(PacketError::Fatal(
+            "cluster_id too long in VoteRequest".to_string(),
+        ));
     }
 
     if src.len() < cid_len + 4 + 8 {
@@ -347,7 +440,9 @@ fn decode_vote_request_packet(
         Ok(s) => s,
         Err(_) => {
             tracing::warn!("VoteRequest: Rejected — cluster_id contains invalid UTF-8");
-            return Err(PacketError::Fatal("Invalid UTF-8 in cluster_id".to_string()));
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in cluster_id".to_string(),
+            ));
         }
     };
     src = &src[cid_len..];
@@ -362,7 +457,8 @@ fn decode_vote_request_packet(
     if &incoming_cluster_id != local_cluster {
         tracing::warn!(
             "VoteRequest: Rejected — cluster mismatch (got '{}', expected '{}')",
-            incoming_cluster_id, local_cluster
+            incoming_cluster_id,
+            local_cluster
         );
         return Ok((bytes_consumed, vec![0x00]));
     }
@@ -383,13 +479,18 @@ fn decode_vote_request_packet(
         engine.replication().record_vote(candidate_id, term);
         tracing::info!(
             "VoteRequest: GRANTED vote to candidate {} for term {} (our epoch was {})",
-            candidate_id, term, our_epoch
+            candidate_id,
+            term,
+            our_epoch
         );
         Ok((bytes_consumed, vec![0x01]))
     } else {
         tracing::info!(
             "VoteRequest: DENIED — candidate {} term {} (epoch: {}, can_vote: {})",
-            candidate_id, term, our_epoch, engine.replication().can_vote_for(candidate_id, term)
+            candidate_id,
+            term,
+            our_epoch,
+            engine.replication().can_vote_for(candidate_id, term)
         );
         Ok((bytes_consumed, vec![0x00]))
     }
@@ -415,8 +516,13 @@ fn decode_replication_packet(
     // CRIT-01: Read cluster_id prefix for authentication before touching any partition state.
     let cid_len = src.get_u16() as usize;
     if cid_len > MAX_CLUSTER_ID_LEN {
-        tracing::warn!("HA Replication: Rejected — cluster_id length {} exceeds maximum", cid_len);
-        return Err(PacketError::Fatal("cluster_id too long in replication packet".to_string()));
+        tracing::warn!(
+            "HA Replication: Rejected — cluster_id length {} exceeds maximum",
+            cid_len
+        );
+        return Err(PacketError::Fatal(
+            "cluster_id too long in replication packet".to_string(),
+        ));
     }
     if src.len() < cid_len {
         return Err(PacketError::NeedMoreData);
@@ -424,7 +530,11 @@ fn decode_replication_packet(
     // CRIT-01: Use from_utf8 (strict) so invalid UTF-8 cannot spoof a cluster_id.
     let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
         Ok(s) => s,
-        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in replication cluster_id".to_string())),
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in replication cluster_id".to_string(),
+            ))
+        }
     };
     src = &src[cid_len..];
 
@@ -433,9 +543,12 @@ fn decode_replication_packet(
     if &incoming_cluster_id != local_cluster {
         tracing::warn!(
             "HA Replication: REJECTED — cluster_id mismatch (got '{}', expected '{}').",
-            incoming_cluster_id, local_cluster
+            incoming_cluster_id,
+            local_cluster
         );
-        return Err(PacketError::Fatal("Replication cluster_id mismatch".to_string()));
+        return Err(PacketError::Fatal(
+            "Replication cluster_id mismatch".to_string(),
+        ));
     }
 
     // Topic length and name
@@ -443,13 +556,18 @@ fn decode_replication_packet(
         return Err(PacketError::NeedMoreData);
     }
     let topic_len = src.get_u16() as usize;
-    if src.len() < topic_len + 4 + 8 + 4 { // topic + partition(4) + epoch(8) + count(4)
+    if src.len() < topic_len + 4 + 8 + 4 {
+        // topic + partition(4) + epoch(8) + count(4)
         return Err(PacketError::NeedMoreData);
     }
     // CRIT-01: Use strict UTF-8 for topic name too.
     let topic = match String::from_utf8(src[..topic_len].to_vec()) {
         Ok(s) => s,
-        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in replicated topic name".to_string())),
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in replicated topic name".to_string(),
+            ))
+        }
     };
     src = &src[topic_len..];
 
@@ -464,9 +582,13 @@ fn decode_replication_packet(
     if count > MAX_REPLICATION_BATCH_COUNT {
         tracing::warn!(
             "HA Replication: Rejected — record count {} exceeds maximum {}",
-            count, MAX_REPLICATION_BATCH_COUNT
+            count,
+            MAX_REPLICATION_BATCH_COUNT
         );
-        return Err(PacketError::Fatal(format!("Replication batch count {} too large", count)));
+        return Err(PacketError::Fatal(format!(
+            "Replication batch count {} too large",
+            count
+        )));
     }
 
     // Epoch fencing: reject stale leader writes and signal STALE_EPOCH so leader steps down
@@ -487,7 +609,9 @@ fn decode_replication_packet(
         engine.replication().set_epoch(incoming_epoch);
         tracing::info!(
             "HA Replication: Updated epoch to {} from leader for topic '{}' partition {}",
-            incoming_epoch, topic, partition
+            incoming_epoch,
+            topic,
+            partition
         );
     }
 
@@ -537,7 +661,11 @@ fn decode_replication_packet(
         if let Err(e) = pm.produce_frame(payload) {
             tracing::error!(
                 "HA Replication: Failed to persist record {}/{} on '{}' P{}: {}",
-                i + 1, count, topic, partition, e
+                i + 1,
+                count,
+                topic,
+                partition,
+                e
             );
             write_failed = true;
         }
@@ -547,7 +675,11 @@ fn decode_replication_packet(
         if is_cluster_meta {
             if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(payload) {
                 match meta_rec {
-                    crate::replication::MetadataRecord::TopicPartition { topic: ref t, partition: p, .. } => {
+                    crate::replication::MetadataRecord::TopicPartition {
+                        topic: ref t,
+                        partition: p,
+                        ..
+                    } => {
                         // SEC-MED-07: Validate topic name before creating partitions from metadata.
                         if crate::server::engine::validate_topic_name(t).is_ok() {
                             tracing::info!(
@@ -564,20 +696,33 @@ fn decode_replication_packet(
                             tracing::warn!("HA Replication: Skipping invalid topic name '{}' in metadata record", t);
                         }
                     }
-                    crate::replication::MetadataRecord::BrokerRegister { node_id, ref bind_addr } => {
+                    crate::replication::MetadataRecord::BrokerRegister {
+                        node_id,
+                        ref bind_addr,
+                    } => {
                         engine.register_broker_address(node_id, bind_addr.clone());
                         tracing::info!(
                             "HA Replication: Broker register metadata record parsed. Node {} is at {}",
                             node_id, bind_addr
                         );
                     }
-                    crate::replication::MetadataRecord::TopicCreated { topic: ref t, num_partitions, .. } => {
+                    crate::replication::MetadataRecord::TopicCreated {
+                        topic: ref t,
+                        num_partitions,
+                        ..
+                    } => {
                         let _ = engine.create_topic(t, num_partitions);
                     }
                     crate::replication::MetadataRecord::TopicDeleted { topic: ref t } => {
                         let _ = engine.delete_topic(t);
                     }
-                    crate::replication::MetadataRecord::PartitionLeadershipChange { topic: ref t, partition, leader_id, leader_epoch, isr } => {
+                    crate::replication::MetadataRecord::PartitionLeadershipChange {
+                        topic: ref t,
+                        partition,
+                        leader_id,
+                        leader_epoch,
+                        isr,
+                    } => {
                         let replicas = isr.clone();
                         if let Ok(pm) = engine.get_or_create_partition(t, partition) {
                             pm.update_leadership(leader_id, leader_epoch, replicas, isr);
@@ -590,7 +735,9 @@ fn decode_replication_packet(
 
     tracing::info!(
         "HA Replication: Follower persisted {} replicated record(s) on Topic '{}' Partition {}",
-        count, topic, partition
+        count,
+        topic,
+        partition
     );
 
     if write_failed {
@@ -622,16 +769,23 @@ fn decode_heartbeat_packet(
 
     // CRIT-02/03: Cap cluster_id length.
     if cid_len > MAX_CLUSTER_ID_LEN {
-        return Err(PacketError::Fatal("cluster_id too long in heartbeat".to_string()));
+        return Err(PacketError::Fatal(
+            "cluster_id too long in heartbeat".to_string(),
+        ));
     }
-    if src.len() < cid_len + 4 + 8 { // node_id(4) + term(8)
+    if src.len() < cid_len + 4 + 8 {
+        // node_id(4) + term(8)
         return Err(PacketError::NeedMoreData);
     }
 
     // CRIT-03: Use from_utf8 (strict) so crafted invalid-UTF-8 cannot spoof a cluster_id.
     let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
         Ok(s) => s,
-        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in heartbeat cluster_id".to_string())),
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in heartbeat cluster_id".to_string(),
+            ))
+        }
     };
     src = &src[cid_len..];
     let peer_node_id = src.get_u32();
@@ -643,14 +797,20 @@ fn decode_heartbeat_packet(
     }
     let addr_len = src.get_u16() as usize;
     if addr_len > 256 {
-        return Err(PacketError::Fatal("leader_bind_addr too long in heartbeat".to_string()));
+        return Err(PacketError::Fatal(
+            "leader_bind_addr too long in heartbeat".to_string(),
+        ));
     }
     if src.len() < addr_len {
         return Err(PacketError::NeedMoreData);
     }
     let leader_bind_addr = match String::from_utf8(src[..addr_len].to_vec()) {
         Ok(s) => s,
-        Err(_) => return Err(PacketError::Fatal("Invalid UTF-8 in leader_bind_addr".to_string())),
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in leader_bind_addr".to_string(),
+            ))
+        }
     };
     src = &src[addr_len..];
 
@@ -660,7 +820,9 @@ fn decode_heartbeat_packet(
     if incoming_cluster_id != *local_cluster_id {
         tracing::warn!(
             "HA Heartbeat: REJECTED Node {}! Expected cluster '{}', got '{}'",
-            peer_node_id, local_cluster_id, incoming_cluster_id
+            peer_node_id,
+            local_cluster_id,
+            incoming_cluster_id
         );
         return Ok((bytes_consumed, vec![1u8]));
     }
@@ -688,20 +850,39 @@ fn decode_heartbeat_packet(
         engine.set_leader_addr(leader_bind_addr.clone());
         tracing::info!(
             "HA Heartbeat: Leader is Node {} at {} term {} (Cluster '{}')",
-            peer_node_id, leader_bind_addr, incoming_term, incoming_cluster_id
+            peer_node_id,
+            leader_bind_addr,
+            incoming_term,
+            incoming_cluster_id
         );
     } else {
         // Stale heartbeat from ghost leader — ignore, don't reset election timer
         tracing::warn!(
             "HA Heartbeat: Ignoring ghost heartbeat from Node {} — term {} < our epoch {}",
-            peer_node_id, incoming_term, our_epoch
+            peer_node_id,
+            incoming_term,
+            our_epoch
         );
     }
-    Ok((bytes_consumed, vec![0u8]))
+
+    // Reply with this node's own identity (node_id + bind_addr) so the Leader can learn
+    // this follower's broker address purely from the heartbeat round-trip.  Followers
+    // otherwise have no way to publish their address, since only the partition leader
+    // for `__cluster_metadata` may write BrokerRegister records.
+    let self_bind_addr = &engine.config().bind_addr;
+    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_bind_addr.len());
+    ack.put_u8(0u8);
+    ack.put_u32(engine.config().node_id);
+    crate::protocol::wire::write_pascal_string(&mut ack, self_bind_addr);
+    Ok((bytes_consumed, ack))
 }
 
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
-async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireResponse {
+async fn process_request(
+    engine: &StorageEngine,
+    req: WireRequest,
+    client_key: &str,
+) -> WireResponse {
     match req.payload {
         RequestPayload::ProduceBatch {
             topic,
@@ -724,6 +905,11 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             if !engine.is_partition_leader(&topic, target_partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
+            // Quota: account for produced bytes before executing the write so we know
+            // exactly how many bytes this request will use, then apply the throttle
+            // delay (if any) after the write completes — matching Kafka's model of
+            // "process the request, delay the response" rather than rejecting outright.
+            let produced_bytes: u64 = records.iter().map(|r| r.len() as u64).sum();
             match engine
                 .produce_batch(crate::server::engine::ProduceBatchParams {
                     topic: &topic,
@@ -742,6 +928,7 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 .await
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
+                    engine.throttle_produce(client_key, produced_bytes).await;
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
                     buf.put_u64(first_offset);
@@ -750,7 +937,7 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 }
                 Err(e) => WireResponse::error(&format!("ProduceBatch failed: {}", e)),
             }
-        },
+        }
         RequestPayload::Fetch {
             topic,
             partition,
@@ -764,14 +951,17 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
+                    let mut fetched_bytes: u64 = 0;
                     for frame in frames {
+                        fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
+                    engine.throttle_fetch(client_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
             }
-        },
+        }
         RequestPayload::FetchCommitted {
             topic,
             partition,
@@ -785,14 +975,17 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
+                    let mut fetched_bytes: u64 = 0;
                     for frame in frames {
+                        fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
+                    engine.throttle_fetch(client_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
             }
-        },
+        }
         RequestPayload::CommitOffset {
             group_id,
             topic,
@@ -857,7 +1050,9 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Err(e) => WireResponse::error(&format!("AbortTx failed: {}", e)),
             }
         }
-        RequestPayload::InitProducerId { transactional_id: _transactional_id } => {
+        RequestPayload::InitProducerId {
+            transactional_id: _transactional_id,
+        } => {
             let pid = engine.transactions().generate_producer_id();
             let mut buf = Vec::with_capacity(10);
             buf.put_u64(pid);
@@ -909,9 +1104,12 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
             Ok(frames) => {
                 let mut buf = Vec::new();
                 buf.put_u32(frames.len() as u32);
+                let mut fetched_bytes: u64 = 0;
                 for frame in frames {
+                    fetched_bytes += frame.encoded_size() as u64;
                     frame.encode_into(&mut buf);
                 }
+                engine.throttle_fetch(client_key, fetched_bytes).await;
                 WireResponse::ok(buf)
             }
             Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
@@ -953,8 +1151,15 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
             }
         }
-        RequestPayload::JoinGroup { group_id, member_id, protocols } => {
-            match engine.group_coordinator().join_group(&group_id, &member_id, protocols) {
+        RequestPayload::JoinGroup {
+            group_id,
+            member_id,
+            protocols,
+        } => {
+            match engine
+                .group_coordinator()
+                .join_group(&group_id, &member_id, protocols)
+            {
                 Ok(m_id) => {
                     let mut buf = Vec::new();
                     crate::protocol::wire::write_pascal_string(&mut buf, &m_id);
@@ -963,20 +1168,43 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
                 Err(e) => WireResponse::error(&e),
             }
         }
-        RequestPayload::SyncGroup { group_id, generation_id, member_id, assignments } => {
-            match engine.group_coordinator().sync_group(&group_id, generation_id, &member_id, assignments) {
+        RequestPayload::SyncGroup {
+            group_id,
+            generation_id,
+            member_id,
+            assignments,
+        } => {
+            match engine.group_coordinator().sync_group(
+                &group_id,
+                generation_id,
+                &member_id,
+                assignments,
+            ) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&e),
             }
         }
-        RequestPayload::Heartbeat { group_id, generation_id, member_id } => {
-            match engine.group_coordinator().heartbeat(&group_id, generation_id, &member_id) {
+        RequestPayload::Heartbeat {
+            group_id,
+            generation_id,
+            member_id,
+        } => {
+            match engine
+                .group_coordinator()
+                .heartbeat(&group_id, generation_id, &member_id)
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&e),
             }
         }
-        RequestPayload::LeaveGroup { group_id, member_id } => {
-            match engine.group_coordinator().leave_group(&group_id, &member_id) {
+        RequestPayload::LeaveGroup {
+            group_id,
+            member_id,
+        } => {
+            match engine
+                .group_coordinator()
+                .leave_group(&group_id, &member_id)
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&e),
             }
@@ -989,7 +1217,8 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
         }
         RequestPayload::DescribeTopic { topic } => {
             if let Some(partitions) = engine.describe_topic(&topic) {
-                let payload = crate::protocol::wire::encode_describe_topic_response(&topic, &partitions);
+                let payload =
+                    crate::protocol::wire::encode_describe_topic_response(&topic, &partitions);
                 WireResponse::ok(payload)
             } else {
                 WireResponse::error("Topic not found")
@@ -1006,21 +1235,39 @@ async fn process_request(engine: &StorageEngine, req: WireRequest) -> WireRespon
         }
         RequestPayload::DescribeGroup { group_id } => {
             if let Some(desc) = engine.group_coordinator().describe_group(&group_id) {
-                let payload = crate::protocol::wire::encode_describe_group_response(&desc.state_str, &desc.members);
+                let payload = crate::protocol::wire::encode_describe_group_response(
+                    &desc.state_str,
+                    &desc.members,
+                );
                 WireResponse::ok(payload)
             } else {
                 WireResponse::error("Group not found")
             }
         }
-        RequestPayload::OffsetCommit { group_id, topic, partition, offset, metadata } => {
-            match engine.commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata) {
+        RequestPayload::OffsetCommit {
+            group_id,
+            topic,
+            partition,
+            offset,
+            metadata,
+        } => {
+            match engine
+                .commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("OffsetCommit failed: {}", e)),
             }
         }
-        RequestPayload::OffsetFetch { group_id, topic, partition } => {
+        RequestPayload::OffsetFetch {
+            group_id,
+            topic,
+            partition,
+        } => {
             if let Some(entry) = engine.fetch_offset_with_metadata(&group_id, &topic, partition) {
-                let payload = crate::protocol::wire::encode_offset_fetch_response(entry.offset, &entry.metadata);
+                let payload = crate::protocol::wire::encode_offset_fetch_response(
+                    entry.offset,
+                    &entry.metadata,
+                );
                 WireResponse::ok(payload)
             } else {
                 WireResponse::error("Offset not found")

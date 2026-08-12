@@ -76,7 +76,10 @@ impl Server {
                 sleep(retention_interval).await;
                 match retention_engine.apply_retention_all() {
                     Ok(count) if count > 0 => {
-                        tracing::info!("Retention Garbage Collector: Unlinked {} expired log segment files.", count);
+                        tracing::info!(
+                            "Retention Garbage Collector: Unlinked {} expired log segment files.",
+                            count
+                        );
                     }
                     Err(e) => {
                         tracing::error!("Retention Garbage Collector error: {}", e);

@@ -65,7 +65,9 @@ impl GroupCoordinator {
         let expired: Vec<String> = group
             .members
             .iter()
-            .filter(|(_, member)| now.duration_since(member.last_heartbeat) > member.session_timeout)
+            .filter(|(_, member)| {
+                now.duration_since(member.last_heartbeat) > member.session_timeout
+            })
             .map(|(member_id, _)| member_id.clone())
             .collect();
 
@@ -88,26 +90,40 @@ impl GroupCoordinator {
         }
     }
 
-    pub fn join_group(&self, group_id: &str, member_id: &str, _protocols: Vec<String>) -> Result<String, String> {
+    pub fn join_group(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        _protocols: Vec<String>,
+    ) -> Result<String, String> {
         let mut groups = self.groups.lock().unwrap();
-        let group = groups.entry(group_id.to_string()).or_insert_with(|| ConsumerGroup::new(group_id.to_string()));
+        let group = groups
+            .entry(group_id.to_string())
+            .or_insert_with(|| ConsumerGroup::new(group_id.to_string()));
         Self::prune_expired_members(group);
-        
+
         let m_id = if member_id.is_empty() {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string()
         } else {
             member_id.to_string()
         };
 
         let mut rebalance_needed = false;
         if !group.members.contains_key(&m_id) {
-            group.members.insert(m_id.clone(), MemberState {
-                member_id: m_id.clone(),
-                client_id: m_id.clone(), // Simplify for now
-                session_timeout: Duration::from_secs(10),
-                assigned_partitions: HashMap::new(),
-                last_heartbeat: Instant::now(),
-            });
+            group.members.insert(
+                m_id.clone(),
+                MemberState {
+                    member_id: m_id.clone(),
+                    client_id: m_id.clone(), // Simplify for now
+                    session_timeout: Duration::from_secs(10),
+                    assigned_partitions: HashMap::new(),
+                    last_heartbeat: Instant::now(),
+                },
+            );
             rebalance_needed = true;
         } else if let Some(member) = group.members.get_mut(&m_id) {
             member.last_heartbeat = Instant::now();
@@ -120,11 +136,17 @@ impl GroupCoordinator {
         if group.leader.is_none() {
             group.leader = Some(m_id.clone());
         }
-        
+
         Ok(m_id)
     }
 
-    pub fn sync_group(&self, group_id: &str, generation_id: u32, member_id: &str, assignments: Vec<crate::protocol::wire::MemberAssignment>) -> Result<(), String> {
+    pub fn sync_group(
+        &self,
+        group_id: &str,
+        generation_id: u32,
+        member_id: &str,
+        assignments: Vec<crate::protocol::wire::MemberAssignment>,
+    ) -> Result<(), String> {
         let mut groups = self.groups.lock().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
             Self::prune_expired_members(group);
@@ -137,7 +159,9 @@ impl GroupCoordinator {
             if group.leader.as_deref() == Some(member_id) {
                 for assign in assignments {
                     if let Some(member) = group.members.get_mut(&assign.member_id) {
-                        member.assigned_partitions.insert(assign.topic, assign.partitions);
+                        member
+                            .assigned_partitions
+                            .insert(assign.topic, assign.partitions);
                     }
                 }
                 group.state = GroupState::Stable;
@@ -148,7 +172,12 @@ impl GroupCoordinator {
         Err("Group not found".to_string())
     }
 
-    pub fn heartbeat(&self, group_id: &str, generation_id: u32, member_id: &str) -> Result<(), String> {
+    pub fn heartbeat(
+        &self,
+        group_id: &str,
+        generation_id: u32,
+        member_id: &str,
+    ) -> Result<(), String> {
         let mut groups = self.groups.lock().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
             Self::prune_expired_members(group);

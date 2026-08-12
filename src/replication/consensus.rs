@@ -34,14 +34,22 @@ impl HermesConsensus {
     /// Create consensus with a specific initial state.
     /// Used when a node is configured as Leader at startup so it begins accepting
     /// produce requests immediately without waiting for a full election round.
-    pub fn new_with_state(node_id: u32, cluster_size: usize, initial_state: ConsensusState) -> Self {
+    pub fn new_with_state(
+        node_id: u32,
+        cluster_size: usize,
+        initial_state: ConsensusState,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ControllerInner {
                 node_id,
                 cluster_size,
                 state: initial_state,
                 current_term: 0,
-                voted_for: if initial_state == ConsensusState::Leader { Some(node_id) } else { None },
+                voted_for: if initial_state == ConsensusState::Leader {
+                    Some(node_id)
+                } else {
+                    None
+                },
                 last_heartbeat: Instant::now(),
                 election_timeout: Duration::from_millis(1500 + (node_id as u64 * 100)),
             })),
@@ -82,7 +90,9 @@ impl HermesConsensus {
     /// Checks heartbeat expiry and triggers automated Hermes consensus election if Leader missed heartbeat
     pub fn check_election_timeout(&self) -> bool {
         let mut lock = self.inner.lock();
-        if lock.state != ConsensusState::Leader && lock.last_heartbeat.elapsed() >= lock.election_timeout {
+        if lock.state != ConsensusState::Leader
+            && lock.last_heartbeat.elapsed() >= lock.election_timeout
+        {
             // Transition to Candidate & increment election term
             lock.state = ConsensusState::Candidate;
             lock.current_term += 1;

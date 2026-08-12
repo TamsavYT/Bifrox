@@ -43,7 +43,12 @@ impl MmapLogSegment {
     }
 
     /// Fast zero-copy decode of record frames directly from mmap memory slice
-    pub fn fetch_zero_copy(&self, start_pos: u64, start_offset: u64, max_bytes: usize) -> Vec<RecordFrame> {
+    pub fn fetch_zero_copy(
+        &self,
+        start_pos: u64,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Vec<RecordFrame> {
         let mut frames = Vec::new();
         if let Some(slice) = self.get_slice(start_pos, max_bytes) {
             let mut cursor = 0usize;

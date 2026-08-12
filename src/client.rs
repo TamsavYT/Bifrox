@@ -22,9 +22,12 @@ pub struct ConsumerCoordinator {
 
 impl ConsumerCoordinator {
     pub fn new(group_id: String, member_id: String) -> Self {
-        Self { group_id, member_id }
+        Self {
+            group_id,
+            member_id,
+        }
     }
-    
+
     // A mock background task loop for Rebalance and Heartbeat
     pub async fn run_background_task(&self, mut client: TestClient) {
         loop {
@@ -116,8 +119,14 @@ impl TestClient {
         num_partitions: u32,
         payload: impl AsRef<[u8]>,
     ) -> IoResult<ProduceResult> {
-        self.produce_batch(topic, key, transaction_id, num_partitions, &[payload.as_ref()])
-            .await
+        self.produce_batch(
+            topic,
+            key,
+            transaction_id,
+            num_partitions,
+            &[payload.as_ref()],
+        )
+        .await
     }
 
     pub async fn produce_batch(
@@ -128,7 +137,8 @@ impl TestClient {
         num_partitions: u32,
         records: &[impl AsRef<[u8]>],
     ) -> IoResult<ProduceResult> {
-        self.produce_batch_eos(topic, key, transaction_id, num_partitions, 0, 0, 0, records).await
+        self.produce_batch_eos(topic, key, transaction_id, num_partitions, 0, 0, 0, records)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,7 +342,10 @@ impl TestClient {
         }
     }
 
-    pub async fn describe_topic(&mut self, topic: &str) -> IoResult<(String, Vec<crate::protocol::wire::DescribedPartition>)> {
+    pub async fn describe_topic(
+        &mut self,
+        topic: &str,
+    ) -> IoResult<(String, Vec<crate::protocol::wire::DescribedPartition>)> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::DescribeTopic as u8);
 
@@ -383,7 +396,10 @@ impl TestClient {
         }
     }
 
-    pub async fn describe_group(&mut self, group_id: &str) -> IoResult<(String, Vec<crate::protocol::wire::DescribedGroupMember>)> {
+    pub async fn describe_group(
+        &mut self,
+        group_id: &str,
+    ) -> IoResult<(String, Vec<crate::protocol::wire::DescribedGroupMember>)> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::DescribeGroup as u8);
 
@@ -513,7 +529,11 @@ impl TestClient {
         }
     }
 
-    pub async fn begin_transaction(&mut self, transaction_id: &str, producer_id: u64) -> IoResult<()> {
+    pub async fn begin_transaction(
+        &mut self,
+        transaction_id: &str,
+        producer_id: u64,
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::BeginTx as u8);
 
@@ -619,7 +639,10 @@ impl TestClient {
 
         if status == 0 {
             if resp_payload.len() < 10 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Payload too short"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Payload too short",
+                ));
             }
             let producer_id = u64::from_be_bytes(resp_payload[0..8].try_into().unwrap());
             let producer_epoch = i16::from_be_bytes(resp_payload[8..10].try_into().unwrap());
@@ -631,7 +654,13 @@ impl TestClient {
         }
     }
 
-    pub async fn add_partitions_to_txn(&mut self, transactional_id: &str, producer_id: u64, producer_epoch: i16, topics: &[(&str, &[u32])]) -> IoResult<()> {
+    pub async fn add_partitions_to_txn(
+        &mut self,
+        transactional_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+        topics: &[(&str, &[u32])],
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::AddPartitionsToTxn as u8);
 
@@ -669,7 +698,13 @@ impl TestClient {
         }
     }
 
-    pub async fn end_txn(&mut self, transactional_id: &str, producer_id: u64, producer_epoch: i16, committed: bool) -> IoResult<()> {
+    pub async fn end_txn(
+        &mut self,
+        transactional_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::EndTxn as u8);
 
@@ -911,9 +946,13 @@ impl TestClient {
             let count = src.get_u32() as usize;
             let mut topics = Vec::with_capacity(count);
             for _ in 0..count {
-                if src.len() < 2 { break; }
+                if src.len() < 2 {
+                    break;
+                }
                 let len = src.get_u16() as usize;
-                if src.len() < len { break; }
+                if src.len() < len {
+                    break;
+                }
                 let t = String::from_utf8_lossy(&src[..len]).to_string();
                 src = &src[len..];
                 topics.push(t);
@@ -955,7 +994,12 @@ impl TestClient {
         }
     }
 
-    pub async fn join_group(&mut self, group_id: &str, member_id: &str, protocols: &[&str]) -> IoResult<String> {
+    pub async fn join_group(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        protocols: &[&str],
+    ) -> IoResult<String> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::JoinGroup as u8);
         let mut inner = Vec::new();
@@ -982,14 +1026,20 @@ impl TestClient {
         }
     }
 
-    pub async fn sync_group(&mut self, group_id: &str, generation_id: u32, member_id: &str, assignments: &[crate::protocol::wire::MemberAssignment]) -> IoResult<()> {
+    pub async fn sync_group(
+        &mut self,
+        group_id: &str,
+        generation_id: u32,
+        member_id: &str,
+        assignments: &[crate::protocol::wire::MemberAssignment],
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::SyncGroup as u8);
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, group_id);
         inner.put_u32(generation_id);
         crate::protocol::wire::write_pascal_string(&mut inner, member_id);
-        
+
         inner.put_u32(assignments.len() as u32);
         for a in assignments {
             crate::protocol::wire::write_pascal_string(&mut inner, &a.member_id);
@@ -1010,7 +1060,12 @@ impl TestClient {
         }
     }
 
-    pub async fn heartbeat(&mut self, group_id: &str, generation_id: u32, member_id: &str) -> IoResult<()> {
+    pub async fn heartbeat(
+        &mut self,
+        group_id: &str,
+        generation_id: u32,
+        member_id: &str,
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::Heartbeat as u8);
         let mut inner = Vec::new();
@@ -1043,7 +1098,14 @@ impl TestClient {
         }
     }
 
-    pub async fn offset_commit(&mut self, group_id: &str, topic: &str, partition: u32, offset: u64, metadata: &str) -> IoResult<()> {
+    pub async fn offset_commit(
+        &mut self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        metadata: &str,
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::OffsetCommit as u8);
         let mut inner = Vec::new();
@@ -1062,7 +1124,12 @@ impl TestClient {
         }
     }
 
-    pub async fn offset_fetch(&mut self, group_id: &str, topic: &str, partition: u32) -> IoResult<(u64, String)> {
+    pub async fn offset_fetch(
+        &mut self,
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> IoResult<(u64, String)> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::OffsetFetch as u8);
         let mut inner = Vec::new();
@@ -1075,7 +1142,9 @@ impl TestClient {
         if resp.status == 0 {
             let mut payload = &resp.payload[..];
             if payload.len() < 8 {
-                return Err(std::io::Error::other("Incomplete OffsetFetch response payload"));
+                return Err(std::io::Error::other(
+                    "Incomplete OffsetFetch response payload",
+                ));
             }
             let offset = payload.get_u64();
             let metadata = if payload.len() >= 2 {
@@ -1103,7 +1172,8 @@ pub struct RoutedClient {
     auth_token: Option<String>,
     connections: std::collections::HashMap<u32, TestClient>,
     broker_addrs: std::collections::HashMap<u32, SocketAddr>,
-    topic_metadata: std::collections::HashMap<String, Vec<crate::protocol::wire::DescribedPartition>>,
+    topic_metadata:
+        std::collections::HashMap<String, Vec<crate::protocol::wire::DescribedPartition>>,
 }
 
 impl RoutedClient {
@@ -1132,7 +1202,10 @@ impl RoutedClient {
     /// Refresh metadata for target topic via DescribeTopic
     pub async fn refresh_metadata(&mut self, topic: &str) -> IoResult<()> {
         let client = self.connections.get_mut(&1).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "Bootstrap client not connected")
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Bootstrap client not connected",
+            )
         })?;
 
         if let Ok(cluster) = client.describe_cluster().await {
@@ -1159,7 +1232,11 @@ impl RoutedClient {
     /// Ensures connection to target broker node ID
     pub async fn ensure_connection(&mut self, node_id: u32) -> IoResult<&mut TestClient> {
         if !self.connections.contains_key(&node_id) {
-            let addr = self.broker_addrs.get(&node_id).copied().unwrap_or(self.bootstrap_addr);
+            let addr = self
+                .broker_addrs
+                .get(&node_id)
+                .copied()
+                .unwrap_or(self.bootstrap_addr);
             let client = TestClient::connect(addr).await?;
             self.connections.insert(node_id, client);
         }

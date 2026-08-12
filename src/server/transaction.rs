@@ -59,7 +59,9 @@ impl TransactionManager {
     /// Records sequence number for idempotent producer
     pub fn record_sequence(&self, producer_id: u64, seq_num: u32) {
         if producer_id > 0 {
-            if self.producer_sequences.len() >= 100_000 && !self.producer_sequences.contains_key(&producer_id) {
+            if self.producer_sequences.len() >= 100_000
+                && !self.producer_sequences.contains_key(&producer_id)
+            {
                 self.producer_sequences.clear();
             }
             self.producer_sequences.insert(producer_id, seq_num);
@@ -67,7 +69,10 @@ impl TransactionManager {
     }
 
     pub fn generate_producer_id(&self) -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 
     pub fn add_partitions_to_txn(
@@ -81,19 +86,26 @@ impl TransactionManager {
         if !self.transactions.contains_key(transaction_id) {
             self.begin_transaction(transaction_id, producer_id)?;
         }
-        
-        let mut state = self.transactions.get_mut(transaction_id)
+
+        let mut state = self
+            .transactions
+            .get_mut(transaction_id)
             .ok_or_else(|| format!("Transaction '{}' not found", transaction_id))?;
-            
+
         if state.producer_id != producer_id {
             return Err("Producer ID mismatch".to_string());
         }
-        
+
         for (topic, parts) in topics {
             for part in parts {
-                let already = state.partitions.iter().any(|(t, p, _, _)| t == topic && p == part);
+                let already = state
+                    .partitions
+                    .iter()
+                    .any(|(t, p, _, _)| t == topic && p == part);
                 if !already {
-                    state.partitions.push((topic.clone(), *part, u64::MAX, u64::MAX));
+                    state
+                        .partitions
+                        .push((topic.clone(), *part, u64::MAX, u64::MAX));
                 }
             }
         }
@@ -104,7 +116,10 @@ impl TransactionManager {
     pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
         use dashmap::mapref::entry::Entry;
         match self.transactions.entry(transaction_id.to_string()) {
-            Entry::Occupied(_) => Err(format!("Transaction ID '{}' already exists", transaction_id)),
+            Entry::Occupied(_) => Err(format!(
+                "Transaction ID '{}' already exists",
+                transaction_id
+            )),
             Entry::Vacant(e) => {
                 e.insert(TransactionState {
                     transaction_id: transaction_id.to_string(),
@@ -118,7 +133,13 @@ impl TransactionManager {
     }
 
     /// Records that a produce touched (topic, partition) with the given start_offset for this tx.
-    pub fn register_partition(&self, transaction_id: &str, topic: &str, partition: u32, start_offset: u64) {
+    pub fn register_partition(
+        &self,
+        transaction_id: &str,
+        topic: &str,
+        partition: u32,
+        start_offset: u64,
+    ) {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             let mut found = false;
             for (t, p, ref mut so, _) in &mut state.partitions {
@@ -131,13 +152,18 @@ impl TransactionManager {
                 }
             }
             if !found {
-                state.partitions.push((topic.to_string(), partition, start_offset, u64::MAX));
+                state
+                    .partitions
+                    .push((topic.to_string(), partition, start_offset, u64::MAX));
             }
         }
     }
 
     /// Phase 1 2PC: Transitions transaction to PrepareCommit
-    pub fn prepare_commit(&self, transaction_id: &str) -> Result<(u64, PartitionRangeList), String> {
+    pub fn prepare_commit(
+        &self,
+        transaction_id: &str,
+    ) -> Result<(u64, PartitionRangeList), String> {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             if state.status != TxStatus::Ongoing {
                 return Err(format!("Transaction '{}' is not active", transaction_id));
@@ -153,7 +179,10 @@ impl TransactionManager {
     pub fn prepare_abort(&self, transaction_id: &str) -> Result<(u64, PartitionRangeList), String> {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             if state.status != TxStatus::Ongoing && state.status != TxStatus::PrepareAbort {
-                return Err(format!("Transaction '{}' cannot be aborted", transaction_id));
+                return Err(format!(
+                    "Transaction '{}' cannot be aborted",
+                    transaction_id
+                ));
             }
             state.status = TxStatus::PrepareAbort;
             Ok((state.producer_id, state.partitions.clone()))
@@ -173,7 +202,11 @@ impl TransactionManager {
     }
 
     /// Phase 2 2PC: Transitions transaction to Aborted
-    pub fn complete_abort(&self, transaction_id: &str, end_offsets: &[(String, u32, u64)]) -> Result<(), String> {
+    pub fn complete_abort(
+        &self,
+        transaction_id: &str,
+        end_offsets: &[(String, u32, u64)],
+    ) -> Result<(), String> {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             state.status = TxStatus::Aborted;
             for (topic, part, end_off) in end_offsets {
@@ -189,14 +222,15 @@ impl TransactionManager {
         }
     }
 
-
-
     /// Returns the Last Stable Offset (LSO) for a given (topic, partition).
     pub fn last_stable_offset(&self, topic: &str, partition: u32) -> u64 {
         let mut lso = u64::MAX;
         for entry in self.transactions.iter() {
             let state = entry.value();
-            if state.status == TxStatus::Ongoing || state.status == TxStatus::PrepareCommit || state.status == TxStatus::PrepareAbort {
+            if state.status == TxStatus::Ongoing
+                || state.status == TxStatus::PrepareCommit
+                || state.status == TxStatus::PrepareAbort
+            {
                 for (t, p, start_offset, _) in &state.partitions {
                     if t == topic && *p == partition && *start_offset < lso {
                         lso = *start_offset;
@@ -225,19 +259,29 @@ impl TransactionManager {
 
     /// Returns the producer_id for a transaction (CORR-03).
     pub fn get_producer_id(&self, transaction_id: &str) -> u64 {
-        self.transactions.get(transaction_id).map(|s| s.producer_id).unwrap_or(0)
+        self.transactions
+            .get(transaction_id)
+            .map(|s| s.producer_id)
+            .unwrap_or(0)
     }
 
     /// Returns the partition list for a transaction (BUG-12).
     pub fn get_partitions(&self, transaction_id: &str) -> PartitionRangeList {
-        self.transactions.get(transaction_id).map(|s| s.partitions.clone()).unwrap_or_default()
+        self.transactions
+            .get(transaction_id)
+            .map(|s| s.partitions.clone())
+            .unwrap_or_default()
     }
 
     /// Returns whether the given transaction_id is currently Ongoing.
     pub fn is_ongoing(&self, transaction_id: &str) -> bool {
         self.transactions
             .get(transaction_id)
-            .map(|s| s.status == TxStatus::Ongoing || s.status == TxStatus::PrepareCommit || s.status == TxStatus::PrepareAbort)
+            .map(|s| {
+                s.status == TxStatus::Ongoing
+                    || s.status == TxStatus::PrepareCommit
+                    || s.status == TxStatus::PrepareAbort
+            })
             .unwrap_or(false)
     }
 
@@ -257,7 +301,13 @@ impl TransactionManager {
     }
 
     /// Restores a transaction with its full partition list during startup recovery (BUG-12).
-    pub fn restore_transaction(&self, transaction_id: &str, producer_id: u64, status: TxStatus, partitions: PartitionRangeList) {
+    pub fn restore_transaction(
+        &self,
+        transaction_id: &str,
+        producer_id: u64,
+        status: TxStatus,
+        partitions: PartitionRangeList,
+    ) {
         self.transactions.insert(
             transaction_id.to_string(),
             TransactionState {
@@ -274,7 +324,12 @@ pub type DecodedTxStateRecord = (TxStatus, u64, String, PartitionRangeList);
 
 /// Binary encoding for __transaction_state log records with partition list (BUG-12).
 /// Format: `[status: 1b] [producer_id: 8b] [tx_id: pascal] [part_count: 4b] { [topic: pascal] [partition: 4b] [start_offset: 8b] [end_offset: 8b] }...`
-pub fn encode_tx_state_record(status: TxStatus, producer_id: u64, transaction_id: &str, partitions: &[(String, u32, u64, u64)]) -> Vec<u8> {
+pub fn encode_tx_state_record(
+    status: TxStatus,
+    producer_id: u64,
+    transaction_id: &str,
+    partitions: &[(String, u32, u64, u64)],
+) -> Vec<u8> {
     use bytes::BufMut;
     let mut buf = Vec::new();
     let status_byte = match status {
@@ -346,4 +401,3 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
     };
     Some((status, producer_id, tx_id, partitions))
 }
-

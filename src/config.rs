@@ -65,6 +65,14 @@ pub struct EngineConfig {
     /// Shared-secret token required from client connections (None = no auth check).
     /// Inter-node peers identified by `peer_addrs` are exempt from this check.
     pub auth_token: Option<String>,
+    /// Default per-client produce byte-rate quota in bytes/sec (Kafka
+    /// `quota.producer.default.bytes.per.second`). `None` = unlimited (default).
+    /// Clients exceeding this rate have their produce response delayed rather than
+    /// rejected, matching Kafka's throttling behavior.
+    pub produce_quota_bytes_per_sec: Option<u64>,
+    /// Default per-client fetch byte-rate quota in bytes/sec (Kafka
+    /// `quota.consumer.default.bytes.per.second`). `None` = unlimited (default).
+    pub fetch_quota_bytes_per_sec: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -75,7 +83,7 @@ impl Default for EngineConfig {
             role: NodeRole::Leader,
             data_dir: PathBuf::from("./data"),
             max_segment_bytes: 10 * 1024 * 1024, // 10 MB per segment
-            index_interval_bytes: 4096,           // 4 KB sparse index interval
+            index_interval_bytes: 4096,          // 4 KB sparse index interval
             flush_policy: FlushPolicy::default(),
             preallocate_segments: true,
             log_file_dir: PathBuf::from("./logs"),
@@ -84,9 +92,11 @@ impl Default for EngineConfig {
             min_insync_replicas: 1,
             default_replication_factor: 1,
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
-            retention_millis: Some(86400 * 1000),      // 24 hours retention
+            retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
             auth_token: None,
+            produce_quota_bytes_per_sec: None,
+            fetch_quota_bytes_per_sec: None,
         }
     }
 }
@@ -123,9 +133,7 @@ impl EngineConfig {
                         };
                     }
                     "listeners" | "bind.addr" => {
-                        let clean_addr = value
-                            .strip_prefix("PLAINTEXT://")
-                            .unwrap_or(value);
+                        let clean_addr = value.strip_prefix("PLAINTEXT://").unwrap_or(value);
                         config.bind_addr = clean_addr.to_string();
                     }
                     "log.dirs" | "data.dir" => {
@@ -171,10 +179,19 @@ impl EngineConfig {
                             config.retention_millis = Some(v);
                         }
                     }
-                    "auth.token"
-                        if !value.is_empty() => {
-                            config.auth_token = Some(value.to_string());
+                    "auth.token" if !value.is_empty() => {
+                        config.auth_token = Some(value.to_string());
+                    }
+                    "quota.producer.default.bytes.per.second" | "producer.byte.rate" => {
+                        if let Ok(v) = value.parse::<u64>() {
+                            config.produce_quota_bytes_per_sec = Some(v);
                         }
+                    }
+                    "quota.consumer.default.bytes.per.second" | "consumer.byte.rate" => {
+                        if let Ok(v) = value.parse::<u64>() {
+                            config.fetch_quota_bytes_per_sec = Some(v);
+                        }
+                    }
                     _ => {}
                 }
             }
