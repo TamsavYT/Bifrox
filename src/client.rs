@@ -52,15 +52,111 @@ pub struct ClusterDescription {
     pub brokers: Vec<(u32, String)>,
 }
 
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum ClientStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl tokio::io::AsyncRead for ClientStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ClientStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ClientStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ClientStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ClientStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ClientStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
+}
+
 /// Helper client for testing protocol commands over TCP
 #[derive(Debug)]
 pub struct TestClient {
     addr: SocketAddr,
-    stream: Option<TcpStream>,
+    stream: Option<ClientStream>,
 }
 
 impl TestClient {
-    async fn read_wire_response(stream: &mut TcpStream) -> IoResult<WireResponse> {
+    async fn read_wire_response<S: AsyncReadExt + Unpin>(stream: &mut S) -> IoResult<WireResponse> {
         let mut resp_header = [0u8; 5];
         stream.read_exact(&mut resp_header).await?;
         let status = resp_header[0];
@@ -86,7 +182,98 @@ impl TestClient {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self {
             addr,
-            stream: Some(stream),
+            stream: Some(ClientStream::Plain(stream)),
+        })
+    }
+
+    pub async fn connect_tls(addr: SocketAddr) -> IoResult<Self> {
+        Self::connect_tls_full(addr, None, None, false).await
+    }
+
+    pub async fn connect_tls_with_ca(
+        addr: SocketAddr,
+        ca_path: &std::path::Path,
+    ) -> IoResult<Self> {
+        Self::connect_tls_full(addr, Some(ca_path), None, false).await
+    }
+
+    pub async fn connect_mtls(
+        addr: SocketAddr,
+        ca_path: &std::path::Path,
+        client_cert_path: &std::path::Path,
+        client_key_path: &std::path::Path,
+    ) -> IoResult<Self> {
+        Self::connect_tls_full(
+            addr,
+            Some(ca_path),
+            Some((client_cert_path, client_key_path)),
+            false,
+        )
+        .await
+    }
+
+    pub async fn connect_tls_full(
+        addr: SocketAddr,
+        ca_path: Option<&std::path::Path>,
+        client_auth: Option<(&std::path::Path, &std::path::Path)>,
+        insecure_skip_verify: bool,
+    ) -> IoResult<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tcp_stream = TcpStream::connect(addr).await?;
+
+        let config = if insecure_skip_verify {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+                .with_no_client_auth()
+        } else {
+            let mut root_store = rustls::RootCertStore::empty();
+            if let Some(ca) = ca_path {
+                let ca_file = std::fs::File::open(ca)?;
+                let mut ca_reader = std::io::BufReader::new(ca_file);
+                let ca_certs =
+                    rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+                for c in ca_certs {
+                    root_store.add(c).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                }
+            } else {
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+            let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+            if let Some((cert_path, key_path)) = client_auth {
+                let cert_file = std::fs::File::open(cert_path)?;
+                let mut cert_reader = std::io::BufReader::new(cert_file);
+                let client_certs =
+                    rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+                let key_file = std::fs::File::open(key_path)?;
+                let mut key_reader = std::io::BufReader::new(key_file);
+                let client_key =
+                    rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "No private key found in client SSL key file",
+                        )
+                    })?;
+
+                builder
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                    })?
+            } else {
+                builder.with_no_client_auth()
+            }
+        };
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream = connector.connect(domain, tcp_stream).await?;
+        Ok(Self {
+            addr,
+            stream: Some(ClientStream::Tls(tls_stream)),
         })
     }
 
@@ -99,8 +286,14 @@ impl TestClient {
     }
 
     pub async fn reconnect(&mut self) -> IoResult<()> {
-        let stream = TcpStream::connect(self.addr).await?;
-        self.stream = Some(stream);
+        let is_tls = matches!(self.stream, Some(ClientStream::Tls(_)));
+        if is_tls {
+            let tls_client = Self::connect_tls(self.addr).await?;
+            self.stream = tls_client.stream;
+        } else {
+            let stream = TcpStream::connect(self.addr).await?;
+            self.stream = Some(ClientStream::Plain(stream));
+        }
         Ok(())
     }
 
@@ -248,8 +441,11 @@ impl TestClient {
                     break;
                 }
                 match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((frame, consumed)) => {
+                    Ok((mut frame, consumed)) => {
                         cursor += consumed;
+                        if let Ok(decompressed) = frame.decompress_payload() {
+                            frame.payload = decompressed;
+                        }
                         frames.push(frame);
                     }
                     Err(_) => break,
@@ -525,6 +721,201 @@ impl TestClient {
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn register_broker(&mut self, node_id: u32, endpoint: &str) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::RegisterBroker as u8);
+
+        let mut inner = Vec::new();
+        inner.put_u32(node_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, endpoint);
+
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn unregister_broker(&mut self, node_id: u32) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::UnregisterBroker as u8);
+
+        let mut inner = Vec::new();
+        inner.put_u32(node_id);
+
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn sasl_handshake(&mut self, mechanism: &str) -> IoResult<(i16, Vec<String>)> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::SaslHandshake as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, mechanism);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        let mut buf = &resp.payload[..];
+        if buf.len() < 6 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid SaslHandshake payload",
+            ));
+        }
+        let err_code = buf.get_i16();
+        let count = buf.get_u32() as usize;
+        let mut mechs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = buf.get_u16() as usize;
+            let m = String::from_utf8_lossy(&buf[..len]).to_string();
+            buf = &buf[len..];
+            mechs.push(m);
+        }
+        Ok((err_code, mechs))
+    }
+
+    pub async fn sasl_authenticate(&mut self, auth_bytes: &[u8]) -> IoResult<i16> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::SaslAuthenticate as u8);
+        req_buf.put_u32(auth_bytes.len() as u32);
+        req_buf.extend_from_slice(auth_bytes);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.payload.len() >= 2 {
+            let error_code = i16::from_be_bytes(resp.payload[0..2].try_into().unwrap());
+            Ok(error_code)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid SaslAuthenticate payload",
+            ))
+        }
+    }
+
+    pub async fn create_acl(&mut self, binding: &crate::server::acl::AclBinding) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::CreateAcls as u8);
+        let mut inner = Vec::new();
+        inner.put_u8(binding.resource_type);
+        crate::protocol::wire::write_pascal_string(&mut inner, &binding.resource_name);
+        inner.put_u8(binding.pattern_type);
+        crate::protocol::wire::write_pascal_string(&mut inner, &binding.principal);
+        crate::protocol::wire::write_pascal_string(&mut inner, &binding.host);
+        inner.put_u8(binding.operation);
+        inner.put_u8(binding.permission_type);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn describe_acls(
+        &mut self,
+        filter: &crate::server::acl::AclBinding,
+    ) -> IoResult<Vec<crate::server::acl::AclBinding>> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::DescribeAcls as u8);
+        let mut inner = Vec::new();
+        inner.put_u8(filter.resource_type);
+        crate::protocol::wire::write_pascal_string(&mut inner, &filter.resource_name);
+        inner.put_u8(filter.pattern_type);
+        crate::protocol::wire::write_pascal_string(&mut inner, &filter.principal);
+        crate::protocol::wire::write_pascal_string(&mut inner, &filter.host);
+        inner.put_u8(filter.operation);
+        inner.put_u8(filter.permission_type);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            let mut buf = &resp.payload[..];
+            if buf.len() < 6 {
+                return Ok(Vec::new());
+            }
+            let _err_code = buf.get_i16();
+            let count = buf.get_u32() as usize;
+            let mut result = Vec::with_capacity(count);
+            for _ in 0..count {
+                let resource_type = buf.get_u8();
+                let r_len = buf.get_u16() as usize;
+                let resource_name = String::from_utf8_lossy(&buf[..r_len]).to_string();
+                buf = &buf[r_len..];
+                let pattern_type = buf.get_u8();
+                let p_len = buf.get_u16() as usize;
+                let principal = String::from_utf8_lossy(&buf[..p_len]).to_string();
+                buf = &buf[p_len..];
+                let h_len = buf.get_u16() as usize;
+                let host = String::from_utf8_lossy(&buf[..h_len]).to_string();
+                buf = &buf[h_len..];
+                let operation = buf.get_u8();
+                let permission_type = buf.get_u8();
+                result.push(crate::server::acl::AclBinding {
+                    resource_type,
+                    resource_name,
+                    pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+            Ok(result)
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
             ))
         }
     }

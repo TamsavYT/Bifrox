@@ -5,8 +5,16 @@
 /data_m2/
 /data_store/
 /data/
+/data_*/
 *.log
+*.log.*
 *.index
+
+# Log directories & files
+log/
+logs/
+logs_*/
+log_*/
 
 # IDEs & Editor configurations
 .idea/

@@ -16,6 +16,36 @@ impl Drop for TestEnv {
     }
 }
 
+pub struct TestDataDirGuard {
+    pub path: std::path::PathBuf,
+}
+
+impl TestDataDirGuard {
+    pub fn new(prefix: &str) -> Self {
+        let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hermes_test_{}_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            nanos,
+            count
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TestDataDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Helper function implementing Rules A, B, and C:
 /// - Rule A: Unique Data Directory per test using nanosecond timestamping
 /// - Rule B: Bind TCP Server to Port 0 (Dynamic Ephemeral Port: 127.0.0.1:0)
@@ -1494,4 +1524,683 @@ async fn test_scenario_22_per_client_quota_throttling() {
         "Fetch exceeding quota should be delayed, only took {:?}",
         elapsed
     );
+}
+
+#[tokio::test]
+async fn test_scenario_23_cleanup_policy_log_compaction() {
+    use hermes::config::CleanupPolicy;
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    // 1. Verify parsing cleanup.policy from server.properties
+    let dir_guard = TestDataDirGuard::new("cleanup_policy_config_test");
+    let props_path = dir_guard.path.join("server.properties");
+    std::fs::write(
+        &props_path,
+        "cleanup.policy=compact\nlog.retention.bytes=52428800\n",
+    )
+    .unwrap();
+
+    let cfg = hermes::config::EngineConfig::from_properties_file(&props_path).unwrap();
+    assert_eq!(cfg.cleanup_policy, CleanupPolicy::Compact);
+    assert!(cfg.cleanup_policy.is_compact());
+    assert!(!cfg.cleanup_policy.is_delete());
+
+    // 2. Test SegmentManager Log Compaction behavior
+    let seg_dir_guard = TestDataDirGuard::new("log_compaction_segment_test");
+    let config = hermes::config::EngineConfig {
+        cleanup_policy: CleanupPolicy::Compact,
+        max_segment_bytes: 100, // Small max_segment_bytes to force segment rotations
+        ..Default::default()
+    };
+
+    let mut seg_mgr = hermes::segment::SegmentManager::open(&seg_dir_guard.path, config).unwrap();
+
+    // Append records with duplicate keys across multiple segment rotations
+    // Format: "key:value" payload
+    let r0 = seg_mgr.append(b"user1:val_1", 1000).unwrap(); // offset 0
+    let r1 = seg_mgr.append(b"user2:val_1", 1001).unwrap(); // offset 1
+    let r2 = seg_mgr.append(b"user1:val_2", 1002).unwrap(); // offset 2 (should override offset 0)
+
+    // Force rotation into historical segment
+    seg_mgr.rotate_segment().unwrap();
+
+    let r3 = seg_mgr.append(b"user2:val_2", 1003).unwrap(); // offset 3 (should override offset 1)
+    let r4 = seg_mgr.append(b"user1:val_3", 1004).unwrap(); // offset 4 (should override offset 2)
+
+    // Force another rotation
+    seg_mgr.rotate_segment().unwrap();
+
+    let r5 = seg_mgr.append(b"user3:val_1", 1005).unwrap(); // offset 5 in active segment
+
+    assert_eq!(r0.offset, 0);
+    assert_eq!(r1.offset, 1);
+    assert_eq!(r2.offset, 2);
+    assert_eq!(r3.offset, 3);
+    assert_eq!(r4.offset, 4);
+    assert_eq!(r5.offset, 5);
+
+    // Trigger log compaction garbage collector
+    let compacted_count = seg_mgr.apply_retention().unwrap();
+    assert!(
+        compacted_count >= 3,
+        "Compaction should drop older duplicate keys (offsets 0, 1, 2), dropped {}",
+        compacted_count
+    );
+
+    // Verify fetching remaining offsets returns latest values per key
+    let fetched_3 = seg_mgr.fetch(3, 1024).unwrap();
+    assert!(!fetched_3.is_empty());
+    assert_eq!(fetched_3[0].offset, 3);
+    assert_eq!(fetched_3[0].payload.as_ref(), b"user2:val_2");
+
+    let fetched_4 = seg_mgr.fetch(4, 1024).unwrap();
+    assert!(!fetched_4.is_empty());
+    assert_eq!(fetched_4[0].offset, 4);
+    assert_eq!(fetched_4[0].payload.as_ref(), b"user1:val_3");
+}
+
+#[tokio::test]
+async fn test_scenario_24_sasl_and_acls() {
+    use hermes::config::{EngineConfig, SecurityProtocol};
+    use hermes::server::acl::{AclBinding, AclOperation, AclPermissionType, ResourceType};
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    let dir_guard = TestDataDirGuard::new("sasl_acls_test");
+    let props_path = dir_guard.path.join("server.properties");
+    std::fs::write(
+        &props_path,
+        "security.protocol=SASL_PLAINTEXT\n\
+         sasl.enabled.mechanisms=PLAIN,SCRAM-SHA-256\n\
+         sasl.user.alice=password123\n\
+         sasl.user.admin=adminpass\n\
+         acls.enabled=true\n\
+         super.users=User:admin\n",
+    )
+    .unwrap();
+
+    // 1. Verify property file loading for SASL and ACLs
+    let config = EngineConfig::from_properties_file(&props_path).unwrap();
+    assert_eq!(config.security_protocol, SecurityProtocol::SaslPlaintext);
+    assert_eq!(
+        config.sasl_users.get("alice"),
+        Some(&"password123".to_string())
+    );
+    assert_eq!(
+        config.sasl_users.get("admin"),
+        Some(&"adminpass".to_string())
+    );
+    assert!(config.acls_enabled);
+    assert_eq!(config.super_users, vec!["User:admin".to_string()]);
+
+    // 2. Start Hermes server with SASL and ACL enforcement enabled
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut engine_cfg = config.clone();
+    engine_cfg.data_dir = dir_guard.path.clone();
+    engine_cfg.bind_addr = addr.to_string();
+
+    let engine = hermes::server::StorageEngine::new(engine_cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 3. Test SASL Handshake & Authenticate over TCP wire connection
+    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+
+    // SASL Handshake
+    let (err_code, mechs) = client.sasl_handshake("PLAIN").await.unwrap();
+    assert_eq!(err_code, 0);
+    assert!(mechs.contains(&"PLAIN".to_string()));
+
+    // SASL Authenticate with valid credentials for alice
+    let auth_payload = b"\0alice\0password123";
+    let auth_res = client.sasl_authenticate(auth_payload).await.unwrap();
+    assert_eq!(auth_res, 0); // 0 = SUCCESS
+
+    // SASL Authenticate with invalid credentials
+    let mut invalid_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let invalid_auth_res = invalid_client
+        .sasl_authenticate(b"\0alice\0wrongpass")
+        .await
+        .unwrap();
+    assert_eq!(invalid_auth_res, 58); // 58 = SASL_AUTHENTICATION_FAILED
+
+    // SASL Handshake for SCRAM-SHA-256 mechanism
+    let mut scram_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let (scram_err, scram_mechs) = scram_client.sasl_handshake("SCRAM-SHA-256").await.unwrap();
+    assert_eq!(scram_err, 0);
+    assert!(scram_mechs.contains(&"SCRAM-SHA-256".to_string()));
+
+    // SASL Authenticate for SCRAM-SHA-256 client-first message
+    let scram_auth_res = scram_client
+        .sasl_authenticate(b"n,,n=alice,r=rOprNGfwEbeRWgbNEkqO")
+        .await
+        .unwrap();
+    assert_eq!(scram_auth_res, 0);
+
+    // Authenticate admin client with superuser privileges
+    let mut admin_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let _ = admin_client.sasl_handshake("PLAIN").await.unwrap();
+    let admin_auth_res = admin_client
+        .sasl_authenticate(b"\0admin\0adminpass")
+        .await
+        .unwrap();
+    assert_eq!(admin_auth_res, 0);
+
+    // 4. Test ACL Management (CreateAcls & DescribeAcls)
+    let acl_binding = AclBinding {
+        resource_type: ResourceType::Topic as u8,
+        resource_name: "secure_orders".to_string(),
+        pattern_type: 3, // Literal
+        principal: "User:alice".to_string(),
+        host: "*".to_string(),
+        operation: AclOperation::Write as u8,
+        permission_type: AclPermissionType::Allow as u8,
+    };
+
+    // Non-admin alice attempt to create ACL fails authorization
+    let alice_acl_err = client.create_acl(&acl_binding).await;
+    assert!(
+        alice_acl_err.is_err(),
+        "non-superuser alice cannot create ACLs"
+    );
+
+    // Superuser admin creates ACL successfully
+    admin_client.create_acl(&acl_binding).await.unwrap();
+
+    let filter = AclBinding {
+        resource_type: ResourceType::Topic as u8,
+        resource_name: "secure_orders".to_string(),
+        pattern_type: 3,
+        principal: "*".to_string(),
+        host: "*".to_string(),
+        operation: 1,       // Any
+        permission_type: 1, // Any
+    };
+
+    let listed_acls = admin_client.describe_acls(&filter).await.unwrap();
+    assert_eq!(listed_acls.len(), 1);
+    assert_eq!(listed_acls[0].principal, "User:alice");
+
+    // 5. Test ACL Authorization enforcement on engine
+    // Authorized user 'User:alice' produce attempt -> Allowed
+    let is_authorized = engine.authorize(
+        "User:alice",
+        "127.0.0.1",
+        AclOperation::Write as u8,
+        ResourceType::Topic as u8,
+        "secure_orders",
+    );
+    assert!(is_authorized, "alice should be authorized by Allow ACL");
+
+    // Unauthorized user 'User:bob' produce attempt -> Denied
+    let is_bob_authorized = engine.authorize(
+        "User:bob",
+        "127.0.0.1",
+        AclOperation::Write as u8,
+        ResourceType::Topic as u8,
+        "secure_orders",
+    );
+    assert!(
+        !is_bob_authorized,
+        "bob should be denied access under default-deny ACL policy"
+    );
+
+    // Superuser 'User:admin' -> Always Allowed
+    let is_admin_authorized = engine.authorize(
+        "User:admin",
+        "127.0.0.1",
+        AclOperation::Write as u8,
+        ResourceType::Topic as u8,
+        "secure_orders",
+    );
+    assert!(is_admin_authorized, "superusers are exempt from ACL checks");
+}
+
+#[tokio::test]
+async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
+    use hermes::config::{EngineConfig, SecurityProtocol};
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    // 1. Test SSL mode over encrypted TLS transport
+    let dir_guard = TestDataDirGuard::new("ssl_transport_test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let ssl_cfg = EngineConfig {
+        security_protocol: SecurityProtocol::Ssl,
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(ssl_cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Connect TestClient over TLS (insecure mode for auto-generated self-signed test cert)
+    let mut tls_client = hermes::client::TestClient::connect_tls_full(addr, None, None, true)
+        .await
+        .unwrap();
+
+    // Produce over TLS
+    let recs = vec![bytes::Bytes::from("encrypted_payload_over_tls")];
+    let prod_res = tls_client
+        .produce_batch("tls_topic", "", None, 1, &recs)
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    // Fetch over TLS
+    let fetched = tls_client.fetch("tls_topic", 0, 0, 1024).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload.as_ref(), b"encrypted_payload_over_tls");
+
+    // 2. Test SASL_SSL mode (encrypted TLS transport + SASL authentication)
+    let sasl_ssl_guard = TestDataDirGuard::new("sasl_ssl_transport_test");
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+
+    let mut sasl_users = std::collections::HashMap::new();
+    sasl_users.insert("charlie".to_string(), "tls_secret_password".to_string());
+
+    let sasl_ssl_cfg = EngineConfig {
+        security_protocol: SecurityProtocol::SaslSsl,
+        sasl_mechanisms: vec!["PLAIN".to_string()],
+        sasl_users,
+        data_dir: sasl_ssl_guard.path.clone(),
+        bind_addr: addr2.to_string(),
+        ..Default::default()
+    };
+
+    let engine2 = hermes::server::StorageEngine::new(sasl_ssl_cfg).unwrap();
+    let server2 = hermes::server::Server::new(engine2.clone());
+
+    tokio::spawn(async move {
+        server2.run_with_listener(listener2).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Connect TestClient over TLS for SASL_SSL
+    let mut unauth_client = hermes::client::TestClient::connect_tls_full(addr2, None, None, true)
+        .await
+        .unwrap();
+    let unauth_res = unauth_client
+        .produce_batch("sasl_ssl_topic", "", None, 1, &recs)
+        .await;
+    assert!(
+        unauth_res.is_err(),
+        "Unauthenticated produce on SASL_SSL port must be rejected!"
+    );
+
+    let mut sasl_tls_client = hermes::client::TestClient::connect_tls_full(addr2, None, None, true)
+        .await
+        .unwrap();
+
+    let (err_code, mechs) = sasl_tls_client.sasl_handshake("PLAIN").await.unwrap();
+    assert_eq!(err_code, 0);
+    assert!(mechs.contains(&"PLAIN".to_string()));
+
+    let auth_res = sasl_tls_client
+        .sasl_authenticate(b"\0charlie\0tls_secret_password")
+        .await
+        .unwrap();
+    assert_eq!(auth_res, 0);
+
+    // Produce & Consume over SASL_SSL
+    let prod_res2 = sasl_tls_client
+        .produce_batch("sasl_ssl_topic", "", None, 1, &recs)
+        .await
+        .unwrap();
+    assert_eq!(prod_res2.first_offset, 0);
+
+    let fetched2 = sasl_tls_client
+        .fetch("sasl_ssl_topic", 0, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(fetched2.len(), 1);
+    assert_eq!(fetched2[0].payload.as_ref(), b"encrypted_payload_over_tls");
+}
+
+#[tokio::test]
+async fn test_scenario_26_pem_file_tls_key_and_mtls() {
+    use hermes::config::{EngineConfig, SecurityProtocol};
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    let dir_guard = TestDataDirGuard::new("pem_tls_file_test");
+
+    // Generate real X.509 CA certificate, server certificate, and client certificate
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let server_cert = rcgen::generate_simple_self_signed(subject_alt_names.clone()).unwrap();
+    let client_cert = rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
+
+    let cert_pem = server_cert.cert.pem();
+    let key_pem = server_cert.key_pair.serialize_pem();
+
+    let client_cert_pem = client_cert.cert.pem();
+    let client_key_pem = client_cert.key_pair.serialize_pem();
+
+    let cert_path = dir_guard.path.join("server.crt");
+    let key_path = dir_guard.path.join("server.key");
+
+    let client_cert_path = dir_guard.path.join("client.crt");
+    let client_key_path = dir_guard.path.join("client.key");
+
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    std::fs::write(&key_path, &key_pem).unwrap();
+
+    std::fs::write(&client_cert_path, &client_cert_pem).unwrap();
+    std::fs::write(&client_key_path, &client_key_pem).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Server configured with Mutual TLS (mTLS) enabled (ssl_client_auth = true)
+    let ssl_cfg = EngineConfig {
+        security_protocol: SecurityProtocol::Ssl,
+        ssl_cert_path: Some(cert_path.clone()),
+        ssl_key_path: Some(key_path.clone()),
+        ssl_ca_path: Some(client_cert_path.clone()), // trust the client's CA/cert
+        ssl_client_auth: "required".to_string(),
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(ssl_cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 1. Client connecting WITHOUT client cert when mTLS is required MUST fail handshake or request
+    let unauthenticated_client_res =
+        hermes::client::TestClient::connect_tls_with_ca(addr, &cert_path).await;
+    if let Ok(mut c) = unauthenticated_client_res {
+        let res = c.ping().await;
+        assert!(
+            res.is_err(),
+            "Client without client-cert authentication must be rejected by mTLS server"
+        );
+    }
+
+    // 2. Client connecting WITH valid client cert over mTLS MUST succeed and verify server CA
+    let mut mtls_client = hermes::client::TestClient::connect_mtls(
+        addr,
+        &cert_path,
+        &client_cert_path,
+        &client_key_path,
+    )
+    .await
+    .unwrap();
+
+    let recs = vec![bytes::Bytes::from("verified_pem_mtls_payload")];
+    let prod_res = mtls_client
+        .produce_batch("pem_tls_topic", "", None, 1, &recs)
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    let fetched = mtls_client
+        .fetch("pem_tls_topic", 0, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload.as_ref(), b"verified_pem_mtls_payload");
+}
+
+#[tokio::test]
+async fn test_scenario_27_dynamic_broker_registration_and_membership() {
+    use hermes::config::EngineConfig;
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    let dir_guard = TestDataDirGuard::new("dynamic_broker_membership_test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let cfg = EngineConfig {
+        node_id: 1,
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+
+    // Initial DescribeCluster -> 1 node (node 1)
+    let desc_initial = client.describe_cluster().await.unwrap();
+    assert_eq!(desc_initial.brokers.len(), 1);
+    assert_eq!(desc_initial.brokers[0].0, 1);
+
+    // Dynamic RegisterBroker for node 2 and node 3
+    client.register_broker(2, "127.0.0.1:9093").await.unwrap();
+    client.register_broker(3, "127.0.0.1:9094").await.unwrap();
+
+    // Query DescribeCluster -> 3 active brokers
+    let desc_after_reg = client.describe_cluster().await.unwrap();
+    assert_eq!(desc_after_reg.brokers.len(), 3);
+    assert_eq!(desc_after_reg.brokers[0], (1, addr.to_string()));
+    assert_eq!(desc_after_reg.brokers[1], (2, "127.0.0.1:9093".to_string()));
+    assert_eq!(desc_after_reg.brokers[2], (3, "127.0.0.1:9094".to_string()));
+
+    // Dynamic UnregisterBroker for node 2
+    client.unregister_broker(2).await.unwrap();
+
+    // Query DescribeCluster -> 2 active brokers (node 1, node 3)
+    let desc_after_unreg = client.describe_cluster().await.unwrap();
+    assert_eq!(desc_after_unreg.brokers.len(), 2);
+    assert_eq!(desc_after_unreg.brokers[0], (1, addr.to_string()));
+    assert_eq!(
+        desc_after_unreg.brokers[1],
+        (3, "127.0.0.1:9094".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
+    use hermes::config::EngineConfig;
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    let dir_guard = TestDataDirGuard::new("prometheus_and_lz4_test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let cfg = EngineConfig {
+        node_id: 1,
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        compression_codec: hermes::config::CompressionCodec::Lz4,
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Test Real End-to-End Client Produce & Fetch over LZ4-compressed storage engine
+    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let raw_payload_str = "end_to_end_lz4_wire_compressed_payload_0123456789_0123456789_0123456789";
+    let recs = vec![bytes::Bytes::from(raw_payload_str)];
+    let prod_res = client
+        .produce_batch("lz4_wire_topic", "", None, 1, &recs)
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    // Fetch over wire TCP: server returns 0xAC LZ4 compressed frame, client decompresses transparently
+    let fetched = client.fetch("lz4_wire_topic", 0, 0, 1024).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
+
+    // Verify on-disk log segment file directly: confirm 0xAC magic byte stored on disk
+    let log_file_path = dir_guard
+        .path
+        .join("lz4_wire_topic-0")
+        .join("00000000000000000000.log");
+    let log_bytes = std::fs::read(&log_file_path).unwrap();
+    let (disk_frame, _) = hermes::protocol::RecordFrame::decode(&log_bytes).unwrap();
+    assert_eq!(
+        disk_frame.magic,
+        hermes::protocol::COMPRESSED_LZ4_MAGIC_BYTE
+    );
+
+    // Query Prometheus HTTP /metrics Endpoint
+    let metrics_port = addr.port().checked_add(1000).unwrap_or(9090);
+    let metrics_url = format!("127.0.0.1:{}", metrics_port);
+    let mut http_stream = tokio::net::TcpStream::connect(&metrics_url).await.unwrap();
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = format!(
+        "GET /metrics HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        metrics_url
+    );
+    http_stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut resp_buf = Vec::new();
+    http_stream.read_to_end(&mut resp_buf).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+
+    assert!(resp_str.contains("200 OK"));
+    assert!(resp_str.contains("hermes_produce_bytes_total"));
+    assert!(resp_str.contains("hermes_produce_records_total"));
+    assert!(resp_str.contains("hermes_fetch_bytes_total"));
+    assert!(resp_str.contains("hermes_topics_count"));
+    assert!(resp_str.contains("hermes_active_brokers_count"));
+    assert!(resp_str.contains("hermes_active_connections"));
 }

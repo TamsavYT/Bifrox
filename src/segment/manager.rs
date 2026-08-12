@@ -9,6 +9,29 @@ use std::path::{Path, PathBuf};
 
 use crate::segment::txnindex::TxnIndexSegment;
 
+/// Helper to extract record key from payload for log compaction deduplication
+pub fn extract_key(payload: &[u8]) -> &[u8] {
+    if payload.len() >= 2 {
+        let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if key_len > 0 && 2 + key_len <= payload.len() {
+            return &payload[2..2 + key_len];
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(payload) {
+        if let Some((k, _)) = s.split_once(':') {
+            if !k.is_empty() {
+                return k.as_bytes();
+            }
+        }
+        if let Some((k, _)) = s.split_once('=') {
+            if !k.is_empty() {
+                return k.as_bytes();
+            }
+        }
+    }
+    payload
+}
+
 /// Segment pair holding associated log segment and index segment
 #[derive(Debug)]
 pub struct SegmentPair {
@@ -18,6 +41,35 @@ pub struct SegmentPair {
     pub time_index: TimeIndexSegment,
     pub txn_index: TxnIndexSegment,
     pub mmap: Option<crate::segment::mmap::MmapLogSegment>,
+}
+
+impl SegmentPair {
+    /// Reads all valid record frames sequentially from this log segment
+    pub fn read_all_frames(&mut self) -> IoResult<Vec<RecordFrame>> {
+        let size = self.log.physical_size as usize;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let raw_bytes = self.log.read_at(0, size)?;
+        let mut frames = Vec::new();
+        let mut cursor = 0usize;
+
+        while cursor < raw_bytes.len() {
+            if cursor + HEADER_SIZE > raw_bytes.len() {
+                break;
+            }
+            let slice = &raw_bytes[cursor..];
+            match RecordFrame::decode(slice) {
+                Ok((frame, consumed)) => {
+                    cursor += consumed;
+                    frames.push(frame);
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(frames)
+    }
 }
 
 /// Rotates log and index segments, manages historical segments, and performs index-accelerated seeks
@@ -133,8 +185,22 @@ impl SegmentManager {
 
     /// Append record frames into active segment. Performs segment rotation if size limit reached.
     pub fn append(&mut self, payload: &[u8], timestamp: u64) -> IoResult<RecordFrame> {
+        self.append_with_codec(payload, timestamp, false)
+    }
+
+    /// Append record frames with optional LZ4 payload compression
+    pub fn append_with_codec(
+        &mut self,
+        payload: &[u8],
+        timestamp: u64,
+        use_lz4: bool,
+    ) -> IoResult<RecordFrame> {
         let assigned_offset = self.high_watermark;
-        let frame = RecordFrame::create(assigned_offset, timestamp, payload.to_vec());
+        let frame = if use_lz4 {
+            RecordFrame::create_compressed_lz4(assigned_offset, timestamp, payload)
+        } else {
+            RecordFrame::create(assigned_offset, timestamp, payload.to_vec())
+        };
         let frame_size = frame.encoded_size() as u64;
 
         // Rotate segment if active log size exceeds configured threshold
@@ -206,7 +272,7 @@ impl SegmentManager {
     }
 
     /// Rotate active segment to new segment file
-    fn rotate_segment(&mut self) -> IoResult<()> {
+    pub fn rotate_segment(&mut self) -> IoResult<()> {
         let new_base_offset = self.high_watermark;
         tracing::info!(
             "Rotating segment at offset {}. Active segment size was {} bytes.",
@@ -335,8 +401,225 @@ impl SegmentManager {
             })
     }
 
-    /// Garbage collector: unlinks closed segments exceeding configured size or time retention limits
+    pub fn set_cleanup_policy(&mut self, policy: crate::config::CleanupPolicy) {
+        self.config.cleanup_policy = policy;
+    }
+
+    pub fn cleanup_policy(&self) -> crate::config::CleanupPolicy {
+        self.config.cleanup_policy
+    }
+
+    /// Garbage collector: applies log compaction and/or time/size retention based on configured cleanup.policy
     pub fn apply_retention(&mut self) -> IoResult<usize> {
+        let mut total_affected = 0;
+
+        if self.config.cleanup_policy.is_compact() {
+            total_affected += self.compact_segments()?;
+        }
+
+        if self.config.cleanup_policy.is_delete() {
+            total_affected += self.apply_delete_retention()?;
+        }
+
+        Ok(total_affected)
+    }
+
+    /// Log compaction garbage collector: deduplicates historical segment entries keeping only the latest offset per key
+    pub fn compact_segments(&mut self) -> IoResult<usize> {
+        if self.historical.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 1: Build map of key -> highest (latest) offset across all historical and active segments
+        let mut latest_offsets: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
+
+        for pair in &mut self.historical {
+            let frames = pair.read_all_frames()?;
+            for frame in frames {
+                if frame.is_control_marker() {
+                    continue;
+                }
+                let key = extract_key(&frame.payload).to_vec();
+                let entry = latest_offsets.entry(key).or_insert(frame.offset);
+                if frame.offset > *entry {
+                    *entry = frame.offset;
+                }
+            }
+        }
+
+        let active_frames = self.active.read_all_frames()?;
+        for frame in active_frames {
+            if frame.is_control_marker() {
+                continue;
+            }
+            let key = extract_key(&frame.payload).to_vec();
+            let entry = latest_offsets.entry(key).or_insert(frame.offset);
+            if frame.offset > *entry {
+                *entry = frame.offset;
+            }
+        }
+
+        if latest_offsets.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total_compacted_frames = 0;
+        let mut i = 0;
+
+        while i < self.historical.len() {
+            let all_frames = self.historical[i].read_all_frames()?;
+            if all_frames.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            let mut kept_frames = Vec::with_capacity(all_frames.len());
+            let mut discarded_count = 0;
+
+            for frame in all_frames {
+                if frame.is_control_marker() {
+                    kept_frames.push(frame);
+                } else {
+                    let key = extract_key(&frame.payload);
+                    if let Some(&latest_off) = latest_offsets.get(key) {
+                        if frame.offset == latest_off {
+                            kept_frames.push(frame);
+                        } else {
+                            discarded_count += 1;
+                        }
+                    } else {
+                        kept_frames.push(frame);
+                    }
+                }
+            }
+
+            if discarded_count == 0 {
+                i += 1;
+                continue;
+            }
+
+            total_compacted_frames += discarded_count;
+            let base_offset = self.historical[i].base_offset;
+
+            if kept_frames.is_empty() {
+                let pair_to_remove = self.historical.remove(i);
+                let log_path = pair_to_remove.log.path.clone();
+                let index_path = pair_to_remove.index.path().to_path_buf();
+                let time_index_path = pair_to_remove.time_index.path().to_path_buf();
+                let txn_index_path = pair_to_remove.txn_index.path().to_path_buf();
+
+                drop(pair_to_remove);
+
+                let _ = fs::remove_file(&log_path);
+                let _ = fs::remove_file(&index_path);
+                let _ = fs::remove_file(&time_index_path);
+                let _ = fs::remove_file(&txn_index_path);
+                continue;
+            }
+
+            let filename = format_segment_filename(base_offset);
+            let tmp_log_path = self.dir.join(format!("{}.log.compact", filename));
+            let tmp_index_path = self.dir.join(format!("{}.index.compact", filename));
+            let tmp_timeindex_path = self.dir.join(format!("{}.timeindex.compact", filename));
+            let tmp_txnindex_path = self.dir.join(format!("{}.txnindex.compact", filename));
+
+            let _ = fs::remove_file(&tmp_log_path);
+            let _ = fs::remove_file(&tmp_index_path);
+            let _ = fs::remove_file(&tmp_timeindex_path);
+            let _ = fs::remove_file(&tmp_txnindex_path);
+
+            {
+                let mut tmp_index = IndexSegment::open(&tmp_index_path, base_offset)?;
+                let mut tmp_timeindex = TimeIndexSegment::open(&tmp_timeindex_path, base_offset)?;
+                let mut tmp_txnindex = TxnIndexSegment::open(&tmp_txnindex_path)?;
+
+                for txn_e in self.historical[i].txn_index.entries() {
+                    tmp_txnindex.append(
+                        txn_e.producer_id,
+                        txn_e.first_offset,
+                        txn_e.last_offset,
+                    )?;
+                }
+
+                let mut tmp_log = LogSegment::open(
+                    &self.dir,
+                    base_offset,
+                    self.config.max_segment_bytes,
+                    self.config.index_interval_bytes,
+                    false,
+                    &mut tmp_index,
+                )?;
+
+                let mut bytes_since_last_index = 0u64;
+
+                for (idx, frame) in kept_frames.iter().enumerate() {
+                    let mut encoded = Vec::with_capacity(frame.encoded_size());
+                    frame.encode_into(&mut encoded);
+                    let phys_pos = tmp_log.append_bytes(&encoded)?;
+
+                    if idx == 0 || bytes_since_last_index >= self.config.index_interval_bytes {
+                        tmp_index.append(frame.offset, phys_pos)?;
+                        tmp_timeindex.append(frame.timestamp, frame.offset)?;
+                        bytes_since_last_index = 0;
+                    }
+                    bytes_since_last_index += encoded.len() as u64;
+                }
+
+                tmp_log.sync()?;
+                tmp_index.sync()?;
+                tmp_timeindex.sync()?;
+                tmp_txnindex.sync()?;
+            }
+
+            let pair_to_replace = self.historical.remove(i);
+            let log_path = pair_to_replace.log.path.clone();
+            let index_path = pair_to_replace.index.path().to_path_buf();
+            let time_index_path = pair_to_replace.time_index.path().to_path_buf();
+            let txn_index_path = pair_to_replace.txn_index.path().to_path_buf();
+
+            drop(pair_to_replace);
+
+            let _ = fs::remove_file(&log_path);
+            let _ = fs::remove_file(&index_path);
+            let _ = fs::remove_file(&time_index_path);
+            let _ = fs::remove_file(&txn_index_path);
+
+            fs::rename(&tmp_log_path, &log_path)?;
+            fs::rename(&tmp_index_path, &index_path)?;
+            fs::rename(&tmp_timeindex_path, &time_index_path)?;
+            fs::rename(&tmp_txnindex_path, &txn_index_path)?;
+
+            let mut new_index = IndexSegment::open(&index_path, base_offset)?;
+            let new_timeindex = TimeIndexSegment::open(&time_index_path, base_offset)?;
+            let new_txnindex = TxnIndexSegment::open(&txn_index_path)?;
+            let new_log = LogSegment::open(
+                &self.dir,
+                base_offset,
+                self.config.max_segment_bytes,
+                self.config.index_interval_bytes,
+                false,
+                &mut new_index,
+            )?;
+
+            let new_pair = SegmentPair {
+                base_offset,
+                log: new_log,
+                index: new_index,
+                time_index: new_timeindex,
+                txn_index: new_txnindex,
+                mmap: None,
+            };
+
+            self.historical.insert(i, new_pair);
+            i += 1;
+        }
+
+        Ok(total_compacted_frames)
+    }
+
+    /// Garbage collector: unlinks closed segments exceeding configured size or time retention limits
+    pub fn apply_delete_retention(&mut self) -> IoResult<usize> {
         let mut removed_count = 0;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -376,6 +659,7 @@ impl SegmentManager {
                 let log_path = pair_to_remove.log.path.clone();
                 let index_path = pair_to_remove.index.path().to_path_buf();
                 let time_index_path = pair_to_remove.time_index.path().to_path_buf();
+                let txn_index_path = pair_to_remove.txn_index.path().to_path_buf();
 
                 tracing::info!(
                     "Garbage Collector: Unlinking expired log segment {} and index {}",
@@ -389,6 +673,7 @@ impl SegmentManager {
                 let _ = fs::remove_file(&log_path);
                 let _ = fs::remove_file(&index_path);
                 let _ = fs::remove_file(&time_index_path);
+                let _ = fs::remove_file(&txn_index_path);
                 removed_count += 1;
             } else {
                 i += 1;

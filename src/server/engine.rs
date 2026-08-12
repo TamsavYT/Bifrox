@@ -76,6 +76,7 @@ pub struct TopicConfig {
     pub topic: String,
     pub num_partitions: u32,
     pub replication_factor: u16,
+    pub cleanup_policy: crate::config::CleanupPolicy,
     pub partitions: std::collections::HashMap<u32, PartitionAssignment>,
 }
 
@@ -94,6 +95,8 @@ pub struct StorageEngine {
     group_coordinator: Arc<GroupCoordinator>,
     broker_addrs: Arc<DashMap<u32, String>>,
     quota: Arc<QuotaManager>,
+    acl: Arc<crate::server::acl::AclManager>,
+    metrics: Arc<crate::server::metrics::MetricsCollector>,
 }
 
 impl StorageEngine {
@@ -107,20 +110,20 @@ impl StorageEngine {
             peer_addrs: config.peer_addrs.clone(),
             min_insync_replicas: config.min_insync_replicas,
         };
-        // Shared between StorageEngine and ReplicationManager so that broker addresses
-        // learned via the heartbeat round-trip (see send_leader_heartbeat) are visible
-        // to both partition-leader routing (StorageEngine) and heartbeat broadcasting
-        // (ReplicationManager) without a second, out-of-sync copy of the registry.
-        let broker_addrs: Arc<DashMap<u32, String>> = Arc::new(DashMap::new());
+
+        let broker_addrs = Arc::new(DashMap::new());
         let replication = ReplicationManager::new(
             cluster_config,
             config.bind_addr.clone(),
             broker_addrs.clone(),
         );
+        let group_coordinator = Arc::new(GroupCoordinator::new());
         let quota = Arc::new(QuotaManager::new(
             config.produce_quota_bytes_per_sec,
             config.fetch_quota_bytes_per_sec,
         ));
+        let acl = Arc::new(crate::server::acl::AclManager::new());
+        let metrics = Arc::new(crate::server::metrics::MetricsCollector::new());
 
         let engine = Self {
             config,
@@ -130,9 +133,11 @@ impl StorageEngine {
             consumer_groups,
             transactions,
             replication,
-            group_coordinator: Arc::new(GroupCoordinator::new()),
+            group_coordinator,
             broker_addrs,
             quota,
+            acl,
+            metrics,
         };
 
         engine
@@ -209,14 +214,24 @@ impl StorageEngine {
     /// Accounts `bytes` of produced data for `client_key` (typically the connecting
     /// client's source IP) and delays as needed to enforce `produce_quota_bytes_per_sec`.
     /// No-op when no produce quota is configured.
-    pub async fn throttle_produce(&self, client_key: &str, bytes: u64) {
+    pub async fn throttle_produce(&self, client_key: &str, bytes: u64, records: u64) {
+        self.metrics.record_produce(bytes, records);
+        let start = std::time::Instant::now();
         self.quota.throttle_produce(client_key, bytes).await;
+        if start.elapsed() > std::time::Duration::from_millis(5) {
+            self.metrics.record_quota_throttle();
+        }
     }
 
     /// Accounts `bytes` of fetched data for `client_key` and delays as needed to
     /// enforce `fetch_quota_bytes_per_sec`. No-op when no fetch quota is configured.
     pub async fn throttle_fetch(&self, client_key: &str, bytes: u64) {
+        self.metrics.record_fetch(bytes);
+        let start = std::time::Instant::now();
         self.quota.throttle_fetch(client_key, bytes).await;
+        if start.elapsed() > std::time::Duration::from_millis(5) {
+            self.metrics.record_quota_throttle();
+        }
     }
 
     /// Returns true if this node is the cluster Leader (handles produces + replicates)
@@ -268,6 +283,7 @@ impl StorageEngine {
                 )?);
 
                 if let Some(cfg) = self.topic_registry.get(topic) {
+                    pm.set_cleanup_policy(cfg.cleanup_policy);
                     if let Some(assign) = cfg.partitions.get(&partition) {
                         pm.update_leadership(
                             assign.leader_id,
@@ -319,6 +335,7 @@ impl StorageEngine {
                                         topic,
                                         num_partitions,
                                         replication_factor,
+                                        cleanup_policy: self.config.cleanup_policy,
                                         partitions: std::collections::HashMap::new(),
                                     },
                                 );
@@ -351,8 +368,17 @@ impl StorageEngine {
                             } => {
                                 self.broker_addrs.insert(node_id, bind_addr);
                             }
+                            crate::replication::MetadataRecord::BrokerUnregister { node_id } => {
+                                self.broker_addrs.remove(&node_id);
+                            }
                             crate::replication::MetadataRecord::TopicDeleted { topic } => {
                                 self.topic_registry.remove(&topic);
+                            }
+                            crate::replication::MetadataRecord::AclCreated { binding } => {
+                                self.acl.add_acl(binding);
+                            }
+                            crate::replication::MetadataRecord::AclDeleted { binding } => {
+                                self.acl.remove_acl(&binding);
                             }
                         }
                     }
@@ -361,6 +387,64 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    pub fn acl(&self) -> &crate::server::acl::AclManager {
+        &self.acl
+    }
+
+    pub fn metrics(&self) -> &Arc<crate::server::metrics::MetricsCollector> {
+        &self.metrics
+    }
+
+    pub fn authorize(
+        &self,
+        principal: &str,
+        host: &str,
+        operation: u8,
+        resource_type: u8,
+        resource_name: &str,
+    ) -> bool {
+        let allowed = self.acl.authorize(
+            principal,
+            host,
+            operation,
+            resource_type,
+            resource_name,
+            &self.config.super_users,
+            self.config.acls_enabled,
+        );
+        if !allowed {
+            self.metrics.record_acl_deny();
+        }
+        allowed
+    }
+
+    pub fn create_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+        let record = crate::replication::MetadataRecord::AclCreated {
+            binding: binding.clone(),
+        };
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+        Ok(self.acl.add_acl(binding))
+    }
+
+    pub fn delete_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+        let record = crate::replication::MetadataRecord::AclDeleted {
+            binding: binding.clone(),
+        };
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+        Ok(self.acl.remove_acl(&binding))
+    }
+
+    pub fn list_acls(
+        &self,
+        filter: crate::server::acl::AclBinding,
+    ) -> Vec<crate::server::acl::AclBinding> {
+        self.acl.list_acls(&filter)
     }
 
     /// P2: Replays the __transaction_state log to restore in-flight transactions after restart (BUG-12).
@@ -866,6 +950,7 @@ impl StorageEngine {
                 topic: topic.to_string(),
                 num_partitions,
                 replication_factor,
+                cleanup_policy: self.config.cleanup_policy,
                 partitions: partitions.clone(),
             },
         );
@@ -881,6 +966,18 @@ impl StorageEngine {
         }
 
         Ok(())
+    }
+
+    /// Dynamically update a topic's cleanup policy (Kafka topic config alteration)
+    pub fn set_topic_cleanup_policy(&self, topic: &str, policy: crate::config::CleanupPolicy) {
+        if let Some(mut cfg) = self.topic_registry.get_mut(topic) {
+            cfg.cleanup_policy = policy;
+        }
+        for entry in self.partitions.iter() {
+            if entry.key().0 == topic {
+                entry.value().set_cleanup_policy(policy);
+            }
+        }
     }
 
     /// Returns list of all active non-system topics (Sprint 5)
@@ -926,6 +1023,34 @@ impl StorageEngine {
     /// Registers a broker socket address mapping (node_id -> bind_addr)
     pub fn register_broker_address(&self, node_id: u32, bind_addr: String) {
         self.broker_addrs.insert(node_id, bind_addr);
+    }
+
+    /// Unregisters a broker socket address mapping
+    pub fn unregister_broker_address(&self, node_id: u32) {
+        self.broker_addrs.remove(&node_id);
+    }
+
+    /// Dynamically registers a broker in the cluster metadata catalog and replicates to peers
+    pub fn register_broker(&self, node_id: u32, bind_addr: String) -> IoResult<()> {
+        let record = crate::replication::MetadataRecord::BrokerRegister {
+            node_id,
+            bind_addr: bind_addr.clone(),
+        };
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+        self.register_broker_address(node_id, bind_addr);
+        Ok(())
+    }
+
+    /// Dynamically unregisters a broker from the cluster metadata catalog and replicates to peers
+    pub fn unregister_broker(&self, node_id: u32) -> IoResult<()> {
+        let record = crate::replication::MetadataRecord::BrokerUnregister { node_id };
+        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+            let _ = meta_pm.produce(&record.encode());
+        }
+        self.unregister_broker_address(node_id);
+        Ok(())
     }
 
     /// Returns the active bind address for a broker node ID

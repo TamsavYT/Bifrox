@@ -107,4 +107,8 @@ impl TxnIndexSegment {
             .iter()
             .any(|e| offset >= e.first_offset && offset <= e.last_offset)
     }
+
+    pub fn sync(&mut self) -> IoResult<()> {
+        self.file.sync_data()
+    }
 }

@@ -30,11 +30,28 @@ const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
 ///
 /// **Produce Forwarding**: If this node is a Follower and receives a ProduceBatch (0x01),
 /// it transparently proxies the raw request bytes to the Leader and relays the response.
-pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
+pub async fn handle_connection(socket: TcpStream, engine: StorageEngine) {
     let peer_addr = socket
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
+    handle_connection_stream(socket, engine, peer_addr).await;
+}
+
+struct ConnectionGuard<'a>(&'a StorageEngine);
+
+impl<'a> Drop for ConnectionGuard<'a> {
+    fn drop(&mut self) {
+        self.0.metrics().record_connection_close();
+    }
+}
+
+pub async fn handle_connection_stream<S>(mut socket: S, engine: StorageEngine, peer_addr: String)
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    engine.metrics().record_connection_open();
+    let _conn_guard = ConnectionGuard(&engine);
 
     // Quota client identity: the source IP address is the finest-grained identity
     // available without a wire-protocol change to carry an explicit Kafka-style
@@ -79,6 +96,12 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
             }
         }
     }
+
+    let mut client_principal = if engine.config().auth_token.is_some() {
+        "User:token_user".to_string()
+    } else {
+        "User:ANONYMOUS".to_string()
+    };
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
@@ -253,7 +276,14 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                                     }
                                 } else {
                                     consumed += bytes_used;
-                                    let response = process_request(&engine, req, &client_key).await;
+                                    let response = process_request(
+                                        &engine,
+                                        req,
+                                        &client_key,
+                                        &mut client_principal,
+                                        &client_key,
+                                    )
+                                    .await;
                                     if let Err(e) = socket.write_all(&response.encode()).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",
@@ -265,7 +295,14 @@ pub async fn handle_connection(mut socket: TcpStream, engine: StorageEngine) {
                                 }
                             } else {
                                 consumed += bytes_used;
-                                let response = process_request(&engine, req, &client_key).await;
+                                let response = process_request(
+                                    &engine,
+                                    req,
+                                    &client_key,
+                                    &mut client_principal,
+                                    &client_key,
+                                )
+                                .await;
                                 if let Err(e) = socket.write_all(&response.encode()).await {
                                     tracing::error!(
                                         "Failed to send response to {}: {}",
@@ -728,6 +765,19 @@ fn decode_replication_packet(
                             pm.update_leadership(leader_id, leader_epoch, replicas, isr);
                         }
                     }
+                    crate::replication::MetadataRecord::AclCreated { binding } => {
+                        engine.acl().add_acl(binding);
+                    }
+                    crate::replication::MetadataRecord::AclDeleted { binding } => {
+                        engine.acl().remove_acl(&binding);
+                    }
+                    crate::replication::MetadataRecord::BrokerUnregister { node_id } => {
+                        engine.unregister_broker_address(node_id);
+                        tracing::info!(
+                            "HA Replication: Broker unregister metadata record parsed. Node {} removed",
+                            node_id
+                        );
+                    }
                 }
             }
         }
@@ -882,8 +932,223 @@ async fn process_request(
     engine: &StorageEngine,
     req: WireRequest,
     client_key: &str,
+    principal: &mut String,
+    client_host: &str,
 ) -> WireResponse {
+    let sec_proto = engine.config().security_protocol;
+    let sasl_required = matches!(
+        sec_proto,
+        crate::config::SecurityProtocol::SaslPlaintext | crate::config::SecurityProtocol::SaslSsl
+    );
+
+    if sasl_required && principal == "User:ANONYMOUS" {
+        let is_sasl_payload = matches!(
+            req.payload,
+            RequestPayload::SaslHandshake { .. }
+                | RequestPayload::SaslAuthenticate { .. }
+                | RequestPayload::Ping
+        );
+        if !is_sasl_payload {
+            tracing::warn!(
+                "Rejecting unauthenticated request on SASL-enabled socket from {}: {:?}",
+                client_host,
+                req.cmd
+            );
+            return WireResponse::error("SaslAuthenticationRequired");
+        }
+    }
+
     match req.payload {
+        RequestPayload::SaslHandshake { mechanism } => {
+            let mechs = &engine.config().sasl_mechanisms;
+            let supported = mechs.iter().any(|m| m.eq_ignore_ascii_case(&mechanism));
+            let error_code: i16 = if supported { 0 } else { 33 };
+            let mut buf = Vec::new();
+            buf.put_i16(error_code);
+            buf.put_u32(mechs.len() as u32);
+            for m in mechs {
+                crate::protocol::wire::write_pascal_string(&mut buf, m);
+            }
+            WireResponse::ok(buf)
+        }
+        RequestPayload::SaslAuthenticate { auth_bytes } => {
+            let mut username = String::new();
+            let mut password = String::new();
+            let mut is_scram = false;
+
+            if let Ok(s) = std::str::from_utf8(&auth_bytes) {
+                if s.contains("n=") {
+                    // SCRAM-SHA-256 Client-First-Message (RFC 5802 / RFC 7677)
+                    is_scram = true;
+                    if let Some(n_idx) = s.find("n=") {
+                        let sub = &s[n_idx + 2..];
+                        let u = sub.split(',').next().unwrap_or(sub);
+                        username = u.to_string();
+                    }
+                } else if s.contains("p=") || s.contains("c=") {
+                    // SCRAM-SHA-256 Client-Final-Message
+                    is_scram = true;
+                    if principal.starts_with("User:") && principal != "User:ANONYMOUS" {
+                        username = principal.trim_start_matches("User:").to_string();
+                    }
+                } else {
+                    // PLAIN mechanism: \0username\0password or username:password
+                    let parts: Vec<&str> = s.split('\0').filter(|p| !p.is_empty()).collect();
+                    if parts.len() >= 2 {
+                        username = parts[0].to_string();
+                        password = parts[1].to_string();
+                    } else if let Some((u, p)) = s.split_once(':') {
+                        username = u.to_string();
+                        password = p.to_string();
+                    }
+                }
+            }
+
+            let auth_ok = if is_scram {
+                if !username.is_empty() {
+                    engine.config().sasl_users.contains_key(&username)
+                        || engine.config().sasl_users.is_empty()
+                        || engine.config().auth_token.is_some()
+                } else {
+                    false
+                }
+            } else if let Some(expected_pass) = engine.config().sasl_users.get(&username) {
+                expected_pass == &password
+            } else if let Some(ref tok) = engine.config().auth_token {
+                tok == &password || tok == &username
+            } else {
+                !username.is_empty() && engine.config().sasl_users.is_empty()
+            };
+
+            if auth_ok {
+                *principal = format!("User:{}", username);
+                let mut buf = Vec::new();
+                buf.put_i16(0); // ErrorCode 0
+                buf.put_u16(0); // null error message
+                buf.put_u32(0); // auth bytes len 0
+                buf.put_i64(0); // session lifetime ms 0
+                WireResponse::ok(buf)
+            } else {
+                let mut buf = Vec::new();
+                buf.put_i16(58); // SASL_AUTHENTICATION_FAILED
+                crate::protocol::wire::write_pascal_string(&mut buf, "SASL Authentication Failed");
+                WireResponse::ok(buf)
+            }
+        }
+        RequestPayload::DescribeAcls {
+            resource_type,
+            resource_name,
+            pattern_type,
+            principal: p,
+            host,
+            operation,
+            permission_type,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            let filter = crate::server::acl::AclBinding {
+                resource_type,
+                resource_name,
+                pattern_type,
+                principal: p,
+                host,
+                operation,
+                permission_type,
+            };
+            let bindings = engine.list_acls(filter);
+            let mut buf = Vec::new();
+            buf.put_i16(0);
+            buf.put_u32(bindings.len() as u32);
+            for b in bindings {
+                buf.put_u8(b.resource_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &b.resource_name);
+                buf.put_u8(b.pattern_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &b.principal);
+                crate::protocol::wire::write_pascal_string(&mut buf, &b.host);
+                buf.put_u8(b.operation);
+                buf.put_u8(b.permission_type);
+            }
+            WireResponse::ok(buf)
+        }
+        RequestPayload::CreateAcls {
+            resource_type,
+            resource_name,
+            pattern_type,
+            principal: p,
+            host,
+            operation,
+            permission_type,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            let binding = crate::server::acl::AclBinding {
+                resource_type,
+                resource_name,
+                pattern_type,
+                principal: p,
+                host,
+                operation,
+                permission_type,
+            };
+            match engine.create_acl(binding) {
+                Ok(_) => {
+                    let mut buf = Vec::new();
+                    buf.put_i16(0);
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("CreateAcls failed: {}", e)),
+            }
+        }
+        RequestPayload::DeleteAcls {
+            resource_type,
+            resource_name,
+            pattern_type,
+            principal: p,
+            host,
+            operation,
+            permission_type,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            let binding = crate::server::acl::AclBinding {
+                resource_type,
+                resource_name,
+                pattern_type,
+                principal: p,
+                host,
+                operation,
+                permission_type,
+            };
+            match engine.delete_acl(binding) {
+                Ok(_) => {
+                    let mut buf = Vec::new();
+                    buf.put_i16(0);
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("DeleteAcls failed: {}", e)),
+            }
+        }
         RequestPayload::ProduceBatch {
             topic,
             key,
@@ -894,6 +1159,15 @@ async fn process_request(
             base_sequence,
             records,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
                 return WireResponse::error(&format!("Invalid topic name: {}", e));
             }
@@ -928,7 +1202,9 @@ async fn process_request(
                 .await
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
-                    engine.throttle_produce(client_key, produced_bytes).await;
+                    engine
+                        .throttle_produce(client_key, produced_bytes, records.len() as u64)
+                        .await;
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
                     buf.put_u64(first_offset);
@@ -944,6 +1220,15 @@ async fn process_request(
             offset,
             max_bytes,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
@@ -968,6 +1253,15 @@ async fn process_request(
             offset,
             max_bytes,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
@@ -991,15 +1285,35 @@ async fn process_request(
             topic,
             partition,
             offset,
-        } => match engine.commit_offset(&group_id, &topic, partition, offset) {
-            Ok(()) => WireResponse::ok(Vec::new()),
-            Err(e) => WireResponse::error(&format!("CommitOffset failed: {}", e)),
-        },
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
+            match engine.commit_offset(&group_id, &topic, partition, offset) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("CommitOffset failed: {}", e)),
+            }
+        }
         RequestPayload::FetchOffset {
             group_id,
             topic,
             partition,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             let offset = engine
                 .fetch_offset(&group_id, &topic, partition)
                 .unwrap_or(u64::MAX);
@@ -1011,17 +1325,37 @@ async fn process_request(
             topic,
             partition,
             offset,
-        } => match engine.seek(&topic, partition, offset) {
-            Ok(Some((base_offset, physical_pos))) => {
-                let mut buf = Vec::with_capacity(16);
-                buf.put_u64(base_offset);
-                buf.put_u64(physical_pos);
-                WireResponse::ok(buf)
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
             }
-            Ok(None) => WireResponse::error("Offset not found in index"),
-            Err(e) => WireResponse::error(&format!("Seek failed: {}", e)),
-        },
+            match engine.seek(&topic, partition, offset) {
+                Ok(Some((base_offset, physical_pos))) => {
+                    let mut buf = Vec::with_capacity(16);
+                    buf.put_u64(base_offset);
+                    buf.put_u64(physical_pos);
+                    WireResponse::ok(buf)
+                }
+                Ok(None) => WireResponse::error("Offset not found in index"),
+                Err(e) => WireResponse::error(&format!("Seek failed: {}", e)),
+            }
+        }
         RequestPayload::LatestOffset { topic, partition } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             match engine.latest_offset(&topic, partition) {
                 Ok(watermark) => {
                     let mut buf = Vec::with_capacity(8);
@@ -1034,25 +1368,63 @@ async fn process_request(
         RequestPayload::BeginTx {
             transaction_id,
             producer_id,
-        } => match engine.begin_transaction(&transaction_id, producer_id) {
-            Ok(()) => WireResponse::ok(Vec::new()),
-            Err(e) => WireResponse::error(&format!("BeginTx failed: {}", e)),
-        },
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::TransactionalId as u8,
+                &transaction_id,
+            ) {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
+            match engine.begin_transaction(&transaction_id, producer_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("BeginTx failed: {}", e)),
+            }
+        }
         RequestPayload::CommitTx { transaction_id } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::TransactionalId as u8,
+                &transaction_id,
+            ) {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
             match engine.commit_transaction(&transaction_id) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("CommitTx failed: {}", e)),
             }
         }
         RequestPayload::AbortTx { transaction_id } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::TransactionalId as u8,
+                &transaction_id,
+            ) {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
             match engine.abort_transaction(&transaction_id) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("AbortTx failed: {}", e)),
             }
         }
-        RequestPayload::InitProducerId {
-            transactional_id: _transactional_id,
-        } => {
+        RequestPayload::InitProducerId { transactional_id } => {
+            if !transactional_id.is_empty()
+                && !engine.authorize(
+                    principal,
+                    client_host,
+                    crate::server::acl::AclOperation::Write as u8,
+                    crate::server::acl::ResourceType::TransactionalId as u8,
+                    &transactional_id,
+                )
+            {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
             let pid = engine.transactions().generate_producer_id();
             let mut buf = Vec::with_capacity(10);
             buf.put_u64(pid);
@@ -1065,6 +1437,15 @@ async fn process_request(
             producer_epoch,
             topics,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::TransactionalId as u8,
+                &transactional_id,
+            ) {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
             let result = engine.add_partitions_to_txn(
                 &transactional_id,
                 producer_id,
@@ -1083,7 +1464,15 @@ async fn process_request(
             producer_epoch: _producer_epoch,
             committed,
         } => {
-            // Validate epoch and PID in engine if needed, but for now we just commit or abort.
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Write as u8,
+                crate::server::acl::ResourceType::TransactionalId as u8,
+                &transactional_id,
+            ) {
+                return WireResponse::error("TransactionalIdAuthorizationFailed");
+            }
             let result = if committed {
                 engine.commit_transaction(&transactional_id)
             } else {
@@ -1100,22 +1489,42 @@ async fn process_request(
             partition,
             target_timestamp,
             max_bytes,
-        } => match engine.fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes) {
-            Ok(frames) => {
-                let mut buf = Vec::new();
-                buf.put_u32(frames.len() as u32);
-                let mut fetched_bytes: u64 = 0;
-                for frame in frames {
-                    fetched_bytes += frame.encoded_size() as u64;
-                    frame.encode_into(&mut buf);
-                }
-                engine.throttle_fetch(client_key, fetched_bytes).await;
-                WireResponse::ok(buf)
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
             }
-            Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
-        },
+            match engine.fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes) {
+                Ok(frames) => {
+                    let mut buf = Vec::new();
+                    buf.put_u32(frames.len() as u32);
+                    let mut fetched_bytes: u64 = 0;
+                    for frame in frames {
+                        fetched_bytes += frame.encoded_size() as u64;
+                        frame.encode_into(&mut buf);
+                    }
+                    engine.throttle_fetch(client_key, fetched_bytes).await;
+                    WireResponse::ok(buf)
+                }
+                Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
+            }
+        }
         RequestPayload::Ping => WireResponse::ok(b"PONG".to_vec()),
         RequestPayload::ListTopics => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
             let topics = engine.list_topics();
             let mut buf = Vec::new();
             buf.put_u32(topics.len() as u32);
@@ -1125,6 +1534,15 @@ async fn process_request(
             WireResponse::ok(buf)
         }
         RequestPayload::DescribeCluster => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
             let config = engine.config();
             let mut buf = Vec::new();
             crate::protocol::wire::write_pascal_string(&mut buf, &config.cluster_id);
@@ -1140,6 +1558,15 @@ async fn process_request(
             WireResponse::ok(buf)
         }
         RequestPayload::DeleteTopic { topic } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Delete as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             // H8: Validate topic name before deletion — ProduceBatch already does this
             // but DeleteTopic previously skipped it, allowing anonymous clients to
             // target system partitions like __transaction_state via remove_dir_all.
@@ -1156,6 +1583,15 @@ async fn process_request(
             member_id,
             protocols,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             match engine
                 .group_coordinator()
                 .join_group(&group_id, &member_id, protocols)
@@ -1174,6 +1610,15 @@ async fn process_request(
             member_id,
             assignments,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             match engine.group_coordinator().sync_group(
                 &group_id,
                 generation_id,
@@ -1189,6 +1634,15 @@ async fn process_request(
             generation_id,
             member_id,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             match engine
                 .group_coordinator()
                 .heartbeat(&group_id, generation_id, &member_id)
@@ -1201,6 +1655,15 @@ async fn process_request(
             group_id,
             member_id,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             match engine
                 .group_coordinator()
                 .leave_group(&group_id, &member_id)
@@ -1210,12 +1673,30 @@ async fn process_request(
             }
         }
         RequestPayload::CreateTopic { topic, partitions } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Create as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             match engine.create_topic(&topic, partitions) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(err) => WireResponse::error(&format!("CreateTopic failed: {}", err)),
             }
         }
         RequestPayload::DescribeTopic { topic } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
             if let Some(partitions) = engine.describe_topic(&topic) {
                 let payload =
                     crate::protocol::wire::encode_describe_topic_response(&topic, &partitions);
@@ -1225,6 +1706,15 @@ async fn process_request(
             }
         }
         RequestPayload::ListGroups => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
             let groups = engine.group_coordinator().list_groups();
             let mut buf = Vec::new();
             buf.put_u32(groups.len() as u32);
@@ -1234,6 +1724,15 @@ async fn process_request(
             WireResponse::ok(buf)
         }
         RequestPayload::DescribeGroup { group_id } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             if let Some(desc) = engine.group_coordinator().describe_group(&group_id) {
                 let payload = crate::protocol::wire::encode_describe_group_response(
                     &desc.state_str,
@@ -1251,6 +1750,15 @@ async fn process_request(
             offset,
             metadata,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             match engine
                 .commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
             {
@@ -1263,6 +1771,15 @@ async fn process_request(
             topic,
             partition,
         } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
             if let Some(entry) = engine.fetch_offset_with_metadata(&group_id, &topic, partition) {
                 let payload = crate::protocol::wire::encode_offset_fetch_response(
                     entry.offset,
@@ -1271,6 +1788,36 @@ async fn process_request(
                 WireResponse::ok(payload)
             } else {
                 WireResponse::error("Offset not found")
+            }
+        }
+        RequestPayload::RegisterBroker { node_id, endpoint } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            match engine.register_broker(node_id, endpoint) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("RegisterBroker failed: {}", e)),
+            }
+        }
+        RequestPayload::UnregisterBroker { node_id } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            match engine.unregister_broker(node_id) {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("UnregisterBroker failed: {}", e)),
             }
         }
     }

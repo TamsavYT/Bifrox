@@ -28,6 +28,15 @@ pub enum MetadataRecord {
         leader_epoch: u32,
         isr: Vec<u32>,
     },
+    AclCreated {
+        binding: crate::server::acl::AclBinding,
+    },
+    AclDeleted {
+        binding: crate::server::acl::AclBinding,
+    },
+    BrokerUnregister {
+        node_id: u32,
+    },
 }
 
 impl MetadataRecord {
@@ -84,6 +93,30 @@ impl MetadataRecord {
                 for &id in isr {
                     buf.put_u32(id);
                 }
+            }
+            MetadataRecord::AclCreated { binding } => {
+                buf.put_u8(0x06); // record type
+                buf.put_u8(binding.resource_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.resource_name);
+                buf.put_u8(binding.pattern_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.principal);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.host);
+                buf.put_u8(binding.operation);
+                buf.put_u8(binding.permission_type);
+            }
+            MetadataRecord::AclDeleted { binding } => {
+                buf.put_u8(0x07); // record type
+                buf.put_u8(binding.resource_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.resource_name);
+                buf.put_u8(binding.pattern_type);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.principal);
+                crate::protocol::wire::write_pascal_string(&mut buf, &binding.host);
+                buf.put_u8(binding.operation);
+                buf.put_u8(binding.permission_type);
+            }
+            MetadataRecord::BrokerUnregister { node_id } => {
+                buf.put_u8(0x08); // record type
+                buf.put_u32(*node_id);
             }
         }
         buf
@@ -183,6 +216,57 @@ impl MetadataRecord {
                     leader_epoch,
                     isr,
                 })
+            }
+            0x06 | 0x07 => {
+                if src.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete ACL metadata",
+                    ));
+                }
+                let resource_type = src.get_u8();
+                let resource_name = read_pascal_string_io(&mut src)?;
+                if src.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete ACL pattern_type",
+                    ));
+                }
+                let pattern_type = src.get_u8();
+                let principal = read_pascal_string_io(&mut src)?;
+                let host = read_pascal_string_io(&mut src)?;
+                if src.len() < 2 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete ACL operations",
+                    ));
+                }
+                let operation = src.get_u8();
+                let permission_type = src.get_u8();
+                let binding = crate::server::acl::AclBinding {
+                    resource_type,
+                    resource_name,
+                    pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                };
+                if record_type == 0x06 {
+                    Ok(MetadataRecord::AclCreated { binding })
+                } else {
+                    Ok(MetadataRecord::AclDeleted { binding })
+                }
+            }
+            0x08 => {
+                if src.len() < 4 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete BrokerUnregister node_id",
+                    ));
+                }
+                let node_id = src.get_u32();
+                Ok(MetadataRecord::BrokerUnregister { node_id })
             }
             _ => Err(Error::new(
                 ErrorKind::InvalidData,

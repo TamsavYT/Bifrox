@@ -1,11 +1,85 @@
 use crate::config::FlushPolicy;
 use crate::server::engine::StorageEngine;
-use crate::server::handler::handle_connection;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+
+pub fn build_tls_acceptor(
+    config: &crate::config::EngineConfig,
+) -> IoResult<tokio_rustls::TlsAcceptor> {
+    let (certs, key) =
+        if let (Some(cert_path), Some(key_path)) = (&config.ssl_cert_path, &config.ssl_key_path) {
+            let cert_file = std::fs::File::open(cert_path)?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+            let key_file = std::fs::File::open(key_path)?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No private key found in SSL key file",
+                )
+            })?;
+
+            (certs, key)
+        } else {
+            // Auto-generate self-signed TLS cert for testing & zero-config SSL mode
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let cert_der = cert.cert.der().to_vec();
+            let key_der = cert.key_pair.serialize_der();
+            (
+                vec![CertificateDer::from(cert_der)],
+                PrivateKeyDer::Pkcs8(key_der.into()),
+            )
+        };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let client_auth_enabled = matches!(
+        config.ssl_client_auth.to_lowercase().as_str(),
+        "required" | "requested" | "true"
+    );
+
+    let server_config = if client_auth_enabled {
+        let mut root_store = rustls::RootCertStore::empty();
+        if let Some(ca_path) = &config.ssl_ca_path {
+            let ca_file = std::fs::File::open(ca_path)?;
+            let mut ca_reader = std::io::BufReader::new(ca_file);
+            let ca_certs = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+            for c in ca_certs {
+                root_store.add(c).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+            }
+        } else {
+            for c in &certs {
+                let _ = root_store.add(c.clone());
+            }
+        }
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+    } else {
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+    };
+
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
 
 /// High-throughput Tokio TCP server backed by Windows IOCP
 pub struct Server {
@@ -57,6 +131,21 @@ impl Server {
         let local_addr = listener.local_addr()?;
         tracing::info!("TCP Storage Server listening on http://{}", local_addr);
 
+        let tls_acceptor = if matches!(
+            self.engine.config().security_protocol,
+            crate::config::SecurityProtocol::Ssl | crate::config::SecurityProtocol::SaslSsl
+        ) {
+            match build_tls_acceptor(self.engine.config()) {
+                Ok(acceptor) => Some(acceptor),
+                Err(e) => {
+                    tracing::error!("Failed to initialize TLS/SSL acceptor: {}", e);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
         if let FlushPolicy::AsyncPeriodic { interval, .. } = self.engine.config().flush_policy {
             let engine_clone = self.engine.clone();
             tokio::spawn(async move {
@@ -89,6 +178,38 @@ impl Server {
             }
         });
 
+        let metrics_engine = self.engine.clone();
+        tokio::spawn(async move {
+            let metrics_port = local_addr.port().checked_add(1000).unwrap_or(9090);
+            let metrics_addr = SocketAddr::from(([127, 0, 0, 1], metrics_port));
+            if let Ok(listener) = TcpListener::bind(metrics_addr).await {
+                tracing::info!(
+                    "Prometheus Metrics Exporter listening on http://{}/metrics",
+                    metrics_addr
+                );
+                loop {
+                    if let Ok((mut socket, _)) = listener.accept().await {
+                        let engine = metrics_engine.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = [0u8; 1024];
+                            let _ = socket.read(&mut buf).await;
+                            let body = engine.metrics().render_prometheus(
+                                engine.list_topics().len(),
+                                engine.broker_endpoints().len(),
+                            );
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+
         loop {
             tokio::select! {
                 res = listener.accept() => {
@@ -96,8 +217,30 @@ impl Server {
                         Ok((socket, addr)) => {
                             tracing::debug!("Accepted incoming connection from {}", addr);
                             let engine_clone = self.engine.clone();
+                            let acceptor = tls_acceptor.clone();
                             tokio::spawn(async move {
-                                handle_connection(socket, engine_clone).await;
+                                if let Some(acceptor) = acceptor {
+                                    match acceptor.accept(socket).await {
+                                        Ok(tls_stream) => {
+                                            crate::server::handler::handle_connection_stream(
+                                                tls_stream,
+                                                engine_clone,
+                                                addr.to_string(),
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("TLS handshake failed for {}: {}", addr, e);
+                                        }
+                                    }
+                                } else {
+                                    crate::server::handler::handle_connection_stream(
+                                        socket,
+                                        engine_clone,
+                                        addr.to_string(),
+                                    )
+                                    .await;
+                                }
                             });
                         }
                         Err(err) => {

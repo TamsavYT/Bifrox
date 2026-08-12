@@ -15,6 +15,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 socket2 = "0.5"
 memmap2 = "0.9"
-    
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.1"
+rcgen = "0.13"
+lz4_flex = "0.11"
+webpki-roots = "0.26"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }

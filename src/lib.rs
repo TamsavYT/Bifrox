@@ -7,7 +7,7 @@ pub mod segment;
 pub mod server;
 
 pub use client::{ProduceResult, RoutedClient, SeekResult, TestClient};
-pub use config::{EngineConfig, FlushPolicy};
+pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{CommandCode, FrameError, RecordFrame, WireError, WireRequest, WireResponse};
 pub use replication::{
@@ -20,6 +20,7 @@ pub use segment::{
     TimeIndexSegment, TxnIndexEntry, TxnIndexSegment,
 };
 pub use server::{
-    hash_key, PartitionManager, QuotaManager, Server, StorageEngine, TransactionManager,
-    TransactionState, TxStatus,
+    hash_key, AclBinding, AclManager, AclOperation, AclPermissionType, PartitionManager,
+    QuotaManager, ResourceType, Server, StorageEngine, TransactionManager, TransactionState,
+    TxStatus,
 };

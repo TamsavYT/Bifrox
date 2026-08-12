@@ -3,6 +3,7 @@ use crc32fast::Hasher;
 use thiserror::Error;
 
 pub const MAGIC_BYTE: u8 = 0xAB;
+pub const COMPRESSED_LZ4_MAGIC_BYTE: u8 = 0xAC;
 pub const CONTROL_MAGIC_BYTE: u8 = 0xAD;
 pub const HEADER_SIZE: usize = 1 + 4 + 8 + 8 + 4; // 25 bytes
 
@@ -46,6 +47,34 @@ impl RecordFrame {
             timestamp,
             payload_len,
             payload,
+        }
+    }
+
+    /// Creates an LZ4 compressed RecordFrame (magic 0xAC)
+    pub fn create_compressed_lz4(offset: u64, timestamp: u64, raw_payload: &[u8]) -> Self {
+        let compressed = lz4_flex::compress_prepend_size(raw_payload);
+        let payload = Bytes::from(compressed);
+        let payload_len = payload.len() as u32;
+        let crc = Self::calculate_crc(offset, timestamp, &payload);
+
+        Self {
+            magic: COMPRESSED_LZ4_MAGIC_BYTE,
+            crc,
+            offset,
+            timestamp,
+            payload_len,
+            payload,
+        }
+    }
+
+    /// Decompresses frame payload if frame magic is 0xAC (LZ4)
+    pub fn decompress_payload(&self) -> Result<Bytes, std::io::Error> {
+        if self.magic == COMPRESSED_LZ4_MAGIC_BYTE {
+            let decompressed = lz4_flex::decompress_size_prepended(&self.payload)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Bytes::from(decompressed))
+        } else {
+            Ok(self.payload.clone())
         }
     }
 
@@ -136,7 +165,8 @@ impl RecordFrame {
         }
 
         let magic = src.get_u8();
-        if magic != MAGIC_BYTE && magic != CONTROL_MAGIC_BYTE {
+        if magic != MAGIC_BYTE && magic != COMPRESSED_LZ4_MAGIC_BYTE && magic != CONTROL_MAGIC_BYTE
+        {
             return Err(FrameError::InvalidMagic {
                 expected: MAGIC_BYTE,
                 found: magic,

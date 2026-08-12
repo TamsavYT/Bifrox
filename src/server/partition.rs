@@ -115,6 +115,8 @@ pub struct PartitionManager {
     leader_epoch: AtomicU32,
     replicas: RwLock<Vec<u32>>,
     isr: RwLock<Vec<u32>>,
+    compression_codec: RwLock<crate::config::CompressionCodec>,
+    flush_policy: crate::config::FlushPolicy,
 }
 
 impl PartitionManager {
@@ -142,6 +144,8 @@ impl PartitionManager {
             leader_epoch: AtomicU32::new(0),
             replicas: RwLock::new(vec![config.node_id]),
             isr: RwLock::new(vec![config.node_id]),
+            compression_codec: RwLock::new(config.compression_codec),
+            flush_policy: config.flush_policy,
         })
     }
 
@@ -219,10 +223,13 @@ impl PartitionManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let codec = *self.compression_codec.read();
+        let use_lz4 = codec == crate::config::CompressionCodec::Lz4;
+
         let (frame, rolled) = {
             let mut seg_guard = self.segment_manager.lock();
             let base_before = seg_guard.active_base_offset();
-            let frame = seg_guard.append(payload, timestamp)?;
+            let frame = seg_guard.append_with_codec(payload, timestamp, use_lz4)?;
             let base_after = seg_guard.active_base_offset();
 
             let assigned_offset = frame.offset;
@@ -238,6 +245,14 @@ impl PartitionManager {
 
         if rolled {
             let _ = psm.take_snapshot();
+        }
+
+        if matches!(
+            self.flush_policy,
+            crate::config::FlushPolicy::SyncEveryBatch | crate::config::FlushPolicy::UnbufferedSync
+        ) {
+            let mut seg_guard = self.segment_manager.lock();
+            seg_guard.sync()?;
         }
 
         Ok(Ok(frame))
@@ -311,6 +326,16 @@ impl PartitionManager {
     pub fn apply_retention(&self) -> IoResult<usize> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.apply_retention()
+    }
+
+    pub fn set_cleanup_policy(&self, policy: crate::config::CleanupPolicy) {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.set_cleanup_policy(policy);
+    }
+
+    pub fn cleanup_policy(&self) -> crate::config::CleanupPolicy {
+        let seg_guard = self.segment_manager.lock();
+        seg_guard.cleanup_policy()
     }
 
     /// Explicitly flushes partition log and index files to physical disk

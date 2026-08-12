@@ -72,6 +72,9 @@ pub struct ReplicationManager {
     /// each peer returns in its heartbeat ACK, so a Raft Leader learns every follower's
     /// bind address even though only the Leader can write to `__cluster_metadata`.
     broker_addrs: Arc<DashMap<u32, String>>,
+    /// Persistent peer TCP connection pool (peer_addr -> Arc<Mutex<Option<TcpStream>>>)
+    /// Prevents ephemeral OS port exhaustion under high-throughput replication & heartbeats.
+    peer_connections: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<TcpStream>>>>>,
 }
 
 impl ReplicationManager {
@@ -109,6 +112,7 @@ impl ReplicationManager {
             voted_for: Arc::new(RwLock::new(None)),
             fetchers: Arc::new(DashMap::new()),
             broker_addrs,
+            peer_connections: Arc::new(DashMap::new()),
         };
 
         // Leader: start heartbeat broadcaster to all followers
@@ -125,6 +129,17 @@ impl ReplicationManager {
 
     pub fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    pub fn get_or_connect_peer(
+        &self,
+        peer_addr: &str,
+    ) -> Arc<tokio::sync::Mutex<Option<TcpStream>>> {
+        self.peer_connections
+            .entry(peer_addr.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .value()
+            .clone()
     }
 
     /// Return current role based on consensus state.
@@ -219,6 +234,7 @@ impl ReplicationManager {
         let bind_addr = self.bind_addr.clone();
         let epoch = self.epoch.clone(); // share epoch for heartbeat term
         let broker_addrs = self.broker_addrs.clone();
+        let manager = self.clone();
 
         tokio::spawn(async move {
             tracing::info!(
@@ -231,7 +247,9 @@ impl ReplicationManager {
             loop {
                 let current_term = epoch.load(std::sync::atomic::Ordering::Acquire);
                 for peer in &peer_addrs {
-                    match send_leader_heartbeat(
+                    let peer_conn = manager.get_or_connect_peer(peer);
+                    match send_leader_heartbeat_pooled(
+                        &peer_conn,
                         peer,
                         &cluster_id,
                         node_id,
@@ -560,16 +578,18 @@ impl ReplicationManager {
         let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
         let cluster_id = self.config.cluster_id.clone();
 
-        // Replicate to each peer concurrently
+        // Replicate to each peer concurrently over persistent pooled TCP streams
         let mut handles = Vec::with_capacity(self.config.peer_addrs.len());
         for peer in &self.config.peer_addrs {
             let peer_addr = peer.clone();
             let topic_name = topic.to_string();
             let frames_vec = frames.to_vec();
             let cid = cluster_id.clone();
+            let peer_conn = self.get_or_connect_peer(&peer_addr);
             handles.push(tokio::spawn(async move {
                 // CRIT-01: pass cluster_id so the follower can authenticate this replication push.
-                let result = send_replication_push(
+                let result = send_replication_push_pooled(
+                    &peer_conn,
                     &peer_addr,
                     &cid,
                     &topic_name,
@@ -630,6 +650,81 @@ impl ReplicationManager {
 /// address registry purely from the existing heartbeat round-trip, without requiring any
 /// out-of-band broker registration step — followers are otherwise unable to publish their
 /// own address since only the partition leader for `__cluster_metadata` may write to it.
+pub async fn send_leader_heartbeat_pooled(
+    peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    peer_addr: &str,
+    cluster_id: &str,
+    node_id: u32,
+    term: u64,
+    leader_bind_addr: &str,
+) -> IoResult<(u32, String)> {
+    let mut buf = Vec::with_capacity(128);
+    buf.put_u8(0xAC);
+    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
+    buf.put_u32(node_id);
+    buf.put_u64(term);
+    crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
+
+    let mut lock = peer_conn.lock().await;
+
+    if let Some(ref mut stream) = *lock {
+        if stream.write_all(&buf).await.is_ok() {
+            let mut status = [0u8; 1];
+            if stream.read_exact(&mut status).await.is_ok() && status[0] == 0 {
+                let mut id_buf = [0u8; 4];
+                if stream.read_exact(&mut id_buf).await.is_ok() {
+                    let follower_node_id = u32::from_be_bytes(id_buf);
+                    let mut len_buf = [0u8; 2];
+                    if stream.read_exact(&mut len_buf).await.is_ok() {
+                        let addr_len = u16::from_be_bytes(len_buf) as usize;
+                        let mut addr_buf = vec![0u8; addr_len];
+                        if stream.read_exact(&mut addr_buf).await.is_ok() {
+                            let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
+                            return Ok((follower_node_id, follower_bind_addr));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    *lock = None;
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Heartbeat connection to {} timed out", peer_addr),
+            ));
+        }
+    };
+
+    stream.write_all(&buf).await?;
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status).await?;
+    if status[0] != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
+        ));
+    }
+
+    let mut id_buf = [0u8; 4];
+    stream.read_exact(&mut id_buf).await?;
+    let follower_node_id = u32::from_be_bytes(id_buf);
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let addr_len = u16::from_be_bytes(len_buf) as usize;
+    let mut addr_buf = vec![0u8; addr_len];
+    stream.read_exact(&mut addr_buf).await?;
+    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
+
+    *lock = Some(stream);
+    Ok((follower_node_id, follower_bind_addr))
+}
+
 pub async fn send_leader_heartbeat(
     peer_addr: &str,
     cluster_id: &str,
@@ -686,6 +781,70 @@ pub async fn send_leader_heartbeat(
 ///
 /// CRIT-01: cluster_id is prepended immediately after the magic byte so followers can authenticate
 /// the sender before touching any partition state.
+pub async fn send_replication_push_pooled(
+    peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    peer_addr: &str,
+    cluster_id: &str,
+    topic: &str,
+    partition: u32,
+    epoch: u64,
+    frames: &[RecordFrame],
+) -> IoResult<()> {
+    let mut buf = Vec::with_capacity(256 + frames.len() * 64);
+    buf.put_u8(0xAA);
+    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
+    crate::protocol::wire::write_pascal_string(&mut buf, topic);
+    buf.put_u32(partition);
+    buf.put_u64(epoch);
+    buf.put_u32(frames.len() as u32);
+    for frame in frames {
+        frame.encode_into(&mut buf);
+    }
+
+    let mut lock = peer_conn.lock().await;
+
+    if let Some(ref mut stream) = *lock {
+        if stream.write_all(&buf).await.is_ok() {
+            let mut ack = [0u8; 1];
+            if stream.read_exact(&mut ack).await.is_ok() {
+                if ack[0] == 0 {
+                    return Ok(());
+                } else if ack[0] == 0x02 {
+                    return Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"));
+                }
+            }
+        }
+    }
+
+    *lock = None;
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Replication push connection to {} timed out", peer_addr),
+            ));
+        }
+    };
+
+    stream.write_all(&buf).await?;
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).await?;
+    if ack[0] == 0 {
+        *lock = Some(stream);
+        Ok(())
+    } else if ack[0] == 0x02 {
+        *lock = Some(stream);
+        Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
+    } else {
+        Err(std::io::Error::other(format!(
+            "Peer {} returned error ACK 0x{:02X}",
+            peer_addr, ack[0]
+        )))
+    }
+}
+
 pub async fn send_replication_push(
     peer_addr: &str,
     cluster_id: &str,

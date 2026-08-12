@@ -33,6 +33,13 @@ pub enum CommandCode {
     EndTxn = 0x1A,
     OffsetCommit = 0x1B,
     OffsetFetch = 0x1C,
+    SaslHandshake = 0x1D,
+    SaslAuthenticate = 0x1E,
+    DescribeAcls = 0x1F,
+    CreateAcls = 0x20,
+    DeleteAcls = 0x21,
+    RegisterBroker = 0x22,
+    UnregisterBroker = 0x23,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -68,6 +75,13 @@ impl TryFrom<u8> for CommandCode {
             0x1A => Ok(CommandCode::EndTxn),
             0x1B => Ok(CommandCode::OffsetCommit),
             0x1C => Ok(CommandCode::OffsetFetch),
+            0x1D => Ok(CommandCode::SaslHandshake),
+            0x1E => Ok(CommandCode::SaslAuthenticate),
+            0x1F => Ok(CommandCode::DescribeAcls),
+            0x20 => Ok(CommandCode::CreateAcls),
+            0x21 => Ok(CommandCode::DeleteAcls),
+            0x22 => Ok(CommandCode::RegisterBroker),
+            0x23 => Ok(CommandCode::UnregisterBroker),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -210,6 +224,46 @@ pub enum RequestPayload {
         group_id: String,
         topic: String,
         partition: u32,
+    },
+    SaslHandshake {
+        mechanism: String,
+    },
+    SaslAuthenticate {
+        auth_bytes: Vec<u8>,
+    },
+    DescribeAcls {
+        resource_type: u8,
+        resource_name: String,
+        pattern_type: u8,
+        principal: String,
+        host: String,
+        operation: u8,
+        permission_type: u8,
+    },
+    CreateAcls {
+        resource_type: u8,
+        resource_name: String,
+        pattern_type: u8,
+        principal: String,
+        host: String,
+        operation: u8,
+        permission_type: u8,
+    },
+    DeleteAcls {
+        resource_type: u8,
+        resource_name: String,
+        pattern_type: u8,
+        principal: String,
+        host: String,
+        operation: u8,
+        permission_type: u8,
+    },
+    RegisterBroker {
+        node_id: u32,
+        endpoint: String,
+    },
+    UnregisterBroker {
+        node_id: u32,
     },
 }
 
@@ -672,6 +726,143 @@ impl WireRequest {
                     topic,
                     partition,
                 }
+            }
+            CommandCode::SaslHandshake => {
+                let mechanism = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::SaslHandshake { mechanism }
+            }
+            CommandCode::SaslAuthenticate => {
+                let auth_bytes = payload_buf.to_vec();
+                RequestPayload::SaslAuthenticate { auth_bytes }
+            }
+            CommandCode::DescribeAcls => {
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let resource_type = payload_buf.get_u8();
+                let resource_name = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let pattern_type = payload_buf.get_u8();
+                let principal = read_pascal_string(&mut payload_buf)?;
+                let host = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 2 {
+                    return Err(WireError::Incomplete {
+                        needed: 2,
+                        available: payload_buf.len(),
+                    });
+                }
+                let operation = payload_buf.get_u8();
+                let permission_type = payload_buf.get_u8();
+                RequestPayload::DescribeAcls {
+                    resource_type,
+                    resource_name,
+                    pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                }
+            }
+            CommandCode::CreateAcls => {
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let resource_type = payload_buf.get_u8();
+                let resource_name = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let pattern_type = payload_buf.get_u8();
+                let principal = read_pascal_string(&mut payload_buf)?;
+                let host = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 2 {
+                    return Err(WireError::Incomplete {
+                        needed: 2,
+                        available: payload_buf.len(),
+                    });
+                }
+                let operation = payload_buf.get_u8();
+                let permission_type = payload_buf.get_u8();
+                RequestPayload::CreateAcls {
+                    resource_type,
+                    resource_name,
+                    pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                }
+            }
+            CommandCode::DeleteAcls => {
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let resource_type = payload_buf.get_u8();
+                let resource_name = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.is_empty() {
+                    return Err(WireError::Incomplete {
+                        needed: 1,
+                        available: 0,
+                    });
+                }
+                let pattern_type = payload_buf.get_u8();
+                let principal = read_pascal_string(&mut payload_buf)?;
+                let host = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 2 {
+                    return Err(WireError::Incomplete {
+                        needed: 2,
+                        available: payload_buf.len(),
+                    });
+                }
+                let operation = payload_buf.get_u8();
+                let permission_type = payload_buf.get_u8();
+                RequestPayload::DeleteAcls {
+                    resource_type,
+                    resource_name,
+                    pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                }
+            }
+            CommandCode::RegisterBroker => {
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let node_id = payload_buf.get_u32();
+                let endpoint = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::RegisterBroker { node_id, endpoint }
+            }
+            CommandCode::UnregisterBroker => {
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let node_id = payload_buf.get_u32();
+                RequestPayload::UnregisterBroker { node_id }
             }
         };
 

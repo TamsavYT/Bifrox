@@ -27,6 +27,102 @@ impl Default for FlushPolicy {
     }
 }
 
+/// Compression Codec for Record Batch Storage (compression.type)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionCodec {
+    #[default]
+    None = 0,
+    Lz4 = 1,
+}
+
+/// Topic and Server Log Cleanup Policy (Kafka cleanup.policy)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupPolicy {
+    /// Time/size based retention (old log segments exceeding retention limit are unlinked)
+    #[default]
+    Delete,
+    /// Key-based log compaction (retains latest record per key in historical log segments)
+    Compact,
+    /// Both key-based compaction and time/size retention apply
+    CompactAndDelete,
+}
+
+impl std::str::FromStr for CleanupPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_lowercase();
+        match normalized.as_str() {
+            "delete" => Ok(CleanupPolicy::Delete),
+            "compact" => Ok(CleanupPolicy::Compact),
+            "compact,delete" | "delete,compact" => Ok(CleanupPolicy::CompactAndDelete),
+            _ => Err(format!("Unknown cleanup.policy: '{}'", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for CleanupPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CleanupPolicy::Delete => write!(f, "delete"),
+            CleanupPolicy::Compact => write!(f, "compact"),
+            CleanupPolicy::CompactAndDelete => write!(f, "compact,delete"),
+        }
+    }
+}
+
+impl CleanupPolicy {
+    pub fn is_compact(&self) -> bool {
+        matches!(
+            self,
+            CleanupPolicy::Compact | CleanupPolicy::CompactAndDelete
+        )
+    }
+
+    pub fn is_delete(&self) -> bool {
+        matches!(
+            self,
+            CleanupPolicy::Delete | CleanupPolicy::CompactAndDelete
+        )
+    }
+}
+
+/// Kafka Security Protocol (Kafka security.protocol)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecurityProtocol {
+    #[default]
+    Plaintext,
+    SaslPlaintext,
+    Ssl,
+    SaslSsl,
+}
+
+impl std::str::FromStr for SecurityProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_uppercase();
+        match normalized.as_str() {
+            "PLAINTEXT" => Ok(SecurityProtocol::Plaintext),
+            "SASL_PLAINTEXT" => Ok(SecurityProtocol::SaslPlaintext),
+            "SSL" => Ok(SecurityProtocol::Ssl),
+            "SASL_SSL" => Ok(SecurityProtocol::SaslSsl),
+            _ => Err(format!("Unknown security.protocol: '{}'", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for SecurityProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecurityProtocol::Plaintext => write!(f, "PLAINTEXT"),
+            SecurityProtocol::SaslPlaintext => write!(f, "SASL_PLAINTEXT"),
+            SecurityProtocol::Ssl => write!(f, "SSL"),
+            SecurityProtocol::SaslSsl => write!(f, "SASL_SSL"),
+        }
+    }
+}
+
 /// Engine Configuration Parameters (Kafka-style configuration support)
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -62,6 +158,26 @@ pub struct EngineConfig {
     pub retention_millis: Option<u64>,
     /// Interval for running background retention garbage collector
     pub retention_check_interval: Duration,
+    /// Server-default Log Cleanup Policy (Kafka cleanup.policy / log.cleanup.policy)
+    pub cleanup_policy: CleanupPolicy,
+    /// Kafka Security Protocol (PLAINTEXT, SASL_PLAINTEXT, SSL, SASL_SSL)
+    pub security_protocol: SecurityProtocol,
+    /// TLS/SSL X.509 Certificate file path (ssl.keystore.location / ssl.cert.path)
+    pub ssl_cert_path: Option<PathBuf>,
+    /// TLS/SSL Private Key file path (ssl.keystore.password / ssl.key.path)
+    pub ssl_key_path: Option<PathBuf>,
+    /// TLS/SSL CA Certificate file path (ssl.truststore.location / ssl.ca.path)
+    pub ssl_ca_path: Option<PathBuf>,
+    /// TLS/SSL Client Authentication mode (ssl.client.auth: none, requested, required)
+    pub ssl_client_auth: String,
+    /// Enabled SASL mechanisms (e.g. PLAIN, SCRAM-SHA-256)
+    pub sasl_mechanisms: Vec<String>,
+    /// SASL user accounts (username -> password)
+    pub sasl_users: std::collections::HashMap<String, String>,
+    /// Whether ACL authorization is enabled
+    pub acls_enabled: bool,
+    /// Superuser principals exempt from ACL enforcement
+    pub super_users: Vec<String>,
     /// Shared-secret token required from client connections (None = no auth check).
     /// Inter-node peers identified by `peer_addrs` are exempt from this check.
     pub auth_token: Option<String>,
@@ -73,6 +189,8 @@ pub struct EngineConfig {
     /// Default per-client fetch byte-rate quota in bytes/sec (Kafka
     /// `quota.consumer.default.bytes.per.second`). `None` = unlimited (default).
     pub fetch_quota_bytes_per_sec: Option<u64>,
+    /// Compression Codec for Record Batch Storage (Kafka `compression.type`)
+    pub compression_codec: CompressionCodec,
 }
 
 impl Default for EngineConfig {
@@ -94,9 +212,20 @@ impl Default for EngineConfig {
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
+            cleanup_policy: CleanupPolicy::Delete,
+            security_protocol: SecurityProtocol::Plaintext,
+            ssl_cert_path: None,
+            ssl_key_path: None,
+            ssl_ca_path: None,
+            ssl_client_auth: "none".to_string(),
+            sasl_mechanisms: vec!["PLAIN".to_string(), "SCRAM-SHA-256".to_string()],
+            sasl_users: std::collections::HashMap::new(),
+            acls_enabled: false,
+            super_users: Vec::new(),
             auth_token: None,
             produce_quota_bytes_per_sec: None,
             fetch_quota_bytes_per_sec: None,
+            compression_codec: CompressionCodec::default(),
         }
     }
 }
@@ -117,6 +246,13 @@ impl EngineConfig {
                 let key = key.trim();
                 let value = value.trim();
 
+                if let Some(username) = key.strip_prefix("sasl.user.") {
+                    config
+                        .sasl_users
+                        .insert(username.trim().to_string(), value.to_string());
+                    continue;
+                }
+
                 match key {
                     "cluster.id" => {
                         config.cluster_id = value.to_string();
@@ -133,8 +269,54 @@ impl EngineConfig {
                         };
                     }
                     "listeners" | "bind.addr" => {
-                        let clean_addr = value.strip_prefix("PLAINTEXT://").unwrap_or(value);
+                        let clean_addr = value
+                            .strip_prefix("PLAINTEXT://")
+                            .or_else(|| value.strip_prefix("SASL_PLAINTEXT://"))
+                            .or_else(|| value.strip_prefix("SSL://"))
+                            .or_else(|| value.strip_prefix("SASL_SSL://"))
+                            .unwrap_or(value);
                         config.bind_addr = clean_addr.to_string();
+                    }
+                    "security.protocol" => {
+                        if let Ok(sp) = value.parse() {
+                            config.security_protocol = sp;
+                        }
+                    }
+                    "ssl.keystore.location" | "ssl.cert.path" => {
+                        config.ssl_cert_path = Some(PathBuf::from(value));
+                    }
+                    "ssl.keystore.password" | "ssl.key.path" => {
+                        config.ssl_key_path = Some(PathBuf::from(value));
+                    }
+                    "ssl.truststore.location" | "ssl.ca.path" => {
+                        config.ssl_ca_path = Some(PathBuf::from(value));
+                    }
+                    "ssl.client.auth" => {
+                        config.ssl_client_auth = value.to_lowercase();
+                    }
+                    "sasl.enabled.mechanisms" | "sasl.mechanism.inter.broker.protocol" => {
+                        config.sasl_mechanisms = value
+                            .split(',')
+                            .map(|s| s.trim().to_uppercase())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    "acls.enabled" | "authorizer.class.name" => {
+                        if value.eq_ignore_ascii_case("true")
+                            || value.contains("AclAuthorizer")
+                            || value.contains("StandardAuthorizer")
+                        {
+                            config.acls_enabled = true;
+                        } else if let Ok(v) = value.parse::<bool>() {
+                            config.acls_enabled = v;
+                        }
+                    }
+                    "super.users" => {
+                        config.super_users = value
+                            .split(';')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
                     }
                     "log.dirs" | "data.dir" => {
                         config.data_dir = PathBuf::from(value);
@@ -145,6 +327,13 @@ impl EngineConfig {
                     "max.segment.bytes" | "segment.bytes" => {
                         if let Ok(v) = value.parse() {
                             config.max_segment_bytes = v;
+                        }
+                    }
+                    "compression.type" => {
+                        if value.eq_ignore_ascii_case("lz4") {
+                            config.compression_codec = CompressionCodec::Lz4;
+                        } else {
+                            config.compression_codec = CompressionCodec::None;
                         }
                     }
                     "index.interval.bytes" => {
@@ -177,6 +366,11 @@ impl EngineConfig {
                     "retention.millis" | "log.retention.ms" => {
                         if let Ok(v) = value.parse() {
                             config.retention_millis = Some(v);
+                        }
+                    }
+                    "cleanup.policy" | "log.cleanup.policy" => {
+                        if let Ok(v) = value.parse() {
+                            config.cleanup_policy = v;
                         }
                     }
                     "auth.token" if !value.is_empty() => {

@@ -32,25 +32,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let command = match args.iter().skip(1).find(|a| !a.starts_with('-')) {
-        Some(cmd) => cmd.to_lowercase(),
+    let known_flags_with_val = [
+        "--server",
+        "-s",
+        "--topic",
+        "--message",
+        "--key",
+        "--partitions",
+        "--partition",
+        "--group",
+        "--offset",
+        "--interval",
+        "--max-bytes",
+        "--sasl-user",
+        "--sasl-pass",
+        "--resource-type",
+        "--resource-name",
+        "--principal",
+        "--operation",
+        "--permission",
+        "--node-id",
+        "--endpoint",
+        "--ca-path",
+        "--cert-path",
+        "--key-path",
+    ];
+
+    let mut command_opt = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if known_flags_with_val.contains(&arg.as_str()) {
+            i += 2; // skip flag and its value
+        } else if arg.starts_with('-') {
+            i += 1; // skip standalone boolean flag
+        } else {
+            command_opt = Some(arg.to_lowercase());
+            break;
+        }
+    }
+
+    let command = match command_opt {
+        Some(cmd) => cmd,
         None => {
             print_usage();
             return Ok(());
         }
     };
 
-    let mut client = match TestClient::connect(server_addr).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "Error: Could not connect to Hermes server at {}: {}",
-                server_addr, e
-            );
-            eprintln!("Make sure the server is running on {} (run: cargo run --bin hermes -- config/server-node1.properties)", server_addr);
-            return Ok(());
+    let use_tls = has_flag(&args, "--tls") || has_flag(&args, "--ssl");
+    let ca_path_opt = get_arg_val(&args, "--ca-path");
+    let cert_path_opt = get_arg_val(&args, "--cert-path");
+    let key_path_opt = get_arg_val(&args, "--key-path");
+    let insecure = has_flag(&args, "--insecure");
+    let sasl_user_opt = get_arg_val(&args, "--sasl-user");
+    let sasl_pass_opt = get_arg_val(&args, "--sasl-pass").unwrap_or_default();
+
+    let mut client = if use_tls {
+        let ca_p = ca_path_opt.as_ref().map(std::path::Path::new);
+        let client_auth = match (&cert_path_opt, &key_path_opt) {
+            (Some(c), Some(k)) => Some((std::path::Path::new(c), std::path::Path::new(k))),
+            _ => None,
+        };
+        let skip_verify = insecure || (ca_path_opt.is_none() && client_auth.is_none());
+
+        match TestClient::connect_tls_full(server_addr, ca_p, client_auth, skip_verify).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Error: Could not connect via TLS/SSL to Hermes server at {}: {}",
+                    server_addr, e
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        match TestClient::connect(server_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Error: Could not connect to Hermes server at {}: {}",
+                    server_addr, e
+                );
+                eprintln!("Make sure the server is running on {} (run: cargo run --bin hermes -- config/server-node1.properties)", server_addr);
+                return Ok(());
+            }
         }
     };
+
+    if let Some(user) = sasl_user_opt {
+        let (err_code, mechs) = client.sasl_handshake("PLAIN").await?;
+        if err_code != 0 {
+            eprintln!("Error: SASL Handshake failed with error code {}", err_code);
+            return Ok(());
+        }
+        let auth_payload = format!("\0{}\0{}", user, sasl_pass_opt);
+        let auth_err = client.sasl_authenticate(auth_payload.as_bytes()).await?;
+        if auth_err != 0 {
+            eprintln!(
+                "Error: SASL Authentication failed for user '{}' (error code {})",
+                user, auth_err
+            );
+            return Ok(());
+        }
+        println!(
+            "🔐 SASL Authentication succeeded for user '{}' (Mechanisms: {:?})",
+            user, mechs
+        );
+    }
 
     match command.as_str() {
         "produce" => {
@@ -300,6 +389,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.delete_topic(&topic).await?;
             println!("🗑️ Topic '{}' deleted successfully.", topic);
         }
+        "create-acl" => {
+            let res_type_str =
+                get_arg_val(&args, "--resource-type").unwrap_or_else(|| "topic".to_string());
+            let res_name = get_arg_val(&args, "--resource-name")
+                .unwrap_or_else(|| "default_topic".to_string());
+            let principal =
+                get_arg_val(&args, "--principal").unwrap_or_else(|| "User:*".to_string());
+            let op_str = get_arg_val(&args, "--operation").unwrap_or_else(|| "read".to_string());
+            let perm_str =
+                get_arg_val(&args, "--permission").unwrap_or_else(|| "allow".to_string());
+
+            let binding = hermes::AclBinding {
+                resource_type: parse_resource_type(&res_type_str),
+                resource_name: res_name.clone(),
+                pattern_type: 3, // Literal
+                principal: principal.clone(),
+                host: "*".to_string(),
+                operation: parse_operation(&op_str),
+                permission_type: parse_permission(&perm_str),
+            };
+
+            client.create_acl(&binding).await?;
+            println!("🛡️ Created ACL Binding: Principal='{}', Resource={}:{}, Operation={}, Permission={}",
+                principal, res_type_str, res_name, op_str, perm_str);
+        }
+        "describe-acls" => {
+            let res_type_str =
+                get_arg_val(&args, "--resource-type").unwrap_or_else(|| "any".to_string());
+            let res_name = get_arg_val(&args, "--resource-name").unwrap_or_else(|| "*".to_string());
+            let principal = get_arg_val(&args, "--principal").unwrap_or_else(|| "*".to_string());
+
+            let filter = hermes::AclBinding {
+                resource_type: parse_resource_type(&res_type_str),
+                resource_name: res_name,
+                pattern_type: 3,
+                principal,
+                host: "*".to_string(),
+                operation: 1,       // Any
+                permission_type: 1, // Any
+            };
+
+            let acls = client.describe_acls(&filter).await?;
+            println!(
+                "🛡️ Active ACL Bindings on Server {}: ({})",
+                server_addr,
+                acls.len()
+            );
+            for (idx, a) in acls.iter().enumerate() {
+                println!("  [{:02}] Principal: {:<15} | ResourceType: {:<2} | ResourceName: {:<15} | Op: {:<2} | Perm: {:<2}",
+                    idx, a.principal, a.resource_type, a.resource_name, a.operation, a.permission_type);
+            }
+        }
+        "register-broker" => {
+            let node_id: u32 = get_arg_val(&args, "--node-id")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            let endpoint =
+                get_arg_val(&args, "--endpoint").unwrap_or_else(|| "127.0.0.1:9093".to_string());
+            client.register_broker(node_id, &endpoint).await?;
+            println!(
+                "🌐 Registered Broker node_id={} endpoint='{}' in cluster catalog",
+                node_id, endpoint
+            );
+        }
+        "unregister-broker" => {
+            let node_id: u32 = get_arg_val(&args, "--node-id")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            client.unregister_broker(node_id).await?;
+            println!(
+                "🌐 Unregistered Broker node_id={} from cluster catalog",
+                node_id
+            );
+        }
         _ => {
             eprintln!("Unknown command: '{}'", command);
             print_usage();
@@ -307,6 +470,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn parse_resource_type(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "topic" => hermes::ResourceType::Topic as u8,
+        "group" => hermes::ResourceType::Group as u8,
+        "cluster" => hermes::ResourceType::Cluster as u8,
+        "tx" | "transactional_id" => hermes::ResourceType::TransactionalId as u8,
+        "user" => hermes::ResourceType::User as u8,
+        _ => hermes::ResourceType::Any as u8,
+    }
+}
+
+fn parse_operation(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "read" => hermes::AclOperation::Read as u8,
+        "write" => hermes::AclOperation::Write as u8,
+        "create" => hermes::AclOperation::Create as u8,
+        "delete" => hermes::AclOperation::Delete as u8,
+        "alter" => hermes::AclOperation::Alter as u8,
+        "describe" => hermes::AclOperation::Describe as u8,
+        "all" => hermes::AclOperation::All as u8,
+        _ => hermes::AclOperation::Any as u8,
+    }
+}
+
+fn parse_permission(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "deny" => hermes::AclPermissionType::Deny as u8,
+        _ => hermes::AclPermissionType::Allow as u8,
+    }
 }
 
 fn get_arg_val(args: &[String], flag: &str) -> Option<String> {
