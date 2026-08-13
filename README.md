@@ -1,75 +1,112 @@
-# Hermes ── High-Performance Event Streaming Engine
+# Hermes
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/your-username/Hermes)
-[![Language](https://img.shields.io/badge/language-Rust-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
+Hermes is a distributed event streaming broker written in Rust. It focuses on Kafka-like
+broker semantics, Windows-friendly operation, and a custom binary protocol that you can
+build dedicated clients against.
 
-Hermes is a production-grade, highly available, distributed event streaming platform and storage engine built from scratch in Rust. Architected around append-only logs, sparse indexing, memory-mapped files, and consensus-driven replication, Hermes delivers Kafka-like features with the memory safety, concurrency, and performance of Rust.
+## What Hermes already has
 
----
+### Core broker features
 
-## 🗺️ Architectural Overview
+- Append-only log storage with sparse offset indexes
+- Time-based lookups with `.timeindex`
+- Aborted-transaction tracking with `.txnindex`
+- Multi-topic, multi-partition storage
+- Key-based partition routing
+- Read-uncommitted and read-committed fetch paths
+- Consumer-group membership, heartbeats, sync, leave, and committed offsets
+- Topic creation, deletion, description, and listing
+- Cluster metadata and dynamic broker registration
 
-Hermes uses a clean, modular architecture. Client connections communicate via a custom binary TCP protocol to the Event Server, which coordinates with local storage and cluster peers.
+### Reliability and replication
+
+- Leader/follower replication
+- ISR-aware writes with `min.insync.replicas`
+- Partition-level leadership
+- Produce forwarding to the current partition leader
+- Metadata-log replay on restart
+- Transaction-state replay on restart
+- Durable `transactional.id -> producer_id / producer_epoch` fencing state
+- Windows-safe segment and file handling
+
+### Transactions and idempotence
+
+- Idempotent producer sequencing
+- `InitProducerId`, `AddPartitionsToTxn`, and `EndTxn`
+- Legacy `BeginTx`, `CommitTx`, and `AbortTx`
+- Read-committed isolation
+- Durable transaction partition registration
+- Producer epoch fencing after restart or re-initialization
+
+### Security and access control
+
+- TLS / SSL transport
+- SASL PLAIN
+- SASL SCRAM-SHA-256
+- ACL-based authorization
+- Persistent SCRAM verifier storage in cluster metadata
+- Bootstrap `sasl.user.*` support for seed users and recovery
+
+### Performance and operations
+
+- LZ4 record payload compression
+- Per-client / per-principal quota throttling
+- Logical `client_id` support for better quota identity
+- Prometheus `/metrics` endpoint
+- Windows CI and Windows packaging guidance
+
+## Important protocol note
+
+Hermes does **not** currently position itself as a drop-in Kafka wire-compatible broker.
+It exposes a custom TCP protocol and is designed to support purpose-built Hermes clients.
+
+If you are building a client or agent, start with
+[docs/HERMES_CLIENT_CREATOR_REFERENCE.md](docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
+
+## Architecture at a glance
 
 ```mermaid
 graph TD
-    Client[Hermes CLI / Client] -->|Custom TCP Protocol| Server[Hermes TCP Server]
-    Server -->|Routes Requests| Handler[Request Handler]
-    Handler -->|Manages Partitions| PartitionMgr[Partition Manager]
-    PartitionMgr -->|Reads/Writes| StorageEngine[Storage Engine]
-    StorageEngine -->|Append-Only| WAL[Write-Ahead Log WAL]
-    StorageEngine -->|High Performance Storage| Segments[Log Segments & Indexes]
-    Segments -->|Memory Map| Mmap[memmap2 Active Segment]
-    Segments -->|Sparse Lookup| Index[.index / .timeindex Sparse Indexes]
-    
-    Server -->|Replication Stream| RepMgr[Replication Manager]
-    RepMgr -->|Consensus / Heartbeat| Peers[HA Peer Nodes]
-    
-    Handler -->|Tracks Consumption| ConsumerGroup[Consumer Group Manager]
-    ConsumerGroup -->|Saves Offsets| OffsetLog[__consumer_offsets Log]
+    Client[Hermes Client / CLI / Agent] -->|Custom TCP Protocol| Server[Hermes TCP Server]
+    Server --> Handler[Request Handler]
+    Handler --> Engine[Storage Engine]
+    Engine --> Segments[Log Segments]
+    Segments --> Log[.log]
+    Segments --> Index[.index]
+    Segments --> TimeIndex[.timeindex]
+    Segments --> TxnIndex[.txnindex]
+    Engine --> GroupOffsets[__consumer_offsets]
+    Engine --> TxState[__transaction_state]
+    Engine --> Metadata[__cluster_metadata]
+    Server --> Replication[Replication Manager]
+    Replication --> Brokers[Peer Brokers]
 ```
 
-### Key Highlights
+## Repository layout
 
-*   **Log-Structured Storage & Indexing**: Segments are persisted as append-only data files. They use memory-mapped active segments (`memmap2`) for optimal performance, accompanied by sparse index (`.index`) and time-based index (`.timeindex`) files to allow $O(1)$ disk seek operations.
-*   **Custom Binary Wire Protocol**: Implements a zero-copy framing codec with frame error checks (CRC32 validation) and specific request/response frames (`WireRequest`, `WireResponse`).
-*   **Replication & High Availability**: Supports multi-node clusters with Leader-Follower roles, consensus validation (`HermesConsensus`), in-sync replicas (ISR) state tracking, and peer heartbeats.
-*   **Transactional Isolation**: Facilitates atomic writes with a dedicated `TransactionManager` tracking state commits (`TxStatus`).
-*   **Consumer Groups**: Features partition distribution, rebalancing, and committed offset tracking persisted to a system-wide `__consumer_offsets` partition.
+| Path | Purpose |
+| --- | --- |
+| [`src/main.rs`](src/main.rs) | Broker entry point |
+| [`src/lib.rs`](src/lib.rs) | Library root and public exports |
+| [`src/client.rs`](src/client.rs) | Reference client implementation |
+| [`src/config.rs`](src/config.rs) | Broker configuration parsing |
+| [`src/consumer_group.rs`](src/consumer_group.rs) | Consumer offset persistence |
+| [`src/protocol/`](src/protocol/) | Wire protocol and record framing |
+| [`src/server/`](src/server/) | Request handling, transactions, ACLs, quotas, listener |
+| [`src/segment/`](src/segment/) | Log segments and indexes |
+| [`src/replication/`](src/replication/) | Metadata and replication logic |
+| [`tests/integration_tests.rs`](tests/integration_tests.rs) | End-to-end scenarios |
+| [`packaging/windows/`](packaging/windows/) | Windows deployment notes |
+| [`docs/`](docs/) | Reference and roadmap documents |
 
----
-
-## 📂 Project Structure
-
-The codebase is structured logically, facilitating simple navigability:
-
-| Directory/File | Description |
-| :--- | :--- |
-| [`src/main.rs`](src/main.rs) | Server entry point. Parses configuration, initializes storage, configures dual-destination tracing logs, and starts the TCP listener. |
-| [`src/lib.rs`](src/lib.rs) | Root library module exposing public APIs for clients, replication, config, storage, and protocol codecs. |
-| [`src/client.rs`](src/client.rs) | Test/production client containing APIs for Produce, Fetch, Seek, and Consumer Group registration. |
-| [`src/config.rs`](src/config.rs) | Configurations parser (`EngineConfig`) supporting properties files and environment variables fallback. |
-| [`src/consumer_group.rs`](src/consumer_group.rs) | Tracks active consumer group offsets and assigns partition ownership. |
-| [`src/bin/hermes_cli.rs`](src/bin/hermes_cli.rs) | Core CLI application containing client control subcommands. |
-| [`src/wal/`](src/wal/) | WAL engine that ensures durability and handles crash recovery logs. |
-| [`src/segment/`](src/segment/) | Manages active and read-only storage segments (MMap log writers, sparse and time indexing). |
-| [`src/server/`](src/server/) | Event loops, TCP connection handlers, partition coordinators, and transactional context. |
-| [`src/protocol/`](src/protocol/) | Serialization & Deserialization codecs for wire commands and data frames. |
-| [`src/replication/`](src/replication/) | Cluster coordination, leader election, metadata exchange, and follower fetch streams. |
-| [`config/`](config/) | Configuration templates for node orchestration (Node 1, Node 2, Node 3). |
-| [`tests/`](tests/) | Full-suite integration test scenarios verifying end-to-end event streaming workflows. |
-
----
-
-## ⚡ Getting Started
+## Quick start
 
 ### Prerequisites
-*   **Rust Toolchain**: Install Rustup (`stable` channel recommended).
-*   **Operating System**: Windows (optimizations via `windows-sys`) or POSIX-compliant systems (Linux/macOS).
 
-### Configuration Setup
-Copy or edit configurations in the [`config/`](config/) folder. Here is a typical Kafka-style `.properties` configuration:
+- Rust stable
+- Windows, Linux, or macOS
+
+### Example configuration
 
 ```properties
 cluster.id=hermes-prod-cluster-01
@@ -81,187 +118,128 @@ logs.dir=./logs_node1
 max.segment.bytes=10485760
 replica.peer.addresses=127.0.0.1:9093,127.0.0.1:9094
 min.insync.replicas=1
-# Optional per-client (source IP) byte-rate quotas — unset means unlimited.
-# Exceeding requests are delayed (not rejected), matching Kafka's throttling model.
-# Quota identity precedence is: authenticated principal + logical client_id,
-# then logical client_id, then principal, then source IP fallback.
+
+# Quotas
 quota.producer.default.bytes.per.second=10485760
 quota.consumer.default.bytes.per.second=10485760
-# Optional bootstrap users. Hermes imports these once into the persistent
-# SCRAM credential store and then authenticates from the stored verifier state.
+
+# Metrics
+metrics.bind.address=127.0.0.1:10092
+
+# Security bootstrap user
 sasl.user.admin=change-me
 ```
 
-Clients may optionally set a connection-scoped logical `client_id` before producing or
-fetching. This gives Hermes a stable quota identity closer to Kafka semantics without
-changing the existing request shapes for every broker operation.
+### Run the broker
 
-For SASL, Hermes now keeps persistent SCRAM verifier state in cluster metadata rather
-than relying on plaintext passwords at authentication time. Runtime credential changes
-can be managed through the broker admin API; `sasl.user.*` entries remain as bootstrap
-seed users for first start or disaster recovery.
-
-Transactional producers also retain durable `transactional.id -> producer_id/epoch`
-state across restart. Re-initializing an existing `transactional.id` now reuses the
-same producer ID, bumps the epoch, and fences stale producers more like Kafka.
-
-### Running the Broker Server
-Start the Hermes broker with a configuration file:
-
-```bash
-cargo run --bin hermes -- ./config/server-node1.properties
+```powershell
+cargo run --bin hermes -- .\config\server-node1.properties
 ```
 
-Or configure using environment variables:
-```bash
+Or with environment variables:
+
+```powershell
 $env:HERMES_BIND_ADDR="127.0.0.1:9092"
-$env:HERMES_DATA_DIR="./data_store"
+$env:HERMES_DATA_DIR=".\data_store"
 cargo run --bin hermes
 ```
 
----
+## Security model
 
-## 🛠️ CLI Client Usage Guide
+Hermes supports multiple deployment styles:
 
-Hermes provides a powerful command-line interface (`hermes_cli`) to interact with running brokers.
+- `PLAINTEXT`
+- `SASL_PLAINTEXT`
+- `SSL`
+- `SASL_SSL`
 
-```bash
-# General Syntax
-cargo run --bin hermes_cli -- [--server <IP:PORT>] <COMMAND> [FLAGS]
-```
+For SASL-enabled deployments:
 
-### 1. Produce Messages
-Produce event payloads to a specific topic. Partitions are automatically hashed based on the provided `--key`.
+- `PLAIN` and `SCRAM-SHA-256` are supported.
+- SCRAM authentication uses persistent verifier material, not plaintext-at-auth-time
+  password lookup.
+- `sasl.user.*` entries are treated as bootstrap seed users and imported into the
+  persistent store if that user is not already present.
 
-```bash
-cargo run --bin hermes_cli -- produce --topic orders --key "user_94" --message "{\"amount\": 42.5}" --partitions 4
-```
+ACLs can be enabled for topic, group, transactional-id, and cluster operations.
 
-### 2. Fetch / Consume Messages
-Fetch records starting at a specific logical offset. Include a consumer `--group` to persist commits.
+## Quotas and client identity
 
-```bash
-# Read from offset 0
-cargo run --bin hermes_cli -- fetch --topic orders --partition 0 --offset 0
+Hermes supports Kafka-style throttling behavior: clients are delayed instead of being
+hard-rejected when they exceed byte-rate quotas.
 
-# Read from beginning with Group Offset Commit tracking
-cargo run --bin hermes_cli -- fetch --topic orders --partition 0 --group billing_processors --from-beginning
-```
+Quota identity precedence is:
 
-### 3. Continuous Group Polling
-Run a continuous consumer polling loop that fetches new events automatically and auto-commits the offsets.
+1. authenticated principal + logical `client_id`
+2. logical `client_id`
+3. authenticated principal
+4. source IP fallback
 
-```bash
-cargo run --bin hermes_cli -- group-consume --group analytics_group --topic orders --partition 0 --interval 500
-```
+Clients can set a connection-scoped logical `client_id` early in the session to get
+more stable quota behavior.
 
-### 4. Fetch Index Positions (Seek)
-Retrieve the physical byte offset on disk for a given logical offset using the sparse index.
+## Transaction behavior
 
-```bash
-cargo run --bin hermes_cli -- seek --topic orders --partition 0 --offset 12
-```
+Hermes supports both:
 
-### 5. Management Commands
-Check high-watermark offsets and committed partition coordinates.
+- legacy transaction commands (`BeginTx`, `CommitTx`, `AbortTx`)
+- producer-ID-based EOS flow (`InitProducerId`, `AddPartitionsToTxn`, `EndTxn`)
 
-```bash
-# Retrieve high watermark offset
-cargo run --bin hermes_cli -- latest-offset --topic orders --partition 0
+Recent hardening includes:
 
-# Fetch committed offset for a group
-cargo run --bin hermes_cli -- fetch-offset --group billing_processors --topic orders --partition 0
-```
+- durable producer ID / epoch registration
+- epoch fencing for stale producers
+- durable transaction partition registration
+- restart recovery of active and prepare transaction states
+- read-committed filtering for uncommitted and aborted data
 
----
+## Metrics and observability
 
-## 🧪 Testing
+Hermes exposes Prometheus metrics through `/metrics`, including:
 
-Hermes uses a robust integration suite to test multi-node scenarios, failovers, transactions, and index searches. To run all tests, use:
+- produce bytes and records
+- fetch bytes
+- active connections
+- topic count
+- active broker count
+- quota throttles
+- ACL denials
 
-```bash
+## Windows notes
+
+Hermes is actively hardened for Windows:
+
+- Windows file-sharing safe segment handling
+- Windows CI coverage
+- Windows packaging notes in [packaging/windows/README.md](packaging/windows/README.md)
+
+If Windows is your primary target, also review:
+
+- [HERMES_TESTING_GUIDE.md](HERMES_TESTING_GUIDE.md)
+- [PRODUCTION_REVIEW.md](PRODUCTION_REVIEW.md)
+
+## Client and agent references
+
+- Main client reference:
+  [docs/HERMES_CLIENT_CREATOR_REFERENCE.md](docs/HERMES_CLIENT_CREATOR_REFERENCE.md)
+- Java SDK roadmap:
+  [docs/HERMES_JAVA_SDK_ROADMAP.md](docs/HERMES_JAVA_SDK_ROADMAP.md)
+
+## Testing and quality checks
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-> [!NOTE]
-> Integration tests automatically spin up ephemeral TCP servers bound to dynamic ports (`127.0.0.1:0`) and clean up all data stores on completion.
+The integration suite covers replication, transactions, security, quotas, metrics,
+restart recovery, and Windows-relevant storage behavior.
 
----
+## Contributing
 
-## 🤝 Contributing to Hermes
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-We welcome contributions to make Hermes even better! Follow this guide to set up the repository for public contribution on GitHub.
+## License
 
-### 🌟 Steps to Publish on GitHub as a Contributing Repository
-
-If you are the maintainer setting up this repository on GitHub:
-
-1.  **Initialize Git & Add Remote**:
-    ```bash
-    git init
-    git add .
-    git commit -m "Initial commit of Hermes source code"
-    git branch -M main
-    git remote add origin https://github.com/your-organization/hermes.git
-    git push -u origin main
-    ```
-2.  **Enable GitHub Features**:
-    *   Under **Repository Settings**, enable **Issues** and **Pull Requests**.
-    *   Set up **Branch Protection Rules** for `main` to require linear histories and passing status checks.
-3.  **Add CI/CD Integration**:
-    Create `.github/workflows/ci.yml` to automatically run tests and code linting on every push or Pull Request.
-
-### 💻 Local Developer Setup
-
-1.  **Fork the Repository**: Click the **Fork** button at the top-right of the GitHub repository page.
-2.  **Clone Your Fork**:
-    ```git
-    git clone https://github.com/your-username/hermes.git
-    cd hermes
-    ```
-3.  **Create a Branch**: Create a descriptive topic branch for your changes:
-    ```bash
-    git checkout -b feature/your-awesome-feature
-    # or
-    git checkout -b fix/issue-name
-    ```
-
-### 📝 Development Guidelines
-
-To keep the repository clean and stable, please adhere to the following standards:
-
-#### 1. Code Formatting & Linting
-We enforce standard Rust styling. Run these commands before committing code:
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-```
-
-#### 2. Writing and Running Tests
-*   Ensure that all changes are backed by relevant tests.
-*   If adding new storage/server features, write integration scenarios in the [`tests/integration_tests.rs`](tests/integration_tests.rs) file.
-*   Validate that all tests execute cleanly:
-    ```bash
-    cargo test
-    ```
-
-#### 3. Commit Message Convention
-We recommend descriptive commit messages following the [Conventional Commits](https://www.conventionalcommits.org/) standard:
-*   `feat: add compression support for segment blocks`
-*   `fix: resolve race condition in consumer group rebalance`
-*   `docs: update readme with multi-node clustering guide`
-
-#### 4. Submitting a Pull Request (PR)
-1.  Push your branch to your GitHub fork:
-    ```bash
-    git push origin feature/your-awesome-feature
-    ```
-2.  Navigate to the original Hermes repository on GitHub.
-3.  Click **New Pull Request**, select your fork's branch, and provide a clear description of the modifications.
-4.  Await review! Our maintainers will review the PR, run tests on CI/CD, and merge it.
-
----
-
-## 📄 License
-
-This project is licensed under the terms of both the **MIT License** and the **Apache License (Version 2.0)**. You may choose to use either license at your discretion.
+Hermes is dual-licensed under MIT or Apache-2.0.
