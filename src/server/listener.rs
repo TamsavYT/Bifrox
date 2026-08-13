@@ -3,7 +3,7 @@ use crate::server::engine::StorageEngine;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::Result as IoResult;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
@@ -180,20 +180,55 @@ impl Server {
 
         let metrics_engine = self.engine.clone();
         tokio::spawn(async move {
-            let metrics_port = local_addr.port().checked_add(1000).unwrap_or(9090);
-            let metrics_addr = SocketAddr::from(([127, 0, 0, 1], metrics_port));
+            let config = metrics_engine.config();
+            let metrics_addr: SocketAddr = if let Some(ref bind_str) = config.metrics_bind_addr {
+                bind_str.parse().unwrap_or_else(|_| {
+                    let metrics_port = local_addr.port().checked_add(1000).unwrap_or(9090);
+                    SocketAddr::from(([127, 0, 0, 1], metrics_port))
+                })
+            } else {
+                let metrics_port = local_addr.port().checked_add(1000).unwrap_or(9090);
+                SocketAddr::from(([127, 0, 0, 1], metrics_port))
+            };
+
             if let Ok(listener) = TcpListener::bind(metrics_addr).await {
                 tracing::info!(
                     "Prometheus Metrics Exporter listening on http://{}/metrics",
                     metrics_addr
                 );
                 loop {
-                    if let Ok((mut socket, _)) = listener.accept().await {
+                    if let Ok((mut socket, peer_addr)) = listener.accept().await {
                         let engine = metrics_engine.clone();
                         tokio::spawn(async move {
                             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                            // Network control: allowed IPs
+                            let allowed_ips = &engine.config().metrics_allowed_ips;
+                            if !is_allowed_metrics_peer(allowed_ips, peer_addr.ip()) {
+                                let res = "HTTP/1.1 403 Forbidden\r\nContent-Length: 15\r\nConnection: close\r\n\r\n403 Forbidden\n";
+                                let _ = socket.write_all(res.as_bytes()).await;
+                                return;
+                            }
+
                             let mut buf = [0u8; 1024];
-                            let _ = socket.read(&mut buf).await;
+                            let read_bytes = match socket.read(&mut buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+
+                            // Scrape auth control: token auth
+                            if let Some(ref token) = engine.config().metrics_auth_token {
+                                let req_str = String::from_utf8_lossy(&buf[..read_bytes]);
+                                let auth_header = format!("Authorization: Bearer {}", token);
+                                if !req_str.contains(&auth_header)
+                                    && !req_str.contains(&format!("token={}", token))
+                                {
+                                    let res = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 18\r\nConnection: close\r\n\r\n401 Unauthorized\n";
+                                    let _ = socket.write_all(res.as_bytes()).await;
+                                    return;
+                                }
+                            }
+
                             let body = engine.metrics().render_prometheus(
                                 engine.list_topics().len(),
                                 engine.broker_endpoints().len(),
@@ -266,5 +301,102 @@ impl Server {
     pub async fn run(&self) -> IoResult<()> {
         let (listener, _) = self.bind()?;
         self.run_with_listener(listener).await
+    }
+}
+
+fn is_allowed_metrics_peer(allowed_ips: &[String], peer_ip: IpAddr) -> bool {
+    if allowed_ips.is_empty() {
+        return true;
+    }
+
+    allowed_ips.iter().any(|rule| {
+        let rule = rule.trim();
+        if rule == "*" {
+            return true;
+        }
+        if let Ok(ip) = rule.parse::<IpAddr>() {
+            return ip == peer_ip;
+        }
+        cidr_contains(rule, peer_ip)
+    })
+}
+
+fn cidr_contains(cidr: &str, peer_ip: IpAddr) -> bool {
+    let (net_str, prefix_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let network_ip: IpAddr = match net_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let prefix: u8 = match prefix_str.parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    match (network_ip, peer_ip) {
+        (IpAddr::V4(net), IpAddr::V4(peer)) => ipv4_cidr_contains(net, prefix, peer),
+        (IpAddr::V6(net), IpAddr::V6(peer)) => ipv6_cidr_contains(net, prefix, peer),
+        _ => false,
+    }
+}
+
+fn ipv4_cidr_contains(network: Ipv4Addr, prefix: u8, peer: Ipv4Addr) -> bool {
+    if prefix > 32 {
+        return false;
+    }
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - prefix);
+    (u32::from(network) & mask) == (u32::from(peer) & mask)
+}
+
+fn ipv6_cidr_contains(network: Ipv6Addr, prefix: u8, peer: Ipv6Addr) -> bool {
+    if prefix > 128 {
+        return false;
+    }
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - prefix);
+    (u128::from(network) & mask) == (u128::from(peer) & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_metrics_peer;
+
+    #[test]
+    fn metrics_allowlist_supports_exact_ip_wildcard_and_cidr() {
+        assert!(is_allowed_metrics_peer(
+            &["*".to_string()],
+            "10.1.2.3".parse().unwrap()
+        ));
+        assert!(is_allowed_metrics_peer(
+            &["127.0.0.1".to_string()],
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(!is_allowed_metrics_peer(
+            &["127.0.0.1".to_string()],
+            "127.0.0.2".parse().unwrap()
+        ));
+        assert!(is_allowed_metrics_peer(
+            &["10.0.0.0/8".to_string()],
+            "10.11.12.13".parse().unwrap()
+        ));
+        assert!(!is_allowed_metrics_peer(
+            &["10.0.0.0/8".to_string()],
+            "11.0.0.1".parse().unwrap()
+        ));
+        assert!(is_allowed_metrics_peer(
+            &["2001:db8::/32".to_string()],
+            "2001:db8:abcd::1".parse().unwrap()
+        ));
+        assert!(!is_allowed_metrics_peer(
+            &["2001:db8::/32".to_string()],
+            "2001:dead::1".parse().unwrap()
+        ));
     }
 }

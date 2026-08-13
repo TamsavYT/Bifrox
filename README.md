@@ -46,19 +46,19 @@ The codebase is structured logically, facilitating simple navigability:
 
 | Directory/File | Description |
 | :--- | :--- |
-| [`src/main.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/main.rs) | Server entry point. Parses configuration, initializes storage, configures dual-destination tracing logs, and starts the TCP listener. |
-| [`src/lib.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/lib.rs) | Root library module exposing public APIs for clients, replication, config, storage, and protocol codecs. |
-| [`src/client.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/client.rs) | Test/production client containing APIs for Produce, Fetch, Seek, and Consumer Group registration. |
-| [`src/config.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/config.rs) | Configurations parser (`EngineConfig`) supporting properties files and environment variables fallback. |
-| [`src/consumer_group.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/consumer_group.rs) | Tracks active consumer group offsets and assigns partition ownership. |
-| [`src/bin/hermes_cli.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/bin/hermes_cli.rs) | Core CLI application containing client control subcommands. |
-| [`src/wal/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/wal/) | WAL engine that ensures durability and handles crash recovery logs. |
-| [`src/segment/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/segment/) | Manages active and read-only storage segments (MMap log writers, sparse and time indexing). |
-| [`src/server/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/server/) | Event loops, TCP connection handlers, partition coordinators, and transactional context. |
-| [`src/protocol/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/protocol/) | Serialization & Deserialization codecs for wire commands and data frames. |
-| [`src/replication/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/src/replication/) | Cluster coordination, leader election, metadata exchange, and follower fetch streams. |
-| [`config/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/config/) | Configuration templates for node orchestration (Node 1, Node 2, Node 3). |
-| [`tests/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/tests/) | Full-suite integration test scenarios verifying end-to-end event streaming workflows. |
+| [`src/main.rs`](src/main.rs) | Server entry point. Parses configuration, initializes storage, configures dual-destination tracing logs, and starts the TCP listener. |
+| [`src/lib.rs`](src/lib.rs) | Root library module exposing public APIs for clients, replication, config, storage, and protocol codecs. |
+| [`src/client.rs`](src/client.rs) | Test/production client containing APIs for Produce, Fetch, Seek, and Consumer Group registration. |
+| [`src/config.rs`](src/config.rs) | Configurations parser (`EngineConfig`) supporting properties files and environment variables fallback. |
+| [`src/consumer_group.rs`](src/consumer_group.rs) | Tracks active consumer group offsets and assigns partition ownership. |
+| [`src/bin/hermes_cli.rs`](src/bin/hermes_cli.rs) | Core CLI application containing client control subcommands. |
+| [`src/wal/`](src/wal/) | WAL engine that ensures durability and handles crash recovery logs. |
+| [`src/segment/`](src/segment/) | Manages active and read-only storage segments (MMap log writers, sparse and time indexing). |
+| [`src/server/`](src/server/) | Event loops, TCP connection handlers, partition coordinators, and transactional context. |
+| [`src/protocol/`](src/protocol/) | Serialization & Deserialization codecs for wire commands and data frames. |
+| [`src/replication/`](src/replication/) | Cluster coordination, leader election, metadata exchange, and follower fetch streams. |
+| [`config/`](config/) | Configuration templates for node orchestration (Node 1, Node 2, Node 3). |
+| [`tests/`](tests/) | Full-suite integration test scenarios verifying end-to-end event streaming workflows. |
 
 ---
 
@@ -69,7 +69,7 @@ The codebase is structured logically, facilitating simple navigability:
 *   **Operating System**: Windows (optimizations via `windows-sys`) or POSIX-compliant systems (Linux/macOS).
 
 ### Configuration Setup
-Copy or edit configurations in the [`config/`](file:///C:/Users/vboxuser/CLionProjects/Hermes/config/) folder. Here is a typical Kafka-style `.properties` configuration:
+Copy or edit configurations in the [`config/`](config/) folder. Here is a typical Kafka-style `.properties` configuration:
 
 ```properties
 cluster.id=hermes-prod-cluster-01
@@ -221,7 +221,7 @@ cargo clippy --all-targets -- -D warnings
 
 #### 2. Writing and Running Tests
 *   Ensure that all changes are backed by relevant tests.
-*   If adding new storage/server features, write integration scenarios in the [`tests/integration_tests.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/tests/integration_tests.rs) file.
+*   If adding new storage/server features, write integration scenarios in the [`tests/integration_tests.rs`](tests/integration_tests.rs) file.
 *   Validate that all tests execute cleanly:
     ```bash
     cargo test

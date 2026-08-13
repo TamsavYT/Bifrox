@@ -191,6 +191,12 @@ pub struct EngineConfig {
     pub fetch_quota_bytes_per_sec: Option<u64>,
     /// Compression Codec for Record Batch Storage (Kafka `compression.type`)
     pub compression_codec: CompressionCodec,
+    /// Configurable bind address for Prometheus metrics endpoint (e.g. "0.0.0.0:9090")
+    pub metrics_bind_addr: Option<String>,
+    /// Optional Bearer token for Prometheus metrics scrape authentication
+    pub metrics_auth_token: Option<String>,
+    /// Optional network IP whitelist for Prometheus metrics scrape endpoint
+    pub metrics_allowed_ips: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -226,6 +232,9 @@ impl Default for EngineConfig {
             produce_quota_bytes_per_sec: None,
             fetch_quota_bytes_per_sec: None,
             compression_codec: CompressionCodec::default(),
+            metrics_bind_addr: None,
+            metrics_auth_token: None,
+            metrics_allowed_ips: Vec::new(),
         }
     }
 }
@@ -385,6 +394,19 @@ impl EngineConfig {
                         if let Ok(v) = value.parse::<u64>() {
                             config.fetch_quota_bytes_per_sec = Some(v);
                         }
+                    }
+                    "metrics.bind.address" | "metrics.bind.addr" if !value.is_empty() => {
+                        config.metrics_bind_addr = Some(value.to_string());
+                    }
+                    "metrics.auth.token" | "metrics.token" if !value.is_empty() => {
+                        config.metrics_auth_token = Some(value.to_string());
+                    }
+                    "metrics.allowed.ips" => {
+                        config.metrics_allowed_ips = value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
                     }
                     _ => {}
                 }

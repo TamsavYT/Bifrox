@@ -21,6 +21,7 @@ rustls-pemfile = "2.1"
 rcgen = "0.13"
 lz4_flex = "0.11"
 webpki-roots = "0.26"
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }

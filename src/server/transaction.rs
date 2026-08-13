@@ -23,6 +23,7 @@ pub struct TransactionState {
     pub status: TxStatus,
     /// Partitions touched by this transaction: (topic, partition_id, start_offset, end_offset)
     pub partitions: PartitionRangeList,
+    pub created_at_ms: u64,
 }
 
 /// Idempotent Producer and Transaction State Tracker
@@ -121,11 +122,16 @@ impl TransactionManager {
                 transaction_id
             )),
             Entry::Vacant(e) => {
+                let created_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 e.insert(TransactionState {
                     transaction_id: transaction_id.to_string(),
                     producer_id,
                     status: TxStatus::Ongoing,
                     partitions: Vec::new(),
+                    created_at_ms,
                 });
                 Ok(())
             }
@@ -308,6 +314,10 @@ impl TransactionManager {
         status: TxStatus,
         partitions: PartitionRangeList,
     ) {
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         self.transactions.insert(
             transaction_id.to_string(),
             TransactionState {
@@ -315,8 +325,35 @@ impl TransactionManager {
                 producer_id,
                 status,
                 partitions,
+                created_at_ms,
             },
         );
+    }
+
+    /// Time-bounded retention queue for transaction states based on max_age_ms (MEM-02).
+    pub fn prune_stale_transactions(&self, max_age_ms: u64) -> usize {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut to_remove = Vec::new();
+        for entry in self.transactions.iter() {
+            let state = entry.value();
+            let age_ms = now_ms.saturating_sub(state.created_at_ms);
+
+            let is_completed =
+                state.status == TxStatus::Committed || state.status == TxStatus::Aborted;
+            if age_ms > max_age_ms || (max_age_ms == 0 && is_completed) {
+                to_remove.push(entry.key().clone());
+            }
+        }
+
+        let count = to_remove.len();
+        for tx_id in to_remove {
+            self.transactions.remove(&tx_id);
+        }
+        count
     }
 }
 

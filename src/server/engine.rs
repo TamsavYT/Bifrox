@@ -865,6 +865,7 @@ impl StorageEngine {
         for entry in self.partitions.iter() {
             total_removed += entry.value().apply_retention()?;
         }
+        total_removed += self.transactions.prune_stale_transactions(604_800_000); // 7 days (604800000ms) retention
         Ok(total_removed)
     }
 

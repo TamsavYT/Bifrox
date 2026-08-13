@@ -218,6 +218,17 @@ impl TestClient {
         client_auth: Option<(&std::path::Path, &std::path::Path)>,
         insecure_skip_verify: bool,
     ) -> IoResult<Self> {
+        Self::connect_tls_full_with_domain(addr, ca_path, client_auth, insecure_skip_verify, None)
+            .await
+    }
+
+    pub async fn connect_tls_full_with_domain(
+        addr: SocketAddr,
+        ca_path: Option<&std::path::Path>,
+        client_auth: Option<(&std::path::Path, &std::path::Path)>,
+        insecure_skip_verify: bool,
+        server_name: Option<&str>,
+    ) -> IoResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tcp_stream = TcpStream::connect(addr).await?;
 
@@ -269,7 +280,27 @@ impl TestClient {
         };
 
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let domain_str = match server_name {
+            Some(name) => name.to_string(),
+            None => {
+                let ip = addr.ip();
+                if ip.is_loopback() {
+                    "localhost".to_string()
+                } else {
+                    ip.to_string()
+                }
+            }
+        };
+
+        let domain = rustls::pki_types::ServerName::try_from(domain_str.as_str())
+            .map(|s| s.to_owned())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid TLS server name '{}': {}", domain_str, e),
+                )
+            })?;
+
         let tls_stream = connector.connect(domain, tcp_stream).await?;
         Ok(Self {
             addr,
@@ -1169,8 +1200,11 @@ impl TestClient {
                     break;
                 }
                 match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((frame, consumed)) => {
+                    Ok((mut frame, consumed)) => {
                         cursor += consumed;
+                        if let Ok(decompressed) = frame.decompress_payload() {
+                            frame.payload = decompressed;
+                        }
                         frames.push(frame);
                     }
                     Err(_) => break,
@@ -1229,8 +1263,11 @@ impl TestClient {
                     break;
                 }
                 match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((frame, consumed)) => {
+                    Ok((mut frame, consumed)) => {
                         cursor += consumed;
+                        if let Ok(decompressed) = frame.decompress_payload() {
+                            frame.payload = decompressed;
+                        }
                         frames.push(frame);
                     }
                     Err(_) => break,

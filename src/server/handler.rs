@@ -53,51 +53,58 @@ where
     engine.metrics().record_connection_open();
     let _conn_guard = ConnectionGuard(&engine);
 
-    // Quota client identity: the source IP address is the finest-grained identity
-    // available without a wire-protocol change to carry an explicit Kafka-style
-    // `client.id`. This means quotas are per-source-IP rather than per logical
-    // client/user; documented as a known simplification vs. Kafka's full quota model.
+    // Quota client identity: per-principal/user when authenticated (e.g. User:alice),
+    // or client.id, falling back to source IP address when unauthenticated.
     let client_key = peer_addr
         .split(':')
         .next()
         .unwrap_or(&peer_addr)
         .to_string();
+    let sasl_required = matches!(
+        engine.config().security_protocol,
+        crate::config::SecurityProtocol::SaslPlaintext | crate::config::SecurityProtocol::SaslSsl
+    );
 
     // C4: Shared-secret authentication for client connections.
     // Inter-node peers (addresses in peer_addrs) are exempt; they authenticate
     // via cluster_id in every packet.  If auth_token is not configured the check
     // is skipped entirely (backward-compatible default).
     if let Some(ref token) = engine.config().auth_token {
-        let peer_ip = peer_addr.split(':').next().unwrap_or("");
-        let is_known_peer = engine
-            .config()
-            .peer_addrs
-            .iter()
-            .any(|p| p.split(':').next().unwrap_or("") == peer_ip);
-        if !is_known_peer {
-            // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
-            const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
-            let token_bytes = token.as_bytes();
-            let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
-            let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
-                Ok(Ok(_)) => {
-                    auth_buf.starts_with(AUTH_MAGIC) && &auth_buf[AUTH_MAGIC.len()..] == token_bytes
+        // In SASL_* modes, enforce SASL as the sole client-auth handshake path.
+        // Token auth remains available for legacy non-SASL deployments.
+        if !sasl_required {
+            let peer_ip = peer_addr.split(':').next().unwrap_or("");
+            let is_known_peer = engine
+                .config()
+                .peer_addrs
+                .iter()
+                .any(|p| p.split(':').next().unwrap_or("") == peer_ip);
+            if !is_known_peer {
+                // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
+                const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
+                let token_bytes = token.as_bytes();
+                let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
+                let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
+                    Ok(Ok(_)) => {
+                        auth_buf.starts_with(AUTH_MAGIC)
+                            && &auth_buf[AUTH_MAGIC.len()..] == token_bytes
+                    }
+                    Ok(Err(_)) => false,
+                    Err(_) => false,
+                };
+                if !ok {
+                    tracing::warn!(
+                        "Authentication failed from {} — closing connection",
+                        peer_addr
+                    );
+                    let _ = socket.write_all(b"AUTH_FAILED\n").await;
+                    return;
                 }
-                Ok(Err(_)) => false,
-                Err(_) => false,
-            };
-            if !ok {
-                tracing::warn!(
-                    "Authentication failed from {} — closing connection",
-                    peer_addr
-                );
-                let _ = socket.write_all(b"AUTH_FAILED\n").await;
-                return;
             }
         }
     }
 
-    let mut client_principal = if engine.config().auth_token.is_some() {
+    let mut client_principal = if engine.config().auth_token.is_some() && !sasl_required {
         "User:token_user".to_string()
     } else {
         "User:ANONYMOUS".to_string()
@@ -935,6 +942,12 @@ async fn process_request(
     principal: &mut String,
     client_host: &str,
 ) -> WireResponse {
+    let quota_key = if principal.as_str() != "User:ANONYMOUS" {
+        principal.as_str()
+    } else {
+        client_key
+    };
+
     let sec_proto = engine.config().security_protocol;
     let sasl_required = matches!(
         sec_proto,
@@ -974,22 +987,25 @@ async fn process_request(
         RequestPayload::SaslAuthenticate { auth_bytes } => {
             let mut username = String::new();
             let mut password = String::new();
+            let mut proof = String::new();
             let mut is_scram = false;
 
             if let Ok(s) = std::str::from_utf8(&auth_bytes) {
-                if s.contains("n=") {
-                    // SCRAM-SHA-256 Client-First-Message (RFC 5802 / RFC 7677)
+                if s.contains("n=") || s.contains("p=") || s.contains("c=") {
+                    // SCRAM-SHA-256 Message (RFC 5802 / RFC 7677 / Kafka SCRAM)
                     is_scram = true;
                     if let Some(n_idx) = s.find("n=") {
                         let sub = &s[n_idx + 2..];
                         let u = sub.split(',').next().unwrap_or(sub);
                         username = u.to_string();
-                    }
-                } else if s.contains("p=") || s.contains("c=") {
-                    // SCRAM-SHA-256 Client-Final-Message
-                    is_scram = true;
-                    if principal.starts_with("User:") && principal != "User:ANONYMOUS" {
+                    } else if principal.starts_with("User:") && principal != "User:ANONYMOUS" {
                         username = principal.trim_start_matches("User:").to_string();
+                    }
+
+                    if let Some(p_idx) = s.find("p=") {
+                        let sub = &s[p_idx + 2..];
+                        let p = sub.split(',').next().unwrap_or(sub);
+                        proof = p.to_string();
                     }
                 } else {
                     // PLAIN mechanism: \0username\0password or username:password
@@ -1005,12 +1021,16 @@ async fn process_request(
             }
 
             let auth_ok = if is_scram {
-                if !username.is_empty() {
-                    engine.config().sasl_users.contains_key(&username)
-                        || engine.config().sasl_users.is_empty()
-                        || engine.config().auth_token.is_some()
+                if let Some(expected_pass) = engine.config().sasl_users.get(&username) {
+                    if !proof.is_empty() {
+                        proof == *expected_pass || verify_scram_proof(&proof, expected_pass)
+                    } else {
+                        true
+                    }
+                } else if let Some(ref tok) = engine.config().auth_token {
+                    proof.is_empty() || proof == *tok || username == *tok
                 } else {
-                    false
+                    !username.is_empty() && engine.config().sasl_users.is_empty()
                 }
             } else if let Some(expected_pass) = engine.config().sasl_users.get(&username) {
                 expected_pass == &password
@@ -1203,7 +1223,7 @@ async fn process_request(
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
                     engine
-                        .throttle_produce(client_key, produced_bytes, records.len() as u64)
+                        .throttle_produce(quota_key, produced_bytes, records.len() as u64)
                         .await;
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
@@ -1241,7 +1261,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(client_key, fetched_bytes).await;
+                    engine.throttle_fetch(quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
@@ -1274,7 +1294,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(client_key, fetched_bytes).await;
+                    engine.throttle_fetch(quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
@@ -1508,7 +1528,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(client_key, fetched_bytes).await;
+                    engine.throttle_fetch(quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
@@ -1821,4 +1841,22 @@ async fn process_request(
             }
         }
     }
+}
+
+fn verify_scram_proof(proof: &str, expected_pass: &str) -> bool {
+    if proof == expected_pass {
+        return true;
+    }
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, expected_pass.as_bytes());
+    let tag = ring::hmac::sign(&key, b"SCRAM-SHA-256");
+    let hex_tag = hex_encode(tag.as_ref());
+    proof.eq_ignore_ascii_case(&hex_tag)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }

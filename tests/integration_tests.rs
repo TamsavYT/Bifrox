@@ -1719,6 +1719,14 @@ async fn test_scenario_24_sasl_and_acls() {
         .unwrap();
     assert_eq!(scram_auth_res, 0);
 
+    // Invalid SCRAM authentication attempt with unknown user
+    let mut invalid_scram_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let invalid_scram_res = invalid_scram_client
+        .sasl_authenticate(b"n,,n=unknown_user,r=rOprNGfwEbeRWgbNEkqO")
+        .await
+        .unwrap();
+    assert_eq!(invalid_scram_res, 58); // 58 = SASL_AUTHENTICATION_FAILED
+
     // Authenticate admin client with superuser privileges
     let mut admin_client = hermes::client::TestClient::connect(addr).await.unwrap();
     let _ = admin_client.sasl_handshake("PLAIN").await.unwrap();

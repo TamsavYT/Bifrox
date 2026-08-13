@@ -56,6 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--ca-path",
         "--cert-path",
         "--key-path",
+        "--sni",
+        "--server-name",
     ];
 
     let mut command_opt = None;
@@ -84,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ca_path_opt = get_arg_val(&args, "--ca-path");
     let cert_path_opt = get_arg_val(&args, "--cert-path");
     let key_path_opt = get_arg_val(&args, "--key-path");
+    let sni_opt = get_arg_val(&args, "--sni").or_else(|| get_arg_val(&args, "--server-name"));
     let insecure = has_flag(&args, "--insecure");
     let sasl_user_opt = get_arg_val(&args, "--sasl-user");
     let sasl_pass_opt = get_arg_val(&args, "--sasl-pass").unwrap_or_default();
@@ -94,15 +97,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Some(c), Some(k)) => Some((std::path::Path::new(c), std::path::Path::new(k))),
             _ => None,
         };
-        let skip_verify = insecure || (ca_path_opt.is_none() && client_auth.is_none());
+        let skip_verify = insecure;
 
-        match TestClient::connect_tls_full(server_addr, ca_p, client_auth, skip_verify).await {
+        match TestClient::connect_tls_full_with_domain(
+            server_addr,
+            ca_p,
+            client_auth,
+            skip_verify,
+            sni_opt.as_deref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
                     "Error: Could not connect via TLS/SSL to Hermes server at {}: {}",
                     server_addr, e
                 );
+                if !insecure {
+                    eprintln!("Hint: For SAN hostname/IP validation, use --sni <hostname>.");
+                    eprintln!(
+                        "Windows Guidance: System CAs (Let's Encrypt, DigiCert, etc.) are verified automatically."
+                    );
+                    eprintln!(
+                        "For custom internal CAs on Windows, export your root cert to PEM ('certutil -encode ca.crt ca.pem') and pass '--ca-path C:\\path\\to\\ca.pem'."
+                    );
+                }
                 return Ok(());
             }
         }
