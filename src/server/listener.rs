@@ -220,9 +220,7 @@ impl Server {
                             if let Some(ref token) = engine.config().metrics_auth_token {
                                 let req_str = String::from_utf8_lossy(&buf[..read_bytes]);
                                 let auth_header = format!("Authorization: Bearer {}", token);
-                                if !req_str.contains(&auth_header)
-                                    && !req_str.contains(&format!("token={}", token))
-                                {
+                                if !req_str.contains(&auth_header) {
                                     let res = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 18\r\nConnection: close\r\n\r\n401 Unauthorized\n";
                                     let _ = socket.write_all(res.as_bytes()).await;
                                     return;

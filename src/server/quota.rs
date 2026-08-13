@@ -41,13 +41,13 @@ impl TokenBucket {
     }
 }
 
-/// Per-client byte-rate quota enforcement for produce and fetch traffic.
+/// Per-logical-client byte-rate quota enforcement for produce and fetch traffic.
 ///
-/// Clients are identified by their source IP address (the finest-grained identity
-/// available without a wire-protocol change to carry an explicit Kafka-style
-/// `client.id`). When either `produce_rate` or `fetch_rate` is `None`, the
-/// corresponding quota is disabled and requests are never delayed — this preserves
-/// existing unthrottled behavior by default.
+/// The caller provides the logical quota key, which may represent an authenticated
+/// principal, a connection-scoped client_id, or a fallback source-IP identity.
+/// When either `produce_rate` or `fetch_rate` is `None`, the corresponding quota is
+/// disabled and requests are never delayed — this preserves existing unthrottled
+/// behavior by default.
 #[derive(Debug)]
 pub struct QuotaManager {
     produce_rate: Option<u64>,

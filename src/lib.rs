@@ -3,6 +3,7 @@ pub mod config;
 pub mod consumer_group;
 pub mod protocol;
 pub mod replication;
+mod scram;
 pub mod segment;
 pub mod server;
 

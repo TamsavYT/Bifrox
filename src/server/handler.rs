@@ -1,7 +1,9 @@
 use crate::protocol::{
     RecordFrame, RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE,
 };
+use crate::scram::{self, ScramCredential};
 use crate::server::engine::StorageEngine;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::{Buf, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -20,6 +22,17 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum allowed size for a forwarded leader response (prevents OOM from a malicious/buggy leader).
 const MAX_FORWARD_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64MB
+const MAX_CLIENT_ID_LEN: usize = 256;
+
+const SCRAM_SERVER_NONCE_LEN: usize = 18;
+
+#[derive(Debug, Clone)]
+struct ScramSession {
+    username: String,
+    client_first_bare: String,
+    server_first_message: String,
+    combined_nonce: String,
+}
 
 /// Handles incoming TCP client connections and inter-node replication/heartbeat streams.
 ///
@@ -53,8 +66,8 @@ where
     engine.metrics().record_connection_open();
     let _conn_guard = ConnectionGuard(&engine);
 
-    // Quota client identity: per-principal/user when authenticated (e.g. User:alice),
-    // or client.id, falling back to source IP address when unauthenticated.
+    // Connection fallback identity for quotas when neither an authenticated principal
+    // nor a logical client_id has been established on the socket.
     let client_key = peer_addr
         .split(':')
         .next()
@@ -109,6 +122,8 @@ where
     } else {
         "User:ANONYMOUS".to_string()
     };
+    let mut logical_client_id: Option<String> = None;
+    let mut scram_session: Option<ScramSession> = None;
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
@@ -289,6 +304,8 @@ where
                                         &client_key,
                                         &mut client_principal,
                                         &client_key,
+                                        &mut logical_client_id,
+                                        &mut scram_session,
                                     )
                                     .await;
                                     if let Err(e) = socket.write_all(&response.encode()).await {
@@ -308,6 +325,8 @@ where
                                     &client_key,
                                     &mut client_principal,
                                     &client_key,
+                                    &mut logical_client_id,
+                                    &mut scram_session,
                                 )
                                 .await;
                                 if let Err(e) = socket.write_all(&response.encode()).await {
@@ -785,6 +804,31 @@ fn decode_replication_packet(
                             node_id
                         );
                     }
+                    crate::replication::MetadataRecord::ScramCredentialUpsert {
+                        username,
+                        iterations,
+                        salt,
+                        stored_key,
+                        server_key,
+                    } => {
+                        engine.apply_scram_credential_state(
+                            username, iterations, salt, stored_key, server_key,
+                        );
+                    }
+                    crate::replication::MetadataRecord::ScramCredentialDelete { username } => {
+                        engine.remove_scram_credential_state(&username);
+                    }
+                    crate::replication::MetadataRecord::TransactionalProducerRegistration {
+                        transactional_id,
+                        producer_id,
+                        producer_epoch,
+                    } => {
+                        engine.transactions().restore_transactional_producer(
+                            &transactional_id,
+                            producer_id,
+                            producer_epoch,
+                        );
+                    }
                 }
             }
         }
@@ -941,12 +985,10 @@ async fn process_request(
     client_key: &str,
     principal: &mut String,
     client_host: &str,
+    logical_client_id: &mut Option<String>,
+    scram_session: &mut Option<ScramSession>,
 ) -> WireResponse {
-    let quota_key = if principal.as_str() != "User:ANONYMOUS" {
-        principal.as_str()
-    } else {
-        client_key
-    };
+    let quota_key = resolve_quota_key(principal.as_str(), logical_client_id.as_deref(), client_key);
 
     let sec_proto = engine.config().security_protocol;
     let sasl_required = matches!(
@@ -959,6 +1001,7 @@ async fn process_request(
             req.payload,
             RequestPayload::SaslHandshake { .. }
                 | RequestPayload::SaslAuthenticate { .. }
+                | RequestPayload::SetClientId { .. }
                 | RequestPayload::Ping
         );
         if !is_sasl_payload {
@@ -985,74 +1028,198 @@ async fn process_request(
             WireResponse::ok(buf)
         }
         RequestPayload::SaslAuthenticate { auth_bytes } => {
-            let mut username = String::new();
-            let mut password = String::new();
-            let mut proof = String::new();
-            let mut is_scram = false;
-
-            if let Ok(s) = std::str::from_utf8(&auth_bytes) {
-                if s.contains("n=") || s.contains("p=") || s.contains("c=") {
-                    // SCRAM-SHA-256 Message (RFC 5802 / RFC 7677 / Kafka SCRAM)
-                    is_scram = true;
-                    if let Some(n_idx) = s.find("n=") {
-                        let sub = &s[n_idx + 2..];
-                        let u = sub.split(',').next().unwrap_or(sub);
-                        username = u.to_string();
-                    } else if principal.starts_with("User:") && principal != "User:ANONYMOUS" {
-                        username = principal.trim_start_matches("User:").to_string();
-                    }
-
-                    if let Some(p_idx) = s.find("p=") {
-                        let sub = &s[p_idx + 2..];
-                        let p = sub.split(',').next().unwrap_or(sub);
-                        proof = p.to_string();
-                    }
-                } else {
-                    // PLAIN mechanism: \0username\0password or username:password
-                    let parts: Vec<&str> = s.split('\0').filter(|p| !p.is_empty()).collect();
-                    if parts.len() >= 2 {
-                        username = parts[0].to_string();
-                        password = parts[1].to_string();
-                    } else if let Some((u, p)) = s.split_once(':') {
-                        username = u.to_string();
-                        password = p.to_string();
-                    }
+            let auth_text = match std::str::from_utf8(&auth_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    scram_session.take();
+                    return build_sasl_auth_response(
+                        58,
+                        Some("SASL Authentication Failed"),
+                        &[],
+                        0,
+                    );
                 }
+            };
+
+            if is_scram_client_first(auth_text) {
+                let (username, client_nonce, client_first_bare) =
+                    match parse_scram_client_first(auth_text) {
+                        Some(parts) => parts,
+                        None => {
+                            scram_session.take();
+                            return build_sasl_auth_response(
+                                58,
+                                Some("SASL Authentication Failed"),
+                                &[],
+                                0,
+                            );
+                        }
+                    };
+
+                let credential = match engine.lookup_scram_credential(&username) {
+                    Some(credential) => credential,
+                    None => {
+                        scram_session.take();
+                        return build_sasl_auth_response(
+                            58,
+                            Some("SASL Authentication Failed"),
+                            &[],
+                            0,
+                        );
+                    }
+                };
+
+                let server_nonce = match generate_scram_server_nonce() {
+                    Ok(nonce) => nonce,
+                    Err(_) => {
+                        scram_session.take();
+                        return build_sasl_auth_response(
+                            58,
+                            Some("SASL Authentication Failed"),
+                            &[],
+                            0,
+                        );
+                    }
+                };
+                let combined_nonce = format!("{}{}", client_nonce, server_nonce);
+                let salt_b64 = BASE64_STANDARD.encode(&credential.salt);
+                let server_first_message = format!(
+                    "r={},s={},i={}",
+                    combined_nonce, salt_b64, credential.iterations
+                );
+
+                *scram_session = Some(ScramSession {
+                    username,
+                    client_first_bare,
+                    server_first_message: server_first_message.clone(),
+                    combined_nonce,
+                });
+
+                return build_sasl_auth_response(0, None, server_first_message.as_bytes(), 0);
             }
 
-            let auth_ok = if is_scram {
-                if let Some(expected_pass) = engine.config().sasl_users.get(&username) {
-                    if !proof.is_empty() {
-                        proof == *expected_pass || verify_scram_proof(&proof, expected_pass)
-                    } else {
-                        true
+            if is_scram_client_final(auth_text) {
+                let session = match scram_session.as_ref() {
+                    Some(session) => session,
+                    None => {
+                        return build_sasl_auth_response(
+                            58,
+                            Some("SASL Authentication Failed"),
+                            &[],
+                            0,
+                        );
                     }
-                } else if let Some(ref tok) = engine.config().auth_token {
-                    proof.is_empty() || proof == *tok || username == *tok
-                } else {
-                    !username.is_empty() && engine.config().sasl_users.is_empty()
+                };
+
+                let credential = match engine.lookup_scram_credential(&session.username) {
+                    Some(credential) => credential,
+                    None => {
+                        scram_session.take();
+                        return build_sasl_auth_response(
+                            58,
+                            Some("SASL Authentication Failed"),
+                            &[],
+                            0,
+                        );
+                    }
+                };
+
+                let client_final = match parse_scram_client_final(auth_text) {
+                    Some(msg) => msg,
+                    None => {
+                        scram_session.take();
+                        return build_sasl_auth_response(
+                            58,
+                            Some("SASL Authentication Failed"),
+                            &[],
+                            0,
+                        );
+                    }
+                };
+
+                if client_final.nonce != session.combined_nonce
+                    || !verify_scram_proof(&client_final, session, &credential)
+                {
+                    scram_session.take();
+                    return build_sasl_auth_response(
+                        58,
+                        Some("SASL Authentication Failed"),
+                        &[],
+                        0,
+                    );
                 }
-            } else if let Some(expected_pass) = engine.config().sasl_users.get(&username) {
-                expected_pass == &password
+
+                let server_final = build_scram_server_final(session, &credential, &client_final);
+
+                *principal = format!("User:{}", session.username);
+                scram_session.take();
+                return build_sasl_auth_response(0, None, server_final.as_bytes(), 0);
+            }
+
+            let (username, password) = parse_plain_auth(auth_text);
+            let auth_ok = if let Some(credential) = engine.lookup_scram_credential(&username) {
+                credential.verify_password(&password)
             } else if let Some(ref tok) = engine.config().auth_token {
                 tok == &password || tok == &username
             } else {
-                !username.is_empty() && engine.config().sasl_users.is_empty()
+                false
             };
 
             if auth_ok {
+                scram_session.take();
                 *principal = format!("User:{}", username);
-                let mut buf = Vec::new();
-                buf.put_i16(0); // ErrorCode 0
-                buf.put_u16(0); // null error message
-                buf.put_u32(0); // auth bytes len 0
-                buf.put_i64(0); // session lifetime ms 0
-                WireResponse::ok(buf)
+                build_sasl_auth_response(0, None, &[], 0)
             } else {
-                let mut buf = Vec::new();
-                buf.put_i16(58); // SASL_AUTHENTICATION_FAILED
-                crate::protocol::wire::write_pascal_string(&mut buf, "SASL Authentication Failed");
-                WireResponse::ok(buf)
+                scram_session.take();
+                build_sasl_auth_response(58, Some("SASL Authentication Failed"), &[], 0)
+            }
+        }
+        RequestPayload::SetClientId { client_id } => {
+            if client_id.is_empty() || client_id.len() > MAX_CLIENT_ID_LEN {
+                return WireResponse::error("Invalid client_id");
+            }
+            *logical_client_id = Some(client_id);
+            WireResponse::ok(Vec::new())
+        }
+        RequestPayload::UpsertScramUser {
+            username,
+            iterations,
+            salt,
+            stored_key,
+            server_key,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            if username.is_empty() {
+                return WireResponse::error("SCRAM username cannot be empty");
+            }
+            match engine
+                .upsert_scram_credential(&username, iterations, salt, stored_key, server_key)
+            {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(err) => WireResponse::error(&format!("UpsertScramUser failed: {}", err)),
+            }
+        }
+        RequestPayload::DeleteScramUser { username } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Alter as u8,
+                crate::server::acl::ResourceType::Cluster as u8,
+                "",
+            ) {
+                return WireResponse::error("ClusterAuthorizationFailed");
+            }
+            match engine.delete_scram_user(&username) {
+                Ok(_) => WireResponse::ok(Vec::new()),
+                Err(err) => WireResponse::error(&format!("DeleteScramUser failed: {}", err)),
             }
         }
         RequestPayload::DescribeAcls {
@@ -1223,7 +1390,7 @@ async fn process_request(
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
                     engine
-                        .throttle_produce(quota_key, produced_bytes, records.len() as u64)
+                        .throttle_produce(&quota_key, produced_bytes, records.len() as u64)
                         .await;
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
@@ -1261,7 +1428,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
@@ -1294,7 +1461,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
@@ -1445,11 +1612,15 @@ async fn process_request(
             {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            let pid = engine.transactions().generate_producer_id();
-            let mut buf = Vec::with_capacity(10);
-            buf.put_u64(pid);
-            buf.put_i16(0); // Epoch 0
-            WireResponse::ok(buf)
+            match engine.init_producer_id(&transactional_id) {
+                Ok((pid, epoch)) => {
+                    let mut buf = Vec::with_capacity(10);
+                    buf.put_u64(pid);
+                    buf.put_i16(epoch);
+                    WireResponse::ok(buf)
+                }
+                Err(err) => WireResponse::error(&format!("InitProducerId failed: {}", err)),
+            }
         }
         RequestPayload::AddPartitionsToTxn {
             transactional_id,
@@ -1480,8 +1651,8 @@ async fn process_request(
         }
         RequestPayload::EndTxn {
             transactional_id,
-            producer_id: _producer_id,
-            producer_epoch: _producer_epoch,
+            producer_id,
+            producer_epoch,
             committed,
         } => {
             if !engine.authorize(
@@ -1493,11 +1664,8 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            let result = if committed {
-                engine.commit_transaction(&transactional_id)
-            } else {
-                engine.abort_transaction(&transactional_id)
-            };
+            let result =
+                engine.end_transaction(&transactional_id, producer_id, producer_epoch, committed);
             if result.is_ok() {
                 WireResponse::ok(Vec::new())
             } else {
@@ -1528,7 +1696,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
@@ -1843,20 +2011,129 @@ async fn process_request(
     }
 }
 
-fn verify_scram_proof(proof: &str, expected_pass: &str) -> bool {
-    if proof == expected_pass {
-        return true;
-    }
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, expected_pass.as_bytes());
-    let tag = ring::hmac::sign(&key, b"SCRAM-SHA-256");
-    let hex_tag = hex_encode(tag.as_ref());
-    proof.eq_ignore_ascii_case(&hex_tag)
+#[derive(Debug)]
+struct ScramClientFinal {
+    nonce: String,
+    proof: Vec<u8>,
+    without_proof: String,
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+fn build_sasl_auth_response(
+    error_code: i16,
+    error_message: Option<&str>,
+    auth_bytes: &[u8],
+    session_lifetime_ms: i64,
+) -> WireResponse {
+    let mut buf = Vec::new();
+    buf.put_i16(error_code);
+    crate::protocol::wire::write_pascal_string(&mut buf, error_message.unwrap_or(""));
+    buf.put_u32(auth_bytes.len() as u32);
+    buf.extend_from_slice(auth_bytes);
+    buf.put_i64(session_lifetime_ms);
+    WireResponse::ok(buf)
+}
+
+fn resolve_quota_key<'a>(
+    principal: &'a str,
+    logical_client_id: Option<&'a str>,
+    fallback_client_key: &'a str,
+) -> String {
+    match (principal != "User:ANONYMOUS", logical_client_id) {
+        (true, Some(client_id)) => format!("{}|client:{}", principal, client_id),
+        (true, None) => principal.to_string(),
+        (false, Some(client_id)) => format!("client:{}", client_id),
+        (false, None) => fallback_client_key.to_string(),
     }
-    s
+}
+
+fn parse_plain_auth(auth_text: &str) -> (String, String) {
+    let parts: Vec<&str> = auth_text.split('\0').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 2 {
+        (parts[0].to_string(), parts[1].to_string())
+    } else if let Some((username, password)) = auth_text.split_once(':') {
+        (username.to_string(), password.to_string())
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+fn is_scram_client_first(auth_text: &str) -> bool {
+    auth_text.contains("n=") && auth_text.contains("r=") && !auth_text.contains("p=")
+}
+
+fn is_scram_client_final(auth_text: &str) -> bool {
+    auth_text.contains("c=") && auth_text.contains("r=") && auth_text.contains("p=")
+}
+
+fn parse_scram_client_first(auth_text: &str) -> Option<(String, String, String)> {
+    let bare_start = auth_text.find("n=")?;
+    let client_first_bare = auth_text[bare_start..].to_string();
+    let mut username = None;
+    let mut nonce = None;
+    for part in client_first_bare.split(',') {
+        if let Some(value) = part.strip_prefix("n=") {
+            username = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("r=") {
+            nonce = Some(value.to_string());
+        }
+    }
+    Some((username?, nonce?, client_first_bare))
+}
+
+fn parse_scram_client_final(auth_text: &str) -> Option<ScramClientFinal> {
+    let mut channel_binding = None;
+    let mut nonce = None;
+    let mut proof_b64 = None;
+    let mut without_proof_parts = Vec::new();
+
+    for part in auth_text.split(',') {
+        if let Some(value) = part.strip_prefix("c=") {
+            channel_binding = Some(value.to_string());
+            without_proof_parts.push(part.to_string());
+        } else if let Some(value) = part.strip_prefix("r=") {
+            nonce = Some(value.to_string());
+            without_proof_parts.push(part.to_string());
+        } else if let Some(value) = part.strip_prefix("p=") {
+            proof_b64 = Some(value.to_string());
+        }
+    }
+
+    channel_binding?;
+    let proof = BASE64_STANDARD.decode(proof_b64?).ok()?;
+    Some(ScramClientFinal {
+        nonce: nonce?,
+        proof,
+        without_proof: without_proof_parts.join(","),
+    })
+}
+
+fn generate_scram_server_nonce() -> Result<String, ring::error::Unspecified> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut nonce = [0u8; SCRAM_SERVER_NONCE_LEN];
+    ring::rand::SecureRandom::fill(&rng, &mut nonce)?;
+    Ok(scram::hex_encode(&nonce))
+}
+
+fn verify_scram_proof(
+    client_final: &ScramClientFinal,
+    session: &ScramSession,
+    credential: &ScramCredential,
+) -> bool {
+    let auth_message = format!(
+        "{},{},{}",
+        session.client_first_bare, session.server_first_message, client_final.without_proof
+    );
+    credential.verify_client_proof(&auth_message, &client_final.proof)
+}
+
+fn build_scram_server_final(
+    session: &ScramSession,
+    credential: &ScramCredential,
+    client_final: &ScramClientFinal,
+) -> String {
+    let auth_message = format!(
+        "{},{},{}",
+        session.client_first_bare, session.server_first_message, client_final.without_proof
+    );
+    credential.build_server_final(&auth_message)
 }

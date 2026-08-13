@@ -77,7 +77,6 @@ impl LogSegment {
                     if pos + HEADER_SIZE > buf_len {
                         let remaining = &read_buf[pos..];
                         if remaining.iter().all(|&b| b == 0) {
-                            pos = buf_len;
                             break;
                         }
                         if n > 0 {
@@ -99,7 +98,6 @@ impl LogSegment {
                             .iter()
                             .all(|&b| b == 0)
                     {
-                        pos = buf_len;
                         break;
                     }
 
@@ -127,7 +125,6 @@ impl LogSegment {
                             } else {
                                 let remaining = &read_buf[pos..];
                                 if remaining.iter().all(|&b| b == 0) {
-                                    pos = buf_len;
                                     break;
                                 }
                                 tracing::warn!(
@@ -142,7 +139,6 @@ impl LogSegment {
                         Err(err) => {
                             let remaining = &read_buf[pos..];
                             if remaining.iter().all(|&b| b == 0) {
-                                pos = buf_len;
                                 break;
                             }
                             tracing::error!(

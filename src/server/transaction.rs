@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,12 @@ pub struct TransactionState {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionalProducerState {
+    pub producer_id: u64,
+    pub producer_epoch: i16,
+}
+
 /// Idempotent Producer and Transaction State Tracker
 #[derive(Debug, Clone, Default)]
 pub struct TransactionManager {
@@ -33,6 +40,9 @@ pub struct TransactionManager {
     producer_sequences: Arc<DashMap<u64, u32>>,
     /// Active transactions map: transaction_id -> TransactionState
     transactions: Arc<DashMap<String, TransactionState>>,
+    /// Transactional-ID coordinator state used to fence old producers and make InitProducerId durable.
+    transactional_producers: Arc<DashMap<String, TransactionalProducerState>>,
+    next_producer_id: Arc<AtomicU64>,
 }
 
 impl TransactionManager {
@@ -40,6 +50,8 @@ impl TransactionManager {
         Self {
             producer_sequences: Arc::new(DashMap::new()),
             transactions: Arc::new(DashMap::new()),
+            transactional_producers: Arc::new(DashMap::new()),
+            next_producer_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -70,10 +82,95 @@ impl TransactionManager {
     }
 
     pub fn generate_producer_id(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+        self.next_producer_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn init_transactional_producer(
+        &self,
+        transactional_id: &str,
+    ) -> Result<(u64, i16), String> {
+        use dashmap::mapref::entry::Entry;
+        match self
+            .transactional_producers
+            .entry(transactional_id.to_string())
+        {
+            Entry::Occupied(mut entry) => {
+                let next_epoch = entry.get().producer_epoch.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "Producer epoch exhausted for transactional.id '{}'",
+                        transactional_id
+                    )
+                })?;
+                entry.get_mut().producer_epoch = next_epoch;
+                Ok((entry.get().producer_id, next_epoch))
+            }
+            Entry::Vacant(entry) => {
+                let producer_id = self.generate_producer_id();
+                entry.insert(TransactionalProducerState {
+                    producer_id,
+                    producer_epoch: 0,
+                });
+                Ok((producer_id, 0))
+            }
+        }
+    }
+
+    pub fn restore_transactional_producer(
+        &self,
+        transactional_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+    ) {
+        self.transactional_producers.insert(
+            transactional_id.to_string(),
+            TransactionalProducerState {
+                producer_id,
+                producer_epoch,
+            },
+        );
+        self.observe_producer_id(producer_id);
+    }
+
+    pub fn validate_transactional_producer(
+        &self,
+        transactional_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+    ) -> Result<(), String> {
+        let current = self
+            .transactional_producers
+            .get(transactional_id)
+            .ok_or_else(|| format!("TransactionalId '{}' is not initialized", transactional_id))?;
+        if current.producer_id != producer_id {
+            return Err(format!(
+                "Producer ID mismatch for transactional.id '{}'",
+                transactional_id
+            ));
+        }
+        if current.producer_epoch != producer_epoch {
+            return Err(format!(
+                "Producer fenced for transactional.id '{}' (expected epoch {}, got {})",
+                transactional_id, current.producer_epoch, producer_epoch
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn has_transactional_producer(&self, transactional_id: &str) -> bool {
+        self.transactional_producers.contains_key(transactional_id)
+    }
+
+    pub fn observe_producer_id(&self, producer_id: u64) {
+        let next_candidate = producer_id.saturating_add(1);
+        let _ = self
+            .next_producer_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                if current < next_candidate {
+                    Some(next_candidate)
+                } else {
+                    None
+                }
+            });
     }
 
     pub fn add_partitions_to_txn(
@@ -145,7 +242,7 @@ impl TransactionManager {
         topic: &str,
         partition: u32,
         start_offset: u64,
-    ) {
+    ) -> Option<(u64, PartitionRangeList)> {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             let mut found = false;
             for (t, p, ref mut so, _) in &mut state.partitions {
@@ -162,6 +259,9 @@ impl TransactionManager {
                     .partitions
                     .push((topic.to_string(), partition, start_offset, u64::MAX));
             }
+            Some((state.producer_id, state.partitions.clone()))
+        } else {
+            None
         }
     }
 

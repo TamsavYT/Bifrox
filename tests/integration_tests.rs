@@ -1524,6 +1524,30 @@ async fn test_scenario_22_per_client_quota_throttling() {
         "Fetch exceeding quota should be delayed, only took {:?}",
         elapsed
     );
+
+    // 4. Two clients behind the same source IP can opt into separate quota buckets by
+    // setting distinct logical client_ids on their connections.
+    let env_client_id_quota = start_test_server_with_quota(Some(100), None).await;
+    let mut client_a = TestClient::connect(env_client_id_quota.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env_client_id_quota.addr).await.unwrap();
+    client_a.set_client_id("producer-a").await.unwrap();
+    client_b.set_client_id("producer-b").await.unwrap();
+
+    client_a
+        .produce_single("quota_client_id_topic_a", "", None, 1, vec![2u8; 100])
+        .await
+        .expect("client_a should consume only its own quota bucket");
+
+    let start = std::time::Instant::now();
+    client_b
+        .produce_single("quota_client_id_topic_b", "", None, 1, vec![3u8; 100])
+        .await
+        .expect("client_b should have an independent quota bucket");
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "Distinct client_ids should avoid cross-throttling on shared source IP, took {:?}",
+        start.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -1712,9 +1736,9 @@ async fn test_scenario_24_sasl_and_acls() {
     assert_eq!(scram_err, 0);
     assert!(scram_mechs.contains(&"SCRAM-SHA-256".to_string()));
 
-    // SASL Authenticate for SCRAM-SHA-256 client-first message
+    // SASL Authenticate for SCRAM-SHA-256 full challenge/response flow
     let scram_auth_res = scram_client
-        .sasl_authenticate(b"n,,n=alice,r=rOprNGfwEbeRWgbNEkqO")
+        .sasl_authenticate_scram_sha256("alice", "password123")
         .await
         .unwrap();
     assert_eq!(scram_auth_res, 0);
@@ -1735,6 +1759,25 @@ async fn test_scenario_24_sasl_and_acls() {
         .await
         .unwrap();
     assert_eq!(admin_auth_res, 0);
+
+    // Superuser-managed SCRAM credential lifecycle over the admin API.
+    admin_client
+        .upsert_scram_user("service_a", "svc_secret_123")
+        .await
+        .unwrap();
+    let mut service_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let service_scram_auth = service_client
+        .sasl_authenticate_scram_sha256("service_a", "svc_secret_123")
+        .await
+        .unwrap();
+    assert_eq!(service_scram_auth, 0);
+    admin_client.delete_scram_user("service_a").await.unwrap();
+    let mut deleted_service_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let deleted_service_auth = deleted_service_client
+        .sasl_authenticate_scram_sha256("service_a", "svc_secret_123")
+        .await
+        .unwrap();
+    assert_eq!(deleted_service_auth, 58);
 
     // 4. Test ACL Management (CreateAcls & DescribeAcls)
     let acl_binding = AclBinding {
@@ -2211,4 +2254,151 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     assert!(resp_str.contains("hermes_topics_count"));
     assert!(resp_str.contains("hermes_active_brokers_count"));
     assert!(resp_str.contains("hermes_active_connections"));
+}
+
+#[tokio::test]
+async fn test_scenario_29_scram_credentials_persist_across_restart() {
+    use hermes::config::{EngineConfig, SecurityProtocol};
+
+    let dir_guard = TestDataDirGuard::new("scram_persist_restart");
+    let bootstrap_cfg = EngineConfig {
+        data_dir: dir_guard.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..Default::default()
+    };
+    let bootstrap_engine = StorageEngine::new(bootstrap_cfg).unwrap();
+    bootstrap_engine
+        .upsert_scram_user("alice", "persist_secret_123")
+        .unwrap();
+    drop(bootstrap_engine);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let restarted_cfg = EngineConfig {
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        security_protocol: SecurityProtocol::SaslPlaintext,
+        sasl_mechanisms: vec!["PLAIN".to_string(), "SCRAM-SHA-256".to_string()],
+        ..Default::default()
+    };
+    let restarted_engine = StorageEngine::new(restarted_cfg).unwrap();
+    let server = Server::new(restarted_engine);
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+    sleep(Duration::from_millis(150)).await;
+
+    let mut plain_client = TestClient::connect(addr).await.unwrap();
+    let (plain_err, plain_mechs) = plain_client.sasl_handshake("PLAIN").await.unwrap();
+    assert_eq!(plain_err, 0);
+    assert!(plain_mechs.contains(&"PLAIN".to_string()));
+    let plain_auth = plain_client
+        .sasl_authenticate(b"\0alice\0persist_secret_123")
+        .await
+        .unwrap();
+    assert_eq!(plain_auth, 0);
+
+    let mut scram_client = TestClient::connect(addr).await.unwrap();
+    let (scram_err, scram_mechs) = scram_client.sasl_handshake("SCRAM-SHA-256").await.unwrap();
+    assert_eq!(scram_err, 0);
+    assert!(scram_mechs.contains(&"SCRAM-SHA-256".to_string()));
+    let scram_auth = scram_client
+        .sasl_authenticate_scram_sha256("alice", "persist_secret_123")
+        .await
+        .unwrap();
+    assert_eq!(scram_auth, 0);
+}
+
+#[tokio::test]
+async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
+    let dir_guard = TestDataDirGuard::new("tx_epoch_recovery");
+    let cfg = EngineConfig {
+        data_dir: dir_guard.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..Default::default()
+    };
+    let engine = StorageEngine::new(cfg.clone()).unwrap();
+    let topic = "tx_recovery_topic";
+    let transactional_id = "tx-recovery-1";
+
+    let (producer_id, producer_epoch) = engine.init_producer_id(transactional_id).unwrap();
+    assert_eq!(producer_epoch, 0);
+    engine
+        .add_partitions_to_txn(
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            &[(topic.to_string(), vec![0])],
+        )
+        .unwrap();
+    let first_record = vec![bytes::Bytes::from_static(b"txn-recovery-record-1")];
+    engine
+        .produce_batch(hermes::server::engine::ProduceBatchParams {
+            topic,
+            key: "",
+            transaction_id: Some(transactional_id),
+            num_partitions: 1,
+            producer_id,
+            producer_epoch,
+            base_sequence: 0,
+            records: &first_record,
+        })
+        .await
+        .unwrap();
+    drop(engine);
+
+    let restarted = StorageEngine::new(cfg).unwrap();
+    assert!(restarted.transactions().is_ongoing(transactional_id));
+    restarted.abort_transaction(transactional_id).unwrap();
+    let aborted_visible = restarted.fetch_committed(topic, 0, 0, 1024).unwrap();
+    assert!(
+        aborted_visible.is_empty(),
+        "aborted transactional data must stay hidden after restart recovery"
+    );
+
+    let (recovered_pid, recovered_epoch) = restarted.init_producer_id(transactional_id).unwrap();
+    assert_eq!(recovered_pid, producer_id);
+    assert_eq!(recovered_epoch, producer_epoch + 1);
+    assert!(
+        restarted
+            .add_partitions_to_txn(
+                transactional_id,
+                producer_id,
+                producer_epoch,
+                &[(topic.to_string(), vec![0])],
+            )
+            .is_err(),
+        "stale producer epoch must be fenced"
+    );
+
+    restarted
+        .add_partitions_to_txn(
+            transactional_id,
+            recovered_pid,
+            recovered_epoch,
+            &[(topic.to_string(), vec![0])],
+        )
+        .unwrap();
+    let second_record = vec![bytes::Bytes::from_static(b"txn-recovery-record-2")];
+    restarted
+        .produce_batch(hermes::server::engine::ProduceBatchParams {
+            topic,
+            key: "",
+            transaction_id: Some(transactional_id),
+            num_partitions: 1,
+            producer_id: recovered_pid,
+            producer_epoch: recovered_epoch,
+            base_sequence: 0,
+            records: &second_record,
+        })
+        .await
+        .unwrap();
+    restarted
+        .end_transaction(transactional_id, recovered_pid, recovered_epoch, true)
+        .unwrap();
+    let all_frames = restarted.fetch(topic, 0, 0, 1024).unwrap();
+    let committed = restarted.fetch_committed(topic, 0, 0, 1024).unwrap();
+    assert_eq!(all_frames.len(), 4);
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].payload.as_ref(), b"txn-recovery-record-2");
 }

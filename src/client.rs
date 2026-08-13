@@ -1,4 +1,6 @@
 use crate::protocol::{CommandCode, RecordFrame, WireResponse};
+use crate::scram;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::{Buf, BufMut};
 use std::io::Result as IoResult;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -18,6 +20,14 @@ pub struct ProduceResult {
 pub struct ConsumerCoordinator {
     pub group_id: String,
     pub member_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslAuthResponse {
+    pub error_code: i16,
+    pub error_message: String,
+    pub auth_bytes: Vec<u8>,
+    pub session_lifetime_ms: i64,
 }
 
 impl ConsumerCoordinator {
@@ -839,7 +849,10 @@ impl TestClient {
         Ok((err_code, mechs))
     }
 
-    pub async fn sasl_authenticate(&mut self, auth_bytes: &[u8]) -> IoResult<i16> {
+    pub async fn sasl_authenticate_full(
+        &mut self,
+        auth_bytes: &[u8],
+    ) -> IoResult<SaslAuthResponse> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::SaslAuthenticate as u8);
         req_buf.put_u32(auth_bytes.len() as u32);
@@ -850,15 +863,77 @@ impl TestClient {
         })?;
         stream.write_all(&req_buf).await?;
         let resp = Self::read_wire_response(stream).await?;
-        if resp.payload.len() >= 2 {
-            let error_code = i16::from_be_bytes(resp.payload[0..2].try_into().unwrap());
-            Ok(error_code)
-        } else {
+        let mut buf = &resp.payload[..];
+        if buf.len() < 2 {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid SaslAuthenticate payload",
             ))
+        } else {
+            let error_code = buf.get_i16();
+            let error_message = if buf.len() >= 2 {
+                let len = buf.get_u16() as usize;
+                if len > 0 && buf.len() >= len {
+                    let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+                    buf = &buf[len..];
+                    msg
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            let auth_bytes = if buf.len() >= 4 {
+                let len = buf.get_u32() as usize;
+                if buf.len() >= len {
+                    let data = buf[..len].to_vec();
+                    buf = &buf[len..];
+                    data
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let session_lifetime_ms = if buf.len() >= 8 { buf.get_i64() } else { 0 };
+            Ok(SaslAuthResponse {
+                error_code,
+                error_message,
+                auth_bytes,
+                session_lifetime_ms,
+            })
         }
+    }
+
+    pub async fn sasl_authenticate(&mut self, auth_bytes: &[u8]) -> IoResult<i16> {
+        Ok(self.sasl_authenticate_full(auth_bytes).await?.error_code)
+    }
+
+    pub async fn sasl_authenticate_scram_sha256(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> IoResult<i16> {
+        let client_nonce = generate_scram_client_nonce()?;
+        let client_first = format!("n,,n={},r={}", username, client_nonce);
+        let first_response = self.sasl_authenticate_full(client_first.as_bytes()).await?;
+        if first_response.error_code != 0 {
+            return Ok(first_response.error_code);
+        }
+
+        let server_first = String::from_utf8(first_response.auth_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let (combined_nonce, salt, iterations) = parse_scram_server_first(&server_first)?;
+        let client_final = build_scram_client_final(
+            password,
+            &client_first[3..],
+            &server_first,
+            &combined_nonce,
+            &salt,
+            iterations,
+        )?;
+        let final_response = self.sasl_authenticate_full(client_final.as_bytes()).await?;
+        Ok(final_response.error_code)
     }
 
     pub async fn create_acl(&mut self, binding: &crate::server::acl::AclBinding) -> IoResult<()> {
@@ -1299,6 +1374,68 @@ impl TestClient {
         Self::read_wire_response(stream).await
     }
 
+    pub async fn set_client_id(&mut self, client_id: &str) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::SetClientId as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, client_id);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn upsert_scram_user(&mut self, username: &str, password: &str) -> IoResult<()> {
+        let credential = scram::ScramCredential::generate(
+            username,
+            password,
+            scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
+        )
+        .map_err(|_| std::io::Error::other("Failed to generate SCRAM credential"))?;
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::UpsertScramUser as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, username);
+        inner.put_u32(credential.iterations);
+        write_len_prefixed_bytes(&mut inner, &credential.salt);
+        write_len_prefixed_bytes(&mut inner, &credential.stored_key);
+        write_len_prefixed_bytes(&mut inner, &credential.server_key);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn delete_scram_user(&mut self, username: &str) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::DeleteScramUser as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, username);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+        let resp = self.send_raw_bytes(&req_buf).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
     pub async fn ping(&mut self) -> IoResult<bool> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::Ping as u8);
@@ -1591,6 +1728,70 @@ impl TestClient {
             Err(std::io::Error::other("OffsetFetch failed"))
         }
     }
+}
+
+fn generate_scram_client_nonce() -> IoResult<String> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut nonce = [0u8; 18];
+    ring::rand::SecureRandom::fill(&rng, &mut nonce)
+        .map_err(|_| std::io::Error::other("Failed to generate SCRAM nonce"))?;
+    Ok(scram::hex_encode(&nonce))
+}
+
+fn parse_scram_server_first(server_first: &str) -> IoResult<(String, Vec<u8>, u32)> {
+    let mut nonce = None;
+    let mut salt_b64 = None;
+    let mut iterations = None;
+    for part in server_first.split(',') {
+        if let Some(value) = part.strip_prefix("r=") {
+            nonce = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("s=") {
+            salt_b64 = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("i=") {
+            iterations = value.parse::<u32>().ok();
+        }
+    }
+
+    let salt = BASE64_STANDARD
+        .decode(salt_b64.ok_or_else(|| std::io::Error::other("SCRAM salt missing"))?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    Ok((
+        nonce.ok_or_else(|| std::io::Error::other("SCRAM nonce missing"))?,
+        salt,
+        iterations.ok_or_else(|| std::io::Error::other("SCRAM iteration count missing"))?,
+    ))
+}
+
+fn build_scram_client_final(
+    password: &str,
+    client_first_bare: &str,
+    server_first: &str,
+    combined_nonce: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> IoResult<String> {
+    let client_final_without_proof = format!("c=biws,r={}", combined_nonce);
+    let auth_message = format!(
+        "{},{},{}",
+        client_first_bare, server_first, client_final_without_proof
+    );
+    let salted_password = scram::derive_scram_salted_password(password, salt, iterations);
+    let client_key = scram::hmac_sha256(&salted_password, b"Client Key");
+    let stored_key = scram::sha256(&client_key);
+    let client_signature = scram::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let proof: Vec<u8> = client_key
+        .iter()
+        .zip(client_signature.iter())
+        .map(|(key_byte, sig_byte)| key_byte ^ sig_byte)
+        .collect();
+    let proof_b64 = BASE64_STANDARD.encode(proof);
+    Ok(format!("{},p={}", client_final_without_proof, proof_b64))
+}
+
+fn write_len_prefixed_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.put_u16(bytes.len() as u16);
+    buf.extend_from_slice(bytes);
 }
 
 /// Smart client supporting cluster metadata discovery, partition leadership resolution, and connection pooling

@@ -96,6 +96,7 @@ pub struct StorageEngine {
     broker_addrs: Arc<DashMap<u32, String>>,
     quota: Arc<QuotaManager>,
     acl: Arc<crate::server::acl::AclManager>,
+    scram_credentials: Arc<DashMap<String, crate::scram::ScramCredential>>,
     metrics: Arc<crate::server::metrics::MetricsCollector>,
 }
 
@@ -123,6 +124,7 @@ impl StorageEngine {
             config.fetch_quota_bytes_per_sec,
         ));
         let acl = Arc::new(crate::server::acl::AclManager::new());
+        let scram_credentials = Arc::new(DashMap::new());
         let metrics = Arc::new(crate::server::metrics::MetricsCollector::new());
 
         let engine = Self {
@@ -137,6 +139,7 @@ impl StorageEngine {
             broker_addrs,
             quota,
             acl,
+            scram_credentials,
             metrics,
         };
 
@@ -166,6 +169,7 @@ impl StorageEngine {
 
         // 2. Replay metadata log to recover dynamic partitions (ERR-01)
         engine.replay_metadata_log()?;
+        engine.bootstrap_legacy_sasl_users()?;
 
         // 3. P2: Replay __transaction_state log to restore in-flight transactions (ERR-01)
         engine.replay_transaction_state()?;
@@ -380,6 +384,40 @@ impl StorageEngine {
                             crate::replication::MetadataRecord::AclDeleted { binding } => {
                                 self.acl.remove_acl(&binding);
                             }
+                            crate::replication::MetadataRecord::ScramCredentialUpsert {
+                                username,
+                                iterations,
+                                salt,
+                                stored_key,
+                                server_key,
+                            } => {
+                                self.scram_credentials.insert(
+                                    username.clone(),
+                                    crate::scram::ScramCredential::new(
+                                        username,
+                                        iterations,
+                                        salt,
+                                        stored_key,
+                                        server_key,
+                                    ),
+                                );
+                            }
+                            crate::replication::MetadataRecord::ScramCredentialDelete {
+                                username,
+                            } => {
+                                self.scram_credentials.remove(&username);
+                            }
+                            crate::replication::MetadataRecord::TransactionalProducerRegistration {
+                                transactional_id,
+                                producer_id,
+                                producer_epoch,
+                            } => {
+                                self.transactions.restore_transactional_producer(
+                                    &transactional_id,
+                                    producer_id,
+                                    producer_epoch,
+                                );
+                            }
                         }
                     }
                     offset = frame.offset + 1;
@@ -395,6 +433,92 @@ impl StorageEngine {
 
     pub fn metrics(&self) -> &Arc<crate::server::metrics::MetricsCollector> {
         &self.metrics
+    }
+
+    pub(crate) fn lookup_scram_credential(
+        &self,
+        username: &str,
+    ) -> Option<crate::scram::ScramCredential> {
+        self.scram_credentials
+            .get(username)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn has_scram_user(&self, username: &str) -> bool {
+        self.scram_credentials.contains_key(username)
+    }
+
+    pub(crate) fn apply_scram_credential_state(
+        &self,
+        username: String,
+        iterations: u32,
+        salt: Vec<u8>,
+        stored_key: Vec<u8>,
+        server_key: Vec<u8>,
+    ) {
+        self.scram_credentials.insert(
+            username.clone(),
+            crate::scram::ScramCredential::new(username, iterations, salt, stored_key, server_key),
+        );
+    }
+
+    pub(crate) fn remove_scram_credential_state(&self, username: &str) {
+        self.scram_credentials.remove(username);
+    }
+
+    pub fn upsert_scram_credential(
+        &self,
+        username: &str,
+        iterations: u32,
+        salt: Vec<u8>,
+        stored_key: Vec<u8>,
+        server_key: Vec<u8>,
+    ) -> IoResult<()> {
+        let record = crate::replication::MetadataRecord::ScramCredentialUpsert {
+            username: username.to_string(),
+            iterations,
+            salt: salt.clone(),
+            stored_key: stored_key.clone(),
+            server_key: server_key.clone(),
+        };
+        let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+        meta_pm.produce(&record.encode())?;
+        self.scram_credentials.insert(
+            username.to_string(),
+            crate::scram::ScramCredential::new(
+                username.to_string(),
+                iterations,
+                salt,
+                stored_key,
+                server_key,
+            ),
+        );
+        Ok(())
+    }
+
+    pub fn upsert_scram_user(&self, username: &str, password: &str) -> IoResult<()> {
+        let credential = crate::scram::ScramCredential::generate(
+            username,
+            password,
+            crate::scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
+        )
+        .map_err(|_| std::io::Error::other("Failed to generate SCRAM credential"))?;
+        self.upsert_scram_credential(
+            &credential.username,
+            credential.iterations,
+            credential.salt,
+            credential.stored_key,
+            credential.server_key,
+        )
+    }
+
+    pub fn delete_scram_user(&self, username: &str) -> IoResult<bool> {
+        let record = crate::replication::MetadataRecord::ScramCredentialDelete {
+            username: username.to_string(),
+        };
+        let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+        meta_pm.produce(&record.encode())?;
+        Ok(self.scram_credentials.remove(username).is_some())
     }
 
     pub fn authorize(
@@ -456,6 +580,14 @@ impl StorageEngine {
 
         if let Ok(pm) = self.get_or_create_partition("__transaction_state", 0) {
             let mut offset = 0u64;
+            let mut latest_states: std::collections::HashMap<
+                String,
+                (
+                    crate::server::transaction::TxStatus,
+                    u64,
+                    crate::server::transaction::PartitionRangeList,
+                ),
+            > = std::collections::HashMap::new();
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
                 if frames.is_empty() {
@@ -465,26 +597,26 @@ impl StorageEngine {
                     if let Some((status, producer_id, tx_id, partitions)) =
                         decode_tx_state_record(&frame.payload)
                     {
-                        // N7: Only restore Ongoing transactions.  Committed/Aborted entries
-                        // have no runtime effect — their data is already baked into the
-                        // partition logs.  Restoring them would permanently block reuse of
-                        // the same transaction ID (begin_transaction returns Err on Occupied)
-                        // and cause aborted_ranges to return stale ranges for unrelated producers.
-                        if status == crate::server::transaction::TxStatus::Ongoing {
-                            self.transactions.restore_transaction(
-                                &tx_id,
-                                producer_id,
-                                status,
-                                partitions,
-                            );
-                            tracing::info!(
-                                "TxReplay: Restored in-flight transaction '{}' producer={}",
-                                tx_id,
-                                producer_id
-                            );
-                        }
+                        latest_states.insert(tx_id, (status, producer_id, partitions));
                     }
                     offset = frame.offset + 1;
+                }
+            }
+            for (tx_id, (status, producer_id, partitions)) in latest_states {
+                if matches!(
+                    status,
+                    crate::server::transaction::TxStatus::Ongoing
+                        | crate::server::transaction::TxStatus::PrepareCommit
+                        | crate::server::transaction::TxStatus::PrepareAbort
+                ) {
+                    self.transactions
+                        .restore_transaction(&tx_id, producer_id, status, partitions);
+                    tracing::info!(
+                        "TxReplay: Restored in-flight transaction '{}' producer={} status={:?}",
+                        tx_id,
+                        producer_id,
+                        status
+                    );
                 }
             }
         }
@@ -501,6 +633,25 @@ impl StorageEngine {
         let producer_epoch = params.producer_epoch;
         let base_sequence = params.base_sequence;
         let records = params.records;
+        if let Some(tx_id) = transaction_id {
+            if self.transactions.has_transactional_producer(tx_id) {
+                if producer_id == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Transactional produce requires a non-zero producer_id",
+                    ));
+                }
+                self.transactions
+                    .validate_transactional_producer(tx_id, producer_id, producer_epoch)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+            }
+            if !self.transactions.is_ongoing(tx_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Transaction '{}' is not active", tx_id),
+                ));
+            }
+        }
         let partition_id = if !key.is_empty() && num_partitions > 0 {
             hash_key(key.as_bytes(), num_partitions as usize)
         } else {
@@ -704,6 +855,13 @@ impl StorageEngine {
         producer_epoch: i16,
         topics: &[(String, Vec<u32>)],
     ) -> Result<(), String> {
+        if self.transactions.has_transactional_producer(transaction_id) {
+            self.transactions.validate_transactional_producer(
+                transaction_id,
+                producer_id,
+                producer_epoch,
+            )?;
+        }
         let result = self.transactions.add_partitions_to_txn(
             transaction_id,
             producer_id,
@@ -719,6 +877,30 @@ impl StorageEngine {
             }
         }
         result
+    }
+
+    pub fn init_producer_id(&self, transactional_id: &str) -> Result<(u64, i16), String> {
+        if transactional_id.is_empty() {
+            return Ok((self.transactions.generate_producer_id(), 0));
+        }
+        if self.transactions.is_ongoing(transactional_id) {
+            self.abort_transaction(transactional_id)?;
+        }
+        let (producer_id, producer_epoch) = self
+            .transactions
+            .init_transactional_producer(transactional_id)?;
+        let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
+            transactional_id: transactional_id.to_string(),
+            producer_id,
+            producer_epoch,
+        };
+        let meta_pm = self
+            .get_or_create_partition("__cluster_metadata", 0)
+            .map_err(|e| format!("Failed to open metadata partition: {}", e))?;
+        meta_pm
+            .produce(&record.encode())
+            .map_err(|e| format!("Failed to persist transactional producer state: {}", e))?;
+        Ok((producer_id, producer_epoch))
     }
 
     pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
@@ -856,8 +1038,50 @@ impl StorageEngine {
         partition: u32,
         start_offset: u64,
     ) {
-        self.transactions
-            .register_partition(transaction_id, topic, partition, start_offset);
+        if let Some((producer_id, parts)) =
+            self.transactions
+                .register_partition(transaction_id, topic, partition, start_offset)
+        {
+            let record =
+                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
+            match self.get_or_create_partition("__transaction_state", 0) {
+                Ok(tx_pm) => {
+                    if let Err(err) = tx_pm.produce(&record) {
+                        tracing::error!(
+                            "Failed to persist transaction partition registration for '{}': {}",
+                            transaction_id,
+                            err
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "Failed to open __transaction_state for '{}': {}",
+                        transaction_id,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn end_transaction(
+        &self,
+        transactional_id: &str,
+        producer_id: u64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> Result<(), String> {
+        self.transactions.validate_transactional_producer(
+            transactional_id,
+            producer_id,
+            producer_epoch,
+        )?;
+        if committed {
+            self.commit_transaction(transactional_id)
+        } else {
+            self.abort_transaction(transactional_id)
+        }
     }
 
     pub fn apply_retention_all(&self) -> IoResult<usize> {
@@ -872,6 +1096,34 @@ impl StorageEngine {
     pub fn flush_all(&self) -> IoResult<()> {
         for entry in self.partitions.iter() {
             entry.value().flush()?;
+        }
+        Ok(())
+    }
+
+    fn bootstrap_legacy_sasl_users(&self) -> IoResult<()> {
+        for (username, password) in &self.config.sasl_users {
+            if self.scram_credentials.contains_key(username) {
+                continue;
+            }
+            let credential = crate::scram::ScramCredential::generate(
+                username,
+                password,
+                crate::scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
+            )
+            .map_err(|_| std::io::Error::other("Failed to bootstrap SCRAM credential"))?;
+            self.scram_credentials
+                .insert(username.clone(), credential.clone());
+            if self.is_leader() {
+                let record = crate::replication::MetadataRecord::ScramCredentialUpsert {
+                    username: credential.username.clone(),
+                    iterations: credential.iterations,
+                    salt: credential.salt.clone(),
+                    stored_key: credential.stored_key.clone(),
+                    server_key: credential.server_key.clone(),
+                };
+                let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+                meta_pm.produce(&record.encode())?;
+            }
         }
         Ok(())
     }

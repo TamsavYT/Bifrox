@@ -83,9 +83,27 @@ replica.peer.addresses=127.0.0.1:9093,127.0.0.1:9094
 min.insync.replicas=1
 # Optional per-client (source IP) byte-rate quotas — unset means unlimited.
 # Exceeding requests are delayed (not rejected), matching Kafka's throttling model.
+# Quota identity precedence is: authenticated principal + logical client_id,
+# then logical client_id, then principal, then source IP fallback.
 quota.producer.default.bytes.per.second=10485760
 quota.consumer.default.bytes.per.second=10485760
+# Optional bootstrap users. Hermes imports these once into the persistent
+# SCRAM credential store and then authenticates from the stored verifier state.
+sasl.user.admin=change-me
 ```
+
+Clients may optionally set a connection-scoped logical `client_id` before producing or
+fetching. This gives Hermes a stable quota identity closer to Kafka semantics without
+changing the existing request shapes for every broker operation.
+
+For SASL, Hermes now keeps persistent SCRAM verifier state in cluster metadata rather
+than relying on plaintext passwords at authentication time. Runtime credential changes
+can be managed through the broker admin API; `sasl.user.*` entries remain as bootstrap
+seed users for first start or disaster recovery.
+
+Transactional producers also retain durable `transactional.id -> producer_id/epoch`
+state across restart. Re-initializing an existing `transactional.id` now reuses the
+same producer ID, bumps the epoch, and fences stale producers more like Kafka.
 
 ### Running the Broker Server
 Start the Hermes broker with a configuration file:

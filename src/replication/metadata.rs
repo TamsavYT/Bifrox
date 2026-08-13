@@ -37,6 +37,21 @@ pub enum MetadataRecord {
     BrokerUnregister {
         node_id: u32,
     },
+    ScramCredentialUpsert {
+        username: String,
+        iterations: u32,
+        salt: Vec<u8>,
+        stored_key: Vec<u8>,
+        server_key: Vec<u8>,
+    },
+    ScramCredentialDelete {
+        username: String,
+    },
+    TransactionalProducerRegistration {
+        transactional_id: String,
+        producer_id: u64,
+        producer_epoch: i16,
+    },
 }
 
 impl MetadataRecord {
@@ -117,6 +132,37 @@ impl MetadataRecord {
             MetadataRecord::BrokerUnregister { node_id } => {
                 buf.put_u8(0x08); // record type
                 buf.put_u32(*node_id);
+            }
+            MetadataRecord::ScramCredentialUpsert {
+                username,
+                iterations,
+                salt,
+                stored_key,
+                server_key,
+            } => {
+                buf.put_u8(0x09); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, username);
+                buf.put_u32(*iterations);
+                buf.put_u16(salt.len() as u16);
+                buf.extend_from_slice(salt);
+                buf.put_u16(stored_key.len() as u16);
+                buf.extend_from_slice(stored_key);
+                buf.put_u16(server_key.len() as u16);
+                buf.extend_from_slice(server_key);
+            }
+            MetadataRecord::ScramCredentialDelete { username } => {
+                buf.put_u8(0x0A); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, username);
+            }
+            MetadataRecord::TransactionalProducerRegistration {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+            } => {
+                buf.put_u8(0x0B); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, transactional_id);
+                buf.put_u64(*producer_id);
+                buf.put_i16(*producer_epoch);
             }
         }
         buf
@@ -268,6 +314,46 @@ impl MetadataRecord {
                 let node_id = src.get_u32();
                 Ok(MetadataRecord::BrokerUnregister { node_id })
             }
+            0x09 => {
+                let username = read_pascal_string_io(&mut src)?;
+                if src.len() < 4 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete SCRAM credential iterations",
+                    ));
+                }
+                let iterations = src.get_u32();
+                let salt = read_len_prefixed_bytes(&mut src, "salt")?;
+                let stored_key = read_len_prefixed_bytes(&mut src, "stored_key")?;
+                let server_key = read_len_prefixed_bytes(&mut src, "server_key")?;
+                Ok(MetadataRecord::ScramCredentialUpsert {
+                    username,
+                    iterations,
+                    salt,
+                    stored_key,
+                    server_key,
+                })
+            }
+            0x0A => {
+                let username = read_pascal_string_io(&mut src)?;
+                Ok(MetadataRecord::ScramCredentialDelete { username })
+            }
+            0x0B => {
+                let transactional_id = read_pascal_string_io(&mut src)?;
+                if src.len() < 10 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete transactional producer state",
+                    ));
+                }
+                let producer_id = src.get_u64();
+                let producer_epoch = src.get_i16();
+                Ok(MetadataRecord::TransactionalProducerRegistration {
+                    transactional_id,
+                    producer_id,
+                    producer_epoch,
+                })
+            }
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("Unknown metadata record type: 0x{:02X}", record_type),
@@ -298,4 +384,23 @@ fn read_pascal_string_io(buf: &mut &[u8]) -> IoResult<String> {
             format!("Invalid UTF-8 metadata: {}", e),
         )
     })
+}
+
+fn read_len_prefixed_bytes(buf: &mut &[u8], field_name: &str) -> IoResult<Vec<u8>> {
+    if buf.len() < 2 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("Incomplete {} length", field_name),
+        ));
+    }
+    let len = buf.get_u16() as usize;
+    if buf.len() < len {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("Incomplete {} bytes", field_name),
+        ));
+    }
+    let bytes = buf[..len].to_vec();
+    *buf = &buf[len..];
+    Ok(bytes)
 }

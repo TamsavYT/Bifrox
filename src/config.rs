@@ -172,7 +172,9 @@ pub struct EngineConfig {
     pub ssl_client_auth: String,
     /// Enabled SASL mechanisms (e.g. PLAIN, SCRAM-SHA-256)
     pub sasl_mechanisms: Vec<String>,
-    /// SASL user accounts (username -> password)
+    /// Legacy bootstrap SASL user accounts (username -> password). At startup Hermes
+    /// imports these into the persistent SCRAM credential store if that user does not
+    /// already exist there.
     pub sasl_users: std::collections::HashMap<String, String>,
     /// Whether ACL authorization is enabled
     pub acls_enabled: bool,

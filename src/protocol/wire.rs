@@ -40,6 +40,9 @@ pub enum CommandCode {
     DeleteAcls = 0x21,
     RegisterBroker = 0x22,
     UnregisterBroker = 0x23,
+    SetClientId = 0x24,
+    UpsertScramUser = 0x25,
+    DeleteScramUser = 0x26,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -82,6 +85,9 @@ impl TryFrom<u8> for CommandCode {
             0x21 => Ok(CommandCode::DeleteAcls),
             0x22 => Ok(CommandCode::RegisterBroker),
             0x23 => Ok(CommandCode::UnregisterBroker),
+            0x24 => Ok(CommandCode::SetClientId),
+            0x25 => Ok(CommandCode::UpsertScramUser),
+            0x26 => Ok(CommandCode::DeleteScramUser),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -264,6 +270,19 @@ pub enum RequestPayload {
     },
     UnregisterBroker {
         node_id: u32,
+    },
+    SetClientId {
+        client_id: String,
+    },
+    UpsertScramUser {
+        username: String,
+        iterations: u32,
+        salt: Vec<u8>,
+        stored_key: Vec<u8>,
+        server_key: Vec<u8>,
+    },
+    DeleteScramUser {
+        username: String,
     },
 }
 
@@ -864,6 +883,34 @@ impl WireRequest {
                 let node_id = payload_buf.get_u32();
                 RequestPayload::UnregisterBroker { node_id }
             }
+            CommandCode::SetClientId => {
+                let client_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::SetClientId { client_id }
+            }
+            CommandCode::UpsertScramUser => {
+                let username = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let iterations = payload_buf.get_u32();
+                let salt = Self::read_len_prefixed_bytes(&mut payload_buf)?;
+                let stored_key = Self::read_len_prefixed_bytes(&mut payload_buf)?;
+                let server_key = Self::read_len_prefixed_bytes(&mut payload_buf)?;
+                RequestPayload::UpsertScramUser {
+                    username,
+                    iterations,
+                    salt,
+                    stored_key,
+                    server_key,
+                }
+            }
+            CommandCode::DeleteScramUser => {
+                let username = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DeleteScramUser { username }
+            }
         };
 
         let total_consumed = 5 + payload_len;
@@ -874,6 +921,25 @@ impl WireRequest {
             },
             total_consumed,
         ))
+    }
+
+    fn read_len_prefixed_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, WireError> {
+        if buf.len() < 2 {
+            return Err(WireError::Incomplete {
+                needed: 2,
+                available: buf.len(),
+            });
+        }
+        let len = buf.get_u16() as usize;
+        if buf.len() < len {
+            return Err(WireError::Incomplete {
+                needed: len,
+                available: buf.len(),
+            });
+        }
+        let bytes = buf[..len].to_vec();
+        *buf = &buf[len..];
+        Ok(bytes)
     }
 }
 
