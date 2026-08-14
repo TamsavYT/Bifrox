@@ -146,6 +146,10 @@ impl AclManager {
         guard.remove(binding)
     }
 
+    pub fn contains(&self, binding: &AclBinding) -> bool {
+        self.bindings.read().contains(binding)
+    }
+
     pub fn list_acls(&self, filter: &AclBinding) -> Vec<AclBinding> {
         let guard = self.bindings.read();
         guard

@@ -178,6 +178,14 @@ impl Server {
             }
         });
 
+        let share_reaper_engine = self.engine.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(std::time::Duration::from_millis(500)).await;
+                share_reaper_engine.sweep_share_lock_timeouts();
+            }
+        });
+
         let metrics_engine = self.engine.clone();
         tokio::spawn(async move {
             let config = metrics_engine.config();

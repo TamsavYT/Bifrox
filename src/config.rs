@@ -199,6 +199,20 @@ pub struct EngineConfig {
     pub metrics_auth_token: Option<String>,
     /// Optional network IP whitelist for Prometheus metrics scrape endpoint
     pub metrics_allowed_ips: Vec<String>,
+    /// How long a replica may go without acknowledging a replicated write before the
+    /// partition leader drops it from the ISR (Kafka `replica.lag.time.max.ms`).
+    pub replica_lag_max_ms: u64,
+    /// How often the ISR-membership and broker-liveness sweep runs.
+    pub isr_check_interval_ms: u64,
+    /// How long a broker may go without a heartbeat ACK before the cluster leader
+    /// considers it dead and, for any partition it currently leads, elects a new leader
+    /// from the remaining ISR.
+    pub broker_down_threshold_ms: u64,
+    /// Whether a partition may fail over to a replica outside the last-known ISR when no
+    /// in-sync replica survives a leader's death (Kafka `unclean.leader.election.enable`).
+    /// Defaults to false: an unrecoverable partition is left leaderless rather than
+    /// silently accepting data loss.
+    pub allow_unclean_leader_election: bool,
 }
 
 impl Default for EngineConfig {
@@ -237,6 +251,10 @@ impl Default for EngineConfig {
             metrics_bind_addr: None,
             metrics_auth_token: None,
             metrics_allowed_ips: Vec::new(),
+            replica_lag_max_ms: 10_000,
+            isr_check_interval_ms: 2_000,
+            broker_down_threshold_ms: 30_000,
+            allow_unclean_leader_election: false,
         }
     }
 }

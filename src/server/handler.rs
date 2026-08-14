@@ -235,6 +235,25 @@ where
                                 _ => None,
                             };
 
+                            // Controller-mutation Forwarding: these requests write to
+                            // `__cluster_metadata` via `propose_metadata`, which only the
+                            // cluster (Raft) leader may do. Forward to it transparently —
+                            // same "connect to any broker" reasoning as produce forwarding
+                            // above, but keyed on cluster leadership rather than partition
+                            // leadership since there's a single controller, not one per
+                            // partition.
+                            let is_controller_mutation = matches!(
+                                &req.payload,
+                                RequestPayload::CreateTopic { .. }
+                                    | RequestPayload::DeleteTopic { .. }
+                                    | RequestPayload::RegisterBroker { .. }
+                                    | RequestPayload::UnregisterBroker { .. }
+                                    | RequestPayload::CreateAcls { .. }
+                                    | RequestPayload::DeleteAcls { .. }
+                                    | RequestPayload::UpsertScramUser { .. }
+                                    | RequestPayload::DeleteScramUser { .. }
+                            );
+
                             if let Some((topic, partition)) = target_partition {
                                 if !engine.is_partition_leader(&topic, partition) {
                                     let raw_request = slice[..bytes_used].to_vec();
@@ -316,6 +335,59 @@ where
                                         );
                                         return;
                                     }
+                                }
+                            } else if is_controller_mutation && !engine.is_leader() {
+                                let raw_request = slice[..bytes_used].to_vec();
+                                consumed += bytes_used;
+
+                                let response_bytes = match engine.leader_addr() {
+                                    Some(leader) => {
+                                        tracing::info!(
+                                            "Controller Forwarding: Proxying request from {} to cluster leader at {}",
+                                            peer_addr,
+                                            leader
+                                        );
+                                        match forward_to_leader(
+                                            &leader,
+                                            &raw_request,
+                                            engine.config().auth_token.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Controller Forwarding: Failed to forward to leader {}: {}",
+                                                    leader,
+                                                    e
+                                                );
+                                                WireResponse::error(&format!(
+                                                    "Failed to forward request to cluster leader: {}",
+                                                    e
+                                                ))
+                                                .encode()
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            "Controller Forwarding: No cluster leader known yet, rejecting request from {}",
+                                            peer_addr
+                                        );
+                                        WireResponse::error(
+                                            "NOT_CONTROLLER: No cluster leader elected. Retry later.",
+                                        )
+                                        .encode()
+                                    }
+                                };
+
+                                if let Err(e) = socket.write_all(&response_bytes).await {
+                                    tracing::error!(
+                                        "Failed to relay leader response to {}: {}",
+                                        peer_addr,
+                                        e
+                                    );
+                                    return;
                                 }
                             } else {
                                 consumed += bytes_used;
@@ -461,12 +533,17 @@ enum PacketError {
 
 /// Decodes a Raft VoteRequest RPC packet (0xAE) from a candidate node.
 ///
-/// Wire format: `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b]`
+/// Wire format: `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b] [candidate_last_log_index: 8b]`
 /// Response:    `[0x01]` = vote granted, `[0x00]` = vote denied.
 ///
-/// Grant rules (simplified Raft):
+/// Grant rules (Raft):
 ///   - The incoming cluster_id must match ours (CRIT-02: prevents external term manipulation).
 ///   - The candidate's term must be >= our current epoch.
+///   - The candidate's `__cluster_metadata` log must be at least as up to date as ours
+///     (§5.4.1 log-completeness / leader-completeness safety) — a candidate that hasn't
+///     seen as much committed metadata as we have must never win, or an election could
+///     silently roll back topics/ACLs/broker registrations that only we (and possibly
+///     other followers) know about.
 ///   - We haven't already voted for someone else in this term.
 fn decode_vote_request_packet(
     engine: &StorageEngine,
@@ -494,7 +571,7 @@ fn decode_vote_request_packet(
         ));
     }
 
-    if src.len() < cid_len + 4 + 8 {
+    if src.len() < cid_len + 4 + 8 + 8 {
         return Err(PacketError::NeedMoreData);
     }
 
@@ -511,6 +588,7 @@ fn decode_vote_request_packet(
     src = &src[cid_len..];
     let candidate_id = src.get_u32();
     let term = src.get_u64();
+    let candidate_last_log_index = src.get_u64();
 
     let bytes_consumed = original_len - src.len();
     let local_cluster = &engine.config().cluster_id;
@@ -536,10 +614,24 @@ fn decode_vote_request_packet(
         return Ok((bytes_consumed, vec![0x00]));
     }
 
-    if term >= our_epoch && engine.replication().can_vote_for(candidate_id, term) {
+    // §5.4.1: our own last-applied `__cluster_metadata` index is the log-completeness
+    // yardstick. get_or_create_partition never fails for a valid static topic name, but
+    // fall back to "empty log" (0) rather than propagating an I/O error into vote denial.
+    let our_last_log_index = engine
+        .get_or_create_partition("__cluster_metadata", 0)
+        .map(|pm| pm.latest_offset())
+        .unwrap_or(0);
+    let log_ok = candidate_last_log_index >= our_last_log_index;
+
+    if term >= our_epoch
+        && log_ok
+        && engine
+            .replication()
+            .consensus()
+            .try_record_vote(candidate_id, term)
+    {
         // Grant vote and adopt the new term epoch
         engine.replication().set_epoch(term);
-        engine.replication().record_vote(candidate_id, term);
         tracing::info!(
             "VoteRequest: GRANTED vote to candidate {} for term {} (our epoch was {})",
             candidate_id,
@@ -549,11 +641,13 @@ fn decode_vote_request_packet(
         Ok((bytes_consumed, vec![0x01]))
     } else {
         tracing::info!(
-            "VoteRequest: DENIED — candidate {} term {} (epoch: {}, can_vote: {})",
+            "VoteRequest: DENIED — candidate {} term {} (our epoch: {}, our last_log_index: {}, candidate last_log_index: {}, log_ok: {})",
             candidate_id,
             term,
             our_epoch,
-            engine.replication().can_vote_for(candidate_id, term)
+            our_last_log_index,
+            candidate_last_log_index,
+            log_ok
         );
         Ok((bytes_consumed, vec![0x00]))
     }
@@ -688,11 +782,16 @@ fn decode_replication_packet(
     // without advancing `consumed`, causing already-written frames to be replayed on
     // the next call and permanently duplicated in the partition log.
     //
-    // Now: first pass collects payloads (no writes); only after the entire batch is
+    // Now: first pass collects frames (no writes); only after the entire batch is
     // confirmed present do we commit writes.  NeedMoreData can therefore only be
     // returned when zero bytes have been written.
+    //
+    // Frames are kept whole (not narrowed to just `.payload`) so the write pass can
+    // append them verbatim — preserving the leader's original offset/timestamp/magic/CRC
+    // instead of reassigning them locally, which is what previously let a replica's log
+    // diverge from its leader's.
     let is_cluster_meta = topic == "__cluster_metadata";
-    let mut parsed_payloads: Vec<bytes::Bytes> = Vec::with_capacity(count);
+    let mut parsed_frames: Vec<RecordFrame> = Vec::with_capacity(count);
 
     for _ in 0..count {
         if src.len() < HEADER_SIZE {
@@ -701,7 +800,7 @@ fn decode_replication_packet(
         match RecordFrame::decode(src) {
             Ok((frame, frame_bytes)) => {
                 src = &src[frame_bytes..];
-                parsed_payloads.push(frame.payload);
+                parsed_frames.push(frame);
             }
             Err(crate::protocol::FrameError::BufferTooShort { .. }) => {
                 return Err(PacketError::NeedMoreData);
@@ -718,118 +817,57 @@ fn decode_replication_packet(
     // C1: Track write failures and NACK the leader so it can remove this node from ISR.
     // Previously, disk errors were logged and silently swallowed; the function returned
     // a success ACK regardless, causing the leader to falsely count this follower as
-    // in-sync for data it never persisted.
+    // in-sync for data it never persisted. A `Gap` (this follower is missing earlier
+    // offsets, e.g. after a reconnect) is treated the same way: NACK so the leader keeps
+    // this replica out of the ISR quorum count until it catches back up, rather than
+    // silently dropping the out-of-order frame.
     let mut write_failed = false;
-    for (i, payload) in parsed_payloads.iter().enumerate() {
-        if let Err(e) = pm.produce_frame(payload) {
-            tracing::error!(
-                "HA Replication: Failed to persist record {}/{} on '{}' P{}: {}",
-                i + 1,
-                count,
-                topic,
-                partition,
-                e
-            );
-            write_failed = true;
+    for (i, frame) in parsed_frames.iter().enumerate() {
+        match pm.append_replica_frame_verbatim(frame) {
+            Ok(crate::segment::VerbatimAppendResult::Appended) => {}
+            Ok(crate::segment::VerbatimAppendResult::AlreadyApplied) => {
+                tracing::debug!(
+                    "HA Replication: Record {}/{} on '{}' P{} at offset {} already applied — skipping",
+                    i + 1,
+                    count,
+                    topic,
+                    partition,
+                    frame.offset
+                );
+            }
+            Ok(crate::segment::VerbatimAppendResult::Gap { expected }) => {
+                tracing::warn!(
+                    "HA Replication: Gap on '{}' P{} — got offset {} but expected {}. Rejecting batch.",
+                    topic,
+                    partition,
+                    frame.offset,
+                    expected
+                );
+                write_failed = true;
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "HA Replication: Failed to persist record {}/{} on '{}' P{}: {}",
+                    i + 1,
+                    count,
+                    topic,
+                    partition,
+                    e
+                );
+                write_failed = true;
+                // Don't apply this frame's metadata-record effects — it was never
+                // durably persisted, so applying it would desync memory from disk.
+                continue;
+            }
         }
 
         // If this node is a Follower and receives a __cluster_metadata replication,
-        // decode it and dynamically initialize partitions locally.
+        // decode it and apply its state effects locally via the same apply path used
+        // by startup replay, so the two can never diverge in behavior.
         if is_cluster_meta {
-            if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(payload) {
-                match meta_rec {
-                    crate::replication::MetadataRecord::TopicPartition {
-                        topic: ref t,
-                        partition: p,
-                        ..
-                    } => {
-                        // SEC-MED-07: Validate topic name before creating partitions from metadata.
-                        if crate::server::engine::validate_topic_name(t).is_ok() {
-                            tracing::info!(
-                                "HA Replication: Received dynamic partition metadata. Initializing partition {}-{}",
-                                t, p
-                            );
-                            if let Err(e) = engine.get_or_create_partition(t, p) {
-                                tracing::error!(
-                                    "HA Replication: Failed to dynamically create partition {}-{}: {}",
-                                    t, p, e
-                                );
-                            }
-                        } else {
-                            tracing::warn!("HA Replication: Skipping invalid topic name '{}' in metadata record", t);
-                        }
-                    }
-                    crate::replication::MetadataRecord::BrokerRegister {
-                        node_id,
-                        ref bind_addr,
-                    } => {
-                        engine.register_broker_address(node_id, bind_addr.clone());
-                        tracing::info!(
-                            "HA Replication: Broker register metadata record parsed. Node {} is at {}",
-                            node_id, bind_addr
-                        );
-                    }
-                    crate::replication::MetadataRecord::TopicCreated {
-                        topic: ref t,
-                        num_partitions,
-                        ..
-                    } => {
-                        let _ = engine.create_topic(t, num_partitions);
-                    }
-                    crate::replication::MetadataRecord::TopicDeleted { topic: ref t } => {
-                        let _ = engine.delete_topic(t);
-                    }
-                    crate::replication::MetadataRecord::PartitionLeadershipChange {
-                        topic: ref t,
-                        partition,
-                        leader_id,
-                        leader_epoch,
-                        isr,
-                    } => {
-                        let replicas = isr.clone();
-                        if let Ok(pm) = engine.get_or_create_partition(t, partition) {
-                            pm.update_leadership(leader_id, leader_epoch, replicas, isr);
-                        }
-                    }
-                    crate::replication::MetadataRecord::AclCreated { binding } => {
-                        engine.acl().add_acl(binding);
-                    }
-                    crate::replication::MetadataRecord::AclDeleted { binding } => {
-                        engine.acl().remove_acl(&binding);
-                    }
-                    crate::replication::MetadataRecord::BrokerUnregister { node_id } => {
-                        engine.unregister_broker_address(node_id);
-                        tracing::info!(
-                            "HA Replication: Broker unregister metadata record parsed. Node {} removed",
-                            node_id
-                        );
-                    }
-                    crate::replication::MetadataRecord::ScramCredentialUpsert {
-                        username,
-                        iterations,
-                        salt,
-                        stored_key,
-                        server_key,
-                    } => {
-                        engine.apply_scram_credential_state(
-                            username, iterations, salt, stored_key, server_key,
-                        );
-                    }
-                    crate::replication::MetadataRecord::ScramCredentialDelete { username } => {
-                        engine.remove_scram_credential_state(&username);
-                    }
-                    crate::replication::MetadataRecord::TransactionalProducerRegistration {
-                        transactional_id,
-                        producer_id,
-                        producer_epoch,
-                    } => {
-                        engine.transactions().restore_transactional_producer(
-                            &transactional_id,
-                            producer_id,
-                            producer_epoch,
-                        );
-                    }
-                }
+            if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
+                engine.apply_metadata_record(frame.offset, meta_rec);
             }
         }
     }
@@ -1202,6 +1240,7 @@ async fn process_request(
             }
             match engine
                 .upsert_scram_credential(&username, iterations, salt, stored_key, server_key)
+                .await
             {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(err) => WireResponse::error(&format!("UpsertScramUser failed: {}", err)),
@@ -1217,7 +1256,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("ClusterAuthorizationFailed");
             }
-            match engine.delete_scram_user(&username) {
+            match engine.delete_scram_user(&username).await {
                 Ok(_) => WireResponse::ok(Vec::new()),
                 Err(err) => WireResponse::error(&format!("DeleteScramUser failed: {}", err)),
             }
@@ -1291,7 +1330,7 @@ async fn process_request(
                 operation,
                 permission_type,
             };
-            match engine.create_acl(binding) {
+            match engine.create_acl(binding).await {
                 Ok(_) => {
                     let mut buf = Vec::new();
                     buf.put_i16(0);
@@ -1327,7 +1366,7 @@ async fn process_request(
                 operation,
                 permission_type,
             };
-            match engine.delete_acl(binding) {
+            match engine.delete_acl(binding).await {
                 Ok(_) => {
                     let mut buf = Vec::new();
                     buf.put_i16(0);
@@ -1761,7 +1800,7 @@ async fn process_request(
             if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
                 return WireResponse::error(&format!("Invalid topic name: {}", e));
             }
-            match engine.delete_topic(&topic) {
+            match engine.delete_topic(&topic).await {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("DeleteTopic failed: {}", e)),
             }
@@ -1870,7 +1909,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("TopicAuthorizationFailed");
             }
-            match engine.create_topic(&topic, partitions) {
+            match engine.create_topic(&topic, partitions).await {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(err) => WireResponse::error(&format!("CreateTopic failed: {}", err)),
             }
@@ -1988,7 +2027,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("ClusterAuthorizationFailed");
             }
-            match engine.register_broker(node_id, endpoint) {
+            match engine.register_broker(node_id, endpoint).await {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("RegisterBroker failed: {}", e)),
             }
@@ -2003,10 +2042,149 @@ async fn process_request(
             ) {
                 return WireResponse::error("ClusterAuthorizationFailed");
             }
-            match engine.unregister_broker(node_id) {
+            match engine.unregister_broker(node_id).await {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("UnregisterBroker failed: {}", e)),
             }
+        }
+        RequestPayload::ShareFetch {
+            group_id,
+            member_id,
+            topic,
+            partition,
+            max_records,
+            max_bytes: _,
+            lock_timeout_ms,
+            acknowledgements,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
+            if !engine.is_partition_replica(&topic, partition) {
+                return WireResponse::error("NotLeaderForPartition");
+            }
+
+            // If piggybacked acknowledgements are present, apply them first
+            if !acknowledgements.is_empty() {
+                if let Err(e) = engine.share_acknowledge(
+                    &group_id,
+                    &member_id,
+                    &topic,
+                    partition,
+                    &acknowledgements,
+                ) {
+                    return WireResponse::error(&format!("ShareAcknowledge failed: {}", e));
+                }
+            }
+
+            match engine.share_fetch(
+                &group_id,
+                &member_id,
+                &topic,
+                partition,
+                max_records,
+                lock_timeout_ms,
+            ) {
+                Ok(batches) => {
+                    let mut fetched_bytes: u64 = 0;
+                    for b in &batches {
+                        for rec in &b.records {
+                            fetched_bytes += rec.encoded_size() as u64;
+                        }
+                    }
+                    let payload = crate::protocol::wire::encode_share_fetch_response(&batches);
+                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
+                    WireResponse::ok(payload)
+                }
+                Err(e) => WireResponse::error(&format!("ShareFetch failed: {}", e)),
+            }
+        }
+        RequestPayload::ShareAcknowledge {
+            group_id,
+            member_id,
+            topic,
+            partition,
+            acknowledgements,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
+            match engine.share_acknowledge(
+                &group_id,
+                &member_id,
+                &topic,
+                partition,
+                &acknowledgements,
+            ) {
+                Ok(()) => {
+                    let payload = crate::protocol::wire::encode_share_acknowledge_response(0, None);
+                    WireResponse::ok(payload)
+                }
+                Err(e) => {
+                    let payload = crate::protocol::wire::encode_share_acknowledge_response(
+                        1,
+                        Some(&e),
+                    );
+                    WireResponse::ok(payload)
+                }
+            }
+        }
+        RequestPayload::ShareGroupHeartbeat {
+            group_id,
+            member_id,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Read as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
+            engine.share_group_heartbeat(&group_id, &member_id);
+            WireResponse::ok(Vec::new())
+        }
+        RequestPayload::ShareGroupDescribe { group_id } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::Describe as u8,
+                crate::server::acl::ResourceType::Group as u8,
+                &group_id,
+            ) {
+                return WireResponse::error("GroupAuthorizationFailed");
+            }
+            let (state, members, inflight, start_offset) =
+                engine.share_group_describe(&group_id);
+            let payload = crate::protocol::wire::encode_share_group_describe_response(
+                &state,
+                &members,
+                inflight,
+                start_offset,
+            );
+            WireResponse::ok(payload)
         }
     }
 }

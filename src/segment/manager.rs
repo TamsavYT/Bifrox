@@ -32,6 +32,18 @@ pub fn extract_key(payload: &[u8]) -> &[u8] {
     payload
 }
 
+/// Outcome of `SegmentManager::append_verbatim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbatimAppendResult {
+    /// The frame was appended at its own offset, byte-for-byte.
+    Appended,
+    /// `frame.offset` is already present locally (idempotent replay/double-delivery) — no-op.
+    AlreadyApplied,
+    /// `frame.offset` is beyond the local log end; the caller must resync from `expected`
+    /// before this frame (or a replacement for it) can be appended.
+    Gap { expected: u64 },
+}
+
 /// Segment pair holding associated log segment and index segment
 #[derive(Debug)]
 pub struct SegmentPair {
@@ -227,6 +239,128 @@ impl SegmentManager {
         self.active.log.next_offset = self.high_watermark;
 
         Ok(frame)
+    }
+
+    /// Appends a frame produced elsewhere (i.e. a leader's `RecordFrame`) byte-for-byte:
+    /// the offset, timestamp, magic byte, and CRC are all taken from `frame` as given,
+    /// never reassigned locally. This is what makes a replica's on-disk log byte-identical
+    /// to the leader's for the same offset range, instead of diverging (the old replication
+    /// path re-derived offset/timestamp/codec through `append_with_codec` on every
+    /// replicated record). `frame` has already been CRC-validated by `RecordFrame::decode`,
+    /// so no additional integrity check is needed here.
+    pub fn append_verbatim(&mut self, frame: &RecordFrame) -> IoResult<VerbatimAppendResult> {
+        if frame.offset < self.high_watermark {
+            return Ok(VerbatimAppendResult::AlreadyApplied);
+        }
+        if frame.offset > self.high_watermark {
+            return Ok(VerbatimAppendResult::Gap {
+                expected: self.high_watermark,
+            });
+        }
+
+        let frame_size = frame.encoded_size() as u64;
+        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
+            self.rotate_segment()?;
+        }
+
+        let mut encoded = Vec::with_capacity(frame.encoded_size());
+        frame.encode_into(&mut encoded);
+        let physical_pos = self.active.log.append_bytes(&encoded)?;
+
+        if self.bytes_since_last_index >= self.config.index_interval_bytes
+            || self.active.index.entries_count() == 0
+        {
+            self.active.index.append(frame.offset, physical_pos)?;
+            let _ = self.active.time_index.append(frame.timestamp, frame.offset);
+            self.bytes_since_last_index = 0;
+        }
+
+        self.bytes_since_last_index += frame_size;
+        self.high_watermark = frame.offset + 1;
+        self.active.log.next_offset = self.high_watermark;
+
+        Ok(VerbatimAppendResult::Appended)
+    }
+
+    /// Discards any locally-stored entries at or beyond `offset`, across the active
+    /// segment and (if necessary) historical segments — Raft-style conflicting-suffix
+    /// truncation, used when a follower's log diverges from its leader's and must be
+    /// brought back in line before appending the leader's authoritative entries.
+    pub fn truncate_after(&mut self, offset: u64) -> IoResult<()> {
+        if offset >= self.high_watermark {
+            return Ok(());
+        }
+
+        // Drop whole historical segments that start at/after the truncation point.
+        self.historical.retain(|seg| seg.base_offset < offset);
+
+        if offset < self.active.base_offset {
+            // The truncation point falls inside a historical segment (rare: it means the
+            // divergence predates the most recent rotation). Promote the highest-based
+            // remaining historical segment to active, truncated at `offset`, and discard
+            // the old active segment's on-disk files entirely.
+            if let Some(mut promoted) = self.historical.pop() {
+                Self::truncate_segment_pair(&mut promoted, offset)?;
+                let old_active = std::mem::replace(&mut self.active, promoted);
+                let _ = fs::remove_file(&old_active.log.path);
+                let _ = fs::remove_file(old_active.index.path());
+                let _ = fs::remove_file(old_active.time_index.path());
+                let _ = fs::remove_file(old_active.txn_index.path());
+            } else {
+                // No historical segment covers `offset` (shouldn't happen if `offset`
+                // is a valid previously-seen index) — fall back to truncating active.
+                Self::truncate_segment_pair(&mut self.active, offset)?;
+            }
+        } else {
+            Self::truncate_segment_pair(&mut self.active, offset)?;
+        }
+
+        self.high_watermark = offset;
+        self.active.log.next_offset = offset;
+        self.bytes_since_last_index = 0;
+        Ok(())
+    }
+
+    /// Truncates a single segment pair so no frame with offset >= `offset` remains.
+    fn truncate_segment_pair(pair: &mut SegmentPair, offset: u64) -> IoResult<()> {
+        let phys = Self::physical_pos_for_offset(pair, offset)?;
+        pair.log.truncate_to(phys)?;
+        pair.index.truncate_after(offset)?;
+        pair.time_index.truncate_after(offset)?;
+        pair.txn_index.truncate_after(offset)?;
+        pair.mmap = None;
+        Ok(())
+    }
+
+    /// Scans forward from the nearest sparse-index entry to find the physical byte
+    /// position at which `offset` begins within this segment pair.
+    fn physical_pos_for_offset(pair: &mut SegmentPair, offset: u64) -> IoResult<u64> {
+        let seek_entry = pair.index.find_nearest_physical_pos(offset);
+        let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
+        let raw = pair
+            .log
+            .read_at(start_pos, pair.log.physical_size as usize)?;
+
+        let mut cursor = 0usize;
+        let mut phys = start_pos;
+        while cursor < raw.len() {
+            if cursor + HEADER_SIZE > raw.len() {
+                break;
+            }
+            match RecordFrame::decode(&raw[cursor..]) {
+                Ok((frame, consumed)) => {
+                    if frame.offset == offset {
+                        return Ok(phys);
+                    }
+                    cursor += consumed;
+                    phys += consumed as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        // `offset` not found in this segment (e.g. it's exactly the segment's end) —
+        // truncating at the current physical size is a safe no-op.
+        Ok(pair.log.physical_size)
     }
 
     /// Append a control marker frame into active segment. Performs segment rotation if size limit reached.
@@ -747,5 +881,133 @@ impl SegmentManager {
             }
         }
         &mut self.historical[0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::frame::MAGIC_BYTE;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_segment_manager_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_manager(dir: &TempDir) -> SegmentManager {
+        SegmentManager::open(&dir.0, EngineConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn append_verbatim_preserves_offset_timestamp_and_payload() {
+        let dir = TempDir::new("verbatim_basic");
+        let mut mgr = open_manager(&dir);
+
+        let leader_frame = RecordFrame::create(0, 123_456_789, b"hello".to_vec());
+        let result = mgr.append_verbatim(&leader_frame).unwrap();
+        assert_eq!(result, VerbatimAppendResult::Appended);
+
+        let fetched = mgr.fetch(0, 4096).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].offset, 0);
+        assert_eq!(fetched[0].timestamp, 123_456_789);
+        assert_eq!(fetched[0].magic, MAGIC_BYTE);
+        assert_eq!(fetched[0].payload.as_ref(), b"hello");
+        assert_eq!(mgr.high_watermark(), 1);
+    }
+
+    #[test]
+    fn append_verbatim_is_idempotent_on_duplicate_offset() {
+        let dir = TempDir::new("verbatim_dup");
+        let mut mgr = open_manager(&dir);
+
+        let frame = RecordFrame::create(0, 1, b"a".to_vec());
+        assert_eq!(
+            mgr.append_verbatim(&frame).unwrap(),
+            VerbatimAppendResult::Appended
+        );
+        // Re-delivering the same offset (e.g. a retried/duplicated replication push)
+        // must not double-append or error.
+        assert_eq!(
+            mgr.append_verbatim(&frame).unwrap(),
+            VerbatimAppendResult::AlreadyApplied
+        );
+        assert_eq!(mgr.high_watermark(), 1);
+        assert_eq!(mgr.fetch(0, 4096).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn append_verbatim_reports_gap_instead_of_skipping() {
+        let dir = TempDir::new("verbatim_gap");
+        let mut mgr = open_manager(&dir);
+
+        let frame = RecordFrame::create(5, 1, b"a".to_vec());
+        match mgr.append_verbatim(&frame).unwrap() {
+            VerbatimAppendResult::Gap { expected } => assert_eq!(expected, 0),
+            other => panic!("expected Gap, got {:?}", other),
+        }
+        // Nothing should have been written.
+        assert_eq!(mgr.high_watermark(), 0);
+    }
+
+    #[test]
+    fn truncate_after_removes_conflicting_tail_and_allows_reappend() {
+        let dir = TempDir::new("truncate_basic");
+        let mut mgr = open_manager(&dir);
+
+        for i in 0..5u64 {
+            let frame = RecordFrame::create(i, i, format!("v{}", i).into_bytes());
+            mgr.append_verbatim(&frame).unwrap();
+        }
+        assert_eq!(mgr.high_watermark(), 5);
+
+        // Simulate a conflicting suffix: truncate back to offset 3, then append a
+        // different value at offset 3 (as a new leader would after a term change).
+        mgr.truncate_after(3).unwrap();
+        assert_eq!(mgr.high_watermark(), 3);
+        assert_eq!(mgr.fetch(0, 4096).unwrap().len(), 3);
+
+        let replacement = RecordFrame::create(3, 999, b"replacement".to_vec());
+        assert_eq!(
+            mgr.append_verbatim(&replacement).unwrap(),
+            VerbatimAppendResult::Appended
+        );
+
+        let all = mgr.fetch(0, 4096).unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[3].payload.as_ref(), b"replacement");
+        assert_eq!(all[3].timestamp, 999);
+    }
+
+    #[test]
+    fn truncate_after_offset_beyond_hw_is_a_no_op() {
+        let dir = TempDir::new("truncate_noop");
+        let mut mgr = open_manager(&dir);
+        let frame = RecordFrame::create(0, 1, b"a".to_vec());
+        mgr.append_verbatim(&frame).unwrap();
+
+        mgr.truncate_after(50).unwrap();
+        assert_eq!(mgr.high_watermark(), 1);
+        assert_eq!(mgr.fetch(0, 4096).unwrap().len(), 1);
     }
 }

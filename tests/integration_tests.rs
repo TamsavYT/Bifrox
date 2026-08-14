@@ -1153,6 +1153,7 @@ async fn test_scenario_17_durable_metadata_catalog() {
     // 5. Delete topic and verify removal from registry and describe
     restarted_engine
         .delete_topic("meta_topic")
+        .await
         .expect("DeleteTopic failed");
     assert!(restarted_engine.describe_topic("meta_topic").is_none());
     assert!(!restarted_engine
@@ -2269,6 +2270,7 @@ async fn test_scenario_29_scram_credentials_persist_across_restart() {
     let bootstrap_engine = StorageEngine::new(bootstrap_cfg).unwrap();
     bootstrap_engine
         .upsert_scram_user("alice", "persist_secret_123")
+        .await
         .unwrap();
     drop(bootstrap_engine);
 
@@ -2401,4 +2403,358 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
     assert_eq!(all_frames.len(), 4);
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].payload.as_ref(), b"txn-recovery-record-2");
+}
+
+#[tokio::test]
+async fn test_scenario_31_share_consumer_and_queue_semantics() {
+    use hermes::{
+        AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest,
+    };
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let env = start_test_server().await;
+    let topic = "share-queue-topic";
+    let group_id = "test-share-group";
+
+    // 1. Produce 6 records to partition 0
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+    let produce_payloads: Vec<bytes::Bytes> = (0..6)
+        .map(|i| bytes::Bytes::from(format!("share-msg-{}", i)))
+        .collect();
+    client
+        .produce_batch(topic, "", None, 1, &produce_payloads)
+        .await
+        .unwrap();
+
+    // 2. Member 1 connects over TCP and fetches 2 records
+    let mut stream1 = TcpStream::connect(env.addr).await.unwrap();
+    let fetch_req1 = WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: "member-1".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 2,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 1000, // 1s lock
+            acknowledgements: vec![],
+        },
+    };
+    let encoded1 = encode_wire_request(&fetch_req1);
+    stream1.write_all(&encoded1).await.unwrap();
+
+    let resp1 = read_wire_response(&mut stream1).await;
+    assert_eq!(resp1.status, 0);
+    // Parse batches: expect offsets 0 and 1
+    let mut resp_buf = &resp1.payload[..];
+    use bytes::Buf;
+    let batch_count = resp_buf.get_u32();
+    assert_eq!(batch_count, 1);
+    let first_offset = resp_buf.get_u64();
+    let last_offset = resp_buf.get_u64();
+    let delivery_count = resp_buf.get_u16();
+    assert_eq!(first_offset, 0);
+    assert_eq!(last_offset, 1);
+    assert_eq!(delivery_count, 1);
+
+    // 3. Member 2 connects concurrently and fetches 2 records -> cooperative consumption gets 2 and 3!
+    let mut stream2 = TcpStream::connect(env.addr).await.unwrap();
+    let fetch_req2 = WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: "member-2".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 2,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 1000,
+            acknowledgements: vec![],
+        },
+    };
+    stream2
+        .write_all(&encode_wire_request(&fetch_req2))
+        .await
+        .unwrap();
+    let resp2 = read_wire_response(&mut stream2).await;
+    assert_eq!(resp2.status, 0);
+    let mut resp_buf2 = &resp2.payload[..];
+    assert_eq!(resp_buf2.get_u32(), 1);
+    assert_eq!(resp_buf2.get_u64(), 2);
+    assert_eq!(resp_buf2.get_u64(), 3);
+
+    // 4. Member 1 acknowledges offset 0 as ACCEPT, and offset 1 as RELEASE (transient error)
+    let ack_req1 = WireRequest {
+        cmd: CommandCode::ShareAcknowledge,
+        payload: RequestPayload::ShareAcknowledge {
+            group_id: group_id.to_string(),
+            member_id: "member-1".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            acknowledgements: vec![
+                AckBatch {
+                    first_offset: 0,
+                    last_offset: 0,
+                    ack_type: AcknowledgeType::Accept,
+                },
+                AckBatch {
+                    first_offset: 1,
+                    last_offset: 1,
+                    ack_type: AcknowledgeType::Release,
+                },
+            ],
+        },
+    };
+    stream1
+        .write_all(&encode_wire_request(&ack_req1))
+        .await
+        .unwrap();
+    let ack_resp1 = read_wire_response(&mut stream1).await;
+    assert_eq!(ack_resp1.status, 0);
+
+    // 5. Member 2 fetches again — gets the released offset 1 with delivery_count = 2!
+    let fetch_req3 = WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: "member-2".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 1,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 1000,
+            acknowledgements: vec![],
+        },
+    };
+    stream2
+        .write_all(&encode_wire_request(&fetch_req3))
+        .await
+        .unwrap();
+    let resp3 = read_wire_response(&mut stream2).await;
+    assert_eq!(resp3.status, 0);
+    let mut resp_buf3 = &resp3.payload[..];
+    assert_eq!(resp_buf3.get_u32(), 1);
+    assert_eq!(resp_buf3.get_u64(), 1); // Offset 1 redelivered!
+    assert_eq!(resp_buf3.get_u64(), 1);
+    assert_eq!(resp_buf3.get_u16(), 2); // delivery_count is 2!
+
+    // 6. Member 2 rejects offset 1 (poison pill) -> should be routed to DLQ topic "share-queue-topic-dlq"
+    let ack_req2 = WireRequest {
+        cmd: CommandCode::ShareAcknowledge,
+        payload: RequestPayload::ShareAcknowledge {
+            group_id: group_id.to_string(),
+            member_id: "member-2".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            acknowledgements: vec![
+                AckBatch {
+                    first_offset: 1,
+                    last_offset: 1,
+                    ack_type: AcknowledgeType::Reject,
+                },
+                AckBatch {
+                    first_offset: 2,
+                    last_offset: 3,
+                    ack_type: AcknowledgeType::Accept,
+                },
+            ],
+        },
+    };
+    stream2
+        .write_all(&encode_wire_request(&ack_req2))
+        .await
+        .unwrap();
+    let ack_resp2 = read_wire_response(&mut stream2).await;
+    assert_eq!(ack_resp2.status, 0);
+
+    // Verify DLQ topic has the rejected record
+    let dlq_frames = env.engine.fetch("share-queue-topic-dlq", 0, 0, 1024).unwrap();
+    assert_eq!(dlq_frames.len(), 1);
+    assert_eq!(dlq_frames[0].payload.as_ref(), b"share-msg-1");
+
+    // 7. Test automatic lock lease timeout expiry & redelivery
+    // Member 1 acquires offsets 4 and 5 with short 100ms lock timeout
+    let fetch_req_timeout = WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: "member-1".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 2,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 100, // 100ms lock timeout
+            acknowledgements: vec![],
+        },
+    };
+    stream1
+        .write_all(&encode_wire_request(&fetch_req_timeout))
+        .await
+        .unwrap();
+    let resp_to = read_wire_response(&mut stream1).await;
+    assert_eq!(resp_to.status, 0);
+
+    // Member 1 does NOT acknowledge and times out -> wait 200ms
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Member 2 now fetches -> automatically gets offsets 4 and 5 redelivered!
+    let fetch_req_redeliver = WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: "member-2".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 2,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 1000,
+            acknowledgements: vec![],
+        },
+    };
+    stream2
+        .write_all(&encode_wire_request(&fetch_req_redeliver))
+        .await
+        .unwrap();
+    let resp_redeliver = read_wire_response(&mut stream2).await;
+    assert_eq!(resp_redeliver.status, 0);
+    let mut resp_buf_rd = &resp_redeliver.payload[..];
+    assert_eq!(resp_buf_rd.get_u32(), 1);
+    assert_eq!(resp_buf_rd.get_u64(), 4);
+    assert_eq!(resp_buf_rd.get_u64(), 5);
+    assert_eq!(resp_buf_rd.get_u16(), 2); // delivery count is 2 due to auto timeout redelivery!
+
+    // Member 2 accepts both
+    let ack_req_final = WireRequest {
+        cmd: CommandCode::ShareAcknowledge,
+        payload: RequestPayload::ShareAcknowledge {
+            group_id: group_id.to_string(),
+            member_id: "member-2".to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            acknowledgements: vec![AckBatch {
+                first_offset: 4,
+                last_offset: 5,
+                ack_type: AcknowledgeType::Accept,
+            }],
+        },
+    };
+    stream2
+        .write_all(&encode_wire_request(&ack_req_final))
+        .await
+        .unwrap();
+    let ack_resp_final = read_wire_response(&mut stream2).await;
+    assert_eq!(ack_resp_final.status, 0);
+
+    // 8. Describe group API test
+    let desc_req = WireRequest {
+        cmd: CommandCode::ShareGroupDescribe,
+        payload: RequestPayload::ShareGroupDescribe {
+            group_id: group_id.to_string(),
+        },
+    };
+    stream1
+        .write_all(&encode_wire_request(&desc_req))
+        .await
+        .unwrap();
+    let desc_resp = read_wire_response(&mut stream1).await;
+    assert_eq!(desc_resp.status, 0);
+
+    // 9. Restart StorageEngine and verify persistent watermark recovery
+    drop(stream1);
+    drop(stream2);
+    let mut restart_cfg = env.engine.config().clone();
+    restart_cfg.data_dir = env.data_dir.clone();
+    let restarted = StorageEngine::new(restart_cfg).unwrap();
+
+    let sp = restarted
+        .share_groups()
+        .get_or_create_partition(group_id, topic, 0);
+    // All offsets 0..=5 were acknowledged or archived, so start_offset is 6
+    assert_eq!(
+        sp.start_offset.load(std::sync::atomic::Ordering::SeqCst),
+        6
+    );
+}
+
+fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
+    use bytes::BufMut;
+    let mut body = Vec::new();
+    match &req.payload {
+        hermes::RequestPayload::ShareFetch {
+            group_id,
+            member_id,
+            topic,
+            partition,
+            max_records,
+            max_bytes,
+            lock_timeout_ms,
+            acknowledgements,
+        } => {
+            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
+            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
+            hermes::protocol::wire::write_pascal_string(&mut body, topic);
+            body.put_u32(*partition);
+            body.put_u32(*max_records);
+            body.put_u32(*max_bytes);
+            body.put_u32(*lock_timeout_ms);
+            body.put_u32(acknowledgements.len() as u32);
+            for ack in acknowledgements {
+                body.put_u64(ack.first_offset);
+                body.put_u64(ack.last_offset);
+                body.put_u8(ack.ack_type as u8);
+            }
+        }
+        hermes::RequestPayload::ShareAcknowledge {
+            group_id,
+            member_id,
+            topic,
+            partition,
+            acknowledgements,
+        } => {
+            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
+            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
+            hermes::protocol::wire::write_pascal_string(&mut body, topic);
+            body.put_u32(*partition);
+            body.put_u32(acknowledgements.len() as u32);
+            for ack in acknowledgements {
+                body.put_u64(ack.first_offset);
+                body.put_u64(ack.last_offset);
+                body.put_u8(ack.ack_type as u8);
+            }
+        }
+        hermes::RequestPayload::ShareGroupHeartbeat {
+            group_id,
+            member_id,
+        } => {
+            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
+            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
+        }
+        hermes::RequestPayload::ShareGroupDescribe { group_id } => {
+            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
+        }
+        _ => panic!("Unsupported in test encode"),
+    }
+
+    let mut buf = Vec::new();
+    buf.put_u8(req.cmd as u8);
+    buf.put_u32(body.len() as u32);
+    buf.extend_from_slice(&body);
+    buf
+}
+
+async fn read_wire_response<S>(stream: &mut S) -> hermes::WireResponse
+where
+    S: tokio::io::AsyncReadExt + Unpin,
+{
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await.unwrap();
+    let status = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut payload).await.unwrap();
+    }
+    hermes::WireResponse { status, payload }
 }

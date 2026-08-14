@@ -109,7 +109,14 @@ pub struct PartitionManager {
     topic: String,
     partition: u32,
     segment_manager: Mutex<SegmentManager>,
-    high_watermark: AtomicU64,
+    /// Log-end-offset: the next offset to be assigned locally. Bumped synchronously on
+    /// every local append (leader produce, replica verbatim-append, control marker).
+    log_end_offset: AtomicU64,
+    /// The real Kafka-style high watermark: the highest offset guaranteed replicated to
+    /// a full ISR quorum. Only advanced explicitly (see `advance_committed_hw`) — never
+    /// implicitly by an append — so fetch/describe can expose only what's actually
+    /// durable across the ISR instead of whatever the leader happens to have on disk.
+    committed_hw: AtomicU64,
     producer_state_manager: Mutex<ProducerStateManager>,
     leader_id: AtomicU32,
     leader_epoch: AtomicU32,
@@ -130,7 +137,11 @@ impl PartitionManager {
         let partition_dir = base_data_dir.as_ref().to_path_buf();
 
         let segment_manager = SegmentManager::open(&partition_dir, config.clone())?;
-        let high_watermark = AtomicU64::new(segment_manager.high_watermark());
+        // Everything already on disk at startup is treated as committed — consistent
+        // with how recovery elsewhere in this codebase already trusts on-disk state.
+        let recovered_offset = segment_manager.high_watermark();
+        let log_end_offset = AtomicU64::new(recovered_offset);
+        let committed_hw = AtomicU64::new(recovered_offset);
         let snapshot_path = partition_dir.join(format!("{}.snapshot", partition));
         let producer_state_manager = ProducerStateManager::open(snapshot_path)?;
 
@@ -138,7 +149,8 @@ impl PartitionManager {
             topic,
             partition,
             segment_manager: Mutex::new(segment_manager),
-            high_watermark,
+            log_end_offset,
+            committed_hw,
             producer_state_manager: Mutex::new(producer_state_manager),
             leader_id: AtomicU32::new(config.node_id),
             leader_epoch: AtomicU32::new(0),
@@ -190,8 +202,23 @@ impl PartitionManager {
         self.isr.read().clone()
     }
 
+    /// Returns the log-end-offset: the next offset that will be assigned to a new local
+    /// append. This includes data that may not yet be replicated to the ISR — use
+    /// `high_watermark()` for the committed-only view.
     pub fn latest_offset(&self) -> u64 {
-        self.high_watermark.load(Ordering::Acquire)
+        self.log_end_offset.load(Ordering::Acquire)
+    }
+
+    /// Returns the committed high watermark: the highest offset guaranteed replicated to
+    /// a full ISR quorum. Consumers should never be shown data beyond this.
+    pub fn high_watermark(&self) -> u64 {
+        self.committed_hw.load(Ordering::Acquire)
+    }
+
+    /// Monotonically advances the committed high watermark to `candidate` (a no-op if
+    /// `candidate` isn't past the current value).
+    pub fn advance_committed_hw(&self, candidate: u64) {
+        self.committed_hw.fetch_max(candidate, Ordering::AcqRel);
     }
 
     /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame
@@ -233,7 +260,11 @@ impl PartitionManager {
             let base_after = seg_guard.active_base_offset();
 
             let assigned_offset = frame.offset;
-            self.high_watermark
+            // Only LEO advances here. `committed_hw` is deliberately NOT bumped on local
+            // leader append — it only advances once `produce_batch` confirms ISR quorum
+            // (see engine.rs), so a crashed/partitioned leader can never have exposed data
+            // to consumers that no other replica ever received.
+            self.log_end_offset
                 .store(assigned_offset + 1, Ordering::Release);
 
             (frame, base_before != base_after)
@@ -258,9 +289,72 @@ impl PartitionManager {
         Ok(Ok(frame))
     }
 
+    /// Appends a record and immediately marks it committed. Used by every internal
+    /// system-partition writer (cluster metadata proposals, DLQ routing, consumer-offset
+    /// commits, transaction-state records, bootstrap) that doesn't itself integrate with
+    /// ISR-quorum gating — unlike `produce_batch`'s per-record use of `produce_frame_eos`
+    /// directly, which leaves `committed_hw` ungated so it can advance only after quorum.
     pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
         let f = self.produce_frame_eos(payload, 0, 0, 0)?;
-        Ok(f.unwrap())
+        let frame = f.unwrap();
+        self.advance_committed_hw(frame.offset + 1);
+        Ok(frame)
+    }
+
+    /// Appends a frame received from another node (leader push or catch-up fetch) verbatim,
+    /// preserving its original offset/timestamp/magic/CRC exactly rather than reassigning
+    /// them locally. See `SegmentManager::append_verbatim`.
+    pub fn append_replica_frame_verbatim(
+        &self,
+        frame: &RecordFrame,
+    ) -> IoResult<crate::segment::VerbatimAppendResult> {
+        let result = {
+            let mut seg_guard = self.segment_manager.lock();
+            seg_guard.append_verbatim(frame)?
+        };
+
+        if result == crate::segment::VerbatimAppendResult::Appended {
+            self.log_end_offset
+                .store(frame.offset + 1, Ordering::Release);
+            // A follower's own durably-written data is immediately safe for it to serve
+            // to directly-connected consumers (KIP-392 follower fetch) — unlike the
+            // leader, a follower never has to guess whether anyone else has the data,
+            // since committing was the leader's job before this push was ever sent.
+            self.advance_committed_hw(frame.offset + 1);
+
+            if matches!(
+                self.flush_policy,
+                crate::config::FlushPolicy::SyncEveryBatch
+                    | crate::config::FlushPolicy::UnbufferedSync
+            ) {
+                let mut seg_guard = self.segment_manager.lock();
+                seg_guard.sync()?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Discards any locally-stored entries at or beyond `offset` (Raft-style conflicting-
+    /// suffix truncation). Also rewinds LEO, and clamps the committed HW down if it had
+    /// advanced past the truncation point (it can never legitimately exceed LEO).
+    pub fn truncate_after(&self, offset: u64) -> IoResult<()> {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.truncate_after(offset)?;
+        self.log_end_offset.store(offset, Ordering::Release);
+        let mut hw = self.committed_hw.load(Ordering::Acquire);
+        while hw > offset {
+            match self.committed_hw.compare_exchange_weak(
+                hw,
+                offset,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => hw = actual,
+            }
+        }
+        Ok(())
     }
 
     /// Appends a control marker to the partition.
@@ -285,8 +379,13 @@ impl PartitionManager {
             )?;
 
             let assigned_offset = frame.offset;
-            self.high_watermark
+            // Control markers (transaction commit/abort boundaries) are leader-internal
+            // bookkeeping, not user-visible records — keep them immediately visible like
+            // before rather than gating them behind ISR quorum, which the transaction
+            // manager's own commit/abort flow doesn't currently integrate with.
+            self.log_end_offset
                 .store(assigned_offset + 1, Ordering::Release);
+            self.advance_committed_hw(assigned_offset + 1);
 
             frame
         };

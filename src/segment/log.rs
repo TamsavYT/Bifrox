@@ -226,6 +226,15 @@ impl LogSegment {
         self.file.sync_data()
     }
 
+    /// Truncates the log file to exactly `physical_size` bytes (Raft-style conflict
+    /// truncation: discards a diverging suffix before appending the leader's entries).
+    pub fn truncate_to(&mut self, physical_size: u64) -> IoResult<()> {
+        self.file.set_len(physical_size)?;
+        self.file.sync_data()?;
+        self.physical_size = physical_size;
+        Ok(())
+    }
+
     /// Returns last modified timestamp in milliseconds since Unix epoch
     pub fn modified_time_ms(&self) -> IoResult<u64> {
         let metadata = self.file.metadata()?;

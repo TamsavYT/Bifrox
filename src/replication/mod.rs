@@ -57,13 +57,29 @@ pub struct ReplicationManager {
     bind_addr: String,
     /// Tracking partition high watermarks for replicas: (topic, partition, peer_addr) -> watermark_offset
     replica_watermarks: Arc<DashMap<(String, u32, String), u64>>,
+    /// Wall-clock time of the most recent successful replication ACK per
+    /// (topic, partition, peer_addr) — the ISR-membership signal: a replica that hasn't
+    /// acked recently is lagging and should be dropped from the ISR (Kafka
+    /// `replica.lag.time.max.ms`), independent of whether it happens to be caught up on
+    /// the specific offset that triggered the check.
+    replica_ack_time: Arc<DashMap<(String, u32, String), std::time::Instant>>,
+    /// Wall-clock time this node (as cluster leader) last received a heartbeat ACK from
+    /// each peer broker — used to detect a dead broker so any partition it leads can be
+    /// failed over to a surviving in-sync replica.
+    broker_last_seen: Arc<DashMap<u32, std::time::Instant>>,
     consensus: HermesConsensus,
     /// Dynamically tracked leader address (set by followers from heartbeat)
     leader_addr: Arc<RwLock<Option<String>>>,
     /// Last time a heartbeat was received (used for election timeout)
     last_heartbeat: Arc<RwLock<std::time::Instant>>,
-    /// REP-02: Tracks (term, candidate_id) for which this node voted in the current term
-    voted_for: Arc<RwLock<Option<(u64, u32)>>>,
+    /// This node's last-known `__cluster_metadata` log index (LEO), kept in sync by
+    /// `StorageEngine::apply_metadata_record`/`propose_metadata` on every local append
+    /// or applied replicated record. Used as the "last log index" this node advertises
+    /// in its own VoteRequest when it becomes a candidate (Raft §5.4.1 log-completeness
+    /// check) — kept here rather than looked up live because the election-timeout loop
+    /// runs inside `ReplicationManager`, which (to avoid a construction cycle with
+    /// `StorageEngine`) has no direct handle to the partition log itself.
+    local_metadata_log_index: Arc<std::sync::atomic::AtomicU64>,
     /// Active per-partition follower fetcher tasks: (topic, partition) -> JoinHandle
     fetchers: Arc<DashMap<(String, u32), tokio::task::JoinHandle<()>>>,
     /// Shared broker address registry (node_id -> bind_addr), also used by StorageEngine
@@ -106,22 +122,28 @@ impl ReplicationManager {
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bind_addr,
             replica_watermarks: Arc::new(DashMap::new()),
+            replica_ack_time: Arc::new(DashMap::new()),
+            broker_last_seen: Arc::new(DashMap::new()),
             consensus,
             leader_addr,
             last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
-            voted_for: Arc::new(RwLock::new(None)),
+            local_metadata_log_index: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fetchers: Arc::new(DashMap::new()),
             broker_addrs,
             peer_connections: Arc::new(DashMap::new()),
         };
 
-        // Leader: start heartbeat broadcaster to all followers
-        // Start appropriate background loops based on initial role.
+        // Always run the election-timeout watchdog. `check_election_timeout` is a no-op
+        // while this node's consensus state is Leader, so this is safe to start
+        // unconditionally — and it is what lets a node that steps down from a
+        // statically-configured Leader role (e.g. on a STALE_EPOCH nack) ever become a
+        // candidate again and re-acquire leadership. Previously this loop was only
+        // started for nodes that booted as Follower, so a stepped-down static Leader
+        // could never recontest an election.
+        mgr.start_election_timeout_loop();
+        // Leader: additionally start the heartbeat broadcaster to all followers.
         if mgr.config.role == NodeRole::Leader && !mgr.config.peer_addrs.is_empty() {
             mgr.start_leader_heartbeat_loop();
-        } else {
-            // Followers start election timeout monitoring
-            mgr.start_election_timeout_loop();
         }
 
         mgr
@@ -189,27 +211,17 @@ impl ReplicationManager {
         *guard = std::time::Instant::now();
     }
 
-    /// Checks if a vote can be granted to candidate_id for term (REP-02)
-    pub fn can_vote_for(&self, candidate_id: u32, term: u64) -> bool {
-        let guard = self.voted_for.read().unwrap();
-        match *guard {
-            Some((voted_term, voted_candidate)) => {
-                if voted_term < term {
-                    true
-                } else if voted_term == term {
-                    voted_candidate == candidate_id
-                } else {
-                    false
-                }
-            }
-            None => true,
-        }
+    /// Returns this node's last-known `__cluster_metadata` log index (LEO).
+    pub fn local_metadata_log_index(&self) -> u64 {
+        self.local_metadata_log_index
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Records a vote for candidate_id in term (REP-02)
-    pub fn record_vote(&self, candidate_id: u32, term: u64) {
-        let mut guard = self.voted_for.write().unwrap();
-        *guard = Some((term, candidate_id));
+    /// Records this node's `__cluster_metadata` log index. Monotonic — a stale/out-of-order
+    /// caller can never regress it.
+    pub fn set_local_metadata_log_index(&self, idx: u64) {
+        self.local_metadata_log_index
+            .fetch_max(idx, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub fn update_replica_watermark(
@@ -223,6 +235,36 @@ impl ReplicationManager {
             (topic.to_string(), partition, peer_addr.to_string()),
             offset,
         );
+        self.replica_ack_time.insert(
+            (topic.to_string(), partition, peer_addr.to_string()),
+            std::time::Instant::now(),
+        );
+    }
+
+    /// Returns how long ago `peer_addr` last acknowledged a replicated write for this
+    /// partition, if ever. `None` means no ack has ever been observed (e.g. a replica
+    /// that just joined, or one this leader has never successfully pushed to).
+    pub fn replica_ack_age(
+        &self,
+        topic: &str,
+        partition: u32,
+        peer_addr: &str,
+    ) -> Option<std::time::Duration> {
+        self.replica_ack_time
+            .get(&(topic.to_string(), partition, peer_addr.to_string()))
+            .map(|t| t.elapsed())
+    }
+
+    /// Returns how long ago this node (as cluster leader) last heard from broker `node_id`
+    /// via a heartbeat ACK. `None` means it's never been observed alive at all.
+    pub fn broker_last_seen_age(&self, node_id: u32) -> Option<std::time::Duration> {
+        self.broker_last_seen.get(&node_id).map(|t| t.elapsed())
+    }
+
+    /// Records that `node_id` was just observed alive (via heartbeat or replication ACK).
+    pub fn note_broker_alive(&self, node_id: u32) {
+        self.broker_last_seen
+            .insert(node_id, std::time::Instant::now());
     }
 
     /// Leader heartbeat broadcaster: sends periodic heartbeats to all follower peers,
@@ -234,6 +276,7 @@ impl ReplicationManager {
         let bind_addr = self.bind_addr.clone();
         let epoch = self.epoch.clone(); // share epoch for heartbeat term
         let broker_addrs = self.broker_addrs.clone();
+        let consensus = self.consensus.clone();
         let manager = self.clone();
 
         tokio::spawn(async move {
@@ -245,6 +288,20 @@ impl ReplicationManager {
             );
 
             loop {
+                // Bonus fix: this loop is also started unconditionally at boot for a
+                // statically-configured Leader. Without this guard, a node that later
+                // steps down (e.g. on a STALE_EPOCH nack) would keep broadcasting leader
+                // heartbeats forever, causing two nodes to simultaneously claim
+                // leadership — a direct Raft safety violation. The election-winner path
+                // below already guards its own spawned loop the same way.
+                if consensus.state() != ConsensusState::Leader {
+                    tracing::info!(
+                        "HA Cluster [{}]: Node {} is no longer Leader — stopping heartbeat broadcaster",
+                        cluster_id,
+                        node_id
+                    );
+                    break;
+                }
                 let current_term = epoch.load(std::sync::atomic::Ordering::Acquire);
                 for peer in &peer_addrs {
                     let peer_conn = manager.get_or_connect_peer(peer);
@@ -263,6 +320,7 @@ impl ReplicationManager {
                             // leader's broker_addrs registry stays complete even without any
                             // manual registration step (fixes real-cluster broker discovery).
                             broker_addrs.insert(follower_id, follower_addr);
+                            manager.note_broker_alive(follower_id);
                             tracing::info!(
                                 "HA Cluster [{}]: Heartbeat OK — peer {} acknowledged leader",
                                 cluster_id,
@@ -387,6 +445,8 @@ impl ReplicationManager {
         let leader_addr = self.leader_addr.clone();
         let bind_addr = self.bind_addr.clone();
         let broker_addrs = self.broker_addrs.clone();
+        let local_metadata_log_index = self.local_metadata_log_index.clone();
+        let broker_last_seen = self.broker_last_seen.clone();
 
         tokio::spawn(async move {
             let mut tick: u64 = 0;
@@ -419,10 +479,23 @@ impl ReplicationManager {
                     node_id, new_term, peer_addrs.len()
                 );
 
-                // Broadcast VoteRequest to each peer and collect granted votes.
+                // Broadcast VoteRequest to each peer and collect granted votes. Includes
+                // our own last-applied metadata-log index so voters can enforce Raft's
+                // log-completeness rule (§5.4.1): a candidate whose metadata log is behind
+                // a voter's must not win the election, or committed metadata could be lost.
+                let candidate_last_log_index =
+                    local_metadata_log_index.load(std::sync::atomic::Ordering::Acquire);
                 let mut votes_granted = 1usize; // vote for self
                 for peer in &peer_addrs {
-                    match send_vote_request(peer, &cluster_id, node_id, new_term).await {
+                    match send_vote_request(
+                        peer,
+                        &cluster_id,
+                        node_id,
+                        new_term,
+                        candidate_last_log_index,
+                    )
+                    .await
+                    {
                         Ok(true) => {
                             votes_granted += 1;
                             tracing::info!(
@@ -481,6 +554,7 @@ impl ReplicationManager {
                         let epoch_c = epoch.clone();
                         let consensus_c = consensus.clone();
                         let broker_addrs_c = broker_addrs.clone();
+                        let broker_last_seen_c = broker_last_seen.clone();
                         tokio::spawn(async move {
                             loop {
                                 if consensus_c.state() != ConsensusState::Leader {
@@ -503,6 +577,8 @@ impl ReplicationManager {
                                     .await
                                     {
                                         broker_addrs_c.insert(follower_id, follower_addr);
+                                        broker_last_seen_c
+                                            .insert(follower_id, std::time::Instant::now());
                                     }
                                 }
                                 sleep(HEARTBEAT_INTERVAL).await;
@@ -605,8 +681,14 @@ impl ReplicationManager {
         for handle in handles {
             match handle.await {
                 Ok((peer_addr, Ok(()))) => {
-                    self.replica_watermarks
-                        .insert((topic.to_string(), partition, peer_addr), last_offset);
+                    self.replica_watermarks.insert(
+                        (topic.to_string(), partition, peer_addr.clone()),
+                        last_offset,
+                    );
+                    self.replica_ack_time.insert(
+                        (topic.to_string(), partition, peer_addr),
+                        std::time::Instant::now(),
+                    );
                 }
                 Ok((peer_addr, Err(e))) => {
                     // Check if the error string indicates a stale-epoch rejection
@@ -924,13 +1006,17 @@ pub async fn send_replication_push(
 
 /// Sends a Raft VoteRequest RPC (0xAE) to a peer and returns whether the vote was granted.
 ///
-/// Wire format (request):  `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b]`
+/// Wire format (request):  `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b] [candidate_last_log_index: 8b]`
 /// Wire format (response): `[granted: 1b]`  — 0x01 = granted, 0x00 = denied
+///
+/// `candidate_last_log_index` lets voters enforce Raft §5.4.1: they must not grant a vote
+/// to a candidate whose `__cluster_metadata` log is behind their own.
 pub async fn send_vote_request(
     peer_addr: &str,
     cluster_id: &str,
     candidate_id: u32,
     term: u64,
+    candidate_last_log_index: u64,
 ) -> IoResult<bool> {
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
@@ -955,6 +1041,7 @@ pub async fn send_vote_request(
     crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
     buf.put_u32(candidate_id);
     buf.put_u64(term);
+    buf.put_u64(candidate_last_log_index);
 
     stream.write_all(&buf).await?;
 

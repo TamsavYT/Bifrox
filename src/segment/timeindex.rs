@@ -97,6 +97,25 @@ impl TimeIndexSegment {
         self.file.sync_data()
     }
 
+    /// Drops all entries pointing at or beyond `offset` (Raft-style conflict truncation).
+    pub fn truncate_after(&mut self, offset: u64) -> IoResult<()> {
+        let kept: Vec<TimeIndexEntry> = self
+            .entries
+            .iter()
+            .copied()
+            .filter(|e| e.logical_offset < offset)
+            .collect();
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.entries.clear();
+        for entry in kept {
+            let encoded = entry.encode();
+            self.file.write_all(&encoded)?;
+            self.entries.push(entry);
+        }
+        self.file.sync_data()
+    }
+
     /// Binary search ($O(\log N)$) for nearest logical offset corresponding to target timestamp
     pub fn find_offset_for_timestamp(&self, target_time_ms: u64) -> Option<u64> {
         if self.entries.is_empty() {
