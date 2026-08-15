@@ -726,13 +726,6 @@ fn decode_replication_packet(
             ))
         }
     };
-
-    if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
-        return Err(PacketError::Fatal(format!(
-            "Invalid replicated topic name: {}",
-            e
-        )));
-    }
     src = &src[topic_len..];
 
     // Partition ID

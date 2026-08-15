@@ -206,6 +206,7 @@ impl ShareGroupManager {
     }
 
     /// Fetches acquired records for ShareFetch
+    #[allow(clippy::too_many_arguments)]
     pub fn share_fetch(
         &self,
         group_id: &str,
@@ -254,6 +255,7 @@ impl ShareGroupManager {
     }
 
     /// Acknowledges records for ShareAcknowledge or piggybacked on ShareFetch
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn share_acknowledge(
         &self,
         group_id: &str,
@@ -312,6 +314,7 @@ impl ShareGroupManager {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     /// Sweeps all share partitions for expired locks and routes DLQ messages
     pub fn sweep_lock_timeouts(&self, dlq_writer: Option<&dyn Fn(&str, u32, &[u64])>) {
         for entry in self.partitions.iter() {
