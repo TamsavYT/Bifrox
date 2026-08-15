@@ -75,7 +75,8 @@ impl ShareGroupManager {
                     if temp + 2 > buf.len() {
                         break;
                     }
-                    let group_len = u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
+                    let group_len =
+                        u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
                     temp += 2;
 
                     if temp + group_len > buf.len() {
@@ -93,7 +94,8 @@ impl ShareGroupManager {
                     if temp + 2 > buf.len() {
                         break;
                     }
-                    let topic_len = u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
+                    let topic_len =
+                        u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
                     temp += 2;
 
                     if temp + topic_len > buf.len() {
@@ -216,7 +218,8 @@ impl ShareGroupManager {
     ) -> Result<Vec<AcquiredRecordBatch>, String> {
         self.record_heartbeat(group_id, member_id);
         let sp = self.get_or_create_partition(group_id, topic, partition);
-        let acquired = sp.acquire_records(member_id, max_records, lock_timeout, partition_manager)?;
+        let acquired =
+            sp.acquire_records(member_id, max_records, lock_timeout, partition_manager)?;
 
         if acquired.is_empty() {
             return Ok(Vec::new());
@@ -230,7 +233,9 @@ impl ShareGroupManager {
             let frame = info.frame;
 
             if let Some(last_batch) = batches.last_mut() {
-                if last_batch.last_offset + 1 == offset && last_batch.delivery_count == delivery_count {
+                if last_batch.last_offset + 1 == offset
+                    && last_batch.delivery_count == delivery_count
+                {
                     last_batch.last_offset = offset;
                     last_batch.records.push(frame);
                     continue;
@@ -335,7 +340,9 @@ impl ShareGroupManager {
         let timeout = Duration::from_secs(60);
         self.heartbeats
             .iter()
-            .filter(|entry| entry.key().0 == group_id && now.duration_since(*entry.value()) <= timeout)
+            .filter(|entry| {
+                entry.key().0 == group_id && now.duration_since(*entry.value()) <= timeout
+            })
             .map(|entry| entry.key().1.clone())
             .collect()
     }

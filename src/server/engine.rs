@@ -350,10 +350,16 @@ impl StorageEngine {
     /// `offset` is this record's position in the `__cluster_metadata` log; it is tracked
     /// as this node's "last log index" so that if it ever contests a leader election, its
     /// VoteRequest reflects how up to date its metadata log actually is (Raft §5.4.1).
-    pub(crate) fn apply_metadata_record(&self, offset: u64, rec: crate::replication::MetadataRecord) {
+    pub(crate) fn apply_metadata_record(
+        &self,
+        offset: u64,
+        rec: crate::replication::MetadataRecord,
+    ) {
         self.replication.set_local_metadata_log_index(offset + 1);
         match rec {
-            crate::replication::MetadataRecord::TopicPartition { topic, partition, .. } => {
+            crate::replication::MetadataRecord::TopicPartition {
+                topic, partition, ..
+            } => {
                 if validate_topic_name(&topic).is_ok() {
                     let _ = self.get_or_create_partition(&topic, partition);
                 } else {
@@ -423,7 +429,9 @@ impl StorageEngine {
                 stored_key,
                 server_key,
             } => {
-                self.apply_scram_credential_state(username, iterations, salt, stored_key, server_key);
+                self.apply_scram_credential_state(
+                    username, iterations, salt, stored_key, server_key,
+                );
             }
             crate::replication::MetadataRecord::ScramCredentialDelete { username } => {
                 self.remove_scram_credential_state(&username);
@@ -1338,7 +1346,13 @@ impl StorageEngine {
 
                 if !new_isr.is_empty() && new_isr != current_isr {
                     match self
-                        .propose_isr_update(&topic, partition, leader_id, leader_epoch, new_isr.clone())
+                        .propose_isr_update(
+                            &topic,
+                            partition,
+                            leader_id,
+                            leader_epoch,
+                            new_isr.clone(),
+                        )
                         .await
                     {
                         Ok(_) => tracing::info!(
@@ -1371,14 +1385,18 @@ impl StorageEngine {
                     .unwrap_or(false);
 
                 if dead {
-                    let mut isr_candidates: Vec<u32> =
-                        current_isr.iter().copied().filter(|&r| r != leader_id).collect();
+                    let mut isr_candidates: Vec<u32> = current_isr
+                        .iter()
+                        .copied()
+                        .filter(|&r| r != leader_id)
+                        .collect();
                     isr_candidates.sort_unstable();
 
                     let (new_leader_id, new_isr) = match isr_candidates.first().copied() {
                         Some(id) => (Some(id), isr_candidates.clone()),
                         None if self.config.allow_unclean_leader_election => {
-                            let fallback = replicas.iter().copied().filter(|&r| r != leader_id).min();
+                            let fallback =
+                                replicas.iter().copied().filter(|&r| r != leader_id).min();
                             (fallback, fallback.into_iter().collect())
                         }
                         None => (None, Vec::new()),
@@ -1798,10 +1816,7 @@ impl StorageEngine {
     }
 
     /// Describes share group state, active members, and tracked metrics
-    pub fn share_group_describe(
-        &self,
-        group_id: &str,
-    ) -> (String, Vec<String>, usize, u64) {
+    pub fn share_group_describe(&self, group_id: &str) -> (String, Vec<String>, usize, u64) {
         let members = self.share_groups.list_active_members(group_id);
         let state = if members.is_empty() {
             "Empty".to_string()

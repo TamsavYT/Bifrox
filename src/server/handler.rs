@@ -728,7 +728,10 @@ fn decode_replication_packet(
     };
 
     if let Err(e) = crate::server::engine::validate_topic_name(&topic) {
-        return Err(PacketError::Fatal(format!("Invalid replicated topic name: {}", e)));
+        return Err(PacketError::Fatal(format!(
+            "Invalid replicated topic name: {}",
+            e
+        )));
     }
     src = &src[topic_len..];
 
@@ -2146,10 +2149,8 @@ async fn process_request(
                     WireResponse::ok(payload)
                 }
                 Err(e) => {
-                    let payload = crate::protocol::wire::encode_share_acknowledge_response(
-                        1,
-                        Some(&e),
-                    );
+                    let payload =
+                        crate::protocol::wire::encode_share_acknowledge_response(1, Some(&e));
                     WireResponse::ok(payload)
                 }
             }
@@ -2180,8 +2181,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("GroupAuthorizationFailed");
             }
-            let (state, members, inflight, start_offset) =
-                engine.share_group_describe(&group_id);
+            let (state, members, inflight, start_offset) = engine.share_group_describe(&group_id);
             let payload = crate::protocol::wire::encode_share_group_describe_response(
                 &state,
                 &members,
