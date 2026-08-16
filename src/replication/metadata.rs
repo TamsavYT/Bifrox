@@ -12,6 +12,11 @@ pub enum MetadataRecord {
     BrokerRegister {
         node_id: u32,
         bind_addr: String,
+        /// Process role byte codes: 1 = Controller, 2 = Broker (matches
+        /// `crate::config::ProcessRole`). Empty/unknown codes are treated as "both roles"
+        /// on apply, so records from before this field existed keep today's combined-mode
+        /// behavior — see `crate::config::parse_process_role_bytes`.
+        roles: Vec<u8>,
     },
     TopicCreated {
         topic: String,
@@ -52,6 +57,14 @@ pub enum MetadataRecord {
         producer_id: u64,
         producer_epoch: i16,
     },
+    /// Full-replace of a topic's dynamic config map (Kafka `AlterConfigs`/
+    /// `IncrementalAlterConfigs` both resolve to this — the engine computes the merged
+    /// result before proposing for the incremental case, so there's only one on-disk
+    /// representation to replay).
+    TopicConfigChanged {
+        topic: String,
+        configs: Vec<(String, String)>,
+    },
 }
 
 impl MetadataRecord {
@@ -73,10 +86,16 @@ impl MetadataRecord {
                     buf.put_u32(r);
                 }
             }
-            MetadataRecord::BrokerRegister { node_id, bind_addr } => {
+            MetadataRecord::BrokerRegister {
+                node_id,
+                bind_addr,
+                roles,
+            } => {
                 buf.put_u8(0x02); // record type
                 buf.put_u32(*node_id);
                 crate::protocol::wire::write_pascal_string(&mut buf, bind_addr);
+                buf.put_u8(roles.len() as u8);
+                buf.extend_from_slice(roles);
             }
             MetadataRecord::TopicCreated {
                 topic,
@@ -164,6 +183,15 @@ impl MetadataRecord {
                 buf.put_u64(*producer_id);
                 buf.put_i16(*producer_epoch);
             }
+            MetadataRecord::TopicConfigChanged { topic, configs } => {
+                buf.put_u8(0x0C); // record type
+                crate::protocol::wire::write_pascal_string(&mut buf, topic);
+                buf.put_u32(configs.len() as u32);
+                for (key, value) in configs {
+                    crate::protocol::wire::write_pascal_string(&mut buf, key);
+                    crate::protocol::wire::write_pascal_string(&mut buf, value);
+                }
+            }
         }
         buf
     }
@@ -214,7 +242,28 @@ impl MetadataRecord {
                 }
                 let node_id = src.get_u32();
                 let bind_addr = read_pascal_string_io(&mut src)?;
-                Ok(MetadataRecord::BrokerRegister { node_id, bind_addr })
+                // Lenient: older on-disk records (pre-dating the `roles` field) simply
+                // have no trailing bytes here — treat that as "roles unknown", which
+                // `crate::config::parse_process_role_bytes` maps to combined mode.
+                let roles = if !src.is_empty() {
+                    let count = src.get_u8() as usize;
+                    if src.len() < count {
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete broker roles list",
+                        ));
+                    }
+                    let r = src[..count].to_vec();
+                    src.advance(count);
+                    r
+                } else {
+                    Vec::new()
+                };
+                Ok(MetadataRecord::BrokerRegister {
+                    node_id,
+                    bind_addr,
+                    roles,
+                })
             }
             0x03 => {
                 let topic = read_pascal_string_io(&mut src)?;
@@ -353,6 +402,23 @@ impl MetadataRecord {
                     producer_id,
                     producer_epoch,
                 })
+            }
+            0x0C => {
+                let topic = read_pascal_string_io(&mut src)?;
+                if src.len() < 4 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete TopicConfigChanged count",
+                    ));
+                }
+                let count = src.get_u32() as usize;
+                let mut configs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let key = read_pascal_string_io(&mut src)?;
+                    let value = read_pascal_string_io(&mut src)?;
+                    configs.push((key, value));
+                }
+                Ok(MetadataRecord::TopicConfigChanged { topic, configs })
             }
             _ => Err(Error::new(
                 ErrorKind::InvalidData,

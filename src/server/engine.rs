@@ -2,7 +2,7 @@ use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
 use crate::protocol::frame::CONTROL_MAGIC_BYTE;
 use crate::protocol::RecordFrame;
-use crate::replication::{ClusterConfig, NodeRole, ReplicationManager};
+use crate::replication::{ClusterConfig, ReplicationManager};
 use crate::server::coordinator::GroupCoordinator;
 use crate::server::partition::PartitionManager;
 use crate::server::quota::QuotaManager;
@@ -78,6 +78,12 @@ pub struct TopicConfig {
     pub replication_factor: u16,
     pub cleanup_policy: crate::config::CleanupPolicy,
     pub partitions: std::collections::HashMap<u32, PartitionAssignment>,
+    /// Dynamic per-topic config overrides (Kafka `AlterConfigs`/`IncrementalAlterConfigs`).
+    /// Recognized keys (`cleanup.policy`, `compression.type`, `retention.ms`,
+    /// `retention.bytes`, `min.insync.replicas`) are applied to every open partition of
+    /// this topic; unrecognized keys are stored and returned by `DescribeConfigs` but
+    /// have no runtime effect.
+    pub configs: std::collections::HashMap<String, String>,
 }
 
 pub type TopicRegistry = DashMap<String, TopicConfig>;
@@ -91,9 +97,11 @@ pub struct StorageEngine {
     topic_registry: Arc<TopicRegistry>,
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
+    share_groups: crate::server::share::ShareGroupManager,
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
     broker_addrs: Arc<DashMap<u32, String>>,
+    broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
     quota: Arc<QuotaManager>,
     acl: Arc<crate::server::acl::AclManager>,
     scram_credentials: Arc<DashMap<String, crate::scram::ScramCredential>>,
@@ -103,6 +111,7 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn new(config: EngineConfig) -> IoResult<Self> {
         let consumer_groups = ConsumerGroupManager::open(&config.data_dir)?;
+        let share_groups = crate::server::share::ShareGroupManager::open(&config.data_dir)?;
         let transactions = TransactionManager::new();
         let cluster_config = ClusterConfig {
             cluster_id: config.cluster_id.clone(),
@@ -110,13 +119,17 @@ impl StorageEngine {
             role: config.role,
             peer_addrs: config.peer_addrs.clone(),
             min_insync_replicas: config.min_insync_replicas,
+            roles: config.roles.clone(),
+            controller_peer_addrs: config.controller_peer_addrs.clone(),
         };
 
         let broker_addrs = Arc::new(DashMap::new());
+        let broker_roles = Arc::new(DashMap::new());
         let replication = ReplicationManager::new(
             cluster_config,
             config.bind_addr.clone(),
             broker_addrs.clone(),
+            broker_roles.clone(),
         );
         let group_coordinator = Arc::new(GroupCoordinator::new());
         let quota = Arc::new(QuotaManager::new(
@@ -134,9 +147,11 @@ impl StorageEngine {
             topic_registry: Arc::new(DashMap::new()),
             consumer_groups,
             transactions,
+            share_groups,
             replication,
             group_coordinator,
             broker_addrs,
+            broker_roles,
             quota,
             acl,
             scram_credentials,
@@ -146,6 +161,9 @@ impl StorageEngine {
         engine
             .broker_addrs
             .insert(engine.config.node_id, engine.config.bind_addr.clone());
+        engine
+            .broker_roles
+            .insert(engine.config.node_id, engine.config.roles.clone());
 
         // 1. Scan data_dir and load existing partitions
         if engine.config.data_dir.exists() {
@@ -182,15 +200,27 @@ impl StorageEngine {
             let reg_rec = crate::replication::MetadataRecord::BrokerRegister {
                 node_id: engine.config.node_id,
                 bind_addr: engine.config.bind_addr.clone(),
+                roles: crate::config::roles_to_bytes(&engine.config.roles),
             };
             if let Ok(meta_pm) = engine.get_or_create_partition("__cluster_metadata", 0) {
                 let _ = meta_pm.produce(&reg_rec.encode());
             }
         }
 
-        engine
-            .replication
-            .start_per_partition_fetcher_manager(engine.clone());
+        // Per-partition pull-fetcher loop (`start_per_partition_fetcher_manager`, gRPC
+        // magic 0xBB) — Kafka-style follower-driven replication: for every partition this
+        // node replicates but doesn't lead, a background loop asks the leader for
+        // everything past its own log end offset and applies it verbatim. This is now the
+        // sole mechanism for *data-topic* replication (see `StorageEngine::produce_batch`,
+        // which no longer pushes data-topic batches to followers); `__cluster_metadata`
+        // still replicates via leader-push (`ReplicationManager::replicate_batch`) since
+        // it's low-volume control-plane traffic where the added latency of a pull round
+        // trip isn't worth it. `handler.rs`'s connection dispatch now has a real 0xBB case
+        // (`decode_grpc_replication_fetch_packet`), so — unlike when this loop was
+        // previously disabled — fetch requests actually succeed against a real peer.
+        engine.replication.start_per_partition_fetcher_manager(engine.clone());
+
+        engine.start_isr_and_failover_sweep();
 
         Ok(engine)
     }
@@ -304,15 +334,32 @@ impl StorageEngine {
         }
     }
 
-    /// Replays the local cluster metadata log to initialize partitions registered on this node
+    /// Replays the local cluster metadata log to initialize partitions registered on this node.
+    ///
+    /// If a snapshot exists (see `snapshot_metadata_if_needed`), it's loaded first and
+    /// replay resumes from the snapshot's offset instead of 0 — the KRaft-style mechanism
+    /// that keeps startup fast and keeps the on-disk log itself trimmable, since replay
+    /// no longer needs every record back to the beginning of time to reconstruct state.
     pub fn replay_metadata_log(&self) -> IoResult<()> {
         let meta_dir = self.config.data_dir.join("__cluster_metadata-0");
         if !meta_dir.exists() {
             return Ok(());
         }
 
+        let mut start_offset = 0u64;
+        if let Some((snapshot_offset, records)) = self.read_metadata_snapshot()? {
+            for rec in records {
+                self.apply_metadata_record(snapshot_offset, rec);
+            }
+            start_offset = snapshot_offset;
+            tracing::info!(
+                "Metadata Snapshot: Loaded snapshot at offset {}, resuming replay from there",
+                snapshot_offset
+            );
+        }
+
         if let Ok(pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let mut offset = 0u64;
+            let mut offset = start_offset;
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
                 if frames.is_empty() {
@@ -320,111 +367,587 @@ impl StorageEngine {
                 }
                 for frame in &frames {
                     if let Ok(rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
-                        match rec {
-                            crate::replication::MetadataRecord::TopicPartition {
-                                topic,
-                                partition,
-                                ..
-                            } => {
-                                let _ = self.get_or_create_partition(&topic, partition);
-                            }
-                            crate::replication::MetadataRecord::TopicCreated {
-                                topic,
-                                num_partitions,
-                                replication_factor,
-                            } => {
-                                self.topic_registry.insert(
-                                    topic.clone(),
-                                    TopicConfig {
-                                        topic,
-                                        num_partitions,
-                                        replication_factor,
-                                        cleanup_policy: self.config.cleanup_policy,
-                                        partitions: std::collections::HashMap::new(),
-                                    },
-                                );
-                            }
-                            crate::replication::MetadataRecord::PartitionLeadershipChange {
-                                topic,
-                                partition,
-                                leader_id,
-                                leader_epoch,
-                                isr,
-                            } => {
-                                let replicas = isr.clone();
-                                let assignment = PartitionAssignment {
-                                    partition,
-                                    leader_id,
-                                    leader_epoch,
-                                    replicas: replicas.clone(),
-                                    isr: isr.clone(),
-                                };
-                                if let Some(mut cfg) = self.topic_registry.get_mut(&topic) {
-                                    cfg.partitions.insert(partition, assignment);
-                                }
-                                if let Ok(pm) = self.get_or_create_partition(&topic, partition) {
-                                    pm.update_leadership(leader_id, leader_epoch, replicas, isr);
-                                }
-                            }
-                            crate::replication::MetadataRecord::BrokerRegister {
-                                node_id,
-                                bind_addr,
-                            } => {
-                                self.broker_addrs.insert(node_id, bind_addr);
-                            }
-                            crate::replication::MetadataRecord::BrokerUnregister { node_id } => {
-                                self.broker_addrs.remove(&node_id);
-                            }
-                            crate::replication::MetadataRecord::TopicDeleted { topic } => {
-                                self.topic_registry.remove(&topic);
-                            }
-                            crate::replication::MetadataRecord::AclCreated { binding } => {
-                                self.acl.add_acl(binding);
-                            }
-                            crate::replication::MetadataRecord::AclDeleted { binding } => {
-                                self.acl.remove_acl(&binding);
-                            }
-                            crate::replication::MetadataRecord::ScramCredentialUpsert {
-                                username,
-                                iterations,
-                                salt,
-                                stored_key,
-                                server_key,
-                            } => {
-                                self.scram_credentials.insert(
-                                    username.clone(),
-                                    crate::scram::ScramCredential::new(
-                                        username,
-                                        iterations,
-                                        salt,
-                                        stored_key,
-                                        server_key,
-                                    ),
-                                );
-                            }
-                            crate::replication::MetadataRecord::ScramCredentialDelete {
-                                username,
-                            } => {
-                                self.scram_credentials.remove(&username);
-                            }
-                            crate::replication::MetadataRecord::TransactionalProducerRegistration {
-                                transactional_id,
-                                producer_id,
-                                producer_epoch,
-                            } => {
-                                self.transactions.restore_transactional_producer(
-                                    &transactional_id,
-                                    producer_id,
-                                    producer_epoch,
-                                );
-                            }
-                        }
+                        self.apply_metadata_record(frame.offset, rec);
                     }
                     offset = frame.offset + 1;
                 }
             }
         }
         Ok(())
+    }
+
+    fn metadata_snapshot_path(&self) -> std::path::PathBuf {
+        self.config
+            .data_dir
+            .join("__cluster_metadata-0")
+            .join("metadata.snapshot")
+    }
+
+    /// Builds the minimal set of records that reconstruct the engine's current
+    /// cluster-metadata state — topics/partitions, brokers, ACLs, SCRAM credentials, and
+    /// transactional-producer fencing state. This is also, implicitly, the definition of
+    /// "everything a snapshot must cover" before any log data can be safely trimmed.
+    fn build_metadata_snapshot_records(&self) -> Vec<crate::replication::MetadataRecord> {
+        use crate::replication::MetadataRecord;
+        let mut records = Vec::new();
+
+        for entry in self.broker_addrs.iter() {
+            let node_id = *entry.key();
+            let roles = self
+                .broker_roles
+                .get(&node_id)
+                .map(|r| crate::config::roles_to_bytes(&r))
+                .unwrap_or_default();
+            records.push(MetadataRecord::BrokerRegister {
+                node_id,
+                bind_addr: entry.value().clone(),
+                roles,
+            });
+        }
+
+        for entry in self.topic_registry.iter() {
+            let cfg = entry.value();
+            records.push(MetadataRecord::TopicCreated {
+                topic: cfg.topic.clone(),
+                num_partitions: cfg.num_partitions,
+                replication_factor: cfg.replication_factor,
+            });
+            for assign in cfg.partitions.values() {
+                records.push(MetadataRecord::PartitionLeadershipChange {
+                    topic: cfg.topic.clone(),
+                    partition: assign.partition,
+                    leader_id: assign.leader_id,
+                    leader_epoch: assign.leader_epoch,
+                    isr: assign.isr.clone(),
+                });
+            }
+            if !cfg.configs.is_empty() {
+                records.push(MetadataRecord::TopicConfigChanged {
+                    topic: cfg.topic.clone(),
+                    configs: cfg.configs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                });
+            }
+        }
+
+        // A default/all-wildcard binding matches every stored ACL (see AclManager::list_acls).
+        let match_all = crate::server::acl::AclBinding {
+            resource_type: 0,
+            resource_name: String::new(),
+            pattern_type: 0,
+            principal: String::new(),
+            host: String::new(),
+            operation: 0,
+            permission_type: 0,
+        };
+        for binding in self.acl.list_acls(&match_all) {
+            records.push(MetadataRecord::AclCreated { binding });
+        }
+
+        for entry in self.scram_credentials.iter() {
+            let cred = entry.value();
+            records.push(MetadataRecord::ScramCredentialUpsert {
+                username: cred.username.clone(),
+                iterations: cred.iterations,
+                salt: cred.salt.clone(),
+                stored_key: cred.stored_key.clone(),
+                server_key: cred.server_key.clone(),
+            });
+        }
+
+        for (transactional_id, producer_id, producer_epoch) in
+            self.transactions.all_transactional_producers()
+        {
+            records.push(MetadataRecord::TransactionalProducerRegistration {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+            });
+        }
+
+        records
+    }
+
+    /// Snapshot file format: `[snapshot_offset: u64][record_count: u32] { [len: u32] [encoded MetadataRecord] }...`
+    fn write_metadata_snapshot(&self, snapshot_offset: u64) -> IoResult<()> {
+        let records = self.build_metadata_snapshot_records();
+        let path = self.metadata_snapshot_path();
+        let tmp_path = path.with_extension("snapshot.tmp");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&snapshot_offset.to_be_bytes());
+        buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for record in &records {
+            let encoded = record.encode();
+            buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&encoded);
+        }
+
+        std::fs::write(&tmp_path, &buf)?;
+        // Rename is atomic on the same filesystem, so a crash mid-write never leaves a
+        // half-written snapshot in place of a good one.
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    fn read_metadata_snapshot(
+        &self,
+    ) -> IoResult<Option<(u64, Vec<crate::replication::MetadataRecord>)>> {
+        let path = self.metadata_snapshot_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let buf = std::fs::read(&path)?;
+        if buf.len() < 12 {
+            return Ok(None);
+        }
+        let snapshot_offset = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+        let record_count = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+
+        let mut cursor = &buf[12..];
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            if cursor.len() < 4 {
+                break;
+            }
+            let len = u32::from_be_bytes(cursor[0..4].try_into().unwrap()) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < len {
+                break;
+            }
+            if let Ok(rec) = crate::replication::MetadataRecord::decode(&cursor[..len]) {
+                records.push(rec);
+            }
+            cursor = &cursor[len..];
+        }
+        Ok(Some((snapshot_offset, records)))
+    }
+
+    /// Takes a new `__cluster_metadata` snapshot and trims the now-fully-covered prefix
+    /// of the log, if enough new records have accumulated since the last snapshot to be
+    /// worth it. Safe to call on every node independently (no leader/quorum coordination
+    /// needed) — each node's in-memory state is exactly the replay of its own local log up
+    /// to its own LEO, so a node's snapshot always matches what its own log already says.
+    ///
+    /// This is the fix for the metadata log otherwise having no bound on growth — and,
+    /// just as importantly, for `__cluster_metadata` (a system partition never explicitly
+    /// created via `create_topic`) inheriting the engine's *default* cleanup policy, which
+    /// for most deployments is time/size delete-retention. Without a snapshot boundary,
+    /// that default retention deleting old segments could silently drop a topic's only
+    /// `TopicCreated` record (or similar) if it happened to be old enough — corrupting
+    /// what a freshly-replaying node would ever learn about that topic.
+    pub(crate) fn snapshot_metadata_if_needed(&self) {
+        const MIN_NEW_RECORDS_FOR_SNAPSHOT: u64 = 500;
+
+        let Ok(pm) = self.get_or_create_partition("__cluster_metadata", 0) else {
+            return;
+        };
+        let leo = pm.latest_offset();
+
+        let last_snapshot_offset = match self.read_metadata_snapshot() {
+            Ok(Some((offset, _))) => offset,
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!("Metadata Snapshot: Failed to read existing snapshot: {}", e);
+                return;
+            }
+        };
+
+        if leo <= last_snapshot_offset
+            || leo - last_snapshot_offset < MIN_NEW_RECORDS_FOR_SNAPSHOT
+        {
+            return;
+        }
+
+        if let Err(e) = self.write_metadata_snapshot(leo) {
+            tracing::error!("Metadata Snapshot: Failed to write snapshot: {}", e);
+            return;
+        }
+
+        match pm.trim_before(leo) {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    "Metadata Snapshot: Took snapshot at offset {} and trimmed {} fully-covered segment(s)",
+                    leo,
+                    n
+                );
+            }
+            Err(e) => {
+                tracing::error!("Metadata Snapshot: Failed to trim log after snapshot: {}", e);
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies the in-memory/on-disk state effects of a single cluster-metadata record.
+    ///
+    /// This is the single source of truth for "what does observing this record do to
+    /// broker state" — it never re-encodes or re-appends a `MetadataRecord` itself, so
+    /// it is safe to call both from startup replay (`replay_metadata_log`) and from the
+    /// live inter-node replication apply path. Proposing/writing new metadata records is
+    /// a separate concern (see `create_topic`/`register_broker`/`delete_topic`/etc.),
+    /// which is what actually produces the records this function later applies.
+    ///
+    /// `offset` is this record's position in the `__cluster_metadata` log; it is tracked
+    /// as this node's "last log index" so that if it ever contests a leader election, its
+    /// VoteRequest reflects how up to date its metadata log actually is (Raft §5.4.1).
+    pub(crate) fn apply_metadata_record(
+        &self,
+        offset: u64,
+        rec: crate::replication::MetadataRecord,
+    ) {
+        self.replication.set_local_metadata_log_index(offset + 1);
+        match rec {
+            crate::replication::MetadataRecord::TopicPartition {
+                topic, partition, ..
+            } => {
+                if validate_topic_name(&topic).is_ok() {
+                    let _ = self.get_or_create_partition(&topic, partition);
+                } else {
+                    tracing::warn!(
+                        "apply_metadata_record: skipping invalid topic name '{}' in TopicPartition record",
+                        topic
+                    );
+                }
+            }
+            crate::replication::MetadataRecord::TopicCreated {
+                topic,
+                num_partitions,
+                replication_factor,
+            } => {
+                self.topic_registry.insert(
+                    topic.clone(),
+                    TopicConfig {
+                        topic,
+                        num_partitions,
+                        replication_factor,
+                        cleanup_policy: self.config.cleanup_policy,
+                        partitions: std::collections::HashMap::new(),
+                        configs: std::collections::HashMap::new(),
+                    },
+                );
+            }
+            crate::replication::MetadataRecord::PartitionLeadershipChange {
+                topic,
+                partition,
+                leader_id,
+                leader_epoch,
+                isr,
+            } => {
+                let replicas = isr.clone();
+                let assignment = PartitionAssignment {
+                    partition,
+                    leader_id,
+                    leader_epoch,
+                    replicas: replicas.clone(),
+                    isr: isr.clone(),
+                };
+                if let Some(mut cfg) = self.topic_registry.get_mut(&topic) {
+                    cfg.partitions.insert(partition, assignment);
+                }
+                if let Ok(pm) = self.get_or_create_partition(&topic, partition) {
+                    pm.update_leadership(leader_id, leader_epoch, replicas, isr);
+                }
+            }
+            crate::replication::MetadataRecord::BrokerRegister {
+                node_id,
+                bind_addr,
+                roles,
+            } => {
+                self.register_broker_address(node_id, bind_addr);
+                self.register_broker_roles(node_id, &roles);
+            }
+            crate::replication::MetadataRecord::BrokerUnregister { node_id } => {
+                self.unregister_broker_address(node_id);
+            }
+            crate::replication::MetadataRecord::TopicDeleted { topic } => {
+                self.apply_topic_deletion(&topic);
+            }
+            crate::replication::MetadataRecord::AclCreated { binding } => {
+                self.acl.add_acl(binding);
+            }
+            crate::replication::MetadataRecord::AclDeleted { binding } => {
+                self.acl.remove_acl(&binding);
+            }
+            crate::replication::MetadataRecord::ScramCredentialUpsert {
+                username,
+                iterations,
+                salt,
+                stored_key,
+                server_key,
+            } => {
+                self.apply_scram_credential_state(
+                    username, iterations, salt, stored_key, server_key,
+                );
+            }
+            crate::replication::MetadataRecord::ScramCredentialDelete { username } => {
+                self.remove_scram_credential_state(&username);
+            }
+            crate::replication::MetadataRecord::TransactionalProducerRegistration {
+                transactional_id,
+                producer_id,
+                producer_epoch,
+            } => {
+                self.transactions.restore_transactional_producer(
+                    &transactional_id,
+                    producer_id,
+                    producer_epoch,
+                );
+            }
+            crate::replication::MetadataRecord::TopicConfigChanged { topic, configs } => {
+                self.apply_topic_config_change(&topic, configs);
+            }
+        }
+    }
+
+    /// Applies a full-replace topic config change: updates the stored config map and
+    /// pushes recognized keys down to every currently-open partition of this topic.
+    fn apply_topic_config_change(&self, topic: &str, configs: Vec<(String, String)>) {
+        let configs_map: std::collections::HashMap<String, String> = configs.into_iter().collect();
+
+        if let Some(mut cfg) = self.topic_registry.get_mut(topic) {
+            cfg.configs = configs_map.clone();
+        }
+
+        for entry in self.partitions.iter() {
+            let (t, _p) = entry.key();
+            if t != topic {
+                continue;
+            }
+            let pm = entry.value();
+
+            if let Some(v) = configs_map.get("cleanup.policy") {
+                if let Ok(policy) = v.parse::<crate::config::CleanupPolicy>() {
+                    pm.set_cleanup_policy(policy);
+                }
+            }
+            if let Some(v) = configs_map.get("compression.type") {
+                if let Ok(codec) = v.parse::<crate::config::CompressionCodec>() {
+                    pm.set_compression_codec(codec);
+                }
+            }
+            if let Some(v) = configs_map.get("retention.ms") {
+                pm.set_retention_millis(v.parse::<u64>().ok());
+            }
+            if let Some(v) = configs_map.get("retention.bytes") {
+                pm.set_retention_bytes(v.parse::<u64>().ok());
+            }
+            if let Some(v) = configs_map.get("delete.retention.ms") {
+                pm.set_delete_retention_millis(v.parse::<u64>().ok());
+            }
+            if let Some(v) = configs_map.get("min.cleanable.dirty.ratio") {
+                if let Ok(ratio) = v.parse::<f64>() {
+                    pm.set_min_cleanable_dirty_ratio(ratio);
+                }
+            }
+            // min.insync.replicas is read per-topic from `topic_registry` directly at
+            // produce time (see `produce_batch`) rather than pushed into PartitionManager.
+        }
+    }
+
+    /// Resolves the effective `min.insync.replicas` for `topic`: its per-topic
+    /// `AlterConfigs` override if set and parseable, else the broker's global default.
+    fn effective_min_insync_replicas(&self, topic: &str) -> usize {
+        self.topic_registry
+            .get(topic)
+            .and_then(|cfg| cfg.configs.get("min.insync.replicas").cloned())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(self.config.min_insync_replicas)
+    }
+
+    /// Returns the effective config map for `topic` (currently-stored overrides only —
+    /// keys not present here fall back to the broker's global defaults).
+    pub fn describe_configs(&self, topic: &str) -> Vec<(String, String)> {
+        self.topic_registry
+            .get(topic)
+            .map(|cfg| cfg.configs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Full-replace config update (Kafka `AlterConfigs`). Only the cluster leader may
+    /// propose — routes through the same `propose_metadata` gate as every other
+    /// controller-plane mutation.
+    pub async fn alter_configs(
+        &self,
+        topic: &str,
+        configs: Vec<(String, String)>,
+    ) -> IoResult<()> {
+        if self.topic_registry.get(topic).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Unknown topic '{}'", topic),
+            ));
+        }
+        let record = crate::replication::MetadataRecord::TopicConfigChanged {
+            topic: topic.to_string(),
+            configs,
+        };
+        self.propose_metadata(record).await?;
+        Ok(())
+    }
+
+    /// Merge-then-replace config update (Kafka `IncrementalAlterConfigs`): computes the
+    /// new full config map from the topic's current one plus `upserts`/`deletes`, then
+    /// proposes it the same way `alter_configs` does.
+    pub async fn incremental_alter_configs(
+        &self,
+        topic: &str,
+        upserts: Vec<(String, String)>,
+        deletes: Vec<String>,
+    ) -> IoResult<()> {
+        let mut merged: std::collections::HashMap<String, String> = self
+            .topic_registry
+            .get(topic)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Unknown topic '{}'", topic),
+                )
+            })?
+            .configs
+            .clone();
+
+        for key in &deletes {
+            merged.remove(key);
+        }
+        for (key, value) in upserts {
+            merged.insert(key, value);
+        }
+
+        let record = crate::replication::MetadataRecord::TopicConfigChanged {
+            topic: topic.to_string(),
+            configs: merged.into_iter().collect(),
+        };
+        self.propose_metadata(record).await?;
+        Ok(())
+    }
+
+    /// Proposes a cluster-metadata mutation: appends it to the local `__cluster_metadata`
+    /// log, applies its state effects locally (via `apply_metadata_record`, so this is the
+    /// only place metadata records get both written AND applied — no method ever produces
+    /// a record without also being the one that later reads it back), replicates it to
+    /// every peer, and — when `min_insync_replicas > 1` — waits for ISR quorum before
+    /// returning, exactly like `produce_batch` does for regular topic data.
+    ///
+    /// Only the cluster leader may propose. Previously, `create_topic`/`register_broker`/
+    /// ACL and SCRAM mutations/etc. wrote directly to the local metadata partition with no
+    /// leader check and no replication at all — in a multi-node cluster this meant any node
+    /// could silently write metadata nobody else in the cluster would ever see, forking
+    /// cluster state. Callers reach this exclusively through `create_topic`/`register_broker`/
+    /// `delete_topic`/etc. so every metadata mutation goes through the same gate.
+    async fn propose_metadata(&self, record: crate::replication::MetadataRecord) -> IoResult<u64> {
+        if !self.is_leader() {
+            return Err(std::io::Error::other(
+                "NOT_CONTROLLER: this node is not the cluster leader",
+            ));
+        }
+        self.propose_metadata_unchecked(record).await
+    }
+
+    /// Proposes an ISR-membership-only update to a partition's `PartitionLeadershipChange`
+    /// record — same `leader_id`/`leader_epoch`, only `isr` differs. Authorized by
+    /// *partition* leadership rather than cluster leadership: the current partition leader
+    /// is the node with real observability of follower replication lag for that partition
+    /// (it's the one receiving the ACKs), so it — not necessarily the cluster's Raft
+    /// leader — is the right authority for this specific decision. Real failovers (leader
+    /// changing, epoch bumping) still require cluster leadership; see
+    /// `propose_partition_failover`.
+    async fn propose_isr_update(
+        &self,
+        topic: &str,
+        partition: u32,
+        leader_id: u32,
+        leader_epoch: u32,
+        isr: Vec<u32>,
+    ) -> IoResult<u64> {
+        if !self.is_partition_leader(topic, partition) {
+            return Err(std::io::Error::other(
+                "NOT_PARTITION_LEADER: only the current partition leader may update its ISR",
+            ));
+        }
+        let record = crate::replication::MetadataRecord::PartitionLeadershipChange {
+            topic: topic.to_string(),
+            partition,
+            leader_id,
+            leader_epoch,
+            isr,
+        };
+        self.propose_metadata_unchecked(record).await
+    }
+
+    /// Proposes a real partition failover: a new `leader_id` with a bumped `leader_epoch`.
+    /// Authorized by *cluster* leadership — unlike an ISR-only update, choosing a new
+    /// partition leader is a decision that must have a single, cluster-wide authority to
+    /// avoid two nodes independently promoting themselves (split brain), so only the
+    /// controller (Raft-elected cluster leader) may propose it.
+    async fn propose_partition_failover(
+        &self,
+        topic: &str,
+        partition: u32,
+        new_leader_id: u32,
+        new_leader_epoch: u32,
+        isr: Vec<u32>,
+    ) -> IoResult<u64> {
+        if !self.is_leader() {
+            return Err(std::io::Error::other(
+                "NOT_CONTROLLER: only the cluster leader may fail a partition over",
+            ));
+        }
+        let record = crate::replication::MetadataRecord::PartitionLeadershipChange {
+            topic: topic.to_string(),
+            partition,
+            leader_id: new_leader_id,
+            leader_epoch: new_leader_epoch,
+            isr,
+        };
+        self.propose_metadata_unchecked(record).await
+    }
+
+    /// Core append+apply+replicate+quorum mechanics shared by every proposal path above.
+    /// Callers are responsible for authorization — this function performs none.
+    async fn propose_metadata_unchecked(
+        &self,
+        record: crate::replication::MetadataRecord,
+    ) -> IoResult<u64> {
+        let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+        let frame = meta_pm.produce_frame(&record.encode())?;
+        self.apply_metadata_record(frame.offset, record);
+
+        if !self.config.peer_addrs.is_empty() {
+            let repl = self.replication.clone();
+            let frame_for_replication = frame.clone();
+            tokio::spawn(async move {
+                if let Err(e) = repl
+                    .replicate_batch(
+                        "__cluster_metadata",
+                        0,
+                        std::slice::from_ref(&frame_for_replication),
+                    )
+                    .await
+                {
+                    tracing::error!("propose_metadata: replicate_batch failed: {}", e);
+                }
+            });
+
+            if self.config.min_insync_replicas > 1 {
+                let quorum_ok = self
+                    .replication
+                    .await_isr_quorum(
+                        "__cluster_metadata",
+                        0,
+                        frame.offset,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
+                if !quorum_ok {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ISR quorum not reached for metadata proposal",
+                    ));
+                }
+            }
+        }
+
+        Ok(frame.offset)
     }
 
     pub fn acl(&self) -> &crate::server::acl::AclManager {
@@ -466,7 +989,7 @@ impl StorageEngine {
         self.scram_credentials.remove(username);
     }
 
-    pub fn upsert_scram_credential(
+    pub async fn upsert_scram_credential(
         &self,
         username: &str,
         iterations: u32,
@@ -477,26 +1000,15 @@ impl StorageEngine {
         let record = crate::replication::MetadataRecord::ScramCredentialUpsert {
             username: username.to_string(),
             iterations,
-            salt: salt.clone(),
-            stored_key: stored_key.clone(),
-            server_key: server_key.clone(),
+            salt,
+            stored_key,
+            server_key,
         };
-        let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
-        meta_pm.produce(&record.encode())?;
-        self.scram_credentials.insert(
-            username.to_string(),
-            crate::scram::ScramCredential::new(
-                username.to_string(),
-                iterations,
-                salt,
-                stored_key,
-                server_key,
-            ),
-        );
+        self.propose_metadata(record).await?;
         Ok(())
     }
 
-    pub fn upsert_scram_user(&self, username: &str, password: &str) -> IoResult<()> {
+    pub async fn upsert_scram_user(&self, username: &str, password: &str) -> IoResult<()> {
         let credential = crate::scram::ScramCredential::generate(
             username,
             password,
@@ -510,15 +1022,16 @@ impl StorageEngine {
             credential.stored_key,
             credential.server_key,
         )
+        .await
     }
 
-    pub fn delete_scram_user(&self, username: &str) -> IoResult<bool> {
+    pub async fn delete_scram_user(&self, username: &str) -> IoResult<bool> {
+        let existed = self.scram_credentials.contains_key(username);
         let record = crate::replication::MetadataRecord::ScramCredentialDelete {
             username: username.to_string(),
         };
-        let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
-        meta_pm.produce(&record.encode())?;
-        Ok(self.scram_credentials.remove(username).is_some())
+        self.propose_metadata(record).await?;
+        Ok(existed)
     }
 
     pub fn authorize(
@@ -544,24 +1057,22 @@ impl StorageEngine {
         allowed
     }
 
-    pub fn create_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+    pub async fn create_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+        let is_new = !self.acl.contains(&binding);
         let record = crate::replication::MetadataRecord::AclCreated {
             binding: binding.clone(),
         };
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
-        }
-        Ok(self.acl.add_acl(binding))
+        self.propose_metadata(record).await?;
+        Ok(is_new)
     }
 
-    pub fn delete_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+    pub async fn delete_acl(&self, binding: crate::server::acl::AclBinding) -> IoResult<bool> {
+        let existed = self.acl.contains(&binding);
         let record = crate::replication::MetadataRecord::AclDeleted {
             binding: binding.clone(),
         };
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
-        }
-        Ok(self.acl.remove_acl(&binding))
+        self.propose_metadata(record).await?;
+        Ok(existed)
     }
 
     pub fn list_acls(
@@ -659,37 +1170,90 @@ impl StorageEngine {
         };
 
         let pm = self.get_or_create_partition(topic, partition_id)?;
-        let mut first_offset = 0u64;
-        let mut last_offset = 0u64;
-        let mut frames = Vec::with_capacity(records.len());
 
-        let mut current_seq = base_sequence;
-        for (idx, record) in records.iter().enumerate() {
-            match pm.produce_frame_eos(record, producer_id, producer_epoch, current_seq)? {
-                Ok(frame) => {
-                    if idx == 0 {
-                        first_offset = frame.offset;
+        // The actual disk work (segment append per record, plus the batch's group-commit
+        // fsync) is synchronous, lock-and-syscall-heavy I/O. Running it inline in this
+        // `async fn` would block whichever Tokio worker thread picked up this task for the
+        // whole duration — under disk contention, that worker can't service any other
+        // task in the meantime. `spawn_blocking` moves it to Tokio's dedicated blocking
+        // thread pool instead, so a slow disk only stalls this one request.
+        let pm_blocking = pm.clone();
+        let records_owned: Vec<Bytes> = records.to_vec();
+        let num_records = records_owned.len();
+        let (first_offset, last_offset, frames) =
+            tokio::task::spawn_blocking(move || -> IoResult<(u64, u64, Vec<RecordFrame>)> {
+                let mut first_offset = 0u64;
+                let mut last_offset = 0u64;
+                let mut frames = Vec::with_capacity(num_records);
+                let mut current_seq = base_sequence;
+
+                for (idx, record) in records_owned.iter().enumerate() {
+                    match pm_blocking.produce_frame_eos(
+                        record.clone(),
+                        producer_id,
+                        producer_epoch,
+                        current_seq,
+                    )? {
+                        Ok(frame) => {
+                            if idx == 0 {
+                                first_offset = frame.offset;
+                            }
+                            last_offset = frame.offset;
+                            frames.push(frame);
+                        }
+                        Err(dup_last_offset) => {
+                            if idx == 0 {
+                                last_offset = dup_last_offset;
+                                first_offset = last_offset.saturating_sub(num_records as u64 - 1);
+                            }
+                        }
                     }
-                    last_offset = frame.offset;
-                    frames.push(frame);
-                }
-                Err(dup_last_offset) => {
-                    if idx == 0 {
-                        last_offset = dup_last_offset;
-                        first_offset = last_offset.saturating_sub(records.len() as u64 - 1);
+                    if producer_id != 0 {
+                        current_seq += 1;
                     }
                 }
-            }
-            if producer_id != 0 {
-                current_seq += 1;
-            }
-        }
+
+                // Group commit: one fsync for the whole batch instead of one per record
+                // (see `PartitionManager::flush_if_sync_policy`). `produce_frame_eos`
+                // itself never syncs for exactly this reason.
+                pm_blocking.flush_if_sync_policy()?;
+
+                Ok((first_offset, last_offset, frames))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("produce_batch join error: {}", e)))??;
 
         if let Some(tx_id) = transaction_id {
             self.register_tx_partition(tx_id, topic, partition_id, first_offset);
         }
 
-        if self.config.role == NodeRole::Leader && !self.config.peer_addrs.is_empty() {
+        // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
+        // Hermes assigns an independent leader per partition (KIP-392-style; see
+        // `is_partition_leader`/produce-forwarding in handler.rs), and the cluster Raft
+        // leader is really the controller for `__cluster_metadata`, not necessarily the
+        // leader of every data partition. Gating on cluster leadership here would silently
+        // stop replication for any partition led by a node that isn't currently the
+        // cluster leader.
+        //
+        // Data-topic replication is now Kafka-style follower-pull *in addition to*
+        // leader-push, not a full replacement of it. Every follower's background fetch
+        // loop (`ReplicationManager::start_per_partition_fetcher_manager`) independently
+        // pulls from this partition's log, and the leader's `handler.rs` 0xBB handler
+        // (`decode_grpc_replication_fetch_packet`) records each follower's confirmed
+        // progress into the exact same `replica_watermarks`/`replica_ack_time` maps this
+        // push ack updates below — `await_isr_quorum` doesn't care which mechanism
+        // populated them.
+        //
+        // Push stays as a backstop rather than being fully retired because pull discovery
+        // depends on `describe_topic`/`list_topics()`, which requires a real replica
+        // assignment recorded in `__cluster_metadata` (via `create_topic`). A topic that's
+        // only ever been implicitly auto-created by a bare produce (no explicit
+        // `CreateTopic`) never gets that assignment propagated, so a follower can never
+        // discover — and therefore never pull — a partition it doesn't already know it
+        // replicates. `append_replica_frame_verbatim` is idempotent/gap-safe by design
+        // (`AlreadyApplied`/`Gap` are both no-ops, never corruption), so having both
+        // mechanisms active for a partition pull *can* reach is redundant, not unsafe.
+        if self.is_partition_leader(topic, partition_id) && !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
             let topic_str = topic.to_string();
             let topic_for_spawn = topic_str.clone();
@@ -703,8 +1267,13 @@ impl StorageEngine {
                 }
             });
 
-            // Enforce min_insync_replicas requirement before returning success (REP-05 & PARTIAL-03)
-            if self.config.min_insync_replicas > 1 {
+            // Enforce min_insync_replicas requirement before returning success and before
+            // advancing the committed high watermark (REP-05 & PARTIAL-03). Until quorum
+            // is reached, `pm.latest_offset()` (LEO) has moved but `pm.high_watermark()`
+            // has not — consumers can't fetch past what's actually ISR-committed, and if
+            // the quorum wait times out here, the record stays durably on this leader but
+            // is never exposed as committed (no false "it's safe to read" signal).
+            if self.effective_min_insync_replicas(topic) > 1 {
                 let quorum_ok = self
                     .replication
                     .await_isr_quorum(
@@ -723,10 +1292,15 @@ impl StorageEngine {
             }
         }
 
+        // Reached only once quorum (if required) has been confirmed above — or
+        // immediately for single-node/no-peer deployments and non-partition-leader
+        // system-partition writes, where there's nothing else to wait on.
+        pm.advance_committed_hw(last_offset + 1);
+
         Ok((partition_id, first_offset, last_offset))
     }
 
-    pub fn fetch(
+    pub async fn fetch(
         &self,
         topic: &str,
         partition: u32,
@@ -734,11 +1308,59 @@ impl StorageEngine {
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
         let pm = self.get_or_create_partition(topic, partition)?;
-        pm.fetch(offset, max_bytes)
+        // Clamp to the committed high watermark, not LEO: consumers must never be shown
+        // data that isn't yet guaranteed replicated to the ISR (previously `fetch` exposed
+        // everything up to LEO unconditionally, so a leader crash right after an
+        // un-replicated append could mean a consumer read something no other replica ever
+        // received).
+        //
+        // The actual segment read is blocking file I/O (mutex + syscalls) — moved to
+        // Tokio's blocking thread pool so a slow disk doesn't stall this worker thread
+        // out from under every other in-flight request.
+        //
+        // This intentionally still returns control-marker frames (magic ==
+        // CONTROL_MAGIC_BYTE) alongside real records — matching real Kafka, where the
+        // server exposes raw control batches at the wire level and it's the client
+        // library's job to recognize and skip them (see `RecordFrame::is_control_marker`
+        // and the client-authoring guidance in docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
+        // `fetch_committed` is the path that hides them for callers that want that done
+        // for them. Filtering here too would break raw log introspection (this is also
+        // exactly what the transactional-recovery test suite relies on to verify control
+        // markers were actually durably written).
+        tokio::task::spawn_blocking(move || {
+            let hw = pm.high_watermark();
+            let frames = pm.fetch(offset, max_bytes)?;
+            Ok(frames.into_iter().filter(|f| f.offset < hw).collect())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("fetch join error: {}", e)))?
+    }
+
+    /// Plans a zero-copy fetch for the plain `Fetch` command: same offset/high-watermark
+    /// semantics as `fetch` (clamped to the committed HW, single segment only), but instead
+    /// of reading frame bytes into a `Vec<RecordFrame>`, resolves the exact on-disk byte
+    /// range so the caller can stream it straight to the socket via `TransmitFile`/
+    /// `sendfile` without copying payload bytes through a Rust buffer.
+    ///
+    /// Returns `Ok(None)` whenever there's nothing eligible for a zero-copy transmit (no
+    /// frames at/after `offset` within the committed HW, or the range doesn't start within
+    /// the located segment) — callers should fall back to the buffered `fetch` path in that
+    /// case, not treat it as an error.
+    pub async fn plan_zero_copy_fetch(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
+        let pm = self.get_or_create_partition(topic, partition)?;
+        tokio::task::spawn_blocking(move || pm.plan_zero_copy_fetch(offset, max_bytes))
+            .await
+            .map_err(|e| std::io::Error::other(format!("plan_zero_copy_fetch join error: {}", e)))?
     }
 
     /// BUG-02: Fetch records starting from nearest offset for target_timestamp
-    pub fn fetch_by_timestamp(
+    pub async fn fetch_by_timestamp(
         &self,
         topic: &str,
         partition: u32,
@@ -746,10 +1368,12 @@ impl StorageEngine {
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
         let pm = self.get_or_create_partition(topic, partition)?;
-        pm.fetch_by_timestamp(target_timestamp, max_bytes)
+        tokio::task::spawn_blocking(move || pm.fetch_by_timestamp(target_timestamp, max_bytes))
+            .await
+            .map_err(|e| std::io::Error::other(format!("fetch_by_timestamp join error: {}", e)))?
     }
 
-    pub fn fetch_committed(
+    pub async fn fetch_committed(
         &self,
         topic: &str,
         partition: u32,
@@ -759,28 +1383,33 @@ impl StorageEngine {
         let pm = self.get_or_create_partition(topic, partition)?;
         let lso = self.transactions.last_stable_offset(topic, partition);
         let aborted = self.transactions.aborted_ranges(topic, partition);
-        let all_frames = self.fetch(topic, partition, offset, max_bytes)?;
+        let all_frames = self.fetch(topic, partition, offset, max_bytes).await?;
 
-        let committed_frames: Vec<RecordFrame> = all_frames
-            .into_iter()
-            .filter(|frame| {
-                if frame.magic == CONTROL_MAGIC_BYTE {
-                    return false;
-                }
-                if frame.offset >= lso {
-                    return false;
-                }
-                if pm.is_offset_aborted(frame.offset) {
-                    return false;
-                }
-                for (start, end) in &aborted {
-                    if frame.offset >= *start && frame.offset <= *end {
+        let pm_blocking = pm.clone();
+        let committed_frames: Vec<RecordFrame> = tokio::task::spawn_blocking(move || {
+            all_frames
+                .into_iter()
+                .filter(|frame| {
+                    if frame.magic == CONTROL_MAGIC_BYTE {
                         return false;
                     }
-                }
-                true
-            })
-            .collect();
+                    if frame.offset >= lso {
+                        return false;
+                    }
+                    if pm_blocking.is_offset_aborted(frame.offset) {
+                        return false;
+                    }
+                    for (start, end) in &aborted {
+                        if frame.offset >= *start && frame.offset <= *end {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("fetch_committed join error: {}", e)))?;
 
         Ok(committed_frames)
     }
@@ -1084,11 +1713,42 @@ impl StorageEngine {
         }
     }
 
-    pub fn apply_retention_all(&self) -> IoResult<usize> {
-        let mut total_removed = 0;
-        for entry in self.partitions.iter() {
-            total_removed += entry.value().apply_retention()?;
+    /// Runs retention/compaction across every partition, fanning out up to
+    /// `config.compaction_worker_threads` partitions' `apply_retention()` calls
+    /// concurrently (Kafka-style `log.cleaner.threads`) instead of one sequential loop.
+    /// A slow or large compaction pass on one partition no longer delays every other
+    /// partition's GC within the same tick, and one partition's error no longer aborts
+    /// the rest (each is caught, logged, and skipped independently).
+    pub async fn apply_retention_all(&self) -> IoResult<usize> {
+        let concurrency = self.config.compaction_worker_threads.max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+        let partition_managers: Vec<Arc<PartitionManager>> =
+            self.partitions.iter().map(|entry| entry.value().clone()).collect();
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for pm in partition_managers {
+            let permit_sem = semaphore.clone();
+            join_set.spawn(async move {
+                let _permit = permit_sem
+                    .acquire_owned()
+                    .await
+                    .expect("compaction worker semaphore is never closed");
+                tokio::task::spawn_blocking(move || pm.apply_retention())
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("apply_retention join error: {}", e)))?
+            });
         }
+
+        let mut total_removed = 0usize;
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(n)) => total_removed += n,
+                Ok(Err(e)) => tracing::error!("Retention GC: partition compaction failed: {}", e),
+                Err(e) => tracing::error!("Retention GC: partition compaction task panicked: {}", e),
+            }
+        }
+
         total_removed += self.transactions.prune_stale_transactions(604_800_000); // 7 days (604800000ms) retention
         Ok(total_removed)
     }
@@ -1128,8 +1788,172 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Spawns the background task that keeps each partition's ISR membership honest and
+    /// fails partitions over off dead leaders. Two independent, differently-authorized
+    /// decisions happen per sweep (see `propose_isr_update`/`propose_partition_failover`):
+    ///   - ISR shrink/expand: decided by whichever node currently leads a given partition,
+    ///     since it's the one with real observability of follower replication lag.
+    ///   - Leader failover: decided only by the cluster (Raft) leader, so at most one
+    ///     authority ever promotes a replacement leader — avoiding split-brain promotion.
+    pub fn start_isr_and_failover_sweep(&self) {
+        let engine = self.clone();
+        let interval = std::time::Duration::from_millis(self.config.isr_check_interval_ms.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                engine.run_isr_and_failover_sweep_once().await;
+
+                // Piggybacked on the same tick rather than a dedicated task: cheap to
+                // check (a no-op unless enough new records have accumulated) and doesn't
+                // need its own timer. Snapshotting/trimming is blocking file I/O, so it
+                // runs on Tokio's blocking pool rather than inline on this worker thread.
+                let engine_for_blocking = engine.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    engine_for_blocking.snapshot_metadata_if_needed();
+                })
+                .await;
+            }
+        });
+    }
+
+    async fn run_isr_and_failover_sweep_once(&self) {
+        // Snapshot keys first — DashMap iterators must not be held across `.await` points.
+        let partition_keys: Vec<(String, u32)> =
+            self.partitions.iter().map(|e| e.key().clone()).collect();
+
+        for (topic, partition) in partition_keys {
+            let Ok(pm) = self.get_or_create_partition(&topic, partition) else {
+                continue;
+            };
+            let leader_id = pm.leader_id();
+            let leader_epoch = pm.leader_epoch();
+            let replicas = pm.replicas();
+            let mut current_isr = pm.isr();
+            current_isr.sort_unstable();
+
+            // --- ISR shrink/expand (this node's call only if it leads the partition) ---
+            if leader_id == self.config.node_id && replicas.len() > 1 {
+                let mut new_isr: Vec<u32> = Vec::with_capacity(replicas.len());
+                for &r in &replicas {
+                    if r == self.config.node_id {
+                        new_isr.push(r);
+                        continue;
+                    }
+                    let in_sync = self
+                        .get_broker_address(r)
+                        .and_then(|addr| self.replication.replica_ack_age(&topic, partition, &addr))
+                        .map(|age| age.as_millis() as u64 <= self.config.replica_lag_max_ms)
+                        .unwrap_or(false);
+                    if in_sync {
+                        new_isr.push(r);
+                    }
+                }
+                new_isr.sort_unstable();
+
+                if !new_isr.is_empty() && new_isr != current_isr {
+                    match self
+                        .propose_isr_update(
+                            &topic,
+                            partition,
+                            leader_id,
+                            leader_epoch,
+                            new_isr.clone(),
+                        )
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            "ISR sweep: {}-{} ISR changed {:?} -> {:?}",
+                            topic,
+                            partition,
+                            current_isr,
+                            new_isr
+                        ),
+                        Err(e) => tracing::warn!(
+                            "ISR sweep: failed to update ISR for {}-{}: {}",
+                            topic,
+                            partition,
+                            e
+                        ),
+                    }
+                }
+            }
+
+            // --- Failover (cluster leader's call only, for partitions led elsewhere) ---
+            if self.is_leader() && leader_id != self.config.node_id {
+                // Conservative: only act once we've positively observed this leader go
+                // silent past the threshold. A broker we've simply never heard from yet
+                // (e.g. right after a fresh topic assignment, before its first heartbeat)
+                // is NOT treated as dead — that would cause spurious failovers on startup.
+                let dead = self
+                    .replication
+                    .broker_last_seen_age(leader_id)
+                    .map(|age| age.as_millis() as u64 >= self.config.broker_down_threshold_ms)
+                    .unwrap_or(false);
+
+                if dead {
+                    let mut isr_candidates: Vec<u32> = current_isr
+                        .iter()
+                        .copied()
+                        .filter(|&r| r != leader_id)
+                        .collect();
+                    isr_candidates.sort_unstable();
+
+                    let (new_leader_id, new_isr) = match isr_candidates.first().copied() {
+                        Some(id) => (Some(id), isr_candidates.clone()),
+                        None if self.config.allow_unclean_leader_election => {
+                            let fallback =
+                                replicas.iter().copied().filter(|&r| r != leader_id).min();
+                            (fallback, fallback.into_iter().collect())
+                        }
+                        None => (None, Vec::new()),
+                    };
+
+                    match new_leader_id {
+                        Some(new_leader_id) => {
+                            match self
+                                .propose_partition_failover(
+                                    &topic,
+                                    partition,
+                                    new_leader_id,
+                                    leader_epoch.wrapping_add(1),
+                                    new_isr,
+                                )
+                                .await
+                            {
+                                Ok(_) => tracing::warn!(
+                                    "Failover: {}-{} leader {} appears dead — promoted {} (epoch {})",
+                                    topic,
+                                    partition,
+                                    leader_id,
+                                    new_leader_id,
+                                    leader_epoch.wrapping_add(1)
+                                ),
+                                Err(e) => tracing::error!(
+                                    "Failover: failed to fail {}-{} over from dead leader {}: {}",
+                                    topic,
+                                    partition,
+                                    leader_id,
+                                    e
+                                ),
+                            }
+                        }
+                        None => {
+                            tracing::error!(
+                                "Failover: {}-{} leader {} appears dead and no in-sync replica survives — \
+                                 leaving partition leaderless (set allow_unclean_leader_election to override)",
+                                topic,
+                                partition,
+                                leader_id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Creates a topic by writing a TopicCreated record to __cluster_metadata and populating registry
-    pub fn create_topic(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
+    pub async fn create_topic(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
         validate_topic_name(topic)?;
         if self.deleting_topics.contains(topic) {
             return Err(std::io::Error::other(format!(
@@ -1154,12 +1978,11 @@ impl StorageEngine {
             num_partitions,
             replication_factor,
         };
+        // propose_metadata both writes this record AND applies it (registers the topic
+        // in topic_registry with an empty partition map) via apply_metadata_record, so
+        // there's no separate direct topic_registry.insert here anymore.
+        self.propose_metadata(record).await?;
 
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
-        }
-
-        let mut partitions = std::collections::HashMap::new();
         let total_nodes = broker_ids.len();
         let rf_usize = replication_factor as usize;
 
@@ -1179,43 +2002,10 @@ impl StorageEngine {
                 partition: p,
                 leader_id,
                 leader_epoch: 0,
-                isr: isr.clone(),
-            };
-
-            if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-                let _ = meta_pm.produce(&plc_record.encode());
-            }
-
-            let assignment = PartitionAssignment {
-                partition: p,
-                leader_id,
-                leader_epoch: 0,
-                replicas,
                 isr,
             };
-
-            partitions.insert(p, assignment);
-        }
-
-        self.topic_registry.insert(
-            topic.to_string(),
-            TopicConfig {
-                topic: topic.to_string(),
-                num_partitions,
-                replication_factor,
-                cleanup_policy: self.config.cleanup_policy,
-                partitions: partitions.clone(),
-            },
-        );
-
-        for (p, assignment) in partitions {
-            let pm = self.get_or_create_partition(topic, p)?;
-            pm.update_leadership(
-                assignment.leader_id,
-                assignment.leader_epoch,
-                assignment.replicas,
-                assignment.isr,
-            );
+            // Likewise applies topic_registry.partitions + pm.update_leadership itself.
+            self.propose_metadata(plc_record).await?;
         }
 
         Ok(())
@@ -1281,28 +2071,49 @@ impl StorageEngine {
     /// Unregisters a broker socket address mapping
     pub fn unregister_broker_address(&self, node_id: u32) {
         self.broker_addrs.remove(&node_id);
+        self.broker_roles.remove(&node_id);
     }
 
-    /// Dynamically registers a broker in the cluster metadata catalog and replicates to peers
-    pub fn register_broker(&self, node_id: u32, bind_addr: String) -> IoResult<()> {
+    /// Records a broker's process role(s). Empty/unrecognized bytes mean "unknown role" —
+    /// treated as combined mode (both roles) by `crate::config::parse_process_role_bytes`.
+    pub fn register_broker_roles(&self, node_id: u32, role_bytes: &[u8]) {
+        self.broker_roles
+            .insert(node_id, crate::config::parse_process_role_bytes(role_bytes));
+    }
+
+    /// Returns whether `node_id` is known to have the `Broker` role. Nodes never seen
+    /// (e.g. this one, before its own bootstrap insert, or a node we simply haven't
+    /// learned about yet) are conservatively treated as broker-eligible — combined mode,
+    /// the safe default, rather than silently excluding an unrecognized node from ever
+    /// receiving partition assignments.
+    pub fn is_broker_eligible(&self, node_id: u32) -> bool {
+        self.broker_roles
+            .get(&node_id)
+            .map(|roles| roles.contains(&crate::config::ProcessRole::Broker))
+            .unwrap_or(true)
+    }
+
+    /// Dynamically registers a broker in the cluster metadata catalog and replicates to
+    /// peers. This is the manual/admin registration path (`RegisterBroker` wire command);
+    /// it doesn't know the target node's actual process roles, so it leaves `roles` empty
+    /// — which `apply_metadata_record`/`parse_process_role_bytes` treats as "unknown,
+    /// assume combined mode". A node with dedicated controller-only/broker-only roles
+    /// self-declares them authoritatively via its own heartbeat ACKs instead (see
+    /// `send_leader_heartbeat`), which takes precedence once received.
+    pub async fn register_broker(&self, node_id: u32, bind_addr: String) -> IoResult<()> {
         let record = crate::replication::MetadataRecord::BrokerRegister {
             node_id,
-            bind_addr: bind_addr.clone(),
+            bind_addr,
+            roles: Vec::new(),
         };
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
-        }
-        self.register_broker_address(node_id, bind_addr);
+        self.propose_metadata(record).await?;
         Ok(())
     }
 
     /// Dynamically unregisters a broker from the cluster metadata catalog and replicates to peers
-    pub fn unregister_broker(&self, node_id: u32) -> IoResult<()> {
+    pub async fn unregister_broker(&self, node_id: u32) -> IoResult<()> {
         let record = crate::replication::MetadataRecord::BrokerUnregister { node_id };
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
-        }
-        self.unregister_broker_address(node_id);
+        self.propose_metadata(record).await?;
         Ok(())
     }
 
@@ -1322,9 +2133,17 @@ impl StorageEngine {
         brokers
     }
 
+    /// Returns node_ids eligible to be assigned data-partition leadership/replicas —
+    /// i.e. known brokers with the `Broker` role. A controller-only node must never be
+    /// handed a data partition, so it's excluded here even if it's this node itself.
     fn available_broker_ids(&self) -> Vec<u32> {
-        let mut ids: Vec<u32> = self.broker_addrs.iter().map(|entry| *entry.key()).collect();
-        if !ids.contains(&self.config.node_id) {
+        let mut ids: Vec<u32> = self
+            .broker_addrs
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|&id| self.is_broker_eligible(id))
+            .collect();
+        if self.config.is_broker_role() && !ids.contains(&self.config.node_id) {
             ids.push(self.config.node_id);
         }
         ids.sort_unstable();
@@ -1356,7 +2175,7 @@ impl StorageEngine {
         for entry in self.partitions.iter() {
             let (t, p) = entry.key();
             if t == topic {
-                let hw = entry.value().latest_offset();
+                let hw = entry.value().high_watermark();
                 let leader_id = entry.value().leader_id();
                 let replicas = entry.value().replicas();
                 partitions_map.insert(*p, (hw, leader_id, replicas));
@@ -1399,16 +2218,31 @@ impl StorageEngine {
     }
 
     /// Deletes topic partitions and removes disk directory (NEW-03)
-    pub fn delete_topic(&self, topic: &str) -> IoResult<()> {
-        self.deleting_topics.insert(topic.to_string());
-
+    pub async fn delete_topic(&self, topic: &str) -> IoResult<()> {
         let record = crate::replication::MetadataRecord::TopicDeleted {
             topic: topic.to_string(),
         };
+        // propose_metadata's apply_metadata_record call runs the deletion's state/fs
+        // effects via apply_topic_deletion (which logs rather than propagates fs errors,
+        // matching how a follower applying the same record would handle it).
+        self.propose_metadata(record).await?;
+        Ok(())
+    }
 
-        if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
-            let _ = meta_pm.produce(&record.encode());
+    /// State-only counterpart to `delete_topic`, used by `apply_metadata_record` so that
+    /// replaying/receiving a `TopicDeleted` record never re-produces another one.
+    fn apply_topic_deletion(&self, topic: &str) {
+        if let Err(e) = self.apply_topic_deletion_inner(topic) {
+            tracing::error!(
+                "apply_metadata_record: TopicDeleted cleanup for '{}' failed: {}",
+                topic,
+                e
+            );
         }
+    }
+
+    fn apply_topic_deletion_inner(&self, topic: &str) -> IoResult<()> {
+        self.deleting_topics.insert(topic.to_string());
 
         self.topic_registry.remove(topic);
 
@@ -1451,5 +2285,107 @@ impl StorageEngine {
             return Err(e);
         }
         Ok(())
+    }
+
+    pub fn share_groups(&self) -> &crate::server::share::ShareGroupManager {
+        &self.share_groups
+    }
+
+    /// Fetches acquired records for ShareFetch
+    pub fn share_fetch(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        topic: &str,
+        partition: u32,
+        max_records: u32,
+        lock_timeout_ms: u32,
+    ) -> Result<Vec<crate::protocol::wire::AcquiredRecordBatch>, String> {
+        let pm = self
+            .get_or_create_partition(topic, partition)
+            .map_err(|e| e.to_string())?;
+        let lock_timeout = if lock_timeout_ms > 0 {
+            Some(std::time::Duration::from_millis(lock_timeout_ms as u64))
+        } else {
+            None
+        };
+        self.share_groups.share_fetch(
+            group_id,
+            member_id,
+            topic,
+            partition,
+            max_records as usize,
+            lock_timeout,
+            &pm,
+        )
+    }
+
+    /// Acknowledges records for ShareAcknowledge (or piggybacked on ShareFetch)
+    pub fn share_acknowledge(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        topic: &str,
+        partition: u32,
+        batches: &[crate::protocol::wire::AckBatch],
+    ) -> Result<(), String> {
+        let dlq_writer = |dlq_offsets: &[u64]| {
+            let dlq_topic = format!("{}-dlq", topic);
+            if let Ok(dlq_pm) = self.get_or_create_partition(&dlq_topic, 0) {
+                if let Ok(src_pm) = self.get_or_create_partition(topic, partition) {
+                    for &off in dlq_offsets {
+                        if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
+                            if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
+                                let _ = dlq_pm.produce_frame(&f.payload);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        self.share_groups.share_acknowledge(
+            group_id,
+            member_id,
+            topic,
+            partition,
+            batches,
+            Some(&dlq_writer),
+        )
+    }
+
+    /// Records share group member heartbeat
+    pub fn share_group_heartbeat(&self, group_id: &str, member_id: &str) {
+        self.share_groups.record_heartbeat(group_id, member_id);
+    }
+
+    /// Describes share group state, active members, and tracked metrics
+    pub fn share_group_describe(&self, group_id: &str) -> (String, Vec<String>, usize, u64) {
+        let members = self.share_groups.list_active_members(group_id);
+        let state = if members.is_empty() {
+            "Empty".to_string()
+        } else {
+            "Stable".to_string()
+        };
+        (state, members, 0, 0)
+    }
+
+    /// Sweeps expired acquisition locks and routes poison pills to DLQ
+    pub fn sweep_share_lock_timeouts(&self) {
+        let dlq_writer = |topic: &str, partition: u32, dlq_offsets: &[u64]| {
+            let dlq_topic = format!("{}-dlq", topic);
+            if let Ok(dlq_pm) = self.get_or_create_partition(&dlq_topic, 0) {
+                if let Ok(src_pm) = self.get_or_create_partition(topic, partition) {
+                    for &off in dlq_offsets {
+                        if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
+                            if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
+                                let _ = dlq_pm.produce_frame(&f.payload);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        self.share_groups.sweep_lock_timeouts(Some(&dlq_writer));
     }
 }

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crate::config::EngineConfig;
 use crate::protocol::RecordFrame;
 use crate::segment::SegmentManager;
@@ -109,7 +110,19 @@ pub struct PartitionManager {
     topic: String,
     partition: u32,
     segment_manager: Mutex<SegmentManager>,
-    high_watermark: AtomicU64,
+    /// Log-end-offset: the next offset to be assigned locally. Bumped synchronously on
+    /// every local append (leader produce, replica verbatim-append, control marker).
+    log_end_offset: AtomicU64,
+    /// The real Kafka-style high watermark: the highest offset guaranteed replicated to
+    /// a full ISR quorum. Only advanced explicitly (see `advance_committed_hw`) — never
+    /// implicitly by an append — so fetch/describe can expose only what's actually
+    /// durable across the ISR instead of whatever the leader happens to have on disk.
+    committed_hw: AtomicU64,
+    /// Bytes appended since the last successful `sync()` — the group-commit signal for
+    /// `FlushPolicy::AsyncPeriodic`'s `max_bytes` threshold (previously declared but never
+    /// read anywhere, so periodic flush only ever fired on the timer, never eagerly under
+    /// write pressure). Reset to 0 by every path that actually calls `sync()`.
+    unsynced_bytes: AtomicU64,
     producer_state_manager: Mutex<ProducerStateManager>,
     leader_id: AtomicU32,
     leader_epoch: AtomicU32,
@@ -130,7 +143,11 @@ impl PartitionManager {
         let partition_dir = base_data_dir.as_ref().to_path_buf();
 
         let segment_manager = SegmentManager::open(&partition_dir, config.clone())?;
-        let high_watermark = AtomicU64::new(segment_manager.high_watermark());
+        // Everything already on disk at startup is treated as committed — consistent
+        // with how recovery elsewhere in this codebase already trusts on-disk state.
+        let recovered_offset = segment_manager.high_watermark();
+        let log_end_offset = AtomicU64::new(recovered_offset);
+        let committed_hw = AtomicU64::new(recovered_offset);
         let snapshot_path = partition_dir.join(format!("{}.snapshot", partition));
         let producer_state_manager = ProducerStateManager::open(snapshot_path)?;
 
@@ -138,7 +155,9 @@ impl PartitionManager {
             topic,
             partition,
             segment_manager: Mutex::new(segment_manager),
-            high_watermark,
+            log_end_offset,
+            committed_hw,
+            unsynced_bytes: AtomicU64::new(0),
             producer_state_manager: Mutex::new(producer_state_manager),
             leader_id: AtomicU32::new(config.node_id),
             leader_epoch: AtomicU32::new(0),
@@ -190,14 +209,32 @@ impl PartitionManager {
         self.isr.read().clone()
     }
 
+    /// Returns the log-end-offset: the next offset that will be assigned to a new local
+    /// append. This includes data that may not yet be replicated to the ISR — use
+    /// `high_watermark()` for the committed-only view.
     pub fn latest_offset(&self) -> u64 {
-        self.high_watermark.load(Ordering::Acquire)
+        self.log_end_offset.load(Ordering::Acquire)
     }
 
-    /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame
+    /// Returns the committed high watermark: the highest offset guaranteed replicated to
+    /// a full ISR quorum. Consumers should never be shown data beyond this.
+    pub fn high_watermark(&self) -> u64 {
+        self.committed_hw.load(Ordering::Acquire)
+    }
+
+    /// Monotonically advances the committed high watermark to `candidate` (a no-op if
+    /// `candidate` isn't past the current value).
+    pub fn advance_committed_hw(&self, candidate: u64) {
+        self.committed_hw.fetch_max(candidate, Ordering::AcqRel);
+    }
+
+    /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame.
+    /// Takes `payload` by value as `Bytes` (a cheap refcounted clone at the caller, not a
+    /// copy) so it can be threaded straight through to `SegmentManager::append_with_codec`
+    /// without a redundant `Vec<u8>` allocation on this hot path.
     pub fn produce_frame_eos(
         &self,
-        payload: &[u8],
+        payload: Bytes,
         producer_id: u64,
         epoch: i16,
         sequence: i32,
@@ -224,16 +261,19 @@ impl PartitionManager {
             .as_millis() as u64;
 
         let codec = *self.compression_codec.read();
-        let use_lz4 = codec == crate::config::CompressionCodec::Lz4;
 
         let (frame, rolled) = {
             let mut seg_guard = self.segment_manager.lock();
             let base_before = seg_guard.active_base_offset();
-            let frame = seg_guard.append_with_codec(payload, timestamp, use_lz4)?;
+            let frame = seg_guard.append_with_codec(payload, timestamp, codec)?;
             let base_after = seg_guard.active_base_offset();
 
             let assigned_offset = frame.offset;
-            self.high_watermark
+            // Only LEO advances here. `committed_hw` is deliberately NOT bumped on local
+            // leader append — it only advances once `produce_batch` confirms ISR quorum
+            // (see engine.rs), so a crashed/partitioned leader can never have exposed data
+            // to consumers that no other replica ever received.
+            self.log_end_offset
                 .store(assigned_offset + 1, Ordering::Release);
 
             (frame, base_before != base_after)
@@ -247,20 +287,128 @@ impl PartitionManager {
             let _ = psm.take_snapshot();
         }
 
+        // Note: this function deliberately does NOT sync for `SyncEveryBatch`/
+        // `UnbufferedSync` — `produce_batch` (engine.rs) calls `produce_frame_eos` once
+        // per record in a batch, and syncing here would mean an N-record batch fsyncs N
+        // times instead of once. Callers that write a single record per call (the
+        // `produce_frame()` wrapper — DLQ, offset commits, metadata proposals, etc.) sync
+        // immediately there instead; batched callers sync once via
+        // `flush_if_sync_policy()` after their whole batch completes.
+        let frame_size = frame.encoded_size() as u64;
+        let prev_unsynced = self.unsynced_bytes.fetch_add(frame_size, Ordering::AcqRel);
+        if let crate::config::FlushPolicy::AsyncPeriodic { max_bytes, .. } = &self.flush_policy {
+            let max_bytes = *max_bytes as u64;
+            if max_bytes > 0 && prev_unsynced + frame_size >= max_bytes {
+                let mut seg_guard = self.segment_manager.lock();
+                seg_guard.sync()?;
+                self.unsynced_bytes.store(0, Ordering::Release);
+            }
+        }
+
+        Ok(Ok(frame))
+    }
+
+    /// Appends a record and immediately marks it committed. Used by every internal
+    /// system-partition writer (cluster metadata proposals, DLQ routing, consumer-offset
+    /// commits, transaction-state records, bootstrap) that doesn't itself integrate with
+    /// ISR-quorum gating — unlike `produce_batch`'s per-record use of `produce_frame_eos`
+    /// directly, which leaves `committed_hw` ungated so it can advance only after quorum.
+    pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
+        let f = self.produce_frame_eos(Bytes::copy_from_slice(payload), 0, 0, 0)?;
+        let frame = f.unwrap();
+        self.advance_committed_hw(frame.offset + 1);
+        // Single-record callers (this wrapper) sync immediately under a sync-every-write
+        // policy, same as before this file split fsync out of `produce_frame_eos`.
+        self.flush_if_sync_policy()?;
+        Ok(frame)
+    }
+
+    /// Syncs the segment to disk if the partition's flush policy requires syncing on every
+    /// write. Batched callers (`produce_batch` in engine.rs, which calls
+    /// `produce_frame_eos` directly once per record) should call this ONCE after their
+    /// whole batch, achieving real group-commit instead of one fsync per record.
+    pub fn flush_if_sync_policy(&self) -> IoResult<()> {
         if matches!(
             self.flush_policy,
             crate::config::FlushPolicy::SyncEveryBatch | crate::config::FlushPolicy::UnbufferedSync
         ) {
             let mut seg_guard = self.segment_manager.lock();
             seg_guard.sync()?;
+            self.unsynced_bytes.store(0, Ordering::Release);
         }
-
-        Ok(Ok(frame))
+        Ok(())
     }
 
-    pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
-        let f = self.produce_frame_eos(payload, 0, 0, 0)?;
-        Ok(f.unwrap())
+    /// Appends a frame received from another node (leader push or catch-up fetch) verbatim,
+    /// preserving its original offset/timestamp/magic/CRC exactly rather than reassigning
+    /// them locally. See `SegmentManager::append_verbatim`.
+    pub fn append_replica_frame_verbatim(
+        &self,
+        frame: &RecordFrame,
+    ) -> IoResult<crate::segment::VerbatimAppendResult> {
+        let result = {
+            let mut seg_guard = self.segment_manager.lock();
+            seg_guard.append_verbatim(frame)?
+        };
+
+        if result == crate::segment::VerbatimAppendResult::Appended {
+            self.log_end_offset
+                .store(frame.offset + 1, Ordering::Release);
+            // A follower's own durably-written data is immediately safe for it to serve
+            // to directly-connected consumers (KIP-392 follower fetch) — unlike the
+            // leader, a follower never has to guess whether anyone else has the data,
+            // since committing was the leader's job before this push was ever sent.
+            self.advance_committed_hw(frame.offset + 1);
+
+            // Same group-commit reasoning as `produce_frame_eos`: this is called once per
+            // frame from a replication-push batch that may contain many frames (see
+            // `decode_replication_packet` in handler.rs), so it must not sync here — the
+            // caller syncs once via `flush_if_sync_policy()` after the whole batch.
+            // AsyncPeriodic's byte threshold still applies eagerly per-frame, same as the
+            // local-produce path.
+            let frame_size = frame.encoded_size() as u64;
+            let prev_unsynced = self.unsynced_bytes.fetch_add(frame_size, Ordering::AcqRel);
+            if let crate::config::FlushPolicy::AsyncPeriodic { max_bytes, .. } = &self.flush_policy
+            {
+                let max_bytes = *max_bytes as u64;
+                if max_bytes > 0 && prev_unsynced + frame_size >= max_bytes {
+                    let mut seg_guard = self.segment_manager.lock();
+                    seg_guard.sync()?;
+                    self.unsynced_bytes.store(0, Ordering::Release);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Discards any locally-stored entries at or beyond `offset` (Raft-style conflicting-
+    /// suffix truncation). Also rewinds LEO, and clamps the committed HW down if it had
+    /// advanced past the truncation point (it can never legitimately exceed LEO).
+    pub fn truncate_after(&self, offset: u64) -> IoResult<()> {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.truncate_after(offset)?;
+        self.log_end_offset.store(offset, Ordering::Release);
+        let mut hw = self.committed_hw.load(Ordering::Acquire);
+        while hw > offset {
+            match self.committed_hw.compare_exchange_weak(
+                hw,
+                offset,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => hw = actual,
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes historical segments fully covered by a snapshot at `offset` — see
+    /// `SegmentManager::trim_before`.
+    pub fn trim_before(&self, offset: u64) -> IoResult<usize> {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.trim_before(offset)
     }
 
     /// Appends a control marker to the partition.
@@ -285,8 +433,13 @@ impl PartitionManager {
             )?;
 
             let assigned_offset = frame.offset;
-            self.high_watermark
+            // Control markers (transaction commit/abort boundaries) are leader-internal
+            // bookkeeping, not user-visible records — keep them immediately visible like
+            // before rather than gating them behind ISR quorum, which the transaction
+            // manager's own commit/abort flow doesn't currently integrate with.
+            self.log_end_offset
                 .store(assigned_offset + 1, Ordering::Release);
+            self.advance_committed_hw(assigned_offset + 1);
 
             frame
         };
@@ -304,6 +457,20 @@ impl PartitionManager {
     pub fn fetch(&self, start_offset: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch(start_offset, max_bytes as usize)
+    }
+
+    /// Plans a zero-copy fetch (frame-aligned physical byte range + a cloned file handle)
+    /// for `start_offset`, clamped to the committed high watermark exactly like `fetch`.
+    /// See `SegmentManager::plan_zero_copy_fetch`. The segment lock is held only for the
+    /// duration of this planning call, not for the caller's subsequent network transmit.
+    pub fn plan_zero_copy_fetch(
+        &self,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
+        let hw = self.high_watermark();
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.plan_zero_copy_fetch(start_offset, max_bytes as usize, hw)
     }
 
     /// Reads event records starting from target timestamp
@@ -333,6 +500,39 @@ impl PartitionManager {
         seg_guard.set_cleanup_policy(policy);
     }
 
+    /// Dynamic per-topic config override (Kafka `compression.type` `AlterConfigs`).
+    pub fn set_compression_codec(&self, codec: crate::config::CompressionCodec) {
+        *self.compression_codec.write() = codec;
+    }
+
+    /// Dynamic per-topic config override (Kafka `retention.ms` `AlterConfigs`).
+    /// `None` reverts to no time-based retention for this partition.
+    pub fn set_retention_millis(&self, millis: Option<u64>) {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.set_retention_millis(millis);
+    }
+
+    /// Dynamic per-topic config override (Kafka `retention.bytes` `AlterConfigs`).
+    /// `None` reverts to no size-based retention for this partition.
+    pub fn set_retention_bytes(&self, bytes: Option<u64>) {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.set_retention_bytes(bytes);
+    }
+
+    /// Dynamic per-topic config override (Kafka `delete.retention.ms` `AlterConfigs`).
+    /// `None` disables tombstone expiry — tombstones are kept forever, like any other
+    /// record, once written.
+    pub fn set_delete_retention_millis(&self, millis: Option<u64>) {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.set_delete_retention_millis(millis);
+    }
+
+    /// Dynamic per-topic config override (Kafka `min.cleanable.dirty.ratio` `AlterConfigs`).
+    pub fn set_min_cleanable_dirty_ratio(&self, ratio: f64) {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.set_min_cleanable_dirty_ratio(ratio);
+    }
+
     pub fn cleanup_policy(&self) -> crate::config::CleanupPolicy {
         let seg_guard = self.segment_manager.lock();
         seg_guard.cleanup_policy()
@@ -342,6 +542,8 @@ impl PartitionManager {
     pub fn flush(&self) -> IoResult<()> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.sync()?;
+        drop(seg_guard);
+        self.unsynced_bytes.store(0, Ordering::Release);
         let psm = self.producer_state_manager.lock();
         let _ = psm.take_snapshot();
         Ok(())

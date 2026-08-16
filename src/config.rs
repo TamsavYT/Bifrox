@@ -4,6 +4,79 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// A node's process role(s) — matches Kafka KRaft's `process.roles` (`controller`,
+/// `broker`, or `broker,controller`). A node with only `Controller` participates in the
+/// metadata Raft quorum but never hosts data-topic partitions; a node with only `Broker`
+/// hosts data partitions and replicates `__cluster_metadata` as a non-voting observer but
+/// never contests leadership of it; a node with both (the historical Hermes default)
+/// does everything, same as today's combined-mode behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcessRole {
+    Controller,
+    Broker,
+}
+
+impl std::str::FromStr for ProcessRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "controller" => Ok(ProcessRole::Controller),
+            "broker" => Ok(ProcessRole::Broker),
+            _ => Err(format!("Unknown process role: '{}'", s)),
+        }
+    }
+}
+
+/// Parses a comma-separated `process.roles` value (e.g. `"broker,controller"`,
+/// `"controller"`, `"broker"`) the way Kafka's own config does. An empty/unparseable
+/// value falls back to combined mode (both roles) — the historical Hermes default,
+/// so existing configs that never set this keep working unchanged.
+pub fn parse_process_roles(s: &str) -> Vec<ProcessRole> {
+    let roles: Vec<ProcessRole> = s
+        .split(',')
+        .filter_map(|part| part.parse::<ProcessRole>().ok())
+        .collect();
+    if roles.is_empty() {
+        vec![ProcessRole::Controller, ProcessRole::Broker]
+    } else {
+        roles
+    }
+}
+
+impl ProcessRole {
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ProcessRole::Controller => 1,
+            ProcessRole::Broker => 2,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(ProcessRole::Controller),
+            2 => Some(ProcessRole::Broker),
+            _ => None,
+        }
+    }
+}
+
+pub fn roles_to_bytes(roles: &[ProcessRole]) -> Vec<u8> {
+    roles.iter().map(|r| r.to_byte()).collect()
+}
+
+/// Inverse of `roles_to_bytes`. Empty or all-unrecognized input means "unknown" and maps
+/// to combined mode (both roles) — matches how `BrokerRegister` records written before
+/// this field existed are interpreted on replay.
+pub fn parse_process_role_bytes(bytes: &[u8]) -> Vec<ProcessRole> {
+    let roles: Vec<ProcessRole> = bytes.iter().filter_map(|&b| ProcessRole::from_byte(b)).collect();
+    if roles.is_empty() {
+        vec![ProcessRole::Controller, ProcessRole::Broker]
+    } else {
+        roles
+    }
+}
+
 /// WAL Durability Flush Policy
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlushPolicy {
@@ -33,6 +106,21 @@ pub enum CompressionCodec {
     #[default]
     None = 0,
     Lz4 = 1,
+    Zstd = 2,
+}
+
+impl std::str::FromStr for CompressionCodec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_lowercase();
+        match normalized.as_str() {
+            "none" | "" | "uncompressed" | "producer" => Ok(CompressionCodec::None),
+            "lz4" => Ok(CompressionCodec::Lz4),
+            "zstd" => Ok(CompressionCodec::Zstd),
+            _ => Err(format!("Unknown compression.type: '{}'", s)),
+        }
+    }
 }
 
 /// Topic and Server Log Cleanup Policy (Kafka cleanup.policy)
@@ -199,6 +287,42 @@ pub struct EngineConfig {
     pub metrics_auth_token: Option<String>,
     /// Optional network IP whitelist for Prometheus metrics scrape endpoint
     pub metrics_allowed_ips: Vec<String>,
+    /// How long a replica may go without acknowledging a replicated write before the
+    /// partition leader drops it from the ISR (Kafka `replica.lag.time.max.ms`).
+    pub replica_lag_max_ms: u64,
+    /// How often the ISR-membership and broker-liveness sweep runs.
+    pub isr_check_interval_ms: u64,
+    /// How long a broker may go without a heartbeat ACK before the cluster leader
+    /// considers it dead and, for any partition it currently leads, elects a new leader
+    /// from the remaining ISR.
+    pub broker_down_threshold_ms: u64,
+    /// Whether a partition may fail over to a replica outside the last-known ISR when no
+    /// in-sync replica survives a leader's death (Kafka `unclean.leader.election.enable`).
+    /// Defaults to false: an unrecoverable partition is left leaderless rather than
+    /// silently accepting data loss.
+    pub allow_unclean_leader_election: bool,
+    /// This node's process role(s) — Kafka KRaft's `process.roles`. Defaults to both
+    /// (combined mode, today's historical behavior).
+    pub roles: Vec<ProcessRole>,
+    /// The subset of `peer_addrs` that are controller-eligible (participate in the
+    /// metadata Raft quorum) — Kafka's `controller.quorum.voters`. Only meaningful when
+    /// this node itself has the `Controller` role. Empty means "assume every peer is
+    /// controller-eligible", which matches combined-mode clusters where every node votes.
+    pub controller_peer_addrs: Vec<String>,
+    /// How long a tombstone (a compacted-topic record whose value is empty — Hermes's
+    /// convention for a Kafka-style "delete marker") is kept as the latest record for its
+    /// key before log compaction erases the key entirely (Kafka `delete.retention.ms`).
+    /// `None` disables tombstone expiry: tombstones are kept forever, same as any other
+    /// record, once written (today's behavior).
+    pub delete_retention_millis: Option<u64>,
+    /// Minimum fraction of a historical segment's bytes that must be "dirty" (superseded
+    /// by a newer record for the same key) before log compaction will rewrite that segment
+    /// (Kafka `min.cleanable.dirty.ratio`). Segments below this ratio are left untouched on
+    /// a given compaction pass, avoiding low-value rewrite I/O.
+    pub min_cleanable_dirty_ratio: f64,
+    /// Maximum number of partitions whose retention/compaction pass may run concurrently
+    /// within a single GC tick (Kafka `log.cleaner.threads`).
+    pub compaction_worker_threads: usize,
 }
 
 impl Default for EngineConfig {
@@ -237,6 +361,49 @@ impl Default for EngineConfig {
             metrics_bind_addr: None,
             metrics_auth_token: None,
             metrics_allowed_ips: Vec::new(),
+            replica_lag_max_ms: 10_000,
+            isr_check_interval_ms: 2_000,
+            broker_down_threshold_ms: 30_000,
+            allow_unclean_leader_election: false,
+            roles: vec![ProcessRole::Controller, ProcessRole::Broker],
+            controller_peer_addrs: Vec::new(),
+            delete_retention_millis: Some(24 * 60 * 60 * 1000), // 24 hours, matches Kafka's default
+            min_cleanable_dirty_ratio: 0.5,                     // matches Kafka's default
+            compaction_worker_threads: 4,
+        }
+    }
+}
+
+impl EngineConfig {
+    pub fn is_controller_role(&self) -> bool {
+        self.roles.contains(&ProcessRole::Controller)
+    }
+
+    pub fn is_broker_role(&self) -> bool {
+        self.roles.contains(&ProcessRole::Broker)
+    }
+
+    /// The peers this node should treat as controller-eligible for Raft election/
+    /// heartbeat purposes.
+    ///
+    /// An empty `controller_peer_addrs` is ambiguous on its own — it could mean "not
+    /// configured, please infer it" or "there are genuinely zero peer controllers" (a
+    /// real, valid topology: one controller node plus N broker-only nodes). To resolve
+    /// that: the fallback to `peer_addrs` verbatim (today's combined-mode assumption,
+    /// where every peer votes) only applies when this node's own `roles` is still the
+    /// untouched default (both Controller and Broker) — i.e. an existing config that
+    /// never mentions either new field keeps working exactly as before. The moment an
+    /// operator opts into role separation (`roles` is anything other than the default),
+    /// `controller_peer_addrs` is taken literally, empty included, so a lone controller
+    /// with only broker-only peers correctly computes a quorum of one instead of
+    /// mistaking its brokers for fellow voters.
+    pub fn effective_controller_peer_addrs(&self) -> Vec<String> {
+        let is_default_combined_roles =
+            self.roles.contains(&ProcessRole::Controller) && self.roles.contains(&ProcessRole::Broker);
+        if self.controller_peer_addrs.is_empty() && is_default_combined_roles {
+            self.peer_addrs.clone()
+        } else {
+            self.controller_peer_addrs.clone()
         }
     }
 }
@@ -341,10 +508,8 @@ impl EngineConfig {
                         }
                     }
                     "compression.type" => {
-                        if value.eq_ignore_ascii_case("lz4") {
-                            config.compression_codec = CompressionCodec::Lz4;
-                        } else {
-                            config.compression_codec = CompressionCodec::None;
+                        if let Ok(codec) = value.parse::<CompressionCodec>() {
+                            config.compression_codec = codec;
                         }
                     }
                     "index.interval.bytes" => {
@@ -357,6 +522,25 @@ impl EngineConfig {
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    // Kafka KRaft's `process.roles`: "controller", "broker", or
+                    // "broker,controller" (order doesn't matter). Unset/unrecognized
+                    // falls back to combined mode (both roles) — see
+                    // `parse_process_roles`.
+                    "process.roles" => {
+                        config.roles = parse_process_roles(value);
+                    }
+                    // Kafka KRaft's `controller.quorum.voters`: normally
+                    // `id1@host1:port1,id2@host2:port2,...`; Hermes only needs the
+                    // host:port half for peer targeting, so the optional `id@` prefix is
+                    // accepted and discarded if present.
+                    "controller.quorum.voters" => {
+                        config.controller_peer_addrs = value
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.split('@').next_back().unwrap_or(s).to_string())
                             .collect();
                     }
                     "min.insync.replicas" => {
@@ -377,6 +561,21 @@ impl EngineConfig {
                     "retention.millis" | "log.retention.ms" => {
                         if let Ok(v) = value.parse() {
                             config.retention_millis = Some(v);
+                        }
+                    }
+                    "delete.retention.ms" => {
+                        if let Ok(v) = value.parse() {
+                            config.delete_retention_millis = Some(v);
+                        }
+                    }
+                    "min.cleanable.dirty.ratio" => {
+                        if let Ok(v) = value.parse() {
+                            config.min_cleanable_dirty_ratio = v;
+                        }
+                    }
+                    "log.cleaner.threads" => {
+                        if let Ok(v) = value.parse::<usize>() {
+                            config.compaction_worker_threads = v.max(1);
                         }
                     }
                     "cleanup.policy" | "log.cleanup.policy" => {

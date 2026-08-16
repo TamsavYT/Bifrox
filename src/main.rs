@@ -64,6 +64,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("  Segment Size Limit: {} bytes", config.max_segment_bytes);
     tracing::info!("  Peer Nodes (HA):    {:?}", config.peer_addrs);
     tracing::info!("  Min ISR Replicas:   {}", config.min_insync_replicas);
+    tracing::info!("  Process Roles:      {:?}", config.roles);
+    if !config.controller_peer_addrs.is_empty() {
+        tracing::info!(
+            "  Controller Quorum:  {:?}",
+            config.controller_peer_addrs
+        );
+    }
+    if config.is_controller_role() && !config.is_broker_role() {
+        tracing::info!("  Deployment Mode:    Controller-only (metadata quorum, no data partitions)");
+    } else if config.is_broker_role() && !config.is_controller_role() {
+        tracing::info!("  Deployment Mode:    Broker-only (data partitions, never metadata leader)");
+    } else {
+        tracing::info!("  Deployment Mode:    Combined (controller + broker, historical default)");
+    }
     if config.role == hermes::NodeRole::Leader {
         tracing::info!("  Behavior:           Handles produces, replicates to followers");
     } else {

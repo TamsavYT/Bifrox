@@ -131,6 +131,19 @@ impl IndexSegment {
         }
     }
 
+    /// Drops all entries at or beyond `offset` (used for Raft-style conflicting-suffix
+    /// truncation when a follower's log diverges from the leader's).
+    pub fn truncate_after(&mut self, offset: u64) -> IoResult<()> {
+        let rel_cutoff = offset.saturating_sub(self.base_offset) as u32;
+        let kept: Vec<IndexEntry> = self
+            .entries
+            .iter()
+            .copied()
+            .filter(|e| (e.relative_offset as u64) < (rel_cutoff as u64))
+            .collect();
+        self.truncate_and_rebuild(kept)
+    }
+
     /// Rebuilds index file from scratch (used during crash recovery)
     pub fn truncate_and_rebuild(&mut self, new_entries: Vec<IndexEntry>) -> IoResult<()> {
         self.file.set_len(0)?;

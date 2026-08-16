@@ -43,6 +43,13 @@ pub enum CommandCode {
     SetClientId = 0x24,
     UpsertScramUser = 0x25,
     DeleteScramUser = 0x26,
+    ShareFetch = 0x27,
+    ShareAcknowledge = 0x28,
+    ShareGroupHeartbeat = 0x29,
+    ShareGroupDescribe = 0x2A,
+    DescribeConfigs = 0x2B,
+    AlterConfigs = 0x2C,
+    IncrementalAlterConfigs = 0x2D,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -88,6 +95,13 @@ impl TryFrom<u8> for CommandCode {
             0x24 => Ok(CommandCode::SetClientId),
             0x25 => Ok(CommandCode::UpsertScramUser),
             0x26 => Ok(CommandCode::DeleteScramUser),
+            0x27 => Ok(CommandCode::ShareFetch),
+            0x28 => Ok(CommandCode::ShareAcknowledge),
+            0x29 => Ok(CommandCode::ShareGroupHeartbeat),
+            0x2A => Ok(CommandCode::ShareGroupDescribe),
+            0x2B => Ok(CommandCode::DescribeConfigs),
+            0x2C => Ok(CommandCode::AlterConfigs),
+            0x2D => Ok(CommandCode::IncrementalAlterConfigs),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -284,6 +298,88 @@ pub enum RequestPayload {
     DeleteScramUser {
         username: String,
     },
+    ShareFetch {
+        group_id: String,
+        member_id: String,
+        topic: String,
+        partition: u32,
+        max_records: u32,
+        max_bytes: u32,
+        lock_timeout_ms: u32,
+        acknowledgements: Vec<AckBatch>,
+    },
+    ShareAcknowledge {
+        group_id: String,
+        member_id: String,
+        topic: String,
+        partition: u32,
+        acknowledgements: Vec<AckBatch>,
+    },
+    ShareGroupHeartbeat {
+        group_id: String,
+        member_id: String,
+    },
+    ShareGroupDescribe {
+        group_id: String,
+    },
+    DescribeConfigs {
+        topic: String,
+    },
+    /// Full-replace semantics (Kafka `AlterConfigs`): the given configs entirely replace
+    /// the topic's stored config map.
+    AlterConfigs {
+        topic: String,
+        configs: Vec<(String, String)>,
+    },
+    /// Merge semantics (Kafka `IncrementalAlterConfigs`): `upserts` are set/overwritten,
+    /// `deletes` are removed, everything else in the topic's current config map is left
+    /// untouched.
+    IncrementalAlterConfigs {
+        topic: String,
+        upserts: Vec<(String, String)>,
+        deletes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AcknowledgeType {
+    Accept = 1,
+    Release = 2,
+    Reject = 3,
+    Renew = 4,
+}
+
+impl TryFrom<u8> for AcknowledgeType {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(AcknowledgeType::Accept),
+            2 => Ok(AcknowledgeType::Release),
+            3 => Ok(AcknowledgeType::Reject),
+            4 => Ok(AcknowledgeType::Renew),
+            _ => Err(WireError::InvalidProtocol(format!(
+                "Unknown acknowledge type: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckBatch {
+    pub first_offset: u64,
+    pub last_offset: u64,
+    pub ack_type: AcknowledgeType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquiredRecordBatch {
+    pub first_offset: u64,
+    pub last_offset: u64,
+    pub delivery_count: u16,
+    pub records: Vec<crate::protocol::RecordFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -911,6 +1007,162 @@ impl WireRequest {
                 let username = read_pascal_string(&mut payload_buf)?;
                 RequestPayload::DeleteScramUser { username }
             }
+            CommandCode::ShareFetch => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 16 {
+                    return Err(WireError::Incomplete {
+                        needed: 16,
+                        available: payload_buf.len(),
+                    });
+                }
+                let partition = payload_buf.get_u32();
+                let max_records = payload_buf.get_u32();
+                let max_bytes = payload_buf.get_u32();
+                let lock_timeout_ms = payload_buf.get_u32();
+
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let ack_count = payload_buf.get_u32() as usize;
+                if payload_buf.len() < ack_count * 17 {
+                    return Err(WireError::Incomplete {
+                        needed: ack_count * 17,
+                        available: payload_buf.len(),
+                    });
+                }
+                let mut acknowledgements = Vec::with_capacity(ack_count);
+                for _ in 0..ack_count {
+                    let first_offset = payload_buf.get_u64();
+                    let last_offset = payload_buf.get_u64();
+                    let ack_type_raw = payload_buf.get_u8();
+                    let ack_type = AcknowledgeType::try_from(ack_type_raw)?;
+                    acknowledgements.push(AckBatch {
+                        first_offset,
+                        last_offset,
+                        ack_type,
+                    });
+                }
+
+                RequestPayload::ShareFetch {
+                    group_id,
+                    member_id,
+                    topic,
+                    partition,
+                    max_records,
+                    max_bytes,
+                    lock_timeout_ms,
+                    acknowledgements,
+                }
+            }
+            CommandCode::ShareAcknowledge => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 8 {
+                    return Err(WireError::Incomplete {
+                        needed: 8,
+                        available: payload_buf.len(),
+                    });
+                }
+                let partition = payload_buf.get_u32();
+                let ack_count = payload_buf.get_u32() as usize;
+                if payload_buf.len() < ack_count * 17 {
+                    return Err(WireError::Incomplete {
+                        needed: ack_count * 17,
+                        available: payload_buf.len(),
+                    });
+                }
+                let mut acknowledgements = Vec::with_capacity(ack_count);
+                for _ in 0..ack_count {
+                    let first_offset = payload_buf.get_u64();
+                    let last_offset = payload_buf.get_u64();
+                    let ack_type_raw = payload_buf.get_u8();
+                    let ack_type = AcknowledgeType::try_from(ack_type_raw)?;
+                    acknowledgements.push(AckBatch {
+                        first_offset,
+                        last_offset,
+                        ack_type,
+                    });
+                }
+
+                RequestPayload::ShareAcknowledge {
+                    group_id,
+                    member_id,
+                    topic,
+                    partition,
+                    acknowledgements,
+                }
+            }
+            CommandCode::ShareGroupHeartbeat => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                let member_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::ShareGroupHeartbeat {
+                    group_id,
+                    member_id,
+                }
+            }
+            CommandCode::ShareGroupDescribe => {
+                let group_id = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::ShareGroupDescribe { group_id }
+            }
+            CommandCode::DescribeConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DescribeConfigs { topic }
+            }
+            CommandCode::AlterConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let count = payload_buf.get_u32() as usize;
+                let mut configs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let key = read_pascal_string(&mut payload_buf)?;
+                    let value = read_pascal_string(&mut payload_buf)?;
+                    configs.push((key, value));
+                }
+                RequestPayload::AlterConfigs { topic, configs }
+            }
+            CommandCode::IncrementalAlterConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let upsert_count = payload_buf.get_u32() as usize;
+                let mut upserts = Vec::with_capacity(upsert_count);
+                for _ in 0..upsert_count {
+                    let key = read_pascal_string(&mut payload_buf)?;
+                    let value = read_pascal_string(&mut payload_buf)?;
+                    upserts.push((key, value));
+                }
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let delete_count = payload_buf.get_u32() as usize;
+                let mut deletes = Vec::with_capacity(delete_count);
+                for _ in 0..delete_count {
+                    deletes.push(read_pascal_string(&mut payload_buf)?);
+                }
+                RequestPayload::IncrementalAlterConfigs {
+                    topic,
+                    upserts,
+                    deletes,
+                }
+            }
         };
 
         let total_consumed = 5 + payload_len;
@@ -1035,6 +1287,59 @@ pub fn encode_offset_fetch_response(offset: u64, metadata: &str) -> Vec<u8> {
     buf
 }
 
+/// Encodes DescribeConfigs binary payload: `[Count: 4b] { [Key: pascal] [Value: pascal] }...`
+pub fn encode_describe_configs_response(configs: &[(String, String)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.put_u32(configs.len() as u32);
+    for (key, value) in configs {
+        write_pascal_string(&mut buf, key);
+        write_pascal_string(&mut buf, value);
+    }
+    buf
+}
+
+/// Encodes ShareFetch binary payload: `[NumBatches: 4b] | { [FirstOffset: 8b] | [LastOffset: 8b] | [DeliveryCount: 2b] | [RecordsLen: 4b] | [RecordFrames...] }...`
+pub fn encode_share_fetch_response(batches: &[AcquiredRecordBatch]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.put_u32(batches.len() as u32);
+    for batch in batches {
+        buf.put_u64(batch.first_offset);
+        buf.put_u64(batch.last_offset);
+        buf.put_u16(batch.delivery_count);
+        buf.put_u32(batch.records.len() as u32);
+        for frame in &batch.records {
+            frame.encode_into(&mut buf);
+        }
+    }
+    buf
+}
+
+/// Encodes ShareAcknowledge binary payload: `[ErrorCode: 2b] | [ErrorMessage: pascal]`
+pub fn encode_share_acknowledge_response(error_code: i16, error_msg: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.put_i16(error_code);
+    write_pascal_string(&mut buf, error_msg.unwrap_or(""));
+    buf
+}
+
+/// Encodes ShareGroupDescribe binary payload: `[State: pascal] | [MemberCount: 4b] | { [MemberID: pascal] }... | [InFlightCount: 8b] | [StartOffset: 8b]`
+pub fn encode_share_group_describe_response(
+    state: &str,
+    active_members: &[String],
+    inflight_count: usize,
+    start_offset: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_pascal_string(&mut buf, state);
+    buf.put_u32(active_members.len() as u32);
+    for member in active_members {
+        write_pascal_string(&mut buf, member);
+    }
+    buf.put_u64(inflight_count as u64);
+    buf.put_u64(start_offset);
+    buf
+}
+
 /// Binary response returned to clients over TCP: `[Status Code: 1b] | [Payload Len: 4b] | [Payload]`
 #[derive(Debug)]
 pub struct WireResponse {
@@ -1060,5 +1365,14 @@ impl WireResponse {
         buf.put_u32(self.payload.len() as u32);
         buf.put_slice(&self.payload);
         buf
+    }
+
+    /// Same encoding as `encode()`, but writes into a caller-supplied buffer instead of
+    /// allocating a fresh `Vec` — lets a connection loop reuse one scratch buffer across
+    /// every request/response round trip instead of allocating one per response.
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        buf.put_u8(self.status);
+        buf.put_u32(self.payload.len() as u32);
+        buf.put_slice(&self.payload);
     }
 }

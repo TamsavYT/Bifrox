@@ -111,4 +111,23 @@ impl TxnIndexSegment {
     pub fn sync(&mut self) -> IoResult<()> {
         self.file.sync_data()
     }
+
+    /// Drops aborted-txn ranges starting at or beyond `offset` (Raft-style conflict truncation).
+    pub fn truncate_after(&mut self, offset: u64) -> IoResult<()> {
+        let kept: Vec<TxnIndexEntry> = self
+            .entries
+            .iter()
+            .copied()
+            .filter(|e| e.first_offset < offset)
+            .collect();
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.entries.clear();
+        for entry in kept {
+            let encoded = entry.encode();
+            self.file.write_all(&encoded)?;
+            self.entries.push(entry);
+        }
+        self.file.sync_data()
+    }
 }
