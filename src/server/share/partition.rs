@@ -142,9 +142,13 @@ impl SharePartition {
                     batch.delivery_count += 1;
 
                     // Fetch records from partition manager
-                    if let Ok(frames) = partition_manager.fetch(batch.first_offset, 10 * 1024 * 1024) {
+                    if let Ok(frames) =
+                        partition_manager.fetch(batch.first_offset, 10 * 1024 * 1024)
+                    {
                         for frame in frames {
-                            if frame.offset >= batch.first_offset && frame.offset <= batch.last_offset {
+                            if frame.offset >= batch.first_offset
+                                && frame.offset <= batch.last_offset
+                            {
                                 acquired_infos.push(AcquiredRecordInfo {
                                     offset: frame.offset,
                                     delivery_count: batch.delivery_count,
@@ -180,9 +184,13 @@ impl SharePartition {
                         delivery_count: batch.delivery_count,
                     };
 
-                    if let Ok(frames) = partition_manager.fetch(acquired_batch.first_offset, 10 * 1024 * 1024) {
+                    if let Ok(frames) =
+                        partition_manager.fetch(acquired_batch.first_offset, 10 * 1024 * 1024)
+                    {
                         for frame in frames {
-                            if frame.offset >= acquired_batch.first_offset && frame.offset <= acquired_batch.last_offset {
+                            if frame.offset >= acquired_batch.first_offset
+                                && frame.offset <= acquired_batch.last_offset
+                            {
                                 acquired_infos.push(AcquiredRecordInfo {
                                     offset: frame.offset,
                                     delivery_count: acquired_batch.delivery_count,
@@ -192,7 +200,8 @@ impl SharePartition {
                         }
                     }
 
-                    new_acquired_ranges.push((acquired_batch.first_offset, acquired_batch.last_offset));
+                    new_acquired_ranges
+                        .push((acquired_batch.first_offset, acquired_batch.last_offset));
                     batches.insert(acquired_batch.first_offset, acquired_batch);
                     batches.insert(remainder_batch.first_offset, remainder_batch);
                 }
@@ -239,7 +248,8 @@ impl SharePartition {
                     }
 
                     new_acquired_ranges.push((first_offset, last_offset));
-                    self.next_fetch_offset.store(last_offset + 1, Ordering::SeqCst);
+                    self.next_fetch_offset
+                        .store(last_offset + 1, Ordering::SeqCst);
                 }
             }
         }
@@ -385,7 +395,10 @@ impl SharePartition {
         // Quick lock-free or read-lock check first
         let should_sweep = {
             let timers = self.timers.read();
-            timers.peek().map(|Reverse(t)| t.expire_at <= now).unwrap_or(false)
+            timers
+                .peek()
+                .map(|Reverse(t)| t.expire_at <= now)
+                .unwrap_or(false)
         };
         if should_sweep {
             self.sweep_timers_internal(now);

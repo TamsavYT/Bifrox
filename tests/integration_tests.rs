@@ -2407,9 +2407,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
 
 #[tokio::test]
 async fn test_scenario_31_share_consumer_and_queue_semantics() {
-    use hermes::{
-        AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest,
-    };
+    use hermes::{AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -2570,7 +2568,10 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
     assert_eq!(ack_resp2.status, 0);
 
     // Verify DLQ topic has the rejected record
-    let dlq_frames = env.engine.fetch("share-queue-topic-dlq", 0, 0, 1024).unwrap();
+    let dlq_frames = env
+        .engine
+        .fetch("share-queue-topic-dlq", 0, 0, 1024)
+        .unwrap();
     assert_eq!(dlq_frames.len(), 1);
     assert_eq!(dlq_frames[0].payload.as_ref(), b"share-msg-1");
 
@@ -2672,10 +2673,7 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
         .share_groups()
         .get_or_create_partition(group_id, topic, 0);
     // All offsets 0..=5 were acknowledged or archived, so start_offset is 6
-    assert_eq!(
-        sp.start_offset.load(std::sync::atomic::Ordering::SeqCst),
-        6
-    );
+    assert_eq!(sp.start_offset.load(std::sync::atomic::Ordering::SeqCst), 6);
 }
 
 fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
