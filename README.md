@@ -213,18 +213,6 @@ Hermes is actively hardened for Windows:
 - Windows CI coverage
 - Windows packaging notes in [packaging/windows/README.md](packaging/windows/README.md)
 
-If Windows is your primary target, also review:
-
-- [HERMES_TESTING_GUIDE.md](HERMES_TESTING_GUIDE.md)
-- [PRODUCTION_REVIEW.md](PRODUCTION_REVIEW.md)
-
-## Client and agent references
-
-- Main client reference:
-  [docs/HERMES_CLIENT_CREATOR_REFERENCE.md](docs/HERMES_CLIENT_CREATOR_REFERENCE.md)
-- Java SDK roadmap:
-  [docs/HERMES_JAVA_SDK_ROADMAP.md](docs/HERMES_JAVA_SDK_ROADMAP.md)
-
 ## Testing and quality checks
 
 ```powershell
