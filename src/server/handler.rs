@@ -26,6 +26,28 @@ const MAX_CLIENT_ID_LEN: usize = 256;
 
 const SCRAM_SERVER_NONCE_LEN: usize = 18;
 
+/// Exposes the underlying plain `TcpStream` for zero-copy transmit (`TransmitFile`/
+/// `sendfile`), when there is one. TLS connections are never eligible — the kernel copy
+/// primitives stream raw bytes straight from disk to the socket, bypassing user space
+/// entirely, which would skip encryption. `handle_connection_stream<S>` is generic over
+/// both plain and TLS-wrapped sockets, so this trait lets the zero-copy fetch path opt in
+/// only for the plain case without duplicating the whole connection loop.
+pub trait AsPlainTcpStream {
+    fn as_plain_tcp_stream(&mut self) -> Option<&mut TcpStream>;
+}
+
+impl AsPlainTcpStream for TcpStream {
+    fn as_plain_tcp_stream(&mut self) -> Option<&mut TcpStream> {
+        Some(self)
+    }
+}
+
+impl AsPlainTcpStream for tokio_rustls::server::TlsStream<TcpStream> {
+    fn as_plain_tcp_stream(&mut self) -> Option<&mut TcpStream> {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScramSession {
     username: String,
@@ -61,7 +83,7 @@ impl<'a> Drop for ConnectionGuard<'a> {
 
 pub async fn handle_connection_stream<S>(mut socket: S, engine: StorageEngine, peer_addr: String)
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + AsPlainTcpStream,
 {
     engine.metrics().record_connection_open();
     let _conn_guard = ConnectionGuard(&engine);
@@ -127,6 +149,9 @@ where
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
+    // Reused across every request/response round trip on this connection instead of
+    // allocating a fresh Vec per response (see `WireResponse::encode_into`).
+    let mut response_scratch = bytes::BytesMut::new();
 
     loop {
         let n = match socket.read(&mut buffer[filled..]).await {
@@ -148,6 +173,38 @@ where
             let slice = &buffer[consumed..filled];
             if slice.is_empty() {
                 break;
+            }
+
+            // gRPC-style replication-fetch packets (Kafka-style follower pull) are framed
+            // as `[u32 total_len][0xBB ...]` — a length-prefixed request/response pair
+            // built for a standalone connection (see `send_grpc_replication_fetch`) —
+            // rather than a raw leading magic byte like the other inter-node packet types
+            // below. They need to be detected by peeking past the length prefix, before
+            // the magic-byte dispatch that follows.
+            if slice.len() >= 5 && slice[4] == crate::replication::GRPC_REPLICATION_MAGIC {
+                match decode_grpc_replication_fetch_packet(&engine, slice) {
+                    Ok((bytes_used, response)) => {
+                        consumed += bytes_used;
+                        if let Err(e) = socket.write_all(&response).await {
+                            tracing::error!(
+                                "Failed to send gRPC replication fetch response to {}: {}",
+                                peer_addr,
+                                e
+                            );
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(PacketError::NeedMoreData) => break,
+                    Err(PacketError::Fatal(msg)) => {
+                        tracing::warn!(
+                            "Malformed gRPC replication fetch packet from {}: {}",
+                            peer_addr,
+                            msg
+                        );
+                        return;
+                    }
+                }
             }
 
             let first_byte = slice[0];
@@ -252,6 +309,8 @@ where
                                     | RequestPayload::DeleteAcls { .. }
                                     | RequestPayload::UpsertScramUser { .. }
                                     | RequestPayload::DeleteScramUser { .. }
+                                    | RequestPayload::AlterConfigs { .. }
+                                    | RequestPayload::IncrementalAlterConfigs { .. }
                             );
 
                             if let Some((topic, partition)) = target_partition {
@@ -327,7 +386,9 @@ where
                                         &mut scram_session,
                                     )
                                     .await;
-                                    if let Err(e) = socket.write_all(&response.encode()).await {
+                                    response_scratch.clear();
+                                    response.encode_into(&mut response_scratch);
+                                    if let Err(e) = socket.write_all(&response_scratch).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",
                                             peer_addr,
@@ -391,23 +452,75 @@ where
                                 }
                             } else {
                                 consumed += bytes_used;
-                                let response = process_request(
-                                    &engine,
-                                    req,
-                                    &client_key,
-                                    &mut client_principal,
-                                    &client_key,
-                                    &mut logical_client_id,
-                                    &mut scram_session,
-                                )
-                                .await;
-                                if let Err(e) = socket.write_all(&response.encode()).await {
-                                    tracing::error!(
-                                        "Failed to send response to {}: {}",
-                                        peer_addr,
-                                        e
-                                    );
-                                    return;
+
+                                // Zero-copy fast path: plain `Fetch` requests on a plain
+                                // (non-TLS) TCP connection can be served by streaming the
+                                // exact on-disk frame bytes straight to the socket via the
+                                // kernel (`TransmitFile`/`sendfile`) instead of going
+                                // through `process_request`'s buffered
+                                // read-into-Vec-then-encode path. Any ineligible case
+                                // (TLS, multi-segment span, offset beyond the high
+                                // watermark, unsupported OS) falls straight through to the
+                                // normal buffered handling below — this is purely an
+                                // optimization, never a behavior change.
+                                let mut zero_copy_handled = false;
+                                #[cfg(any(windows, target_os = "linux"))]
+                                if let RequestPayload::Fetch {
+                                    topic,
+                                    partition,
+                                    offset,
+                                    max_bytes,
+                                } = &req.payload
+                                {
+                                    if let Some(raw_socket) = socket.as_plain_tcp_stream() {
+                                        match try_zero_copy_fetch(
+                                            &engine,
+                                            raw_socket,
+                                            topic,
+                                            *partition,
+                                            *offset,
+                                            *max_bytes,
+                                            &client_principal,
+                                            &client_key,
+                                            &logical_client_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => zero_copy_handled = true,
+                                            Ok(false) => {}
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Zero-copy fetch transmit failed for {}: {}",
+                                                    peer_addr,
+                                                    e
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !zero_copy_handled {
+                                    let response = process_request(
+                                        &engine,
+                                        req,
+                                        &client_key,
+                                        &mut client_principal,
+                                        &client_key,
+                                        &mut logical_client_id,
+                                        &mut scram_session,
+                                    )
+                                    .await;
+                                    response_scratch.clear();
+                                    response.encode_into(&mut response_scratch);
+                                    if let Err(e) = socket.write_all(&response_scratch).await {
+                                        tracing::error!(
+                                            "Failed to send response to {}: {}",
+                                            peer_addr,
+                                            e
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -526,6 +639,7 @@ async fn forward_to_leader(
 }
 
 /// Internal error type for packet decoding
+#[derive(Debug)]
 enum PacketError {
     NeedMoreData,
     Fatal(String),
@@ -614,6 +728,19 @@ fn decode_vote_request_packet(
         return Ok((bytes_consumed, vec![0x00]));
     }
 
+    // A broker-only node is never part of the metadata Raft quorum — it must not grant
+    // votes even if asked, both because it isn't counted in any controller's quorum math
+    // (see `ClusterConfig::effective_controller_peer_addrs`) and as defense in depth
+    // against a misconfigured/malicious peer trying to inflate a candidate's vote count
+    // with a voter that was never supposed to be eligible.
+    if !engine.config().is_controller_role() {
+        tracing::warn!(
+            "VoteRequest: Rejected — this node has no Controller role, candidate {} denied",
+            candidate_id
+        );
+        return Ok((bytes_consumed, vec![0x00]));
+    }
+
     // §5.4.1: our own last-applied `__cluster_metadata` index is the log-completeness
     // yardstick. get_or_create_partition never fails for a valid static topic name, but
     // fall back to "empty log" (0) rather than propagating an I/O error into vote denial.
@@ -651,6 +778,87 @@ fn decode_vote_request_packet(
         );
         Ok((bytes_consumed, vec![0x00]))
     }
+}
+
+/// Decodes and serves a Kafka-style follower pull/FETCH request (gRPC magic `0xBB`).
+///
+/// This is the leader side of `start_per_partition_fetcher_manager`'s per-partition fetch
+/// loop: a follower asks for everything from `fetch_offset` onward, and receives raw
+/// frames up to the partition's log end offset (LEO) — *not* clamped to the committed high
+/// watermark, since replication delivery is what lets the high watermark advance in the
+/// first place; clamping here would deadlock it.
+///
+/// Every successful fetch also records the follower's confirmed progress into the exact
+/// same `replica_watermarks`/`replica_ack_time` maps `replicate_batch`'s push-ack path
+/// updates (`ReplicationManager::update_replica_watermark`) — `await_isr_quorum` and the
+/// ISR-membership sweep read those maps and need no changes regardless of which mechanism
+/// is actually delivering the data.
+fn decode_grpc_replication_fetch_packet(
+    engine: &StorageEngine,
+    src: &[u8],
+) -> Result<(usize, Vec<u8>), PacketError> {
+    if src.len() < 4 {
+        return Err(PacketError::NeedMoreData);
+    }
+    let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+    if src.len() < 4 + payload_len {
+        return Err(PacketError::NeedMoreData);
+    }
+
+    let (req, _) = crate::replication::ReplicationFetchRequest::decode(&src[4..4 + payload_len])
+        .map_err(|_| PacketError::Fatal("Invalid gRPC replication fetch request".to_string()))?;
+    let bytes_consumed = 4 + payload_len;
+
+    let response = if !engine.is_partition_leader(&req.topic, req.partition) {
+        // Not this node's partition to serve — respond empty rather than erroring; the
+        // follower will simply see no progress this round and re-resolve the leader on
+        // its next iteration (see the fetcher loop's per-iteration leader lookup).
+        crate::replication::ReplicationFetchResponse {
+            leader_watermark: 0,
+            isr_count: 0,
+            frames: Vec::new(),
+        }
+    } else {
+        match engine.get_or_create_partition(&req.topic, req.partition) {
+            Ok(pm) => {
+                let frames = pm
+                    .fetch(req.fetch_offset, req.max_bytes)
+                    .unwrap_or_default();
+
+                // A Fetch request at offset X is itself proof the follower already durably
+                // has everything up to X-1; record that as this follower's confirmed
+                // watermark. (X == 0 means "nothing yet" — nothing to record.)
+                if req.fetch_offset > 0 {
+                    if let Some(follower_addr) = engine.get_broker_address(req.follower_node_id) {
+                        engine.replication().update_replica_watermark(
+                            &req.topic,
+                            req.partition,
+                            &follower_addr,
+                            req.fetch_offset - 1,
+                        );
+                    }
+                }
+
+                crate::replication::ReplicationFetchResponse {
+                    leader_watermark: pm.high_watermark(),
+                    isr_count: 1,
+                    frames,
+                }
+            }
+            Err(_) => crate::replication::ReplicationFetchResponse {
+                leader_watermark: 0,
+                isr_count: 0,
+                frames: Vec::new(),
+            },
+        }
+    };
+
+    let encoded = response.encode();
+    let mut framed = Vec::with_capacity(4 + encoded.len());
+    framed.put_u32(encoded.len() as u32);
+    framed.extend_from_slice(&encoded);
+
+    Ok((bytes_consumed, framed))
 }
 
 /// Decodes and processes an inter-node replication packet (0xAA).
@@ -872,6 +1080,18 @@ fn decode_replication_packet(
         }
     }
 
+    // Group commit: one fsync for the whole replicated batch instead of one per frame
+    // (see `PartitionManager::flush_if_sync_policy`).
+    if let Err(e) = pm.flush_if_sync_policy() {
+        tracing::error!(
+            "HA Replication: Failed to sync '{}' P{} after replicated batch: {}",
+            topic,
+            partition,
+            e
+        );
+        write_failed = true;
+    }
+
     tracing::info!(
         "HA Replication: Follower persisted {} replicated record(s) on Topic '{}' Partition {}",
         count,
@@ -987,6 +1207,13 @@ fn decode_heartbeat_packet(
         // Valid heartbeat from current or newer leader — update state
         engine.replication().set_epoch(incoming_term);
         engine.set_leader_addr(leader_bind_addr.clone());
+        // Also register the leader's address by node_id (not just as "the current
+        // leader"), so a follower's pull-replication fetch loop
+        // (`ReplicationManager::start_per_partition_fetcher_manager`) can resolve where
+        // to send its Fetch requests via `get_broker_address(leader_id)` — previously
+        // only `__cluster_metadata`'s BrokerRegister replay populated this, which a
+        // freshly-started node hasn't necessarily received yet.
+        engine.register_broker_address(peer_node_id, leader_bind_addr.clone());
         tracing::info!(
             "HA Heartbeat: Leader is Node {} at {} term {} (Cluster '{}')",
             peer_node_id,
@@ -1004,16 +1231,84 @@ fn decode_heartbeat_packet(
         );
     }
 
-    // Reply with this node's own identity (node_id + bind_addr) so the Leader can learn
-    // this follower's broker address purely from the heartbeat round-trip.  Followers
-    // otherwise have no way to publish their address, since only the partition leader
-    // for `__cluster_metadata` may write BrokerRegister records.
+    // Reply with this node's own identity (node_id + bind_addr + roles) so the Leader can
+    // learn this follower's broker address AND process role(s) purely from the heartbeat
+    // round-trip. Followers otherwise have no way to publish this, since only the
+    // controller may durably write `BrokerRegister` records — and a follower's own
+    // bootstrap-time self-registration attempt would just fail with NOT_CONTROLLER.
     let self_bind_addr = &engine.config().bind_addr;
-    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_bind_addr.len());
+    let role_bytes = crate::config::roles_to_bytes(&engine.config().roles);
+    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_bind_addr.len() + 1 + role_bytes.len());
     ack.put_u8(0u8);
     ack.put_u32(engine.config().node_id);
     crate::protocol::wire::write_pascal_string(&mut ack, self_bind_addr);
+    ack.put_u8(role_bytes.len() as u8);
+    ack.extend_from_slice(&role_bytes);
     Ok((bytes_consumed, ack))
+}
+
+/// Attempts to serve a plain `Fetch` request via zero-copy transmit straight from the
+/// segment file to `socket`. Runs the same authorization / partition-replica checks as the
+/// buffered `Fetch` arm in `process_request` and, on failure, returns `Ok(false)` rather
+/// than an error — the caller falls through to `process_request`, which re-does those
+/// checks and produces the correct `WireResponse::error` payload. `Ok(false)` is likewise
+/// returned for anything that just isn't eligible for zero-copy (no matching frames within
+/// the committed high watermark, range spans past the located segment, etc.) — none of
+/// this is a failure, it's just "use the normal path instead."
+///
+/// Once the response header has actually been written to the socket, any further error is
+/// a genuine, unrecoverable mid-response I/O failure and is propagated as `Err` — the
+/// caller must close the connection rather than fall back, since a partial response would
+/// otherwise corrupt the client's read stream.
+#[cfg(any(windows, target_os = "linux"))]
+async fn try_zero_copy_fetch(
+    engine: &StorageEngine,
+    socket: &mut TcpStream,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    max_bytes: u32,
+    principal: &str,
+    client_key: &str,
+    logical_client_id: &Option<String>,
+) -> std::io::Result<bool> {
+    if !engine.authorize(
+        principal,
+        client_key,
+        crate::server::acl::AclOperation::Read as u8,
+        crate::server::acl::ResourceType::Topic as u8,
+        topic,
+    ) {
+        return Ok(false);
+    }
+    if !engine.is_partition_replica(topic, partition) {
+        return Ok(false);
+    }
+
+    let plan = match engine
+        .plan_zero_copy_fetch(topic, partition, offset, max_bytes)
+        .await
+    {
+        Ok(Some(plan)) if plan.frame_count > 0 => plan,
+        Ok(_) => return Ok(false),
+        Err(_) => return Ok(false), // let the buffered path surface the real error
+    };
+
+    let payload_len: u64 = 4 + plan.physical_len;
+    if payload_len > u32::MAX as u64 {
+        return Ok(false);
+    }
+
+    let quota_key = resolve_quota_key(principal, logical_client_id.as_deref(), client_key);
+    engine.throttle_fetch(&quota_key, plan.physical_len).await;
+
+    let mut header = Vec::with_capacity(9);
+    header.put_u8(0u8); // WireResponse status = OK
+    header.put_u32(payload_len as u32);
+    header.put_u32(plan.frame_count);
+    socket.write_all(&header).await?;
+    plan.transmit(socket).await?;
+    Ok(true)
 }
 
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
@@ -1458,7 +1753,7 @@ async fn process_request(
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
-            match engine.fetch(&topic, partition, offset, max_bytes) {
+            match engine.fetch(&topic, partition, offset, max_bytes).await {
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
@@ -1491,7 +1786,7 @@ async fn process_request(
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
-            match engine.fetch_committed(&topic, partition, offset, max_bytes) {
+            match engine.fetch_committed(&topic, partition, offset, max_bytes).await {
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
@@ -1726,7 +2021,10 @@ async fn process_request(
             ) {
                 return WireResponse::error("TopicAuthorizationFailed");
             }
-            match engine.fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes) {
+            match engine
+                .fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes)
+                .await
+            {
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
@@ -1823,9 +2121,12 @@ async fn process_request(
                 .group_coordinator()
                 .join_group(&group_id, &member_id, protocols)
             {
-                Ok(m_id) => {
+                Ok((m_id, generation_id, is_leader, protocol_name)) => {
                     let mut buf = Vec::new();
                     crate::protocol::wire::write_pascal_string(&mut buf, &m_id);
+                    buf.put_u32(generation_id);
+                    buf.put_u8(if is_leader { 1 } else { 0 });
+                    crate::protocol::wire::write_pascal_string(&mut buf, &protocol_name);
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&e),
@@ -1852,7 +2153,18 @@ async fn process_request(
                 &member_id,
                 assignments,
             ) {
-                Ok(()) => WireResponse::ok(Vec::new()),
+                Ok(assignment) => {
+                    let mut buf = Vec::new();
+                    buf.put_u32(assignment.len() as u32);
+                    for (topic, partitions) in assignment {
+                        crate::protocol::wire::write_pascal_string(&mut buf, &topic);
+                        buf.put_u32(partitions.len() as u32);
+                        for p in partitions {
+                            buf.put_u32(p);
+                        }
+                    }
+                    WireResponse::ok(buf)
+                }
                 Err(e) => WireResponse::error(&e),
             }
         }
@@ -2183,6 +2495,58 @@ async fn process_request(
             );
             WireResponse::ok(payload)
         }
+        RequestPayload::DescribeConfigs { topic } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::DescribeConfigs as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
+            let configs = engine.describe_configs(&topic);
+            WireResponse::ok(crate::protocol::wire::encode_describe_configs_response(
+                &configs,
+            ))
+        }
+        RequestPayload::AlterConfigs { topic, configs } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::AlterConfigs as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
+            match engine.alter_configs(&topic, configs).await {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("AlterConfigs failed: {}", e)),
+            }
+        }
+        RequestPayload::IncrementalAlterConfigs {
+            topic,
+            upserts,
+            deletes,
+        } => {
+            if !engine.authorize(
+                principal,
+                client_host,
+                crate::server::acl::AclOperation::AlterConfigs as u8,
+                crate::server::acl::ResourceType::Topic as u8,
+                &topic,
+            ) {
+                return WireResponse::error("TopicAuthorizationFailed");
+            }
+            match engine
+                .incremental_alter_configs(&topic, upserts, deletes)
+                .await
+            {
+                Ok(()) => WireResponse::ok(Vec::new()),
+                Err(e) => WireResponse::error(&format!("IncrementalAlterConfigs failed: {}", e)),
+            }
+        }
     }
 }
 
@@ -2311,4 +2675,184 @@ fn build_scram_server_final(
         session.client_first_bare, session.server_first_message, client_final.without_proof
     );
     credential.build_server_final(&auth_message)
+}
+
+#[cfg(test)]
+mod grpc_replication_fetch_tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::replication::{ReplicationFetchRequest, ReplicationFetchResponse};
+    use bytes::Bytes;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_handler_grpc_fetch_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_engine(dir: &TempDir) -> StorageEngine {
+        StorageEngine::new(EngineConfig {
+            data_dir: dir.0.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            ..EngineConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Encodes a `ReplicationFetchRequest` the exact way `send_grpc_replication_fetch`
+    /// frames it on the wire: `[u32 total_len][0xBB ...]`.
+    fn frame_request(req: &ReplicationFetchRequest) -> Vec<u8> {
+        let payload = req.encode();
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.put_u32(payload.len() as u32);
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    /// Mirrors how `send_grpc_replication_fetch` reads the leader's response back:
+    /// `[u32 resp_len][resp_payload]`.
+    fn decode_response(bytes: &[u8]) -> ReplicationFetchResponse {
+        assert!(bytes.len() >= 4);
+        let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert_eq!(bytes.len(), 4 + len);
+        ReplicationFetchResponse::decode(&bytes[4..]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_frames_from_the_requested_offset_when_this_node_is_partition_leader() {
+        let dir = TempDir::new("leader_serves");
+        let engine = open_engine(&dir);
+
+        let pm = engine.get_or_create_partition("t", 0).unwrap();
+        for payload in [b"rec0".to_vec(), b"rec1".to_vec(), b"rec2".to_vec()] {
+            pm.produce_frame_eos(Bytes::from(payload), 0, 0, 0)
+                .unwrap()
+                .unwrap();
+        }
+        // A freshly auto-created partition already defaults leader_id to this node
+        // (see `PartitionManager::open`), so no explicit `update_leadership` is needed
+        // for this node to be considered the leader.
+
+        let req = ReplicationFetchRequest {
+            follower_node_id: 2,
+            topic: "t".to_string(),
+            partition: 0,
+            fetch_offset: 1,
+            max_bytes: 4096,
+        };
+        let framed = frame_request(&req);
+
+        let (bytes_consumed, response_bytes) =
+            decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+        assert_eq!(bytes_consumed, framed.len());
+
+        let resp = decode_response(&response_bytes);
+        assert_eq!(resp.frames.len(), 2, "expected offsets 1 and 2 (fetch_offset=1)");
+        assert_eq!(resp.frames[0].offset, 1);
+        assert_eq!(resp.frames[0].payload.as_ref(), b"rec1");
+        assert_eq!(resp.frames[1].offset, 2);
+        assert_eq!(resp.frames[1].payload.as_ref(), b"rec2");
+    }
+
+    #[tokio::test]
+    async fn records_follower_progress_into_replica_watermarks_when_address_is_known() {
+        let dir = TempDir::new("watermark_update");
+        let engine = open_engine(&dir);
+        engine.register_broker_address(2, "127.0.0.1:9999".to_string());
+
+        let pm = engine.get_or_create_partition("t", 0).unwrap();
+        pm.produce_frame_eos(Bytes::from_static(b"rec0"), 0, 0, 0)
+            .unwrap()
+            .unwrap();
+        pm.produce_frame_eos(Bytes::from_static(b"rec1"), 0, 0, 0)
+            .unwrap()
+            .unwrap();
+
+        let req = ReplicationFetchRequest {
+            follower_node_id: 2,
+            topic: "t".to_string(),
+            partition: 0,
+            fetch_offset: 2, // follower claims to already have offsets 0 and 1
+            max_bytes: 4096,
+        };
+        let framed = frame_request(&req);
+        decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+
+        assert_eq!(
+            engine
+                .replication()
+                .replica_ack_age("t", 0, "127.0.0.1:9999")
+                .is_some(),
+            true,
+            "a fetch request should record this follower's progress the same way a push ack does"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_empty_frames_without_error_when_this_node_is_not_partition_leader() {
+        let dir = TempDir::new("not_leader");
+        let engine = open_engine(&dir);
+
+        let pm = engine.get_or_create_partition("t", 0).unwrap();
+        pm.produce_frame_eos(Bytes::from_static(b"rec0"), 0, 0, 0)
+            .unwrap()
+            .unwrap();
+        // Explicitly hand leadership to a different node — this node must now refuse to
+        // serve fetches for it rather than handing out possibly-stale local data.
+        pm.update_leadership(99, 1, vec![1, 99], vec![1, 99]);
+
+        let req = ReplicationFetchRequest {
+            follower_node_id: 2,
+            topic: "t".to_string(),
+            partition: 0,
+            fetch_offset: 0,
+            max_bytes: 4096,
+        };
+        let framed = frame_request(&req);
+
+        let (_, response_bytes) = decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+        let resp = decode_response(&response_bytes);
+        assert!(resp.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_need_more_data_for_a_truncated_frame() {
+        let dir = TempDir::new("need_more_data");
+        let engine = open_engine(&dir);
+
+        let req = ReplicationFetchRequest {
+            follower_node_id: 2,
+            topic: "t".to_string(),
+            partition: 0,
+            fetch_offset: 0,
+            max_bytes: 4096,
+        };
+        let framed = frame_request(&req);
+
+        // Only the length prefix plus a few bytes of the payload have arrived so far.
+        let partial = &framed[..6];
+        match decode_grpc_replication_fetch_packet(&engine, partial) {
+            Err(PacketError::NeedMoreData) => {}
+            other => panic!("expected NeedMoreData, got {:?}", other),
+        }
+    }
 }

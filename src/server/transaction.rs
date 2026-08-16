@@ -115,6 +115,19 @@ impl TransactionManager {
         }
     }
 
+    /// Returns every known (transactional_id, producer_id, producer_epoch) triple —
+    /// used to build a `__cluster_metadata` snapshot that fully captures fencing state,
+    /// so trimming the log after a snapshot can never lose an old producer's epoch.
+    pub fn all_transactional_producers(&self) -> Vec<(String, u64, i16)> {
+        self.transactional_producers
+            .iter()
+            .map(|entry| {
+                let state = entry.value();
+                (entry.key().clone(), state.producer_id, state.producer_epoch)
+            })
+            .collect()
+    }
+
     pub fn restore_transactional_producer(
         &self,
         transactional_id: &str,

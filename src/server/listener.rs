@@ -151,8 +151,20 @@ impl Server {
             tokio::spawn(async move {
                 loop {
                     sleep(interval).await;
-                    if let Err(err) = engine_clone.flush_all() {
-                        tracing::error!("Background WAL periodic flush error: {}", err);
+                    // Same reasoning as the retention sweep below: `flush_all` is
+                    // blocking fsync I/O across every partition.
+                    let engine_for_blocking = engine_clone.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || engine_for_blocking.flush_all())
+                            .await;
+                    match result {
+                        Ok(Err(err)) => {
+                            tracing::error!("Background WAL periodic flush error: {}", err);
+                        }
+                        Err(e) => {
+                            tracing::error!("Background WAL periodic flush task join error: {}", e);
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -163,7 +175,12 @@ impl Server {
         tokio::spawn(async move {
             loop {
                 sleep(retention_interval).await;
-                match retention_engine.apply_retention_all() {
+                // `apply_retention_all` internally fans each partition's blocking file
+                // I/O out onto Tokio's blocking thread pool (bounded by
+                // `compaction_worker_threads`), so this task itself just awaits the
+                // aggregate result rather than wrapping the whole call in its own
+                // spawn_blocking.
+                match retention_engine.apply_retention_all().await {
                     Ok(count) if count > 0 => {
                         tracing::info!(
                             "Retention Garbage Collector: Unlinked {} expired log segment files.",

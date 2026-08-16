@@ -47,6 +47,9 @@ pub enum CommandCode {
     ShareAcknowledge = 0x28,
     ShareGroupHeartbeat = 0x29,
     ShareGroupDescribe = 0x2A,
+    DescribeConfigs = 0x2B,
+    AlterConfigs = 0x2C,
+    IncrementalAlterConfigs = 0x2D,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -96,6 +99,9 @@ impl TryFrom<u8> for CommandCode {
             0x28 => Ok(CommandCode::ShareAcknowledge),
             0x29 => Ok(CommandCode::ShareGroupHeartbeat),
             0x2A => Ok(CommandCode::ShareGroupDescribe),
+            0x2B => Ok(CommandCode::DescribeConfigs),
+            0x2C => Ok(CommandCode::AlterConfigs),
+            0x2D => Ok(CommandCode::IncrementalAlterConfigs),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -315,6 +321,23 @@ pub enum RequestPayload {
     },
     ShareGroupDescribe {
         group_id: String,
+    },
+    DescribeConfigs {
+        topic: String,
+    },
+    /// Full-replace semantics (Kafka `AlterConfigs`): the given configs entirely replace
+    /// the topic's stored config map.
+    AlterConfigs {
+        topic: String,
+        configs: Vec<(String, String)>,
+    },
+    /// Merge semantics (Kafka `IncrementalAlterConfigs`): `upserts` are set/overwritten,
+    /// `deletes` are removed, everything else in the topic's current config map is left
+    /// untouched.
+    IncrementalAlterConfigs {
+        topic: String,
+        upserts: Vec<(String, String)>,
+        deletes: Vec<String>,
     },
 }
 
@@ -1087,6 +1110,59 @@ impl WireRequest {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 RequestPayload::ShareGroupDescribe { group_id }
             }
+            CommandCode::DescribeConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                RequestPayload::DescribeConfigs { topic }
+            }
+            CommandCode::AlterConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let count = payload_buf.get_u32() as usize;
+                let mut configs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let key = read_pascal_string(&mut payload_buf)?;
+                    let value = read_pascal_string(&mut payload_buf)?;
+                    configs.push((key, value));
+                }
+                RequestPayload::AlterConfigs { topic, configs }
+            }
+            CommandCode::IncrementalAlterConfigs => {
+                let topic = read_pascal_string(&mut payload_buf)?;
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let upsert_count = payload_buf.get_u32() as usize;
+                let mut upserts = Vec::with_capacity(upsert_count);
+                for _ in 0..upsert_count {
+                    let key = read_pascal_string(&mut payload_buf)?;
+                    let value = read_pascal_string(&mut payload_buf)?;
+                    upserts.push((key, value));
+                }
+                if payload_buf.len() < 4 {
+                    return Err(WireError::Incomplete {
+                        needed: 4,
+                        available: payload_buf.len(),
+                    });
+                }
+                let delete_count = payload_buf.get_u32() as usize;
+                let mut deletes = Vec::with_capacity(delete_count);
+                for _ in 0..delete_count {
+                    deletes.push(read_pascal_string(&mut payload_buf)?);
+                }
+                RequestPayload::IncrementalAlterConfigs {
+                    topic,
+                    upserts,
+                    deletes,
+                }
+            }
         };
 
         let total_consumed = 5 + payload_len;
@@ -1211,6 +1287,17 @@ pub fn encode_offset_fetch_response(offset: u64, metadata: &str) -> Vec<u8> {
     buf
 }
 
+/// Encodes DescribeConfigs binary payload: `[Count: 4b] { [Key: pascal] [Value: pascal] }...`
+pub fn encode_describe_configs_response(configs: &[(String, String)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.put_u32(configs.len() as u32);
+    for (key, value) in configs {
+        write_pascal_string(&mut buf, key);
+        write_pascal_string(&mut buf, value);
+    }
+    buf
+}
+
 /// Encodes ShareFetch binary payload: `[NumBatches: 4b] | { [FirstOffset: 8b] | [LastOffset: 8b] | [DeliveryCount: 2b] | [RecordsLen: 4b] | [RecordFrames...] }...`
 pub fn encode_share_fetch_response(batches: &[AcquiredRecordBatch]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1278,5 +1365,14 @@ impl WireResponse {
         buf.put_u32(self.payload.len() as u32);
         buf.put_slice(&self.payload);
         buf
+    }
+
+    /// Same encoding as `encode()`, but writes into a caller-supplied buffer instead of
+    /// allocating a fresh `Vec` — lets a connection loop reuse one scratch buffer across
+    /// every request/response round trip instead of allocating one per response.
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        buf.put_u8(self.status);
+        buf.put_u32(self.payload.len() as u32);
+        buf.put_slice(&self.payload);
     }
 }

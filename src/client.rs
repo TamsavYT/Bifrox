@@ -16,6 +16,20 @@ pub struct ProduceResult {
     pub last_offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinGroupResult {
+    pub member_id: String,
+    /// Must be passed to subsequent `SyncGroup`/`Heartbeat` calls.
+    pub generation_id: u32,
+    /// If true, this member is responsible for computing the group's assignment and
+    /// submitting it via `SyncGroup`; if false, its `SyncGroup` call should pass an
+    /// empty `assignments` slice and just retrieve its own assignment.
+    pub is_leader: bool,
+    /// The negotiated protocol name (e.g. `"range"`, `"cooperative-sticky"`) for this
+    /// group generation.
+    pub protocol_name: String,
+}
+
 #[derive(Debug)]
 pub struct ConsumerCoordinator {
     pub group_id: String,
@@ -1026,6 +1040,110 @@ impl TestClient {
         }
     }
 
+    pub async fn describe_configs(&mut self, topic: &str) -> IoResult<Vec<(String, String)>> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::DescribeConfigs as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            let mut buf = &resp.payload[..];
+            if buf.len() < 4 {
+                return Ok(Vec::new());
+            }
+            let count = buf.get_u32() as usize;
+            let mut result = Vec::with_capacity(count);
+            for _ in 0..count {
+                let k_len = buf.get_u16() as usize;
+                let key = String::from_utf8_lossy(&buf[..k_len]).to_string();
+                buf = &buf[k_len..];
+                let v_len = buf.get_u16() as usize;
+                let value = String::from_utf8_lossy(&buf[..v_len]).to_string();
+                buf = &buf[v_len..];
+                result.push((key, value));
+            }
+            Ok(result)
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn alter_configs(
+        &mut self,
+        topic: &str,
+        configs: &[(String, String)],
+    ) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::AlterConfigs as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(configs.len() as u32);
+        for (key, value) in configs {
+            crate::protocol::wire::write_pascal_string(&mut inner, key);
+            crate::protocol::wire::write_pascal_string(&mut inner, value);
+        }
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
+    pub async fn incremental_alter_configs(
+        &mut self,
+        topic: &str,
+        upserts: &[(String, String)],
+        deletes: &[String],
+    ) -> IoResult<()> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::IncrementalAlterConfigs as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(upserts.len() as u32);
+        for (key, value) in upserts {
+            crate::protocol::wire::write_pascal_string(&mut inner, key);
+            crate::protocol::wire::write_pascal_string(&mut inner, value);
+        }
+        inner.put_u32(deletes.len() as u32);
+        for key in deletes {
+            crate::protocol::wire::write_pascal_string(&mut inner, key);
+        }
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
+        }
+    }
+
     pub async fn begin_transaction(
         &mut self,
         transaction_id: &str,
@@ -1564,7 +1682,7 @@ impl TestClient {
         group_id: &str,
         member_id: &str,
         protocols: &[&str],
-    ) -> IoResult<String> {
+    ) -> IoResult<JoinGroupResult> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::JoinGroup as u8);
         let mut inner = Vec::new();
@@ -1579,15 +1697,46 @@ impl TestClient {
         let resp = self.send_raw_bytes(&req_buf).await?;
         if resp.status == 0 {
             let mut payload = &resp.payload[..];
-            if payload.len() >= 2 {
-                let len = bytes::Buf::get_u16(&mut payload) as usize;
-                let m_id = String::from_utf8_lossy(&payload[..len]).to_string();
-                Ok(m_id)
-            } else {
-                Ok(member_id.to_string())
+            if payload.len() < 2 {
+                return Ok(JoinGroupResult {
+                    member_id: member_id.to_string(),
+                    generation_id: 1,
+                    is_leader: true,
+                    protocol_name: String::new(),
+                });
             }
+            let len = bytes::Buf::get_u16(&mut payload) as usize;
+            let m_id = String::from_utf8_lossy(&payload[..len]).to_string();
+            payload = &payload[len..];
+            let generation_id = if payload.len() >= 4 {
+                bytes::Buf::get_u32(&mut payload)
+            } else {
+                1
+            };
+            let is_leader = if !payload.is_empty() {
+                let v = payload[0];
+                payload = &payload[1..];
+                v == 1
+            } else {
+                true
+            };
+            let protocol_name = if payload.len() >= 2 {
+                let len = bytes::Buf::get_u16(&mut payload) as usize;
+                String::from_utf8_lossy(&payload[..len]).to_string()
+            } else {
+                String::new()
+            };
+            Ok(JoinGroupResult {
+                member_id: m_id,
+                generation_id,
+                is_leader,
+                protocol_name,
+            })
         } else {
-            Err(std::io::Error::other("JoinGroup failed"))
+            Err(std::io::Error::other(format!(
+                "JoinGroup failed: {}",
+                String::from_utf8_lossy(&resp.payload)
+            )))
         }
     }
 
@@ -1597,7 +1746,7 @@ impl TestClient {
         generation_id: u32,
         member_id: &str,
         assignments: &[crate::protocol::wire::MemberAssignment],
-    ) -> IoResult<()> {
+    ) -> IoResult<Vec<(String, Vec<u32>)>> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::SyncGroup as u8);
         let mut inner = Vec::new();
@@ -1619,12 +1768,42 @@ impl TestClient {
         req_buf.extend_from_slice(&inner);
         let resp = self.send_raw_bytes(&req_buf).await?;
         if resp.status == 0 {
-            Ok(())
+            let mut payload = &resp.payload[..];
+            if payload.len() < 4 {
+                return Ok(Vec::new());
+            }
+            let count = bytes::Buf::get_u32(&mut payload) as usize;
+            let mut result = Vec::with_capacity(count);
+            for _ in 0..count {
+                if payload.len() < 2 {
+                    break;
+                }
+                let t_len = bytes::Buf::get_u16(&mut payload) as usize;
+                let topic = String::from_utf8_lossy(&payload[..t_len]).to_string();
+                payload = &payload[t_len..];
+                let p_count = bytes::Buf::get_u32(&mut payload) as usize;
+                let mut partitions = Vec::with_capacity(p_count);
+                for _ in 0..p_count {
+                    partitions.push(bytes::Buf::get_u32(&mut payload));
+                }
+                result.push((topic, partitions));
+            }
+            Ok(result)
         } else {
-            Err(std::io::Error::other("SyncGroup failed"))
+            // Callers that want to distinguish a retryable in-progress rebalance from a
+            // fatal failure can match on the message containing "REBALANCE_IN_PROGRESS".
+            Err(std::io::Error::other(format!(
+                "SyncGroup failed: {}",
+                String::from_utf8_lossy(&resp.payload)
+            )))
         }
     }
 
+    /// On error, the message may be `"REBALANCE_IN_PROGRESS"` — a retryable signal (only
+    /// possible for groups using a cooperative assignor) meaning this member hasn't
+    /// rejoined the current generation yet but hasn't been kicked either; any other
+    /// message is a fatal failure (unknown group/member, or a non-cooperative generation
+    /// mismatch).
     pub async fn heartbeat(
         &mut self,
         group_id: &str,
@@ -1643,7 +1822,9 @@ impl TestClient {
         if resp.status == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::other("Heartbeat failed"))
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ))
         }
     }
 

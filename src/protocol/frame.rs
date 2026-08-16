@@ -5,6 +5,7 @@ use thiserror::Error;
 pub const MAGIC_BYTE: u8 = 0xAB;
 pub const COMPRESSED_LZ4_MAGIC_BYTE: u8 = 0xAC;
 pub const CONTROL_MAGIC_BYTE: u8 = 0xAD;
+pub const COMPRESSED_ZSTD_MAGIC_BYTE: u8 = 0xAE;
 pub const HEADER_SIZE: usize = 1 + 4 + 8 + 8 + 4; // 25 bytes
 
 #[derive(Debug, Error)]
@@ -67,14 +68,42 @@ impl RecordFrame {
         }
     }
 
-    /// Decompresses frame payload if frame magic is 0xAC (LZ4)
+    /// Creates a Zstandard compressed RecordFrame (magic 0xAE)
+    pub fn create_compressed_zstd(offset: u64, timestamp: u64, raw_payload: &[u8]) -> Self {
+        // Level 3 matches zstd's own CLI/library default — a solid speed/ratio balance for
+        // per-record compression rather than the (much slower) higher levels meant for
+        // one-shot batch archival.
+        let compressed = zstd::stream::encode_all(raw_payload, 3)
+            .expect("in-memory zstd compression is infallible");
+        let payload = Bytes::from(compressed);
+        let payload_len = payload.len() as u32;
+        let crc = Self::calculate_crc(offset, timestamp, &payload);
+
+        Self {
+            magic: COMPRESSED_ZSTD_MAGIC_BYTE,
+            crc,
+            offset,
+            timestamp,
+            payload_len,
+            payload,
+        }
+    }
+
+    /// Decompresses frame payload if frame magic indicates a compressed codec (LZ4 or Zstd)
     pub fn decompress_payload(&self) -> Result<Bytes, std::io::Error> {
-        if self.magic == COMPRESSED_LZ4_MAGIC_BYTE {
-            let decompressed = lz4_flex::decompress_size_prepended(&self.payload)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(Bytes::from(decompressed))
-        } else {
-            Ok(self.payload.clone())
+        match self.magic {
+            COMPRESSED_LZ4_MAGIC_BYTE => {
+                let decompressed = lz4_flex::decompress_size_prepended(&self.payload).map_err(
+                    |e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                )?;
+                Ok(Bytes::from(decompressed))
+            }
+            COMPRESSED_ZSTD_MAGIC_BYTE => {
+                let decompressed = zstd::stream::decode_all(self.payload.as_ref())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                Ok(Bytes::from(decompressed))
+            }
+            _ => Ok(self.payload.clone()),
         }
     }
 
@@ -144,9 +173,12 @@ impl RecordFrame {
         HEADER_SIZE + self.payload.len()
     }
 
-    /// Serializes the binary frame into the provided output buffer
-    pub fn encode_into(&self, buf: &mut Vec<u8>) {
-        buf.reserve(self.encoded_size());
+    /// Serializes the binary frame into the provided output buffer. Generic over `BufMut`
+    /// (rather than concretely `&mut Vec<u8>`) so callers on a hot path can pass a reused
+    /// `BytesMut` scratch buffer instead of allocating a fresh `Vec` per call — every
+    /// existing `&mut Vec<u8>` call site keeps compiling unchanged, since `Vec<u8>` already
+    /// implements `BufMut`.
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
         buf.put_u8(self.magic);
         buf.put_u32(self.crc);
         buf.put_u64(self.offset);
@@ -165,7 +197,10 @@ impl RecordFrame {
         }
 
         let magic = src.get_u8();
-        if magic != MAGIC_BYTE && magic != COMPRESSED_LZ4_MAGIC_BYTE && magic != CONTROL_MAGIC_BYTE
+        if magic != MAGIC_BYTE
+            && magic != COMPRESSED_LZ4_MAGIC_BYTE
+            && magic != COMPRESSED_ZSTD_MAGIC_BYTE
+            && magic != CONTROL_MAGIC_BYTE
         {
             return Err(FrameError::InvalidMagic {
                 expected: MAGIC_BYTE,
@@ -208,5 +243,50 @@ impl RecordFrame {
             },
             total_frame_len,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zstd_frame_round_trips_through_encode_decode_and_decompress() {
+        let raw = b"the quick brown fox jumps over the lazy dog, repeated for compressibility ".repeat(8);
+        let frame = RecordFrame::create_compressed_zstd(42, 123_456, &raw);
+        assert_eq!(frame.magic, COMPRESSED_ZSTD_MAGIC_BYTE);
+        // A reasonably repetitive payload should actually shrink.
+        assert!(frame.payload.len() < raw.len());
+
+        let mut encoded = Vec::new();
+        frame.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordFrame::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.magic, COMPRESSED_ZSTD_MAGIC_BYTE);
+        assert_eq!(decoded.offset, 42);
+        assert_eq!(decoded.timestamp, 123_456);
+
+        let decompressed = decoded.decompress_payload().unwrap();
+        assert_eq!(decompressed.as_ref(), raw.as_slice());
+    }
+
+    #[test]
+    fn lz4_frame_round_trips_through_encode_decode_and_decompress() {
+        let raw = b"lz4 round trip payload".to_vec();
+        let frame = RecordFrame::create_compressed_lz4(1, 2, &raw);
+        assert_eq!(frame.magic, COMPRESSED_LZ4_MAGIC_BYTE);
+
+        let mut encoded = Vec::new();
+        frame.encode_into(&mut encoded);
+        let (decoded, _) = RecordFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded.decompress_payload().unwrap().as_ref(), raw.as_slice());
+    }
+
+    #[test]
+    fn uncompressed_frame_decompress_is_a_no_op() {
+        let raw = b"plain payload".to_vec();
+        let frame = RecordFrame::create(5, 6, raw.clone());
+        assert_eq!(frame.magic, MAGIC_BYTE);
+        assert_eq!(frame.decompress_payload().unwrap().as_ref(), raw.as_slice());
     }
 }

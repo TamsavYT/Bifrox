@@ -36,9 +36,27 @@ impl LogSegment {
     ) -> IoResult<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-
         let filename = format_segment_filename(base_offset);
         let log_path = dir.join(format!("{}.log", filename));
+        Self::open_at_path(log_path, base_offset, max_bytes, index_interval, preallocate, index_segment)
+    }
+
+    /// Same as `open`, but at an exact caller-supplied path instead of reconstructing
+    /// `dir/{base_offset}.log`. Needed by `SegmentManager::compact_segments`'s
+    /// write-to-a-`.compact`-tmp-file-then-rename dance: `open`'s directory-plus-base-offset
+    /// reconstruction would otherwise always resolve back to the live original segment's
+    /// path, silently writing into it in place instead of the intended tmp file.
+    pub fn open_at_path(
+        log_path: PathBuf,
+        base_offset: u64,
+        max_bytes: u64,
+        index_interval: u64,
+        preallocate: bool,
+        index_segment: &mut IndexSegment,
+    ) -> IoResult<Self> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
         let exists = log_path.exists();
         let mut options = OpenOptions::new();
@@ -245,53 +263,127 @@ impl LogSegment {
             .as_millis() as u64)
     }
 
-    /// Windows Kernel Zero-Copy (Tier 3): Streams bytes directly from OS NTFS page cache to Winsock socket via TransmitFile
-    #[cfg(windows)]
-    pub async fn transmit_file_zero_copy(
-        &self,
-        socket: &tokio::net::TcpStream,
-        physical_pos: u64,
-        max_bytes: u32,
-    ) -> IoResult<()> {
-        use std::os::windows::io::{AsRawHandle, AsRawSocket};
-        use windows_sys::Win32::Networking::WinSock::TransmitFile;
-        use windows_sys::Win32::System::IO::OVERLAPPED;
+}
 
-        let raw_socket = socket.as_raw_socket() as usize;
-        let raw_file_handle = self.file.as_raw_handle() as isize;
+/// OS-native zero-copy transmit of `physical_len` bytes starting at `physical_start` in
+/// `file`, streamed directly to `socket` by the kernel (Windows `TransmitFile` / Linux
+/// `sendfile(2)`) — record payload bytes never pass through a user-space Rust buffer.
+///
+/// `file` is expected to be an independently-owned handle (e.g. `File::try_clone`'d while
+/// briefly holding the segment lock, then used here after that lock has been released), so
+/// this function never needs to borrow anything from `SegmentManager`/`LogSegment` across
+/// the `.await`.
+///
+/// Runs `TransmitFile` **synchronously** (`lpOverlapped = NULL`): Tokio's Windows I/O
+/// driver already associates every socket it owns with its own IOCP, and issuing an
+/// *overlapped* `TransmitFile` on that same socket completes asynchronously via that same
+/// IOCP without Tokio ever consuming the completion packet — the send silently races the
+/// connection (observed as the client hitting an early EOF / reset, not a clean transmit).
+/// A NULL-overlapped call has no such race: the blocking-pool thread this runs on simply
+/// doesn't return until the whole range has actually been sent. The file's start position
+/// is set explicitly via `SetFilePointerEx` first, since without an `OVERLAPPED` struct
+/// `TransmitFile` sends from the handle's current file pointer instead of an arbitrary
+/// offset.
+#[cfg(windows)]
+pub async fn transmit_zero_copy(
+    file: &std::fs::File,
+    socket: &tokio::net::TcpStream,
+    physical_start: u64,
+    physical_len: u64,
+) -> IoResult<()> {
+    use std::os::windows::io::{AsRawHandle, AsRawSocket};
+    use windows_sys::Win32::Networking::WinSock::TransmitFile;
+    use windows_sys::Win32::Storage::FileSystem::{SetFilePointerEx, FILE_BEGIN};
 
-        let remaining = if self.physical_size > physical_pos {
-            (self.physical_size - physical_pos) as u32
-        } else {
-            0
-        };
+    if physical_len == 0 {
+        return Ok(());
+    }
 
-        let bytes_to_send = std::cmp::min(remaining, max_bytes);
-        if bytes_to_send == 0 {
-            return Ok(());
+    let raw_socket = socket.as_raw_socket() as usize;
+    let raw_file_handle = file.as_raw_handle() as isize;
+    let bytes_to_send = physical_len as u32;
+
+    tokio::task::spawn_blocking(move || unsafe {
+        if SetFilePointerEx(
+            raw_file_handle,
+            physical_start as i64,
+            std::ptr::null_mut(),
+            FILE_BEGIN,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
         }
 
-        tokio::task::spawn_blocking(move || unsafe {
-            let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            overlapped.Anonymous.Pointer = physical_pos as *mut _;
+        let success = TransmitFile(
+            raw_socket,
+            raw_file_handle,
+            bytes_to_send,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
 
-            let success = TransmitFile(
-                raw_socket,
-                raw_file_handle,
-                bytes_to_send,
-                0,
-                &mut overlapped as *mut _ as *mut _,
-                std::ptr::null_mut(),
-                0,
-            );
+        if success == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
 
-            if success == 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+/// Linux Kernel Zero-Copy: streams bytes directly from the page cache to the socket via
+/// `sendfile(2)`, looping (and waiting for socket writability) across `EWOULDBLOCK` since
+/// Tokio sockets are non-blocking and a single `sendfile` call is not guaranteed to send
+/// the whole range in one syscall.
+#[cfg(target_os = "linux")]
+pub async fn transmit_zero_copy(
+    file: &std::fs::File,
+    socket: &tokio::net::TcpStream,
+    physical_start: u64,
+    physical_len: u64,
+) -> IoResult<()> {
+    use std::os::unix::io::AsRawFd;
+
+    if physical_len == 0 {
+        return Ok(());
+    }
+
+    let raw_file = file.as_raw_fd();
+    let raw_socket = socket.as_raw_fd();
+    let end = physical_start
+        .checked_add(physical_len)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero-copy range overflow"))?
+        as libc::off_t;
+    let mut offset = physical_start as libc::off_t;
+
+    while offset < end {
+        socket.writable().await?;
+        let remaining = (end - offset) as usize;
+
+        let (sent, new_offset, io_err) = tokio::task::spawn_blocking(move || {
+            let mut off = offset;
+            let n = unsafe { libc::sendfile(raw_socket, raw_file, &mut off, remaining) };
+            let err = if n < 0 { Some(std::io::Error::last_os_error()) } else { None };
+            (n, off, err)
         })
         .await
-        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+
+        if sent < 0 {
+            let err = io_err.expect("negative sendfile return must carry an errno");
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                continue;
+            }
+            return Err(err);
+        }
+        if sent == 0 {
+            break; // peer closed or no more data; caller sees a short transmit as an error via len mismatch
+        }
+        offset = new_offset;
     }
+
+    Ok(())
 }

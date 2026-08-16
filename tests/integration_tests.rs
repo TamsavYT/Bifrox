@@ -437,10 +437,13 @@ async fn test_scenario_7_milestone3_features() {
         role: hermes::NodeRole::Leader,
         peer_addrs: Vec::new(),
         min_insync_replicas: 1,
+        roles: vec![hermes::config::ProcessRole::Controller, hermes::config::ProcessRole::Broker],
+        controller_peer_addrs: Vec::new(),
     };
     let repl_mgr = hermes::ReplicationManager::new(
         cluster_config,
         "127.0.0.1:0".to_string(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
         std::sync::Arc::new(dashmap::DashMap::new()),
     );
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
@@ -475,10 +478,13 @@ async fn test_scenario_8_kraft_grpc_isr() {
         role: hermes::NodeRole::Leader,
         peer_addrs: vec!["127.0.0.1:9093".to_string()],
         min_insync_replicas: 2,
+        roles: vec![hermes::config::ProcessRole::Controller, hermes::config::ProcessRole::Broker],
+        controller_peer_addrs: Vec::new(),
     };
     let repl_mgr = hermes::ReplicationManager::new(
         cluster_config,
         "127.0.0.1:0".to_string(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
         std::sync::Arc::new(dashmap::DashMap::new()),
     );
 
@@ -1267,7 +1273,10 @@ async fn test_scenario_19_relative_index_and_txnindex() {
     engine.produce_batch(params_ok).await.unwrap();
 
     // 4. Verify fetch_committed drops the aborted messages via .txnindex
-    let frames = engine.fetch_committed(topic, 0, 0, 1024 * 1024).unwrap();
+    let frames = engine
+        .fetch_committed(topic, 0, 0, 1024 * 1024)
+        .await
+        .unwrap();
     assert_eq!(
         frames.len(),
         1,
@@ -1622,8 +1631,19 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
     assert_eq!(r4.offset, 4);
     assert_eq!(r5.offset, 5);
 
-    // Trigger log compaction garbage collector
-    let compacted_count = seg_mgr.apply_retention().unwrap();
+    // Trigger the log compaction garbage collector. Compaction is intentionally
+    // incremental — one call rewrites at most a handful of segments (bounding how long
+    // it holds the partition's segment-manager lock), so a backlog spanning more
+    // segments than that needs multiple calls to fully drain, same as the real retention
+    // GC's periodic ticks would provide in production.
+    let mut compacted_count = 0usize;
+    for _ in 0..10 {
+        let n = seg_mgr.apply_retention().unwrap();
+        compacted_count += n;
+        if n == 0 {
+            break;
+        }
+    }
     assert!(
         compacted_count >= 3,
         "Compaction should drop older duplicate keys (offsets 0, 1, 2), dropped {}",
@@ -2258,6 +2278,67 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
 }
 
 #[tokio::test]
+async fn test_scenario_37_zstd_compression_end_to_end() {
+    use hermes::config::EngineConfig;
+
+    let dir_guard = TestDataDirGuard::new("zstd_compression_test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let cfg = EngineConfig {
+        node_id: 1,
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        compression_codec: hermes::config::CompressionCodec::Zstd,
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+
+    // Also verify "zstd" parses correctly through the same dynamic-config path clients use.
+    client.create_topic("zstd_wire_topic", 1).await.unwrap();
+    client
+        .alter_configs(
+            "zstd_wire_topic",
+            &[("compression.type".to_string(), "zstd".to_string())],
+        )
+        .await
+        .unwrap();
+
+    let raw_payload_str =
+        "end_to_end_zstd_wire_compressed_payload_0123456789_0123456789_0123456789_repeat_repeat";
+    let recs = vec![bytes::Bytes::from(raw_payload_str)];
+    let prod_res = client
+        .produce_batch("zstd_wire_topic", "", None, 1, &recs)
+        .await
+        .unwrap();
+    assert_eq!(prod_res.first_offset, 0);
+
+    // Fetch over wire TCP: server returns 0xAE Zstd compressed frame, client decompresses transparently
+    let fetched = client.fetch("zstd_wire_topic", 0, 0, 1024).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
+
+    // Verify on-disk log segment file directly: confirm 0xAE magic byte stored on disk.
+    let log_file_path = dir_guard
+        .path
+        .join("zstd_wire_topic-0")
+        .join("00000000000000000000.log");
+    let log_bytes = std::fs::read(&log_file_path).unwrap();
+    let (disk_frame, _) = hermes::protocol::RecordFrame::decode(&log_bytes).unwrap();
+    assert_eq!(disk_frame.magic, hermes::protocol::COMPRESSED_ZSTD_MAGIC_BYTE);
+}
+
+#[tokio::test]
 async fn test_scenario_29_scram_credentials_persist_across_restart() {
     use hermes::config::{EngineConfig, SecurityProtocol};
 
@@ -2352,7 +2433,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
     let restarted = StorageEngine::new(cfg).unwrap();
     assert!(restarted.transactions().is_ongoing(transactional_id));
     restarted.abort_transaction(transactional_id).unwrap();
-    let aborted_visible = restarted.fetch_committed(topic, 0, 0, 1024).unwrap();
+    let aborted_visible = restarted.fetch_committed(topic, 0, 0, 1024).await.unwrap();
     assert!(
         aborted_visible.is_empty(),
         "aborted transactional data must stay hidden after restart recovery"
@@ -2398,8 +2479,8 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
     restarted
         .end_transaction(transactional_id, recovered_pid, recovered_epoch, true)
         .unwrap();
-    let all_frames = restarted.fetch(topic, 0, 0, 1024).unwrap();
-    let committed = restarted.fetch_committed(topic, 0, 0, 1024).unwrap();
+    let all_frames = restarted.fetch(topic, 0, 0, 1024).await.unwrap();
+    let committed = restarted.fetch_committed(topic, 0, 0, 1024).await.unwrap();
     assert_eq!(all_frames.len(), 4);
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].payload.as_ref(), b"txn-recovery-record-2");
@@ -2407,7 +2488,9 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
 
 #[tokio::test]
 async fn test_scenario_31_share_consumer_and_queue_semantics() {
-    use hermes::{AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest};
+    use hermes::{
+        AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest,
+    };
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -2571,6 +2654,7 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
     let dlq_frames = env
         .engine
         .fetch("share-queue-topic-dlq", 0, 0, 1024)
+        .await
         .unwrap();
     assert_eq!(dlq_frames.len(), 1);
     assert_eq!(dlq_frames[0].payload.as_ref(), b"share-msg-1");
@@ -2673,7 +2757,488 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
         .share_groups()
         .get_or_create_partition(group_id, topic, 0);
     // All offsets 0..=5 were acknowledged or archived, so start_offset is 6
-    assert_eq!(sp.start_offset.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(
+        sp.start_offset.load(std::sync::atomic::Ordering::SeqCst),
+        6
+    );
+}
+
+#[tokio::test]
+async fn test_scenario_32_dynamic_topic_configs() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "dynamic-config-topic";
+    client.create_topic(topic, 1).await.unwrap();
+
+    // 1. DescribeConfigs on a freshly-created topic returns no overrides yet.
+    let initial = client.describe_configs(topic).await.unwrap();
+    assert!(initial.is_empty());
+
+    // 2. AlterConfigs (full replace) sets cleanup.policy and retention.ms.
+    client
+        .alter_configs(
+            topic,
+            &[
+                ("cleanup.policy".to_string(), "compact".to_string()),
+                ("retention.ms".to_string(), "3600000".to_string()),
+            ],
+        )
+        .await
+        .expect("AlterConfigs should succeed");
+
+    let after_alter = client.describe_configs(topic).await.unwrap();
+    let as_map: std::collections::HashMap<String, String> = after_alter.into_iter().collect();
+    assert_eq!(as_map.get("cleanup.policy").map(String::as_str), Some("compact"));
+    assert_eq!(as_map.get("retention.ms").map(String::as_str), Some("3600000"));
+
+    // The recognized keys must actually take effect on the live partition, not just be
+    // stored — this is what distinguishes a real dynamic-config API from a no-op one.
+    let pm = env.engine.get_or_create_partition(topic, 0).unwrap();
+    assert_eq!(pm.cleanup_policy(), hermes::config::CleanupPolicy::Compact);
+
+    // 3. IncrementalAlterConfigs merges: upsert one key, delete another, leave the rest.
+    client
+        .incremental_alter_configs(
+            topic,
+            &[("compression.type".to_string(), "lz4".to_string())],
+            &["retention.ms".to_string()],
+        )
+        .await
+        .expect("IncrementalAlterConfigs should succeed");
+
+    let after_incremental = client.describe_configs(topic).await.unwrap();
+    let as_map2: std::collections::HashMap<String, String> =
+        after_incremental.into_iter().collect();
+    assert_eq!(
+        as_map2.get("cleanup.policy").map(String::as_str),
+        Some("compact"),
+        "keys not touched by the incremental update must survive"
+    );
+    assert_eq!(
+        as_map2.get("compression.type").map(String::as_str),
+        Some("lz4")
+    );
+    assert!(
+        !as_map2.contains_key("retention.ms"),
+        "deleted key must be gone"
+    );
+
+    // 4. AlterConfigs/DescribeConfigs against an unknown topic is rejected, not silently
+    // accepted.
+    let err = client
+        .alter_configs("no-such-topic", &[("retention.ms".to_string(), "1".to_string())])
+        .await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn test_scenario_33_cooperative_group_rebalancing() {
+    let env = start_test_server().await;
+    let group_id = "cooperative-group";
+    let topic = "cooperative-topic";
+
+    let mut client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+
+    // 1. Member A forms the group with a cooperative assignor.
+    let join_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .expect("member A join should succeed");
+    assert_eq!(join_a.generation_id, 1);
+    assert!(join_a.is_leader, "first member must be the leader");
+    assert_eq!(join_a.protocol_name, "cooperative-sticky");
+
+    // 2. Leader A submits the initial assignment (all partitions to itself) and stabilizes.
+    let assignment_gen1 = vec![hermes::protocol::wire::MemberAssignment {
+        member_id: "member-a".to_string(),
+        topic: topic.to_string(),
+        partitions: vec![0, 1],
+    }];
+    let a_assignment = client_a
+        .sync_group(group_id, join_a.generation_id, "member-a", &assignment_gen1)
+        .await
+        .expect("leader sync should succeed");
+    assert_eq!(a_assignment, vec![(topic.to_string(), vec![0, 1])]);
+
+    // A's heartbeat at the current generation succeeds normally.
+    client_a
+        .heartbeat(group_id, join_a.generation_id, "member-a")
+        .await
+        .expect("heartbeat at current generation should succeed");
+
+    // 3. Member B joins — triggers a new generation. A is still the leader.
+    let join_b = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .expect("member B join should succeed");
+    assert_eq!(join_b.generation_id, 2);
+    assert!(!join_b.is_leader);
+
+    // 4. A hasn't rejoined yet (still heartbeating at generation 1). Because the group is
+    // cooperative, this must be a retryable signal, not a hard failure — A keeps
+    // consuming its existing assignment in the meantime rather than being cut off.
+    let stale_heartbeat = client_a.heartbeat(group_id, 1, "member-a").await;
+    assert!(stale_heartbeat.is_err());
+    assert!(stale_heartbeat
+        .unwrap_err()
+        .to_string()
+        .contains("REBALANCE_IN_PROGRESS"));
+
+    // 5. B tries to sync before the leader has submitted the new generation's assignment
+    // — also retryable, not fatal.
+    let early_sync = client_b
+        .sync_group(group_id, join_b.generation_id, "member-b", &[])
+        .await;
+    assert!(early_sync.is_err());
+    assert!(early_sync
+        .unwrap_err()
+        .to_string()
+        .contains("REBALANCE_IN_PROGRESS"));
+
+    // 6. Leader A rejoins to learn the new generation, then submits a real incremental
+    // assignment (only reassigning what actually moved: partition 1 to B).
+    let rejoin_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .expect("member A rejoin should succeed");
+    assert_eq!(rejoin_a.generation_id, join_b.generation_id);
+    assert!(rejoin_a.is_leader);
+
+    let assignment_gen2 = vec![
+        hermes::protocol::wire::MemberAssignment {
+            member_id: "member-a".to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+        },
+        hermes::protocol::wire::MemberAssignment {
+            member_id: "member-b".to_string(),
+            topic: topic.to_string(),
+            partitions: vec![1],
+        },
+    ];
+    let a_assignment_gen2 = client_a
+        .sync_group(group_id, rejoin_a.generation_id, "member-a", &assignment_gen2)
+        .await
+        .expect("leader sync for generation 2 should succeed");
+    assert_eq!(a_assignment_gen2, vec![(topic.to_string(), vec![0])]);
+
+    // 7. Now that the leader has synced, B's follower sync succeeds and retrieves its own
+    // (and only its own) assignment.
+    let b_assignment = client_b
+        .sync_group(group_id, join_b.generation_id, "member-b", &[])
+        .await
+        .expect("follower sync should succeed once the leader has submitted");
+    assert_eq!(b_assignment, vec![(topic.to_string(), vec![1])]);
+
+    // 8. Both members' heartbeats at the current generation now succeed cleanly.
+    client_a
+        .heartbeat(group_id, rejoin_a.generation_id, "member-a")
+        .await
+        .expect("A heartbeat at generation 2 should succeed");
+    client_b
+        .heartbeat(group_id, join_b.generation_id, "member-b")
+        .await
+        .expect("B heartbeat at generation 2 should succeed");
+
+    // 9. Contrast with an eager (default) group. Both eager and cooperative stale-
+    // generation heartbeats are errors carrying the same recognizable
+    // "REBALANCE_IN_PROGRESS" signal (so a client never has to guess from free-form text
+    // whether it means "just rejoin" versus something fatal) — the actual behavioral
+    // difference KIP-429 cooperative rebalancing is about is what happens *after* that
+    // signal: a cooperative member's heartbeat still gets refreshed (so it isn't pruned
+    // as expired while it takes its time rejoining and keeps processing partitions it
+    // already owns), while an eager member's does not.
+    let eager_group = "eager-group";
+    let mut client_c = TestClient::connect(env.addr).await.unwrap();
+    let join_c = client_c
+        .join_group(eager_group, "member-c", &["range"])
+        .await
+        .expect("eager join should succeed");
+    assert_eq!(join_c.protocol_name, "range");
+    let mut client_d = TestClient::connect(env.addr).await.unwrap();
+    let _join_d = client_d
+        .join_group(eager_group, "member-d", &["range"])
+        .await
+        .expect("second eager join should succeed");
+
+    let eager_stale_heartbeat = client_c.heartbeat(eager_group, join_c.generation_id, "member-c").await;
+    assert!(eager_stale_heartbeat.is_err());
+    assert!(eager_stale_heartbeat
+        .unwrap_err()
+        .to_string()
+        .contains("REBALANCE_IN_PROGRESS"));
+}
+
+#[tokio::test]
+async fn test_scenario_34_dedicated_controller_and_broker_roles() {
+    use hermes::config::ProcessRole;
+
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("role_split_test_{}_{}", pid, count));
+
+    let node1_dir = base_dir.join("node1_data");
+    let node2_dir = base_dir.join("node2_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // Node 2: broker-only — hosts data partitions, never contests the metadata quorum.
+    let config_node2 = EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: node2_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        roles: vec![ProcessRole::Broker],
+        ..EngineConfig::default()
+    };
+    let engine_node2 = StorageEngine::new(config_node2).unwrap();
+    let server_node2 = Server::new(engine_node2.clone());
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+    let server_node2_task = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // Node 1: controller-only — owns the metadata Raft quorum, must never host a data
+    // partition even though it's the (only) node available at topic-creation time.
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        roles: vec![ProcessRole::Controller],
+        // Explicitly zero peer controllers (this is the only one) — since `roles` is no
+        // longer the default combined set, this is taken literally rather than falling
+        // back to `peer_addrs` (which would incorrectly treat the broker-only peer as a
+        // fellow voter).
+        controller_peer_addrs: Vec::new(),
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1.clone());
+    let (listener_node1, addr_node1) = server_node1.bind().unwrap();
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    sleep(Duration::from_millis(50)).await;
+
+    // Seed broker discovery directly rather than waiting on the real heartbeat
+    // round-trip's timing (same pragmatic shortcut other multi-node tests in this file
+    // use via `register_broker_address`) — this is what `send_leader_heartbeat`'s ACK
+    // round-trip would otherwise populate.
+    engine_node1.register_broker_address(1, addr_node1.to_string());
+    engine_node1.register_broker_roles(1, &[ProcessRole::Controller.to_byte()]);
+    engine_node1.register_broker_address(2, addr_node2.to_string());
+    engine_node1.register_broker_roles(2, &[ProcessRole::Broker.to_byte()]);
+
+    // Node 1 (controller-only) must still be the cluster/Raft leader — that's its whole
+    // job — even though it will host no data.
+    assert!(engine_node1.is_leader());
+    assert!(!engine_node2.is_leader());
+
+    let topic = "role-split-topic";
+    let mut client_controller = TestClient::connect(addr_node1).await.unwrap();
+    client_controller
+        .create_topic(topic, 2)
+        .await
+        .expect("CreateTopic via the controller-only node should succeed");
+
+    // Every partition must have been assigned to node 2 (the only broker-eligible node)
+    // — never to node 1, even though node 1 is technically "available" and would have
+    // been picked by the old role-blind assignment logic.
+    let (_desc_topic, desc_parts) = client_controller
+        .describe_topic(topic)
+        .await
+        .expect("DescribeTopic failed");
+    assert_eq!(desc_parts.len(), 2);
+    for part in &desc_parts {
+        assert_eq!(
+            part.leader_id, 2,
+            "partition {} must be led by the broker-only node, not the controller-only one",
+            part.partition_id
+        );
+    }
+    assert!(
+        !engine_node1.is_partition_leader(topic, 0),
+        "controller-only node must never be a data-partition leader"
+    );
+
+    // Producing via the controller-only node must transparently forward to the actual
+    // (broker-only) partition leader rather than failing or mishandling the write.
+    let prod_res = client_controller
+        .produce_single(topic, "", None, 2, "hello from a controller-only entrypoint")
+        .await
+        .expect("produce forwarded through the controller-only node should succeed");
+    assert_eq!(prod_res.first_offset, 0);
+
+    sleep(Duration::from_millis(100)).await;
+
+    let mut client_broker = TestClient::connect(addr_node2).await.unwrap();
+    let fetched = client_broker
+        .fetch(topic, prod_res.assigned_partition, 0, 65536)
+        .await
+        .expect("fetch directly from the broker-only node should succeed");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(
+        fetched[0].payload,
+        "hello from a controller-only entrypoint".as_bytes()
+    );
+
+    server_node1_task.abort();
+    server_node2_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// Exercises the zero-copy `Fetch` fast path (`TransmitFile`/`sendfile`) end-to-end over a
+/// real plain (non-TLS) TCP connection — `TestClient` decodes the wire response the same
+/// way regardless of whether the server served it via zero-copy transmit or the buffered
+/// path, so any mismatch in the zero-copy header/byte-range logic shows up as wrong
+/// offsets, payloads, or frame counts here.
+#[tokio::test]
+async fn test_scenario_35_zero_copy_fetch_end_to_end() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let topic = "zero_copy_fetch_topic";
+    let partition = 0u32;
+    let total_records = 40usize;
+    let records: Vec<String> = (0..total_records)
+        .map(|i| format!("zero-copy-record-{:04}-with-some-extra-padding", i))
+        .collect();
+    let record_refs: Vec<&str> = records.iter().map(|s| s.as_str()).collect();
+
+    let prod_resp = client
+        .produce_batch(topic, "", None, 1, &record_refs)
+        .await
+        .unwrap();
+    assert_eq!(prod_resp.first_offset, 0);
+    assert_eq!(prod_resp.last_offset, total_records as u64 - 1);
+
+    // 1. Large max_bytes: the whole committed log fits in a single zero-copy plan.
+    let all_frames = client.fetch(topic, partition, 0, 64 * 1024).await.unwrap();
+    assert_eq!(all_frames.len(), total_records);
+    for (i, frame) in all_frames.iter().enumerate() {
+        assert_eq!(frame.offset, i as u64);
+        assert_eq!(frame.payload, records[i].as_bytes());
+        let calculated_crc =
+            RecordFrame::calculate_crc(frame.offset, frame.timestamp, &frame.payload);
+        assert_eq!(frame.crc, calculated_crc, "zero-copy frame CRC mismatch at offset {}", i);
+    }
+
+    // 2. Tight max_bytes budget forcing a multi-round consume loop — reconstructs the
+    // exact same sequence as (1), one small zero-copy-eligible slice at a time.
+    let mut next_offset = 0u64;
+    let mut collected = Vec::new();
+    let small_budget = 200u32; // a handful of records per round, not all of them
+    loop {
+        let frames = client
+            .fetch(topic, partition, next_offset, small_budget)
+            .await
+            .unwrap();
+        if frames.is_empty() {
+            break;
+        }
+        next_offset = frames.last().unwrap().offset + 1;
+        collected.extend(frames);
+        if collected.len() >= total_records {
+            break;
+        }
+    }
+    assert_eq!(collected.len(), total_records);
+    for (i, frame) in collected.iter().enumerate() {
+        assert_eq!(frame.offset, i as u64);
+        assert_eq!(frame.payload, records[i].as_bytes());
+    }
+
+    // 3. Fetching at/beyond the high watermark must return an empty (not erroring) result
+    // — the zero-copy planner returns None for this, and the buffered fallback must still
+    // behave exactly like it always has.
+    let beyond_hw = client
+        .fetch(topic, partition, total_records as u64, 4096)
+        .await
+        .unwrap();
+    assert!(beyond_hw.is_empty());
+}
+
+/// End-to-end tombstone + `delete.retention.ms` + `min.cleanable.dirty.ratio` compaction,
+/// driven entirely through the real client (`AlterConfigs` + `ProduceBatch` + `Fetch`) and
+/// the background-GC-equivalent `PartitionManager::apply_retention()` call — same real
+/// entry points a client/operator would use, not `SegmentManager` internals directly (see
+/// the focused per-branch unit tests in `src/segment/manager.rs` for that level of detail).
+#[tokio::test]
+async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "tombstone_compaction_test_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        count
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Tiny max_segment_bytes forces auto-rotation after each small record, so every
+    // record lands in its own segment — deterministic layout without needing a manual
+    // rotate hook through the client.
+    let config = EngineConfig {
+        data_dir: data_dir.clone(),
+        max_segment_bytes: 40,
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+    let server_task = tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    let mut client = TestClient::connect(addr).await.unwrap();
+    let topic = "tombstone-compaction-topic";
+    client.create_topic(topic, 1).await.unwrap();
+    client
+        .alter_configs(
+            topic,
+            &[
+                ("cleanup.policy".to_string(), "compact".to_string()),
+                ("delete.retention.ms".to_string(), "1".to_string()),
+                ("min.cleanable.dirty.ratio".to_string(), "0.0".to_string()),
+            ],
+        )
+        .await
+        .expect("AlterConfigs should succeed");
+
+    client.produce_single(topic, "", None, 1, "userA:v1").await.unwrap(); // offset 0 — stale
+    client.produce_single(topic, "", None, 1, "userA:v2").await.unwrap(); // offset 1 — current value for userA
+    client.produce_single(topic, "", None, 1, "userB:").await.unwrap(); // offset 2 — tombstone for userB
+    client.produce_single(topic, "", None, 1, "zzz:filler").await.unwrap(); // offset 3 — pushes offset 2's segment into history
+
+    // delete.retention.ms=1 means the tombstone is expired almost as soon as it's
+    // written; this sleep just makes that unambiguous regardless of scheduling jitter.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+    let compacted = pm.apply_retention().unwrap();
+    assert!(
+        compacted >= 2,
+        "offset 0 (stale userA:v1) and offset 2 (expired userB tombstone) should both be dropped, got {}",
+        compacted
+    );
+
+    // The surviving current value for userA must still be exactly as produced.
+    let remaining = client.fetch(topic, 0, 1, 4096).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].offset, 1);
+    assert_eq!(remaining[0].payload.as_ref(), b"userA:v2");
+
+    server_task.abort();
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {

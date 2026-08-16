@@ -58,6 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--key-path",
         "--sni",
         "--server-name",
+        "--num-records",
+        "--record-size",
+        "--batch-size",
+        "--throughput",
+        "--messages",
     ];
 
     let mut command_opt = None;
@@ -182,6 +187,235 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Assigned Partition: {}", res.assigned_partition);
             println!("  Logical Offset:     {}", res.first_offset);
         }
+        "perf-produce" => {
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "perf-test-topic".to_string());
+            let key = get_arg_val(&args, "--key").unwrap_or_default();
+            let num_partitions: u32 = get_arg_val(&args, "--partitions")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            let num_records: u64 = get_arg_val(&args, "--num-records")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000);
+            let record_size: usize = get_arg_val(&args, "--record-size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            let batch_size: u64 = get_arg_val(&args, "--batch-size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100)
+                .max(1);
+            // Matches Kafka's kafka-producer-perf-test.sh --throughput: target records/sec,
+            // -1 (or any non-positive value) means unthrottled — send as fast as possible.
+            let throughput: i64 = get_arg_val(&args, "--throughput")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+
+            let payload: Vec<u8> = vec![b'x'; record_size.max(1)];
+
+            println!("============================================================");
+            println!("   HERMES PRODUCER PERFORMANCE TEST");
+            println!("============================================================");
+            println!("  Server:        {}", server_addr);
+            println!("  Topic:         {}", topic);
+            println!("  Records:       {}", num_records);
+            println!("  Record Size:   {} bytes", record_size);
+            println!("  Batch Size:    {} records/request", batch_size);
+            println!(
+                "  Target Rate:   {}",
+                if throughput > 0 {
+                    format!("{} records/sec", throughput)
+                } else {
+                    "unlimited".to_string()
+                }
+            );
+            println!("------------------------------------------------------------------");
+
+            let mut sent: u64 = 0;
+            let mut sent_bytes: u64 = 0;
+            let mut request_latencies_ms: Vec<f64> = Vec::new();
+            let test_start = std::time::Instant::now();
+            let mut last_report = test_start;
+            let mut last_report_count: u64 = 0;
+
+            while sent < num_records {
+                let this_batch = batch_size.min(num_records - sent) as usize;
+                let records: Vec<&[u8]> = std::iter::repeat(payload.as_slice())
+                    .take(this_batch)
+                    .collect();
+
+                let req_start = std::time::Instant::now();
+                let res = client
+                    .produce_batch(&topic, &key, None, num_partitions, &records)
+                    .await;
+                let elapsed_ms = req_start.elapsed().as_secs_f64() * 1000.0;
+
+                match res {
+                    Ok(_) => {
+                        request_latencies_ms.push(elapsed_ms);
+                        sent += this_batch as u64;
+                        sent_bytes += (this_batch * record_size) as u64;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Produce request failed after {} records: {}", sent, e);
+                        break;
+                    }
+                }
+
+                // Simple target-rate pacing (matches Kafka perf test's --throughput):
+                // sleep just enough to keep cumulative send rate at or below the target,
+                // rather than pacing every individual request independently.
+                if throughput > 0 {
+                    let expected_elapsed_secs = sent as f64 / throughput as f64;
+                    let actual_elapsed_secs = test_start.elapsed().as_secs_f64();
+                    if actual_elapsed_secs < expected_elapsed_secs {
+                        sleep(Duration::from_secs_f64(
+                            expected_elapsed_secs - actual_elapsed_secs,
+                        ))
+                        .await;
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                let since_report = now.duration_since(last_report).as_secs_f64();
+                if since_report >= 1.0 {
+                    let interval_records = sent - last_report_count;
+                    let rate = interval_records as f64 / since_report;
+                    let mb_rate =
+                        (interval_records * record_size as u64) as f64 / (1024.0 * 1024.0) / since_report;
+                    println!(
+                        "  {:>10} records sent, {:>10.1} records/sec ({:>6.2} MB/sec)",
+                        sent, rate, mb_rate
+                    );
+                    last_report = now;
+                    last_report_count = sent;
+                }
+            }
+
+            let total_elapsed = test_start.elapsed().as_secs_f64().max(0.000_001);
+            let overall_rate = sent as f64 / total_elapsed;
+            let overall_mb_rate = sent_bytes as f64 / (1024.0 * 1024.0) / total_elapsed;
+
+            request_latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let avg_latency = if request_latencies_ms.is_empty() {
+                0.0
+            } else {
+                request_latencies_ms.iter().sum::<f64>() / request_latencies_ms.len() as f64
+            };
+            let max_latency = request_latencies_ms.last().copied().unwrap_or(0.0);
+
+            println!("------------------------------------------------------------------");
+            println!(
+                "✅ {} records sent, {:.1} records/sec ({:.2} MB/sec) in {:.2}s",
+                sent, overall_rate, overall_mb_rate, total_elapsed
+            );
+            println!(
+                "   Request latency (per {}-record produce_batch call): avg {:.2} ms, p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+                batch_size,
+                avg_latency,
+                percentile(&request_latencies_ms, 50.0),
+                percentile(&request_latencies_ms, 95.0),
+                percentile(&request_latencies_ms, 99.0),
+                max_latency,
+            );
+        }
+        "perf-consume" => {
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "perf-test-topic".to_string());
+            let partition: u32 = get_arg_val(&args, "--partition")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let target_messages: u64 = get_arg_val(&args, "--messages")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000);
+            let from_beginning = has_flag(&args, "--from-beginning");
+            let max_bytes: u32 = get_arg_val(&args, "--max-bytes")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024 * 1024);
+
+            let mut next_offset: u64 = if let Some(explicit) =
+                get_arg_val(&args, "--offset").and_then(|s| s.parse().ok())
+            {
+                explicit
+            } else if from_beginning {
+                0
+            } else {
+                0
+            };
+
+            println!("============================================================");
+            println!("   HERMES CONSUMER PERFORMANCE TEST");
+            println!("============================================================");
+            println!("  Server:        {}", server_addr);
+            println!("  Topic:         {}", topic);
+            println!("  Partition:     {}", partition);
+            println!("  Target:        {} messages", target_messages);
+            println!("  Start Offset:  {}", next_offset);
+            println!("------------------------------------------------------------------");
+
+            let mut consumed: u64 = 0;
+            let mut consumed_bytes: u64 = 0;
+            let test_start = std::time::Instant::now();
+            let mut last_report = test_start;
+            let mut last_report_count: u64 = 0;
+            let mut empty_fetch_streak: u32 = 0;
+            // Give up waiting for more data after ~2s of consecutive empty fetches
+            // (100ms backoff each) rather than spinning forever if the target message
+            // count exceeds what's actually been produced.
+            const MAX_EMPTY_FETCH_STREAK: u32 = 20;
+
+            while consumed < target_messages {
+                match client.fetch(&topic, partition, next_offset, max_bytes).await {
+                    Ok(frames) if !frames.is_empty() => {
+                        empty_fetch_streak = 0;
+                        for frame in &frames {
+                            next_offset = frame.offset + 1;
+                            // Match the plain fetch/consume command: control markers
+                            // occupy real offsets (advance next_offset) but aren't
+                            // real records for throughput accounting.
+                            if !frame.is_control_marker() {
+                                consumed += 1;
+                                consumed_bytes += frame.payload.len() as u64;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        empty_fetch_streak += 1;
+                        if empty_fetch_streak > MAX_EMPTY_FETCH_STREAK {
+                            println!(
+                                "\n⚠️  No new data after {} empty fetches — stopping early at {} of {} messages.",
+                                empty_fetch_streak, consumed, target_messages
+                            );
+                            break;
+                        }
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Fetch failed after {} records: {}", consumed, e);
+                        break;
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                let since_report = now.duration_since(last_report).as_secs_f64();
+                if since_report >= 1.0 {
+                    let interval_records = consumed - last_report_count;
+                    let rate = interval_records as f64 / since_report;
+                    println!("  {:>10} messages consumed, {:>10.1} msg/sec", consumed, rate);
+                    last_report = now;
+                    last_report_count = consumed;
+                }
+            }
+
+            let total_elapsed = test_start.elapsed().as_secs_f64().max(0.000_001);
+            let overall_rate = consumed as f64 / total_elapsed;
+            let overall_mb_rate = consumed_bytes as f64 / (1024.0 * 1024.0) / total_elapsed;
+
+            println!("------------------------------------------------------------------");
+            println!(
+                "✅ {} messages consumed, {:.1} msg/sec ({:.2} MB/sec) in {:.2}s",
+                consumed, overall_rate, overall_mb_rate, total_elapsed
+            );
+        }
         "fetch" | "consume" => {
             let topic =
                 get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
@@ -215,6 +449,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let frames = client
                 .fetch(&topic, partition, start_offset, max_bytes)
                 .await?;
+            // Plain Fetch returns raw frames, including transaction commit/abort control
+            // markers — the server exposes them at the wire level (same as real Kafka)
+            // and expects the client to skip them. Filter them out here so the CLI never
+            // prints a control marker's raw payload as if it were a real record.
+            let frames: Vec<_> = frames
+                .into_iter()
+                .filter(|f| !f.is_control_marker())
+                .collect();
 
             if let Some(ref group_id) = group_opt {
                 println!(
@@ -292,11 +534,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match client.fetch(&topic, partition, next_offset, 64 * 1024).await {
                             Ok(frames) if !frames.is_empty() => {
                                 for frame in &frames {
-                                    let payload_str = String::from_utf8_lossy(&frame.payload);
-                                    println!(
-                                        "📥 Group '{}' consumed Offset {:<6} | Timestamp: {} | Payload: '{}'",
-                                        group_id, frame.offset, frame.timestamp, payload_str
-                                    );
+                                    // Advance past every frame (control markers occupy
+                                    // real offsets too), but only print real records —
+                                    // see the one-shot fetch command above for why.
+                                    if !frame.is_control_marker() {
+                                        let payload_str = String::from_utf8_lossy(&frame.payload);
+                                        println!(
+                                            "📥 Group '{}' consumed Offset {:<6} | Timestamp: {} | Payload: '{}'",
+                                            group_id, frame.offset, frame.timestamp, payload_str
+                                        );
+                                    }
                                     next_offset = frame.offset + 1;
                                 }
 
@@ -536,6 +783,17 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// Nearest-rank percentile over an already-sorted (ascending) sample set. Returns 0.0 for
+/// an empty set rather than panicking, since a perf test that fails its very first request
+/// should still print a (zeroed) summary rather than crash on the stats line.
+fn percentile(sorted_samples: &[f64], p: f64) -> f64 {
+    if sorted_samples.is_empty() {
+        return 0.0;
+    }
+    let idx = ((p / 100.0) * (sorted_samples.len() - 1) as f64).round() as usize;
+    sorted_samples[idx.min(sorted_samples.len() - 1)]
+}
+
 fn print_usage() {
     println!("============================================================");
     println!("               HERMES EVENT STREAMING CLI                   ");
@@ -545,6 +803,18 @@ fn print_usage() {
     println!("Commands:");
     println!("  produce         Produce an event payload to a topic");
     println!("                  --topic <NAME> --message <MSG> [--key <KEY>] [--partitions <N>]");
+    println!(
+        "  perf-produce    Producer performance test (like kafka-producer-perf-test.sh)"
+    );
+    println!(
+        "                  --topic <NAME> [--num-records <N>] [--record-size <BYTES>] [--batch-size <N>] [--throughput <N>] [--partitions <N>]"
+    );
+    println!(
+        "  perf-consume    Consumer performance test (like kafka-consumer-perf-test.sh)"
+    );
+    println!(
+        "                  --topic <NAME> [--partition <ID>] [--messages <N>] [--offset <N> | --from-beginning] [--max-bytes <N>]"
+    );
     println!(
         "  fetch / consume Kafka-style fetch (supports consumer group tracking & --from-beginning)"
     );
