@@ -87,19 +87,41 @@ impl ProducerStateManager {
         );
     }
 
+    /// Writes the snapshot atomically: a crash or a fresh `.truncate(true)` write directly
+    /// over `self.snapshot_path` risks leaving a half-written (truncated-but-not-yet-
+    /// rewritten) file behind that the next startup would then load as valid producer
+    /// state, silently losing idempotence tracking for every producer whose entry landed
+    /// after the crash point. Writing to a sibling `.tmp` file, fsyncing it, and only then
+    /// renaming it into place means the file at `self.snapshot_path` is always either the
+    /// complete previous snapshot or the complete new one — never a partial write.
     pub fn take_snapshot(&self) -> IoResult<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.snapshot_path)?;
-        for (pid, state) in &self.states {
-            file.write_all(&pid.to_be_bytes())?;
-            file.write_all(&state.epoch.to_be_bytes())?;
-            file.write_all(&state.last_sequence.to_be_bytes())?;
-            file.write_all(&state.last_offset.to_be_bytes())?;
+        let tmp_path = self.snapshot_path.with_extension("snapshot.tmp");
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            for (pid, state) in &self.states {
+                file.write_all(&pid.to_be_bytes())?;
+                file.write_all(&state.epoch.to_be_bytes())?;
+                file.write_all(&state.last_sequence.to_be_bytes())?;
+                file.write_all(&state.last_offset.to_be_bytes())?;
+            }
+            file.sync_all()?;
         }
-        file.sync_all()?;
+        // Windows cannot atomically rename over an existing destination path (unlike
+        // POSIX `rename(2)`) — remove it first, matching the same pattern already used by
+        // `ConsumerGroupManager::compact_log`.
+        match std::fs::remove_file(&self.snapshot_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::rename(&tmp_path, &self.snapshot_path)?;
+        if let Some(parent) = self.snapshot_path.parent() {
+            crate::segment::log::fsync_dir(parent);
+        }
         Ok(())
     }
 }

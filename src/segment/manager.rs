@@ -142,6 +142,20 @@ pub struct SegmentManager {
     /// so a single reused buffer is safe and avoids a fresh `Vec` allocation on every
     /// produced/replicated record.
     frame_encode_scratch: bytes::BytesMut,
+    /// Wall-clock time (ms since epoch) the current active segment became active — either
+    /// this `SegmentManager` opening it for the first time or the last `rotate_segment`
+    /// call. Used for `config.segment_ms`-based time rolling (Kafka `segment.ms`):
+    /// low-volume topics that never hit `max_segment_bytes` still get rotated eventually,
+    /// so their data becomes eligible for retention/compaction instead of sitting in a
+    /// perpetually-active segment forever.
+    active_created_at_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl SegmentManager {
@@ -179,13 +193,18 @@ impl SegmentManager {
             let time_index = TimeIndexSegment::open(time_index_path, base)?;
             let txn_index_path = dir.join(format!("{}.txnindex", format_segment_filename(base)));
             let txn_index = TxnIndexSegment::open(txn_index_path)?;
-            let log = LogSegment::open(
+            // Historical segments are immutable once rotated — trust a valid `.clean`
+            // marker (written by `LogSegment::finalize` at rotation time) to skip the
+            // O(N) full-segment CRC recovery scan on every startup. Only ever safe for
+            // non-active segments; see `LogSegment::open_with_trust`.
+            let log = LogSegment::open_with_trust(
                 &dir,
                 base,
                 config.max_segment_bytes,
                 config.index_interval_bytes,
                 config.preallocate_segments,
                 &mut index,
+                true,
             )?;
             let mmap = crate::segment::mmap::MmapLogSegment::open(&log.path, base).ok();
             historical.push(SegmentPair {
@@ -234,7 +253,35 @@ impl SegmentManager {
             bytes_since_last_index: 0,
             high_watermark,
             frame_encode_scratch: bytes::BytesMut::new(),
+            active_created_at_ms: now_ms(),
         })
+    }
+
+    /// Rotates the active segment before an about-to-be-appended frame if either the
+    /// size threshold (`max_segment_bytes`) or the age threshold (`segment_ms`, see
+    /// `should_roll_by_time`) calls for it. Shared by every append path so a low-volume
+    /// topic that never hits the byte threshold still rotates on time, same as one that
+    /// does.
+    fn maybe_rotate_before_append(&mut self, frame_size: u64) -> IoResult<()> {
+        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes
+            || self.should_roll_by_time()
+        {
+            self.rotate_segment()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the active segment should be rolled purely due to age (Kafka
+    /// `segment.ms`), independent of `max_segment_bytes`. Never rolls an already-empty
+    /// active segment — an idle topic with nothing written yet has nothing to gain from
+    /// rotating, and doing so would just churn empty segment files forever.
+    fn should_roll_by_time(&self) -> bool {
+        match self.config.segment_ms {
+            Some(segment_ms) if segment_ms > 0 && self.active.log.physical_size > 0 => {
+                now_ms().saturating_sub(self.active_created_at_ms) >= segment_ms
+            }
+            _ => false,
+        }
     }
 
     pub fn high_watermark(&self) -> u64 {
@@ -291,10 +338,7 @@ impl SegmentManager {
         };
         let frame_size = frame.encoded_size() as u64;
 
-        // Rotate segment if active log size exceeds configured threshold
-        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
-            self.rotate_segment()?;
-        }
+        self.maybe_rotate_before_append(frame_size)?;
 
         let physical_pos = self.append_frame_to_active(&frame)?;
 
@@ -332,9 +376,7 @@ impl SegmentManager {
         }
 
         let frame_size = frame.encoded_size() as u64;
-        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
-            self.rotate_segment()?;
-        }
+        self.maybe_rotate_before_append(frame_size)?;
 
         let physical_pos = self.append_frame_to_active(frame)?;
 
@@ -389,6 +431,7 @@ impl SegmentManager {
         self.high_watermark = offset;
         self.active.log.next_offset = offset;
         self.bytes_since_last_index = 0;
+        crate::segment::log::fsync_dir(&self.dir);
         Ok(())
     }
 
@@ -451,10 +494,7 @@ impl SegmentManager {
             transaction_id,
         );
         let frame_size = frame.encoded_size() as u64;
-
-        if self.active.log.physical_size + frame_size > self.config.max_segment_bytes {
-            self.rotate_segment()?;
-        }
+        self.maybe_rotate_before_append(frame_size)?;
 
         let physical_pos = self.append_frame_to_active(&frame)?;
 
@@ -527,6 +567,13 @@ impl SegmentManager {
         .ok();
         self.historical.push(old_active);
         self.bytes_since_last_index = 0;
+        self.active_created_at_ms = now_ms();
+
+        // Make the new segment's file creations and the old segment's finalized size
+        // durable against a crash, not just their own contents (fsync'd individually
+        // above/in `finalize`) — a rename or a new file's directory entry can still be
+        // lost on some filesystems without an explicit parent-directory fsync.
+        crate::segment::log::fsync_dir(&self.dir);
 
         Ok(())
     }
@@ -789,7 +836,16 @@ impl SegmentManager {
                 if frame.is_control_marker() {
                     continue;
                 }
-                let (key, value) = extract_key_value(&frame.payload);
+                // Compaction dedups by key, and the key lives inside the record payload —
+                // for a compressed frame that payload is the compressed blob, not the
+                // actual key/value bytes, so it must be decompressed first or every
+                // compressed record looks like a unique, never-matching "key". Falls back
+                // to the raw (compressed) bytes on decompress failure, same as this
+                // function's pre-existing error tolerance elsewhere.
+                let decoded = frame
+                    .decompress_payload()
+                    .unwrap_or_else(|_| frame.payload.clone());
+                let (key, value) = extract_key_value(&decoded);
                 let is_tombstone = value.is_some_and(|v| v.is_empty());
                 observe(key, frame.offset, frame.timestamp, is_tombstone);
             }
@@ -800,7 +856,10 @@ impl SegmentManager {
             if frame.is_control_marker() {
                 continue;
             }
-            let (key, value) = extract_key_value(&frame.payload);
+            let decoded = frame
+                .decompress_payload()
+                .unwrap_or_else(|_| frame.payload.clone());
+            let (key, value) = extract_key_value(&decoded);
             let is_tombstone = value.is_some_and(|v| v.is_empty());
             observe(key, frame.offset, frame.timestamp, is_tombstone);
         }
@@ -857,7 +916,10 @@ impl SegmentManager {
                     kept_frames.push(frame);
                     continue;
                 }
-                let key = extract_key(&frame.payload);
+                let decoded = frame
+                    .decompress_payload()
+                    .unwrap_or_else(|_| frame.payload.clone());
+                let key = extract_key(&decoded);
                 let keep = match latest_offsets.get(key) {
                     Some(&latest_off) => frame.offset == latest_off,
                     // Either the key was never ambiguous-fallback-eligible for dedup (kept,
@@ -901,6 +963,8 @@ impl SegmentManager {
                 let _ = fs::remove_file(&index_path);
                 let _ = fs::remove_file(&time_index_path);
                 let _ = fs::remove_file(&txn_index_path);
+                crate::segment::log::remove_clean_marker(&log_path);
+                crate::segment::log::fsync_dir(&self.dir);
                 continue;
             }
 
@@ -970,16 +1034,20 @@ impl SegmentManager {
             let _ = fs::remove_file(&index_path);
             let _ = fs::remove_file(&time_index_path);
             let _ = fs::remove_file(&txn_index_path);
+            // The old segment's `.clean` marker (if any) describes its pre-compaction
+            // size — stale the instant the file it describes is replaced below.
+            crate::segment::log::remove_clean_marker(&log_path);
 
             fs::rename(&tmp_log_path, &log_path)?;
             fs::rename(&tmp_index_path, &index_path)?;
             fs::rename(&tmp_timeindex_path, &time_index_path)?;
             fs::rename(&tmp_txnindex_path, &txn_index_path)?;
+            crate::segment::log::fsync_dir(&self.dir);
 
             let mut new_index = IndexSegment::open(&index_path, base_offset)?;
             let new_timeindex = TimeIndexSegment::open(&time_index_path, base_offset)?;
             let new_txnindex = TxnIndexSegment::open(&txn_index_path)?;
-            let new_log = LogSegment::open(
+            let mut new_log = LogSegment::open(
                 &self.dir,
                 base_offset,
                 self.config.max_segment_bytes,
@@ -987,6 +1055,10 @@ impl SegmentManager {
                 false,
                 &mut new_index,
             )?;
+            // A just-compacted historical segment is immediately immutable again, exactly
+            // like one that just finished a normal rotation — `finalize()` records that
+            // (and writes a fresh `.clean` marker) so the next startup can trust it too.
+            new_log.finalize()?;
 
             let new_pair = SegmentPair {
                 base_offset,
@@ -1018,12 +1090,21 @@ impl SegmentManager {
         let mut i = 0;
         while i < self.historical.len() {
             let pair = &self.historical[i];
-            let file_age_ms = pair.log.modified_time_ms().unwrap_or(0);
+            // Prefer the segment's own newest record timestamp (from its time index) over
+            // filesystem mtime: mtime tracks when the file was last *written*, which a
+            // backup tool, a replica resync, or a plain `touch` can change without
+            // touching a single record — silently resetting the segment's retention
+            // clock. Falls back to mtime only for the (empty-segment) case where the time
+            // index has no entries at all.
+            let record_age_ms = pair
+                .time_index
+                .max_timestamp()
+                .unwrap_or_else(|| pair.log.modified_time_ms().unwrap_or(0));
 
             let mut remove = false;
 
             if let Some(max_age_ms) = retention_millis {
-                if now_ms > file_age_ms && (now_ms - file_age_ms) > max_age_ms {
+                if now_ms > record_age_ms && (now_ms - record_age_ms) > max_age_ms {
                     remove = true;
                 }
             }
@@ -1060,10 +1141,15 @@ impl SegmentManager {
                 let _ = fs::remove_file(&index_path);
                 let _ = fs::remove_file(&time_index_path);
                 let _ = fs::remove_file(&txn_index_path);
+                crate::segment::log::remove_clean_marker(&log_path);
                 removed_count += 1;
             } else {
                 i += 1;
             }
+        }
+
+        if removed_count > 0 {
+            crate::segment::log::fsync_dir(&self.dir);
         }
 
         Ok(removed_count)
@@ -1109,8 +1195,12 @@ impl SegmentManager {
             let _ = fs::remove_file(&index_path);
             let _ = fs::remove_file(&time_index_path);
             let _ = fs::remove_file(&txn_index_path);
+            crate::segment::log::remove_clean_marker(&log_path);
             removed_count += 1;
             // Don't advance `i` — the next segment shifted down to this index.
+        }
+        if removed_count > 0 {
+            crate::segment::log::fsync_dir(&self.dir);
         }
         Ok(removed_count)
     }
@@ -1538,5 +1628,160 @@ mod tests {
         let n = mgr.apply_retention().unwrap();
         assert_eq!(n, 1, "10% dirty now clears the lowered 5% gate");
         assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn compact_segments_dedups_compressed_records_by_decompressed_key() {
+        let dir = TempDir::new("compact_compressed");
+        let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
+
+        // Both records use the same logical key ("user1:...") but only exist on disk in
+        // compressed form — compaction must decompress before extracting the key, or it
+        // will treat each compressed blob as its own unique "key" and never dedup them.
+        mgr.append_with_codec(
+            Bytes::from_static(b"user1:val_1"),
+            1,
+            crate::config::CompressionCodec::Lz4,
+        )
+        .unwrap(); // offset 0, stale
+        mgr.append_with_codec(
+            Bytes::from_static(b"user1:val_2"),
+            2,
+            crate::config::CompressionCodec::Zstd,
+        )
+        .unwrap(); // offset 1, current
+        mgr.rotate_segment().unwrap();
+
+        let n = mgr.apply_retention().unwrap();
+        assert_eq!(n, 1, "the stale compressed user1:val_1 record should be dropped");
+
+        let remaining = mgr.fetch(0, 4096).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].offset, 1);
+        assert_eq!(
+            remaining[0].decompress_payload().unwrap().as_ref(),
+            b"user1:val_2"
+        );
+    }
+
+    #[test]
+    fn restart_after_clean_rotation_trusts_marker_and_skips_full_scan() {
+        let dir = TempDir::new("restart_clean_trust");
+
+        // First "process": write across a few rotated (historical) segments plus one
+        // active segment, then drop it — simulating a clean shutdown (rotation always
+        // finalizes+marks the segment it rotates out, regardless of how the process
+        // holding it later exits).
+        {
+            let config = EngineConfig {
+                max_segment_bytes: 200,
+                ..EngineConfig::default()
+            };
+            let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+            for i in 0..8u64 {
+                let frame = RecordFrame::create(i, i, format!("payload-{}", i).into_bytes());
+                mgr.append_verbatim(&frame).unwrap();
+                mgr.rotate_segment().unwrap();
+            }
+            let last = RecordFrame::create(8, 8, b"active-tail".to_vec());
+            mgr.append_verbatim(&last).unwrap();
+            assert_eq!(mgr.historical.len(), 8);
+        }
+
+        // Every historical segment should now carry a `.clean` marker.
+        for base in 0..8u64 {
+            let log_path = dir.0.join(format!("{}.log", format_segment_filename(base)));
+            let marker_path = log_path.with_extension("clean");
+            assert!(
+                marker_path.exists(),
+                "expected clean marker for segment {}",
+                base
+            );
+        }
+
+        // "Restart": reopen the same directory and verify all data and offsets survived
+        // identically, whether or not the trusted fast path was taken for each segment.
+        let config = EngineConfig {
+            max_segment_bytes: 200,
+            ..EngineConfig::default()
+        };
+        let mut mgr2 = SegmentManager::open(&dir.0, config).unwrap();
+        assert_eq!(mgr2.high_watermark(), 9);
+        assert_eq!(mgr2.historical.len(), 8);
+        for i in 0..9u64 {
+            let frames = mgr2.fetch(i, 4096).unwrap();
+            assert_eq!(frames.first().map(|f| f.offset), Some(i));
+        }
+
+        // The restarted manager must still be fully writable/rotatable afterwards.
+        let extra = RecordFrame::create(9, 9, b"post-restart".to_vec());
+        assert_eq!(
+            mgr2.append_verbatim(&extra).unwrap(),
+            VerbatimAppendResult::Appended
+        );
+        assert_eq!(mgr2.high_watermark(), 10);
+    }
+
+    #[test]
+    fn corrupted_trusted_segment_falls_back_to_full_scan() {
+        let dir = TempDir::new("restart_trust_fallback");
+        {
+            let config = EngineConfig {
+                max_segment_bytes: 200,
+                ..EngineConfig::default()
+            };
+            let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+            let frame = RecordFrame::create(0, 0, b"first".to_vec());
+            mgr.append_verbatim(&frame).unwrap();
+            mgr.rotate_segment().unwrap();
+            let tail = RecordFrame::create(1, 1, b"second".to_vec());
+            mgr.append_verbatim(&tail).unwrap();
+        }
+
+        // Corrupt the now-historical (rotated, marker-carrying) segment 0's log file by
+        // appending a stray byte after it was already marked clean — the size no longer
+        // matches the marker, so the trusted fast path must refuse it and fall back to a
+        // full scan rather than silently reporting wrong/missing data.
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(&[0xFFu8]).unwrap();
+        }
+
+        let config = EngineConfig {
+            max_segment_bytes: 200,
+            ..EngineConfig::default()
+        };
+        let mgr2 = SegmentManager::open(&dir.0, config).unwrap();
+        // The full-scan recovery path truncates the trailing garbage byte and recovers
+        // exactly the one valid frame that was there.
+        assert_eq!(mgr2.historical.len(), 1);
+        assert_eq!(mgr2.historical[0].log.next_offset, 1);
+    }
+
+    #[test]
+    fn segment_ms_rolls_active_segment_purely_on_age() {
+        let dir = TempDir::new("segment_ms_roll");
+        let config = EngineConfig {
+            max_segment_bytes: u64::MAX, // never roll on size alone
+            segment_ms: Some(1),         // roll almost immediately once non-empty
+            ..EngineConfig::default()
+        };
+        let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+
+        mgr.append(b"first", 1).unwrap();
+        assert_eq!(mgr.historical.len(), 0, "fresh segment shouldn't roll instantly");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mgr.append(b"second", 2).unwrap();
+        assert_eq!(
+            mgr.historical.len(),
+            1,
+            "active segment should have rolled purely due to age"
+        );
     }
 }

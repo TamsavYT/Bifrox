@@ -12,6 +12,106 @@ pub fn format_segment_filename(base_offset: u64) -> String {
     format!("{:020}", base_offset)
 }
 
+/// Sibling path of a `.clean` marker for a given `.log` file path — written by
+/// `LogSegment::finalize()` once a segment is rotated out of the active role and never
+/// appended to again, and consulted (only for historical, non-active segments) by
+/// `LogSegment::open_at_path` to skip the O(N) full-segment CRC recovery scan on startup.
+/// See `read_clean_marker`/`write_clean_marker` for the format.
+fn clean_marker_path(log_path: &Path) -> PathBuf {
+    let mut p = log_path.to_path_buf();
+    p.set_extension("clean");
+    p
+}
+
+/// Writes an 8-byte big-endian file length into `<log_path>.clean`, best-effort (a failure
+/// here just means the next startup falls back to a full scan for this segment — never a
+/// correctness issue, only a missed optimization).
+fn write_clean_marker(log_path: &Path, physical_size: u64) {
+    let marker_path = clean_marker_path(log_path);
+    let _ = std::fs::write(&marker_path, physical_size.to_be_bytes());
+}
+
+/// Reads back the length recorded by `write_clean_marker`, if the marker file exists and
+/// is well-formed.
+fn read_clean_marker(log_path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(clean_marker_path(log_path)).ok()?;
+    let arr: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(u64::from_be_bytes(arr))
+}
+
+/// Removes a segment's `.clean` marker, if any — used when a historical segment's content
+/// changes out from under a previously-written marker (compaction rewriting the file,
+/// Raft-style truncation) so a stale marker can never be trusted again.
+pub fn remove_clean_marker(log_path: &Path) {
+    let _ = std::fs::remove_file(clean_marker_path(log_path));
+}
+
+/// Cross-platform best-effort directory fsync: makes a segment rotation/truncation/
+/// compaction's file creations, renames, and deletes durable against a crash, not just the
+/// file contents themselves. A failure here is logged but never propagated — losing a
+/// just-fsynced rename to a subsequent crash is a rare edge case, not a reason to fail the
+/// operation that already succeeded on the file(s) themselves.
+pub fn fsync_dir(dir: impl AsRef<Path>) {
+    let dir = dir.as_ref();
+    #[cfg(unix)]
+    {
+        match std::fs::File::open(dir) {
+            Ok(f) => {
+                if let Err(e) = f.sync_all() {
+                    tracing::warn!("fsync_dir: failed to sync directory {}: {}", dir.display(), e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("fsync_dir: failed to open directory {}: {}", dir.display(), e);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Directories can't be opened via `std::fs::File::open` on Windows (it lacks
+        // FILE_FLAG_BACKUP_SEMANTICS), so this goes through the Win32 API directly.
+        // NTFS still allows flushing a directory handle's metadata this way.
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let handle = CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                0, // HANDLE hTemplateFile = NULL
+            );
+            if handle == INVALID_HANDLE_VALUE {
+                tracing::warn!(
+                    "fsync_dir: failed to open directory handle for {}: {}",
+                    dir.display(),
+                    std::io::Error::last_os_error()
+                );
+                return;
+            }
+            if FlushFileBuffers(handle) == 0 {
+                tracing::warn!(
+                    "fsync_dir: FlushFileBuffers failed for {}: {}",
+                    dir.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+            CloseHandle(handle);
+        }
+    }
+}
+
 /// Active or historical log segment file
 #[derive(Debug)]
 pub struct LogSegment {
@@ -34,11 +134,38 @@ impl LogSegment {
         preallocate: bool,
         index_segment: &mut IndexSegment,
     ) -> IoResult<Self> {
+        Self::open_with_trust(dir, base_offset, max_bytes, index_interval, preallocate, index_segment, false)
+    }
+
+    /// Same as `open`, but lets the caller assert that `index_segment`'s persisted entries
+    /// may be trusted without a full re-verification scan, when a `.clean` marker (see
+    /// `finalize`) confirms this segment was cleanly finalized and hasn't changed size
+    /// since. Only ever safe to pass `true` for a segment that will never be appended to
+    /// again (i.e. a historical, already-rotated segment) — the currently-active segment
+    /// must always take the full scan path, since it may have been mid-write at the last
+    /// shutdown.
+    pub fn open_with_trust(
+        dir: impl AsRef<Path>,
+        base_offset: u64,
+        max_bytes: u64,
+        index_interval: u64,
+        preallocate: bool,
+        index_segment: &mut IndexSegment,
+        trust_if_clean: bool,
+    ) -> IoResult<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let filename = format_segment_filename(base_offset);
         let log_path = dir.join(format!("{}.log", filename));
-        Self::open_at_path(log_path, base_offset, max_bytes, index_interval, preallocate, index_segment)
+        Self::open_at_path_with_trust(
+            log_path,
+            base_offset,
+            max_bytes,
+            index_interval,
+            preallocate,
+            index_segment,
+            trust_if_clean,
+        )
     }
 
     /// Same as `open`, but at an exact caller-supplied path instead of reconstructing
@@ -53,6 +180,29 @@ impl LogSegment {
         index_interval: u64,
         preallocate: bool,
         index_segment: &mut IndexSegment,
+    ) -> IoResult<Self> {
+        Self::open_at_path_with_trust(
+            log_path,
+            base_offset,
+            max_bytes,
+            index_interval,
+            preallocate,
+            index_segment,
+            false,
+        )
+    }
+
+    /// Same as `open_at_path`, with the trusted-clean-segment fast path described on
+    /// `open_with_trust`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_at_path_with_trust(
+        log_path: PathBuf,
+        base_offset: u64,
+        max_bytes: u64,
+        index_interval: u64,
+        preallocate: bool,
+        index_segment: &mut IndexSegment,
+        trust_if_clean: bool,
     ) -> IoResult<Self> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -71,6 +221,64 @@ impl LogSegment {
         let mut rebuilt_index_entries = Vec::new();
         let mut bytes_since_last_index = 0u64;
         let mut encountered_corruption = false;
+
+        if exists && trust_if_clean {
+            let raw_len = file.metadata()?.len();
+            if read_clean_marker(&log_path) == Some(raw_len) {
+                // Trusted fast path: this segment was cleanly finalized (rotated out of
+                // the active role, `set_len`+`sync_data`'d, and marked) and is exactly the
+                // size it was then — historical segments are never appended to again after
+                // that point (only ever fully rewritten as a new file by compaction, which
+                // removes this marker first), so nothing about its content can have changed
+                // since. Trust the sparse index already loaded into `index_segment` (no
+                // `truncate_and_rebuild` needed) and find `next_offset` by decoding forward
+                // from only the *last* index entry instead of the whole segment.
+                let fast_path_result = (|| -> IoResult<Option<(u64, u64)>> {
+                    match index_segment.last_entry() {
+                        Some(last) => {
+                            let start_pos = last.physical_position as u64;
+                            file.seek(SeekFrom::Start(start_pos))?;
+                            let mut tail = Vec::new();
+                            file.read_to_end(&mut tail)?;
+                            let mut pos = 0usize;
+                            let mut last_offset = base_offset;
+                            while pos < tail.len() {
+                                match RecordFrame::decode(&tail[pos..]) {
+                                    Ok((frame, consumed)) => {
+                                        last_offset = frame.offset;
+                                        pos += consumed;
+                                    }
+                                    Err(_) => return Ok(None), // fall back to full scan
+                                }
+                            }
+                            if start_pos + pos as u64 == raw_len {
+                                Ok(Some((raw_len, last_offset + 1)))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        None if raw_len == 0 => Ok(Some((0, base_offset))),
+                        None => Ok(None),
+                    }
+                })()?;
+
+                if let Some((trusted_size, trusted_next_offset)) = fast_path_result {
+                    file.seek(SeekFrom::Start(trusted_size))?;
+                    return Ok(Self {
+                        base_offset,
+                        next_offset: trusted_next_offset,
+                        path: log_path,
+                        file,
+                        physical_size: trusted_size,
+                        is_preallocated: false,
+                    });
+                }
+                tracing::warn!(
+                    "Clean marker present but tail verification failed for segment {} — falling back to full scan.",
+                    base_offset
+                );
+            }
+        }
 
         if exists {
             // Perform streaming recovery scan & CRC verification on startup (BUG-08)
@@ -238,18 +446,26 @@ impl LogSegment {
         self.file.sync_data()
     }
 
-    /// Finalizes segment upon rotation by trimming any unused preallocated trailing space
+    /// Finalizes segment upon rotation by trimming any unused preallocated trailing space.
+    /// Once finalized, this segment is never appended to again, so a `.clean` marker is
+    /// written recording its now-final size — the next startup can trust it and skip the
+    /// full-segment recovery scan (see `open_with_trust`).
     pub fn finalize(&mut self) -> IoResult<()> {
         self.file.set_len(self.physical_size)?;
-        self.file.sync_data()
+        self.file.sync_data()?;
+        write_clean_marker(&self.path, self.physical_size);
+        Ok(())
     }
 
     /// Truncates the log file to exactly `physical_size` bytes (Raft-style conflict
     /// truncation: discards a diverging suffix before appending the leader's entries).
+    /// Invalidates any `.clean` marker, since it was only ever safe to trust the untouched
+    /// size `finalize()` recorded, not whatever this truncation leaves behind.
     pub fn truncate_to(&mut self, physical_size: u64) -> IoResult<()> {
         self.file.set_len(physical_size)?;
         self.file.sync_data()?;
         self.physical_size = physical_size;
+        remove_clean_marker(&self.path);
         Ok(())
     }
 

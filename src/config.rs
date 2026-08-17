@@ -323,6 +323,27 @@ pub struct EngineConfig {
     /// Maximum number of partitions whose retention/compaction pass may run concurrently
     /// within a single GC tick (Kafka `log.cleaner.threads`).
     pub compaction_worker_threads: usize,
+    /// Maximum age (ms) of the active segment before it's rolled purely due to time,
+    /// independent of `max_segment_bytes` (Kafka `segment.ms`). `None` disables time-based
+    /// rolling — a low-volume topic's active segment then only rotates once it hits the
+    /// byte threshold, which may be never.
+    pub segment_ms: Option<u64>,
+    /// Maximum accepted size (bytes) of a single record payload (Kafka
+    /// `message.max.bytes`). `None` means no explicit limit beyond what already applies
+    /// (segment size, wire framing limits).
+    pub message_max_bytes: Option<u64>,
+    /// Worker threads dedicated to the Tokio runtime driving network I/O (Kafka
+    /// `num.network.threads`, approximately — Hermes doesn't separate network/request-
+    /// handling threads the way Kafka does, so this sizes the whole async runtime).
+    /// `None` uses Tokio's own default (one per logical CPU).
+    pub num_network_threads: Option<usize>,
+    /// How long a transaction restored from `__transaction_state` on startup (still
+    /// `Ongoing`/`PrepareCommit`/`PrepareAbort` — i.e. never reached a terminal state
+    /// before the last shutdown) is given before it's presumed abandoned and aborted to
+    /// release the partitions it was blocking (Kafka `transaction.max.timeout.ms`, applied
+    /// here at replay time since Hermes has no live producer session to time out against
+    /// across a restart).
+    pub transaction_timeout_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -335,12 +356,21 @@ impl Default for EngineConfig {
             max_segment_bytes: 10 * 1024 * 1024, // 10 MB per segment
             index_interval_bytes: 4096,          // 4 KB sparse index interval
             flush_policy: FlushPolicy::default(),
-            preallocate_segments: true,
+            // Kafka's own `log.preallocate` defaults to `false`: pre-touching the full
+            // segment size up front helps HDDs avoid fragmentation, but on SSDs (the
+            // common case today) it just means writing (and later trimming) bytes nobody
+            // asked for. Still fully configurable via `preallocate.segments` for anyone
+            // who wants the old NTFS-fragmentation-avoidance behavior back.
+            preallocate_segments: false,
             log_file_dir: PathBuf::from("./logs"),
             bind_addr: "127.0.0.1:9092".to_string(),
             peer_addrs: Vec::new(),
             min_insync_replicas: 1,
             default_replication_factor: 1,
+            segment_ms: None,
+            message_max_bytes: None,
+            num_network_threads: None,
+            transaction_timeout_ms: 60_000, // matches Kafka's transaction.timeout.ms default
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
@@ -505,6 +535,61 @@ impl EngineConfig {
                     "max.segment.bytes" | "segment.bytes" => {
                         if let Ok(v) = value.parse() {
                             config.max_segment_bytes = v;
+                        }
+                    }
+                    "segment.ms" => {
+                        if let Ok(v) = value.parse() {
+                            config.segment_ms = Some(v);
+                        }
+                    }
+                    "message.max.bytes" | "max.message.bytes" => {
+                        if let Ok(v) = value.parse() {
+                            config.message_max_bytes = Some(v);
+                        }
+                    }
+                    "num.network.threads" => {
+                        if let Ok(v) = value.parse::<usize>() {
+                            config.num_network_threads = Some(v.max(1));
+                        }
+                    }
+                    "transaction.timeout.ms" | "transaction.max.timeout.ms" => {
+                        if let Ok(v) = value.parse() {
+                            config.transaction_timeout_ms = v;
+                        }
+                    }
+                    "log.preallocate" | "preallocate.segments" => {
+                        if let Ok(v) = value.parse::<bool>() {
+                            config.preallocate_segments = v;
+                        }
+                    }
+                    // Kafka's `log.flush.interval.ms` / `log.flush.interval.messages`:
+                    // switches the flush policy to a periodic/byte-threshold flush timed
+                    // by `flush.ms` (byte threshold left at its existing default unless
+                    // `flush.messages` — interpreted here as an approximate byte budget,
+                    // since Hermes's flush threshold is byte- not message-count-based —
+                    // is also given).
+                    "flush.ms" | "log.flush.interval.ms" => {
+                        if let Ok(ms) = value.parse::<u64>() {
+                            let max_bytes = match config.flush_policy {
+                                FlushPolicy::AsyncPeriodic { max_bytes, .. } => max_bytes,
+                                _ => 64 * 1024,
+                            };
+                            config.flush_policy = FlushPolicy::AsyncPeriodic {
+                                interval: Duration::from_millis(ms.max(1)),
+                                max_bytes,
+                            };
+                        }
+                    }
+                    "flush.messages" | "log.flush.interval.messages" => {
+                        if let Ok(bytes) = value.parse::<usize>() {
+                            let interval = match config.flush_policy {
+                                FlushPolicy::AsyncPeriodic { interval, .. } => interval,
+                                _ => Duration::from_millis(5),
+                            };
+                            config.flush_policy = FlushPolicy::AsyncPeriodic {
+                                interval,
+                                max_bytes: bytes,
+                            };
                         }
                     }
                     "compression.type" => {

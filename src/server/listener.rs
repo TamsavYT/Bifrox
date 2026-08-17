@@ -203,6 +203,17 @@ impl Server {
             }
         });
 
+        let tx_timeout_engine = self.engine.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(std::time::Duration::from_secs(5)).await;
+                // Aborts hanging transactions (including ones restored from
+                // `__transaction_state` at startup that no producer ever resumed) once
+                // they exceed `transaction.timeout.ms` — see `sweep_expired_transactions`.
+                tx_timeout_engine.sweep_expired_transactions();
+            }
+        });
+
         let metrics_engine = self.engine.clone();
         tokio::spawn(async move {
             let config = metrics_engine.config();
@@ -344,7 +355,7 @@ fn is_allowed_metrics_peer(allowed_ips: &[String], peer_ip: IpAddr) -> bool {
     })
 }
 
-fn cidr_contains(cidr: &str, peer_ip: IpAddr) -> bool {
+pub(crate) fn cidr_contains(cidr: &str, peer_ip: IpAddr) -> bool {
     let (net_str, prefix_str) = match cidr.split_once('/') {
         Some(parts) => parts,
         None => return false,

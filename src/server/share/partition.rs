@@ -2,8 +2,8 @@ use crate::protocol::wire::{AckBatch, AcknowledgeType};
 use crate::protocol::RecordFrame;
 use crate::server::partition::PartitionManager;
 use parking_lot::RwLock;
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -34,9 +34,21 @@ struct ExpiryTimer {
     member_id: String,
 }
 
+/// Orders primarily by `expire_at` (so `timers.first()`/`pop_first()` on the `BTreeSet`
+/// below still gives the earliest-expiring timer first, same min-heap behavior as before),
+/// tie-broken by the remaining fields so the ordering is a genuine total order consistent
+/// with the derived `Eq` — required for `BTreeSet` correctness: two *distinct* timers that
+/// happen to share the exact same `Instant` (plausible, since `Instant`s from back-to-back
+/// `acquire_records` calls under a fixed `lock_timeout` can collide) must never compare
+/// `Equal`, or the set would silently keep only one of them and the other's batch would
+/// never get reaped on expiry.
 impl Ord for ExpiryTimer {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.expire_at.cmp(&other.expire_at)
+        self.expire_at
+            .cmp(&other.expire_at)
+            .then_with(|| self.first_offset.cmp(&other.first_offset))
+            .then_with(|| self.last_offset.cmp(&other.last_offset))
+            .then_with(|| self.member_id.cmp(&other.member_id))
     }
 }
 
@@ -56,7 +68,12 @@ pub struct SharePartition {
     pub start_offset: AtomicU64,
     pub next_fetch_offset: AtomicU64,
     batches: RwLock<BTreeMap<u64, InFlightBatch>>,
-    timers: RwLock<BinaryHeap<Reverse<ExpiryTimer>>>,
+    /// Pending lock-expiry timers, earliest-first. A `BTreeSet` rather than a
+    /// `BinaryHeap` so a timer whose batch is fully acknowledged/released/rejected before
+    /// it naturally expires can be removed outright (`acknowledge` below) instead of
+    /// lingering in the structure as dead weight until its `expire_at` eventually passes
+    /// and `sweep_timers_internal` discards it as a no-op.
+    timers: RwLock<BTreeSet<ExpiryTimer>>,
 }
 
 pub struct AcquiredRecordInfo {
@@ -83,7 +100,7 @@ impl SharePartition {
             start_offset: AtomicU64::new(initial_start_offset),
             next_fetch_offset: AtomicU64::new(initial_start_offset),
             batches: RwLock::new(BTreeMap::new()),
-            timers: RwLock::new(BinaryHeap::new()),
+            timers: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -256,12 +273,12 @@ impl SharePartition {
 
         // Register timers for newly acquired ranges
         for (f, l) in new_acquired_ranges {
-            timers.push(Reverse(ExpiryTimer {
+            timers.insert(ExpiryTimer {
                 expire_at,
                 first_offset: f,
                 last_offset: l,
                 member_id: member_id.to_string(),
-            }));
+            });
         }
 
         Ok(acquired_infos)
@@ -304,6 +321,24 @@ impl SharePartition {
                     let overlap_start = batch.first_offset.max(target_first);
                     let overlap_end = batch.last_offset.min(target_last);
 
+                    // The batch popped above was `Acquired`, so it has a pending timer
+                    // entry covering its *original, full* [first_offset, last_offset]
+                    // range. That range is about to be superseded by up to three pieces
+                    // (left remainder / acked middle / right remainder) below, so cancel
+                    // the original timer outright — instead of leaving it in the set to
+                    // linger until it eventually expires and gets discarded as a no-op —
+                    // and re-register fresh timers (same `expire_at`, narrower ranges) for
+                    // whichever remainder pieces are still `Acquired` after the split.
+                    let original_expire_at = batch.acquired_at.map(|at| at + batch.lock_timeout);
+                    if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                        timers.remove(&ExpiryTimer {
+                            expire_at,
+                            first_offset: batch.first_offset,
+                            last_offset: batch.last_offset,
+                            member_id: owner.clone(),
+                        });
+                    }
+
                     // 1. Left non-overlapping slice
                     if batch.first_offset < overlap_start {
                         batches.insert(
@@ -318,6 +353,14 @@ impl SharePartition {
                                 delivery_count: batch.delivery_count,
                             },
                         );
+                        if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                            timers.insert(ExpiryTimer {
+                                expire_at,
+                                first_offset: batch.first_offset,
+                                last_offset: overlap_start - 1,
+                                member_id: owner.clone(),
+                            });
+                        }
                     }
 
                     // 2. Middle overlapping slice (apply ACK)
@@ -331,12 +374,12 @@ impl SharePartition {
                             ShareRecordState::Archived
                         }
                         AcknowledgeType::Renew => {
-                            timers.push(Reverse(ExpiryTimer {
+                            timers.insert(ExpiryTimer {
                                 expire_at: now + batch.lock_timeout,
                                 first_offset: overlap_start,
                                 last_offset: overlap_end,
                                 member_id: member_id.to_string(),
-                            }));
+                            });
                             ShareRecordState::Acquired
                         }
                     };
@@ -376,6 +419,14 @@ impl SharePartition {
                                 delivery_count: batch.delivery_count,
                             },
                         );
+                        if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                            timers.insert(ExpiryTimer {
+                                expire_at,
+                                first_offset: overlap_end + 1,
+                                last_offset: batch.last_offset,
+                                member_id: owner.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -395,10 +446,7 @@ impl SharePartition {
         // Quick lock-free or read-lock check first
         let should_sweep = {
             let timers = self.timers.read();
-            timers
-                .peek()
-                .map(|Reverse(t)| t.expire_at <= now)
-                .unwrap_or(false)
+            timers.first().map(|t| t.expire_at <= now).unwrap_or(false)
         };
         if should_sweep {
             self.sweep_timers_internal(now);
@@ -410,12 +458,12 @@ impl SharePartition {
         let mut batches = self.batches.write();
         let mut dlq_offsets = Vec::new();
 
-        while let Some(Reverse(timer)) = timers.peek() {
+        while let Some(timer) = timers.first() {
             if timer.expire_at > now {
                 break; // Earliest timer has not expired — O(1) early return!
             }
 
-            let Reverse(expired) = timers.pop().unwrap();
+            let expired = timers.pop_first().unwrap();
             let target_first = expired.first_offset;
             let target_last = expired.last_offset;
 
@@ -479,5 +527,160 @@ impl SharePartition {
             .values()
             .map(|b| (b.last_offset - b.first_offset + 1) as usize)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::protocol::wire::AckBatch;
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_share_partition_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Produces `count` records into a fresh `PartitionManager` and returns it alongside
+    /// the owning `TempDir` (which must stay alive for the partition's files to persist).
+    fn partition_with_records(label: &str, count: u64) -> (TempDir, PartitionManager) {
+        let dir = TempDir::new(label);
+        let pm = PartitionManager::open(&dir.0, "share-test-topic", 0, EngineConfig::default())
+            .unwrap();
+        for i in 0..count {
+            pm.produce(format!("record-{}", i).as_bytes()).unwrap();
+        }
+        (dir, pm)
+    }
+
+    #[test]
+    fn full_range_accept_cancels_pending_timer() {
+        let (_dir, pm) = partition_with_records("full_accept", 3);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-a".to_string(),
+            Duration::from_secs(30),
+            5,
+            0,
+        );
+
+        let acquired = sp
+            .acquire_records("member-1", 3, None, &pm)
+            .unwrap();
+        assert_eq!(acquired.len(), 3);
+        assert_eq!(
+            sp.timers.read().len(),
+            1,
+            "one timer should be registered for the whole acquired batch"
+        );
+
+        let dlq = sp
+            .acknowledge(
+                "member-1",
+                &[AckBatch {
+                    first_offset: 0,
+                    last_offset: 2,
+                    ack_type: AcknowledgeType::Accept,
+                }],
+            )
+            .unwrap();
+        assert!(dlq.is_empty());
+        assert_eq!(
+            sp.timers.read().len(),
+            0,
+            "acknowledging the entire acquired range must cancel its pending timer, not \
+             leave it to linger until it separately expires"
+        );
+        assert_eq!(sp.start_offset.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn partial_range_ack_still_expires_remaining_acquired_slices() {
+        let (_dir, pm) = partition_with_records("partial_ack", 5);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-b".to_string(),
+            Duration::from_millis(20),
+            5,
+            0,
+        );
+
+        let acquired = sp
+            .acquire_records("member-1", 5, None, &pm)
+            .unwrap();
+        assert_eq!(acquired.len(), 5);
+
+        // Acknowledge only the middle offset — the timer for the original full [0,4]
+        // range gets cancelled and re-split into two fresh timers for the surviving
+        // Acquired left ([0,1]) and right ([3,4]) remainders.
+        sp.acknowledge(
+            "member-1",
+            &[AckBatch {
+                first_offset: 2,
+                last_offset: 2,
+                ack_type: AcknowledgeType::Accept,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            sp.timers.read().len(),
+            2,
+            "splitting an acquired batch must preserve timer coverage for both remainders"
+        );
+
+        std::thread::sleep(Duration::from_millis(50));
+        let dlq = sp.check_lock_timeouts();
+        // Neither remainder has hit max_delivery_attempts, so both should be released
+        // back to Available (re-acquirable), not archived to the DLQ.
+        assert!(dlq.is_empty());
+        assert_eq!(sp.timers.read().len(), 0);
+
+        // Both remainders must still be independently acquirable after release.
+        let reacquired = sp.acquire_records("member-2", 10, None, &pm).unwrap();
+        let mut offsets: Vec<u64> = reacquired.iter().map(|r| r.offset).collect();
+        offsets.sort_unstable();
+        assert_eq!(offsets, vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn check_lock_timeouts_archives_after_max_delivery_attempts() {
+        let (_dir, pm) = partition_with_records("max_delivery", 1);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-c".to_string(),
+            Duration::from_millis(10),
+            1, // max_delivery_attempts
+            0,
+        );
+
+        sp.acquire_records("member-1", 1, None, &pm).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let dlq = sp.check_lock_timeouts();
+        assert_eq!(dlq, vec![0], "delivery limit exceeded — should route to DLQ");
+        assert_eq!(sp.timers.read().len(), 0);
     }
 }

@@ -86,6 +86,13 @@ impl IndexSegment {
         self.entries.len()
     }
 
+    /// Returns the last (highest-offset) sparse index entry, if any — used by
+    /// `LogSegment::open_at_path`'s trusted-clean-segment fast path to find a starting
+    /// point for a cheap tail-only decode instead of scanning the whole segment.
+    pub fn last_entry(&self) -> Option<IndexEntry> {
+        self.entries.last().copied()
+    }
+
     /// Append a new index entry to both RAM vector and physical disk
     pub fn append(&mut self, logical_offset: u64, physical_position: u64) -> IoResult<()> {
         let relative_offset = logical_offset.saturating_sub(self.base_offset) as u32;

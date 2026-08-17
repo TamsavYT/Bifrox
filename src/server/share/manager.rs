@@ -27,7 +27,6 @@ pub struct ShareGroupManager {
     persisted_watermarks: Arc<DashMap<(String, String, u32), u64>>,
     /// Disk persistence for share group watermarks
     state_file: Arc<Mutex<File>>,
-    #[allow(dead_code)]
     state_path: Arc<std::path::PathBuf>,
     default_lock_timeout: Duration,
     max_delivery_attempts: u16,
@@ -48,7 +47,14 @@ impl ShareGroupManager {
         let mut file = options.open(&state_path)?;
         let recovered_offsets = DashMap::new();
 
-        // Recover state from existing system log
+        // Recover state from existing system log.
+        //
+        // Genuinely streaming: each parsed prefix is drained out of `buf` at the end of
+        // every chunk (see the `buf.drain(..cursor)` below), so peak memory stays bounded
+        // by the chunk size plus one partially-parsed record — not by the file size. It
+        // also keeps parsing linear: without the drain, `cursor` restarting at 0 on each
+        // chunk meant every already-parsed record was re-parsed once per subsequent
+        // chunk, making recovery O(file_size²).
         file.seek(SeekFrom::Start(0))?;
         let raw_len = file.metadata()?.len();
         if raw_len > 0 {
@@ -130,6 +136,10 @@ impl ShareGroupManager {
 
                     recovered_offsets.insert((group_id, topic, partition), start_offset);
                     cursor = temp;
+                }
+
+                if cursor > 0 {
+                    buf.drain(..cursor);
                 }
 
                 if is_corrupt {
@@ -288,7 +298,12 @@ impl ShareGroupManager {
         Ok(())
     }
 
-    /// Appends state watermark snapshot to disk log with CRC32
+    /// Appends state watermark snapshot to disk log with CRC32. Every acknowledgement that
+    /// advances a partition's watermark appends a brand new record rather than updating one
+    /// in place — the log is otherwise strictly append-only, so its size is unbounded by
+    /// the number of *events*, not the number of (group, topic, partition) keys it actually
+    /// needs to remember. `maybe_compact_log` below bounds that growth the same way
+    /// `ConsumerGroupManager::compact_log` already does for `__consumer_offsets.log`.
     fn persist_offset(
         &self,
         group_id: &str,
@@ -296,7 +311,25 @@ impl ShareGroupManager {
         partition: u32,
         start_offset: u64,
     ) -> IoResult<()> {
-        let mut file = self.state_file.lock();
+        let entry = Self::encode_entry(group_id, topic, partition, start_offset);
+        {
+            let mut file = self.state_file.lock();
+            file.write_all(&entry)?;
+            file.flush()?;
+
+            if file.metadata()?.len() <= Self::COMPACT_THRESHOLD_BYTES {
+                return Ok(());
+            }
+        }
+        self.compact_log()
+    }
+
+    const COMPACT_THRESHOLD_BYTES: u64 = 1024 * 1024; // matches __consumer_offsets.log's threshold
+
+    /// Encodes one `[magic][group][topic][partition][offset][crc32]` record — the shared
+    /// wire format used both for a single incremental append (`persist_offset`) and for
+    /// every retained key when rewriting the whole log (`compact_log`).
+    fn encode_entry(group_id: &str, topic: &str, partition: u32, start_offset: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32 + group_id.len() + topic.len());
         buf.put_u8(SHARE_GROUP_STATE_MAGIC);
         crate::protocol::wire::write_pascal_string(&mut buf, group_id);
@@ -306,11 +339,50 @@ impl ShareGroupManager {
 
         let mut hasher = Hasher::new();
         hasher.update(&buf);
-        let crc = hasher.finalize();
-        buf.put_u32(crc);
+        buf.put_u32(hasher.finalize());
+        buf
+    }
 
-        file.write_all(&buf)?;
-        file.flush()?;
+    /// Rewrites `__share_group_state.log` keeping only the latest persisted watermark per
+    /// (group, topic, partition) — same strategy and same Windows-safe
+    /// remove-then-rename swap as `ConsumerGroupManager::compact_log`.
+    fn compact_log(&self) -> IoResult<()> {
+        let mut entry_bytes = Vec::new();
+        for item in self.persisted_watermarks.iter() {
+            let (group_id, topic, partition) = item.key();
+            let start_offset = *item.value();
+            entry_bytes.extend_from_slice(&Self::encode_entry(group_id, topic, *partition, start_offset));
+        }
+
+        let tmp_path = self.state_path.with_extension("log.tmp");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        options.share_mode(7);
+
+        let mut tmp_file = options.open(&tmp_path)?;
+        tmp_file.write_all(&entry_bytes)?;
+        tmp_file.sync_data()?;
+
+        let mut file = self.state_file.lock();
+        // Windows cannot atomically rename over an existing destination path — remove it
+        // first while still holding the lock, matching `ConsumerGroupManager::compact_log`.
+        match std::fs::remove_file(&*self.state_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::rename(&tmp_path, &*self.state_path)?;
+
+        let mut open_opts = OpenOptions::new();
+        open_opts.read(true).write(true).create(true);
+        #[cfg(windows)]
+        open_opts.share_mode(7);
+
+        let mut new_file = open_opts.open(&*self.state_path)?;
+        new_file.seek(SeekFrom::End(0))?;
+        *file = new_file;
+
         Ok(())
     }
 

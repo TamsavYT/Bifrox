@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--batch-size",
         "--throughput",
         "--messages",
+        "--tx-id",
     ];
 
     let mut command_opt = None;
@@ -650,11 +651,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  - {}", t);
             }
         }
+        "create-topic" => {
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let num_partitions: u32 = get_arg_val(&args, "--partitions")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+            client.create_topic(&topic, num_partitions).await?;
+            println!(
+                "✅ Created topic '{}' with {} partition(s) on server {}",
+                topic, num_partitions, server_addr
+            );
+        }
         "delete-topic" => {
             let topic =
                 get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             client.delete_topic(&topic).await?;
             println!("🗑️ Topic '{}' deleted successfully.", topic);
+        }
+        "describe-topic" => {
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let (res_topic, partitions) = client.describe_topic(&topic).await?;
+            println!("📋 Topic '{}' on Server {}:", res_topic, server_addr);
+            println!("  Partitions: {}", partitions.len());
+            println!("------------------------------------------------------------------");
+            println!(
+                "  {:<10} | {:<16} | {:<9} | REPLICAS",
+                "PARTITION", "HIGH WATERMARK", "LEADER"
+            );
+            for p in &partitions {
+                println!(
+                    "  {:<10} | {:<16} | {:<9} | {:?}",
+                    p.partition_id, p.high_watermark, p.leader_id, p.replicas
+                );
+            }
+        }
+        "describe-group" => {
+            let group_id =
+                get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
+            let (state, members) = client.describe_group(&group_id).await?;
+            println!("👥 Consumer Group '{}' on Server {}:", group_id, server_addr);
+            println!("  State:   {}", state);
+            println!("  Members: {}", members.len());
+            println!("------------------------------------------------------------------");
+            for m in &members {
+                println!("  Member '{}':", m.member_id);
+                if m.assigned_partitions.is_empty() {
+                    println!("    (no assigned partitions)");
+                }
+                for (topic, partition) in &m.assigned_partitions {
+                    println!("    - {} partition {}", topic, partition);
+                }
+            }
+        }
+        "produce-batch" => {
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let key = get_arg_val(&args, "--key").unwrap_or_default();
+            let num_partitions: u32 = get_arg_val(&args, "--partitions")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            let tx_id = get_arg_val(&args, "--tx-id");
+
+            // Records come either from repeated/comma-separated `--messages`, or — when
+            // `--stdin` is passed — one record per line read from standard input, so a
+            // batch can be piped in rather than squeezed onto the command line.
+            let records: Vec<Vec<u8>> = if has_flag(&args, "--stdin") {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+                stdin
+                    .lock()
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.into_bytes())
+                    .collect()
+            } else {
+                get_arg_val(&args, "--messages")
+                    .unwrap_or_else(|| "msg-1,msg-2,msg-3".to_string())
+                    .split(',')
+                    .map(|s| s.trim().as_bytes().to_vec())
+                    .filter(|b| !b.is_empty())
+                    .collect()
+            };
+
+            if records.is_empty() {
+                eprintln!("Error: no records to produce (use --messages a,b,c or --stdin).");
+                return Ok(());
+            }
+
+            // A transactional batch has to be bracketed by an explicit begin/commit —
+            // the server rejects a produce naming a transaction that isn't Ongoing.
+            if let Some(ref tx) = tx_id {
+                client.begin_transaction(tx, 0).await?;
+            }
+
+            let res = client
+                .produce_batch(&topic, &key, tx_id.as_deref(), num_partitions, &records)
+                .await?;
+
+            if let Some(ref tx) = tx_id {
+                client.commit_transaction(tx).await?;
+            }
+
+            println!("✅ Produced {} record(s) successfully!", records.len());
+            println!("  Server Address:     {}", server_addr);
+            println!("  Topic:              {}", topic);
+            println!("  Assigned Partition: {}", res.assigned_partition);
+            println!("  First Offset:       {}", res.first_offset);
+            println!("  Last Offset:        {}", res.last_offset);
+            if let Some(ref tx) = tx_id {
+                println!("  Transaction:        '{}' (committed)", tx);
+            }
         }
         "create-acl" => {
             let res_type_str =
@@ -803,6 +912,10 @@ fn print_usage() {
     println!("Commands:");
     println!("  produce         Produce an event payload to a topic");
     println!("                  --topic <NAME> --message <MSG> [--key <KEY>] [--partitions <N>]");
+    println!("  produce-batch   Produce multiple records in one request");
+    println!(
+        "                  --topic <NAME> [--messages a,b,c | --stdin] [--key <KEY>] [--partitions <N>] [--tx-id <ID>]"
+    );
     println!(
         "  perf-produce    Producer performance test (like kafka-producer-perf-test.sh)"
     );
@@ -835,8 +948,14 @@ fn print_usage() {
     println!("                  --topic <NAME> [--partition <ID>] --offset <N>");
     println!("  ping            Send health check PING to server");
     println!("  list-topics     List active topics on server");
+    println!("  create-topic    Create a topic with an explicit partition count");
+    println!("                  --topic <NAME> [--partitions <N>]");
     println!("  delete-topic    Delete a topic and its partition files");
     println!("                  --topic <NAME>");
+    println!("  describe-topic  Show a topic's partitions, watermarks, leaders and replicas");
+    println!("                  --topic <NAME>");
+    println!("  describe-group  Show a consumer group's state, members and assignments");
+    println!("                  --group <GROUP>");
     println!("\nGlobal Flag:");
     println!("  --server / -s   Server address (default: 127.0.0.1:9092 or localhost:9092)");
 }

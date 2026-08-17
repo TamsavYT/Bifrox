@@ -443,6 +443,37 @@ impl TransactionManager {
         );
     }
 
+    /// Returns transaction IDs still in a non-terminal state (`Ongoing`, `PrepareCommit`,
+    /// or `PrepareAbort`) whose age exceeds `max_age_ms` — both a producer that has simply
+    /// gone silent mid-transaction (Kafka `transaction.timeout.ms`) and, as a special case
+    /// of the same mechanism, a transaction restored from `__transaction_state` on startup
+    /// that no reconnecting producer ever resumed (`created_at_ms` is reset to "now" by
+    /// `restore_transaction`, so a restored transaction's clock starts fresh at restart —
+    /// giving a producer that reconnects a fair window to continue it before it's presumed
+    /// abandoned). The caller is expected to actually abort each returned ID (see
+    /// `StorageEngine::sweep_expired_transactions`); this only identifies them, since
+    /// aborting requires writing control markers to every partition the transaction
+    /// touched, which this manager has no access to do itself.
+    pub fn expired_ongoing_transaction_ids(&self, max_age_ms: u64) -> Vec<String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        self.transactions
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                let is_ongoing = matches!(
+                    state.status,
+                    TxStatus::Ongoing | TxStatus::PrepareCommit | TxStatus::PrepareAbort
+                );
+                is_ongoing && now_ms.saturating_sub(state.created_at_ms) > max_age_ms
+            })
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Time-bounded retention queue for transaction states based on max_age_ms (MEM-02).
     pub fn prune_stale_transactions(&self, max_age_ms: u64) -> usize {
         let now_ms = std::time::SystemTime::now()

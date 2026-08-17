@@ -23,6 +23,37 @@ pub fn hash_key(key: &[u8], num_partitions: usize) -> u32 {
     (hash as usize % num_partitions) as u32
 }
 
+/// `std::fs::remove_dir_all` with bounded retries.
+///
+/// On Windows, deleting a file still held open by any handle fails with a sharing
+/// violation (`ERROR_SHARING_VIOLATION` / `AccessDenied`) rather than unlinking it the way
+/// POSIX does. Dropping the `Arc<PartitionManager>` closes Hermes's own handles, but that
+/// only takes effect once the *last* clone is gone — an in-flight fetch holding a clone,
+/// or a `plan_zero_copy_fetch` file handle still being transmitted, can keep the directory
+/// briefly undeletable. Retrying over a short window covers that, instead of failing a
+/// topic delete that would have succeeded a few milliseconds later.
+fn remove_dir_all_with_retry(path: &std::path::Path) -> IoResult<()> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const BACKOFF_MS: u64 = 50;
+
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        BACKOFF_MS * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("remove_dir_all failed")))
+}
+
 /// Validates topic names to prevent directory traversal and invalid paths (SEC-03)
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
@@ -93,6 +124,13 @@ pub type TopicRegistry = DashMap<String, TopicConfig>;
 pub struct StorageEngine {
     config: EngineConfig,
     partitions: Arc<DashMap<(String, u32), Arc<PartitionManager>>>,
+    /// Index of topic -> that topic's currently-open partition IDs, maintained alongside
+    /// `partitions` (inserted in `get_or_create_partition`, cleared in
+    /// `apply_topic_deletion_inner`). Lets `list_topics`/`describe_topic` work in time
+    /// proportional to the number of topics (or, for `describe_topic`, that one topic's
+    /// own partition count) instead of scanning every partition of every topic on the
+    /// broker for each call.
+    topic_partitions: Arc<DashMap<String, DashSet<u32>>>,
     deleting_topics: Arc<DashSet<String>>,
     topic_registry: Arc<TopicRegistry>,
     consumer_groups: ConsumerGroupManager,
@@ -143,6 +181,7 @@ impl StorageEngine {
         let engine = Self {
             config,
             partitions: Arc::new(DashMap::new()),
+            topic_partitions: Arc::new(DashMap::new()),
             deleting_topics: Arc::new(DashSet::new()),
             topic_registry: Arc::new(DashMap::new()),
             consumer_groups,
@@ -245,11 +284,17 @@ impl StorageEngine {
         &self.replication
     }
 
-    /// Accounts `bytes` of produced data for `client_key` (typically the connecting
-    /// client's source IP) and delays as needed to enforce `produce_quota_bytes_per_sec`.
-    /// No-op when no produce quota is configured.
-    pub async fn throttle_produce(&self, client_key: &str, bytes: u64, records: u64) {
-        self.metrics.record_produce(bytes, records);
+    /// Charges `bytes` against `client_key`'s produce quota and delays for however long
+    /// the token bucket says, **before** the caller performs the write.
+    ///
+    /// The byte count is fully known up front (the records are already decoded and in
+    /// memory), so there's no reason to wait until after the append to apply the delay —
+    /// and good reason not to. Throttling only afterwards meant an over-quota client's
+    /// burst was already fully committed to disk by the time the broker got around to
+    /// slowing it down, so the quota bounded the *response rate* but never actually
+    /// protected the disk from the burst it was configured to prevent. Delaying first
+    /// paces the writes themselves.
+    pub async fn apply_produce_quota(&self, client_key: &str, bytes: u64) {
         let start = std::time::Instant::now();
         self.quota.throttle_produce(client_key, bytes).await;
         if start.elapsed() > std::time::Duration::from_millis(5) {
@@ -257,10 +302,18 @@ impl StorageEngine {
         }
     }
 
-    /// Accounts `bytes` of fetched data for `client_key` and delays as needed to
-    /// enforce `fetch_quota_bytes_per_sec`. No-op when no fetch quota is configured.
-    pub async fn throttle_fetch(&self, client_key: &str, bytes: u64) {
-        self.metrics.record_fetch(bytes);
+    /// Records produce metrics (global + per-topic) for a write that actually succeeded.
+    /// Separate from `apply_produce_quota` so quota pacing can happen before the write
+    /// while the counters only move for writes that really landed.
+    pub fn record_produce_metrics(&self, topic: &str, bytes: u64, records: u64) {
+        self.metrics.record_produce_topic(topic, bytes, records);
+    }
+
+    /// Accounts `bytes` of fetched data for `client_key`/`topic` and delays as needed to
+    /// enforce `fetch_quota_bytes_per_sec`. No-op (quota-wise) when no fetch quota is
+    /// configured — metrics are still recorded either way.
+    pub async fn throttle_fetch(&self, topic: &str, client_key: &str, bytes: u64) {
+        self.metrics.record_fetch_topic(topic, bytes);
         let start = std::time::Instant::now();
         self.quota.throttle_fetch(client_key, bytes).await;
         if start.elapsed() > std::time::Duration::from_millis(5) {
@@ -329,6 +382,10 @@ impl StorageEngine {
                 }
 
                 e.insert(pm.clone());
+                self.topic_partitions
+                    .entry(topic.to_string())
+                    .or_default()
+                    .insert(partition);
                 Ok(pm)
             }
         }
@@ -699,6 +756,19 @@ impl StorageEngine {
         }
     }
 
+    /// Returns every currently-open `PartitionManager` for `topic`, via the
+    /// `topic_partitions` index — O(this topic's partition count) rather than scanning
+    /// every partition of every topic on the broker.
+    fn partitions_for_topic(&self, topic: &str) -> Vec<Arc<PartitionManager>> {
+        let Some(partition_ids) = self.topic_partitions.get(topic) else {
+            return Vec::new();
+        };
+        partition_ids
+            .iter()
+            .filter_map(|p| self.partitions.get(&(topic.to_string(), *p)).map(|e| e.clone()))
+            .collect()
+    }
+
     /// Applies a full-replace topic config change: updates the stored config map and
     /// pushes recognized keys down to every currently-open partition of this topic.
     fn apply_topic_config_change(&self, topic: &str, configs: Vec<(String, String)>) {
@@ -708,13 +778,7 @@ impl StorageEngine {
             cfg.configs = configs_map.clone();
         }
 
-        for entry in self.partitions.iter() {
-            let (t, _p) = entry.key();
-            if t != topic {
-                continue;
-            }
-            let pm = entry.value();
-
+        for pm in self.partitions_for_topic(topic) {
             if let Some(v) = configs_map.get("cleanup.policy") {
                 if let Ok(policy) = v.parse::<crate::config::CleanupPolicy>() {
                     pm.set_cleanup_policy(policy);
@@ -1134,6 +1198,37 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Aborts any transaction that has sat in a non-terminal state
+    /// (`Ongoing`/`PrepareCommit`/`PrepareAbort`) longer than `config.transaction_timeout_ms`
+    /// (Kafka `transaction.timeout.ms`). Meant to be called periodically (see
+    /// `Server::run_with_listener`'s background task loop).
+    ///
+    /// This is also what makes a hanging transaction restored from `__transaction_state` on
+    /// startup (`replay_transaction_state`) eventually get unstuck: before this existed, a
+    /// transaction that was `Ongoing` at the moment of a crash/restart stayed that way
+    /// forever, since nothing ever aborted it — permanently pinning the Last Stable Offset
+    /// for every partition it touched and blocking `ReadCommitted` consumers from reading
+    /// anything past that point, even data produced long after the restart. Restored
+    /// transactions get `created_at_ms` reset to the restart time by `restore_transaction`,
+    /// so they get the same grace window as any other in-flight transaction before this
+    /// sweep gives up on them — enough time for a reconnecting producer (via `InitProducerId`
+    /// with a bumped epoch) to resume and properly commit/abort it first, if one shows up.
+    pub fn sweep_expired_transactions(&self) {
+        let expired = self
+            .transactions
+            .expired_ongoing_transaction_ids(self.config.transaction_timeout_ms);
+        for tx_id in expired {
+            tracing::warn!(
+                "TxTimeout: transaction '{}' exceeded transaction.timeout.ms ({} ms) — aborting.",
+                tx_id,
+                self.config.transaction_timeout_ms
+            );
+            if let Err(e) = self.abort_transaction(&tx_id) {
+                tracing::error!("TxTimeout: failed to abort expired transaction '{}': {}", tx_id, e);
+            }
+        }
+    }
+
     /// Produce a batch of records to a routed partition (PARTIAL-03 async).
     pub async fn produce_batch(&self, params: ProduceBatchParams<'_>) -> IoResult<(u32, u64, u64)> {
         let topic = params.topic;
@@ -1163,6 +1258,23 @@ impl StorageEngine {
                 ));
             }
         }
+        // Enforce `message.max.bytes` before doing any disk work: an oversized record
+        // should be rejected outright rather than partially written and then discovered
+        // to be too large, and rejecting the whole batch keeps the offsets contiguous
+        // (no half-applied batch).
+        if let Some(max_bytes) = self.config.message_max_bytes {
+            if let Some(oversized) = records.iter().find(|r| r.len() as u64 > max_bytes) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Record of {} bytes exceeds message.max.bytes ({})",
+                        oversized.len(),
+                        max_bytes
+                    ),
+                ));
+            }
+        }
+
         let partition_id = if !key.is_empty() && num_partitions > 0 {
             hash_key(key.as_bytes(), num_partitions as usize)
         } else {
@@ -1424,18 +1536,30 @@ impl StorageEngine {
         Ok(pm.latest_offset())
     }
 
-    pub fn commit_offset(
+    /// Commits a consumer group offset. `ConsumerGroupManager::commit_offset` does a
+    /// synchronous disk write plus `fsync` on every single call (offset commits are
+    /// frequent — once per consumer poll cycle, for every consumer group on the broker),
+    /// so this runs on Tokio's blocking thread pool rather than inline on the async
+    /// runtime's worker threads, same reasoning as the produce/fetch paths.
+    pub async fn commit_offset(
         &self,
         group_id: &str,
         topic: &str,
         partition: u32,
         offset: u64,
     ) -> IoResult<()> {
-        self.consumer_groups
-            .commit_offset(group_id, topic, partition, offset)
+        let consumer_groups = self.consumer_groups.clone();
+        let group_id = group_id.to_string();
+        let topic = topic.to_string();
+        tokio::task::spawn_blocking(move || {
+            consumer_groups.commit_offset(&group_id, &topic, partition, offset)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("commit_offset join error: {}", e)))?
     }
 
-    pub fn commit_offset_with_metadata(
+    /// Same blocking-pool reasoning as `commit_offset`.
+    pub async fn commit_offset_with_metadata(
         &self,
         group_id: &str,
         topic: &str,
@@ -1443,8 +1567,15 @@ impl StorageEngine {
         offset: u64,
         metadata: &str,
     ) -> IoResult<()> {
-        self.consumer_groups
-            .commit_offset_with_metadata(group_id, topic, partition, offset, metadata)
+        let consumer_groups = self.consumer_groups.clone();
+        let group_id = group_id.to_string();
+        let topic = topic.to_string();
+        let metadata = metadata.to_string();
+        tokio::task::spawn_blocking(move || {
+            consumer_groups.commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("commit_offset_with_metadata join error: {}", e)))?
     }
 
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: u32) -> Option<u64> {
@@ -2016,14 +2147,17 @@ impl StorageEngine {
         if let Some(mut cfg) = self.topic_registry.get_mut(topic) {
             cfg.cleanup_policy = policy;
         }
-        for entry in self.partitions.iter() {
-            if entry.key().0 == topic {
-                entry.value().set_cleanup_policy(policy);
-            }
+        for pm in self.partitions_for_topic(topic) {
+            pm.set_cleanup_policy(policy);
         }
     }
 
-    /// Returns list of all active non-system topics (Sprint 5)
+    /// Returns list of all active non-system topics (Sprint 5).
+    ///
+    /// Runs in time proportional to the number of *topics*, not the number of partitions —
+    /// `topic_partitions` carries one entry per topic no matter how many partitions it
+    /// has, unlike iterating `partitions` directly (one entry per topic-partition, so a
+    /// broker with many partitions per topic previously paid for all of them on every call).
     pub fn list_topics(&self) -> Vec<String> {
         let mut topics = std::collections::HashSet::new();
 
@@ -2034,8 +2168,8 @@ impl StorageEngine {
             }
         }
 
-        for entry in self.partitions.iter() {
-            let (topic, _) = entry.key();
+        for entry in self.topic_partitions.iter() {
+            let topic = entry.key();
             if !topic.starts_with("__") && !self.deleting_topics.contains(topic) {
                 topics.insert(topic.clone());
             }
@@ -2160,7 +2294,10 @@ impl StorageEngine {
         }
     }
 
-    /// Returns metadata and initialized partition high watermarks for a topic
+    /// Returns metadata and initialized partition high watermarks for a topic.
+    ///
+    /// Looks up only this topic's own partitions via `topic_partitions` instead of
+    /// scanning every partition of every topic on the broker.
     pub fn describe_topic(
         &self,
         topic: &str,
@@ -2172,13 +2309,15 @@ impl StorageEngine {
         let reg_config = self.topic_registry.get(topic).map(|r| r.value().clone());
         let mut partitions_map = std::collections::HashMap::new();
 
-        for entry in self.partitions.iter() {
-            let (t, p) = entry.key();
-            if t == topic {
-                let hw = entry.value().high_watermark();
-                let leader_id = entry.value().leader_id();
-                let replicas = entry.value().replicas();
-                partitions_map.insert(*p, (hw, leader_id, replicas));
+        if let Some(partition_ids) = self.topic_partitions.get(topic) {
+            for p in partition_ids.iter() {
+                let p = *p;
+                if let Some(pm) = self.partitions.get(&(topic.to_string(), p)) {
+                    let hw = pm.high_watermark();
+                    let leader_id = pm.leader_id();
+                    let replicas = pm.replicas();
+                    partitions_map.insert(p, (hw, leader_id, replicas));
+                }
             }
         }
 
@@ -2217,15 +2356,36 @@ impl StorageEngine {
         Some(partitions_info)
     }
 
-    /// Deletes topic partitions and removes disk directory (NEW-03)
+    /// Deletes topic partitions and removes disk directory (NEW-03).
+    ///
+    /// `apply_metadata_record` has no error channel (it's shared with the follower replay
+    /// path, where there's no client to report to), so the actual filesystem removal in
+    /// `apply_topic_deletion` can only log its failures. That previously meant a delete
+    /// that left directories behind — the common case on Windows, where `remove_dir_all`
+    /// fails with a sharing violation while any handle into the directory is still open —
+    /// reported success to the client anyway. So this verifies the outcome directly after
+    /// the record has been applied, and reports a failure the caller can actually see.
     pub async fn delete_topic(&self, topic: &str) -> IoResult<()> {
         let record = crate::replication::MetadataRecord::TopicDeleted {
             topic: topic.to_string(),
         };
-        // propose_metadata's apply_metadata_record call runs the deletion's state/fs
-        // effects via apply_topic_deletion (which logs rather than propagates fs errors,
-        // matching how a follower applying the same record would handle it).
         self.propose_metadata(record).await?;
+
+        let leftover = self.topic_partition_dirs(topic);
+        if !leftover.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "Topic '{}' metadata was deleted, but {} partition director{} could not be \
+                 removed from disk (still in use?): {}",
+                topic,
+                leftover.len(),
+                if leftover.len() == 1 { "y" } else { "ies" },
+                leftover
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         Ok(())
     }
 
@@ -2246,36 +2406,31 @@ impl StorageEngine {
 
         self.topic_registry.remove(topic);
 
-        let mut to_remove = Vec::new();
-        for entry in self.partitions.iter() {
-            let (t, p) = entry.key();
-            if t == topic {
-                let _ = entry.value().flush();
-                to_remove.push((t.clone(), *p));
+        let partition_ids: Vec<u32> = self
+            .topic_partitions
+            .get(topic)
+            .map(|ids| ids.iter().map(|p| *p).collect())
+            .unwrap_or_default();
+        for p in partition_ids {
+            let key = (topic.to_string(), p);
+            if let Some((_, pm)) = self.partitions.remove(&key) {
+                let _ = pm.flush();
             }
         }
-        for key in to_remove {
-            // Remove from map to drop the Arc<PartitionManager>
-            self.partitions.remove(&key);
-        }
+        self.topic_partitions.remove(topic);
 
         let mut err = None;
-        if let Ok(entries) = std::fs::read_dir(&self.config.data_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(&format!("{}-", topic)) {
-                            let suffix = &name[topic.len() + 1..];
-                            if suffix.parse::<u32>().is_ok() {
-                                if let Err(e) = std::fs::remove_dir_all(&path) {
-                                    err = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        for path in self.topic_partition_dirs(topic) {
+            if let Err(e) = remove_dir_all_with_retry(&path) {
+                tracing::error!(
+                    "Topic deletion: failed to remove partition directory {}: {}",
+                    path.display(),
+                    e
+                );
+                err = Some(e);
+                // Keep going rather than bailing on the first failure — one stuck
+                // partition directory shouldn't leave every *other* partition of the same
+                // topic behind on disk too. The first error is still returned below.
             }
         }
 
@@ -2285,6 +2440,32 @@ impl StorageEngine {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Every on-disk `"{topic}-{partition}"` directory belonging to `topic`.
+    fn topic_partition_dirs(&self, topic: &str) -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        let prefix = format!("{}-", topic);
+        if let Ok(entries) = std::fs::read_dir(&self.config.data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Guard against a prefix collision: "orders-2" belongs to topic "orders",
+                // but "orders-eu-0" belongs to the *different* topic "orders-eu" and must
+                // not be swept up by a delete of "orders".
+                if let Some(suffix) = name.strip_prefix(&prefix) {
+                    if suffix.parse::<u32>().is_ok() {
+                        dirs.push(path);
+                    }
+                }
+            }
+        }
+        dirs
     }
 
     pub fn share_groups(&self) -> &crate::server::share::ShareGroupManager {

@@ -1285,6 +1285,7 @@ async fn try_zero_copy_fetch(
         return Ok(false);
     }
 
+    let fetch_start = std::time::Instant::now();
     let plan = match engine
         .plan_zero_copy_fetch(topic, partition, offset, max_bytes)
         .await
@@ -1299,8 +1300,16 @@ async fn try_zero_copy_fetch(
         return Ok(false);
     }
 
+    // Record fetch latency here too, not just on the buffered `RequestPayload::Fetch`
+    // path — a sequential consumer is served almost entirely by this zero-copy path, so
+    // measuring only the buffered one would leave the fetch-latency histogram reading
+    // near-empty on exactly the workload it's most needed for. Timed before the throttle
+    // sleep and the socket write so the metric reflects broker-side read cost rather than
+    // deliberate quota delay or client-side backpressure.
+    engine.metrics().fetch_latency_ms.record(fetch_start.elapsed());
+
     let quota_key = resolve_quota_key(principal, logical_client_id.as_deref(), client_key);
-    engine.throttle_fetch(&quota_key, plan.physical_len).await;
+    engine.throttle_fetch(topic, &quota_key, plan.physical_len).await;
 
     let mut header = Vec::with_capacity(9);
     header.put_u8(0u8); // WireResponse status = OK
@@ -1700,11 +1709,13 @@ async fn process_request(
             if !engine.is_partition_leader(&topic, target_partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
-            // Quota: account for produced bytes before executing the write so we know
-            // exactly how many bytes this request will use, then apply the throttle
-            // delay (if any) after the write completes — matching Kafka's model of
-            // "process the request, delay the response" rather than rejecting outright.
+            // Quota: the request's byte cost is known up front, so charge it and serve
+            // any resulting throttle delay *before* the write rather than after — a
+            // post-write delay would let an over-quota burst hit the disk in full and
+            // only then slow the client down. See `apply_produce_quota`.
             let produced_bytes: u64 = records.iter().map(|r| r.len() as u64).sum();
+            engine.apply_produce_quota(&quota_key, produced_bytes).await;
+            let produce_start = std::time::Instant::now();
             match engine
                 .produce_batch(crate::server::engine::ProduceBatchParams {
                     topic: &topic,
@@ -1723,9 +1734,8 @@ async fn process_request(
                 .await
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
-                    engine
-                        .throttle_produce(&quota_key, produced_bytes, records.len() as u64)
-                        .await;
+                    engine.metrics().produce_latency_ms.record(produce_start.elapsed());
+                    engine.record_produce_metrics(&topic, produced_bytes, records.len() as u64);
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
                     buf.put_u64(first_offset);
@@ -1753,8 +1763,10 @@ async fn process_request(
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
+            let fetch_start = std::time::Instant::now();
             match engine.fetch(&topic, partition, offset, max_bytes).await {
                 Ok(frames) => {
+                    engine.metrics().fetch_latency_ms.record(fetch_start.elapsed());
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
                     let mut fetched_bytes: u64 = 0;
@@ -1762,7 +1774,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
@@ -1795,7 +1807,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
@@ -1816,7 +1828,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("GroupAuthorizationFailed");
             }
-            match engine.commit_offset(&group_id, &topic, partition, offset) {
+            match engine.commit_offset(&group_id, &topic, partition, offset).await {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("CommitOffset failed: {}", e)),
             }
@@ -2033,7 +2045,7 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
@@ -2300,6 +2312,7 @@ async fn process_request(
             }
             match engine
                 .commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
+                .await
             {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("OffsetCommit failed: {}", e)),
@@ -2420,7 +2433,7 @@ async fn process_request(
                         }
                     }
                     let payload = crate::protocol::wire::encode_share_fetch_response(&batches);
-                    engine.throttle_fetch(&quota_key, fetched_bytes).await;
+                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
                     WireResponse::ok(payload)
                 }
                 Err(e) => WireResponse::error(&format!("ShareFetch failed: {}", e)),

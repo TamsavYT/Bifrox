@@ -116,6 +116,14 @@ impl TimeIndexSegment {
         self.file.sync_data()
     }
 
+    /// Largest timestamp recorded in this segment's sparse time index — a cheap O(index
+    /// size), not O(segment size), stand-in for "the newest record in this segment", used
+    /// by time-based retention instead of the filesystem's mtime (which backup tools,
+    /// replica resync, or a plain `touch` can change without touching any record).
+    pub fn max_timestamp(&self) -> Option<u64> {
+        self.entries.iter().map(|e| e.timestamp).max()
+    }
+
     /// Binary search ($O(\log N)$) for nearest logical offset corresponding to target timestamp
     pub fn find_offset_for_timestamp(&self, target_time_ms: u64) -> Option<u64> {
         if self.entries.is_empty() {
