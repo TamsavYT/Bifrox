@@ -3614,3 +3614,40 @@ async fn test_scenario_42_push_excludes_pull_covered_peers() {
         "__cluster_metadata has no pull fetcher and must keep its push path"
     );
 }
+
+/// A user may hold a SHA-256 and a SHA-512 credential at once, each verifying only under
+/// its own mechanism — and deleting the user must remove both.
+///
+/// Credentials used to be keyed by username alone, so creating one under a second
+/// mechanism silently replaced the first.
+#[tokio::test]
+async fn test_scenario_43_scram_credentials_are_per_mechanism() {
+    use hermes::scram::ScramMechanism;
+
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+
+    engine
+        .upsert_scram_user_with_mechanism("dual", "pw-256", ScramMechanism::Sha256)
+        .await
+        .unwrap();
+    engine
+        .upsert_scram_user_with_mechanism("dual", "pw-512", ScramMechanism::Sha512)
+        .await
+        .unwrap();
+
+    // Both survive: adding the second did not replace the first.
+    assert_eq!(
+        engine.scram_user_mechanisms("dual"),
+        vec![ScramMechanism::Sha512, ScramMechanism::Sha256],
+        "a user must be able to hold both mechanisms at once"
+    );
+
+    // Deleting the user removes every mechanism, not just one.
+    assert!(engine.delete_scram_user("dual").await.unwrap());
+    assert!(!engine.has_scram_user("dual"));
+    assert!(
+        engine.scram_user_mechanisms("dual").is_empty(),
+        "deleting a user must not leave them able to authenticate under another hash"
+    );
+}

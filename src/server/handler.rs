@@ -51,6 +51,9 @@ impl AsPlainTcpStream for tokio_rustls::server::TlsStream<TcpStream> {
 #[derive(Debug, Clone)]
 struct ScramSession {
     username: String,
+    /// Mechanism negotiated in `SaslHandshake`. The credential store holds one entry per
+    /// `(user, mechanism)`, so this selects which credential the exchange validates against.
+    mechanism: crate::scram::ScramMechanism,
     client_first_bare: String,
     server_first_message: String,
     combined_nonce: String,
@@ -146,6 +149,9 @@ where
     };
     let mut logical_client_id: Option<String> = None;
     let mut scram_session: Option<ScramSession> = None;
+    // Set by `SaslHandshake`; selects which of a user's credentials the SCRAM exchange
+    // validates against (see `ScramSession::mechanism`).
+    let mut negotiated_scram_mechanism: Option<crate::scram::ScramMechanism> = None;
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
@@ -384,6 +390,7 @@ where
                                         &client_key,
                                         &mut logical_client_id,
                                         &mut scram_session,
+                                        &mut negotiated_scram_mechanism,
                                     )
                                     .await;
                                     response_scratch.clear();
@@ -509,6 +516,7 @@ where
                                         &client_key,
                                         &mut logical_client_id,
                                         &mut scram_session,
+                                        &mut negotiated_scram_mechanism,
                                     )
                                     .await;
                                     response_scratch.clear();
@@ -1052,6 +1060,12 @@ fn decode_replication_packet(
     // this replica out of the ISR quorum count until it catches back up, rather than
     // silently dropping the out-of-order frame.
     let mut write_failed = false;
+    // Metadata records decoded from this batch, applied only once the batch is durable.
+    // Applying inline (as this used to) meant the in-memory topic registry, ACLs and
+    // partition assignments could reflect records whose fsync then failed — leaving memory
+    // ahead of disk with nothing to signal it, so the broker would serve authorization
+    // decisions that silently revert on restart.
+    let mut pending_metadata: Vec<(u64, crate::replication::MetadataRecord)> = Vec::new();
     for (i, frame) in parsed_frames.iter().enumerate() {
         match pm.append_replica_frame_verbatim(frame) {
             Ok(crate::segment::VerbatimAppendResult::Appended) => {}
@@ -1093,11 +1107,11 @@ fn decode_replication_packet(
         }
 
         // If this node is a Follower and receives a __cluster_metadata replication,
-        // decode it and apply its state effects locally via the same apply path used
-        // by startup replay, so the two can never diverge in behavior.
+        // decode it now but hold the state effects until the batch is durable (see the
+        // apply pass below the flush).
         if is_cluster_meta {
             if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
-                engine.apply_metadata_record(frame.offset, meta_rec);
+                pending_metadata.push((frame.offset, meta_rec));
             }
         }
     }
@@ -1119,6 +1133,28 @@ fn decode_replication_packet(
             e
         );
         write_failed = true;
+    }
+
+    // Metadata takes effect only now — after the batch is durable. Disk is the source of
+    // truth and memory follows it, never the other way round.
+    //
+    // Applying inline during the append loop (as this used to) left a window where the
+    // in-memory topic registry, ACLs and partition assignments reflected records whose
+    // fsync then failed: memory ran ahead of disk with nothing signalling the divergence,
+    // so the broker served authorization decisions that would silently revert on restart.
+    // Leaving them unapplied and NACKing instead makes the leader re-deliver the batch.
+    if !write_failed {
+        for (offset, record) in pending_metadata {
+            engine.apply_metadata_record(offset, record);
+        }
+    } else if !pending_metadata.is_empty() {
+        tracing::error!(
+            "HA Replication: '{}' P{} batch was not durable — {} metadata record(s) left \
+             unapplied so in-memory state cannot run ahead of disk",
+            topic,
+            partition,
+            pending_metadata.len()
+        );
     }
 
     tracing::info!(
@@ -1366,6 +1402,10 @@ async fn try_zero_copy_fetch(
 }
 
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
+// The parameters are this connection's mutable state (principal, client id, SCRAM session
+// and negotiated mechanism), not independent knobs — bundling them into a struct purely to
+// satisfy the lint would obscure that they are borrowed mutably per request.
+#[allow(clippy::too_many_arguments)]
 async fn process_request(
     engine: &StorageEngine,
     req: WireRequest,
@@ -1374,6 +1414,7 @@ async fn process_request(
     client_host: &str,
     logical_client_id: &mut Option<String>,
     scram_session: &mut Option<ScramSession>,
+    negotiated_scram_mechanism: &mut Option<crate::scram::ScramMechanism>,
 ) -> WireResponse {
     let quota_key = resolve_quota_key(principal.as_str(), logical_client_id.as_deref(), client_key);
 
@@ -1406,6 +1447,12 @@ async fn process_request(
             let mechs = &engine.config().sasl_mechanisms;
             let supported = mechs.iter().any(|m| m.eq_ignore_ascii_case(&mechanism));
             let error_code: i16 = if supported { 0 } else { 33 };
+            // Remember which SCRAM mechanism was negotiated, so the subsequent
+            // `SaslAuthenticate` validates against the credential derived under that same
+            // hash — a SHA-256 credential cannot verify a SHA-512 exchange.
+            if supported {
+                *negotiated_scram_mechanism = mechanism.parse::<crate::scram::ScramMechanism>().ok();
+            }
             let mut buf = Vec::new();
             buf.put_i16(error_code);
             buf.put_u32(mechs.len() as u32);
@@ -1443,7 +1490,7 @@ async fn process_request(
                         }
                     };
 
-                let credential = match engine.lookup_scram_credential(&username) {
+                let credential = match engine.lookup_scram_credential(&username, *negotiated_scram_mechanism) {
                     Some(credential) => credential,
                     None => {
                         scram_session.take();
@@ -1477,6 +1524,10 @@ async fn process_request(
 
                 *scram_session = Some(ScramSession {
                     username,
+                    // Pin the exchange to the credential actually selected above, so the
+                    // client-final step verifies under the same hash the server-first
+                    // salt/iterations came from.
+                    mechanism: credential.mechanism,
                     client_first_bare,
                     server_first_message: server_first_message.clone(),
                     combined_nonce,
@@ -1498,7 +1549,7 @@ async fn process_request(
                     }
                 };
 
-                let credential = match engine.lookup_scram_credential(&session.username) {
+                let credential = match engine.lookup_scram_credential(&session.username, Some(session.mechanism)) {
                     Some(credential) => credential,
                     None => {
                         scram_session.take();
@@ -1544,7 +1595,7 @@ async fn process_request(
             }
 
             let (username, password) = parse_plain_auth(auth_text);
-            let auth_ok = if let Some(credential) = engine.lookup_scram_credential(&username) {
+            let auth_ok = if let Some(credential) = engine.lookup_scram_credential(&username, *negotiated_scram_mechanism) {
                 credential.verify_password(&password)
             } else if let Some(ref tok) = engine.config().auth_token {
                 tok == &password || tok == &username

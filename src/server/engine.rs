@@ -155,7 +155,11 @@ pub struct StorageEngine {
     broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
     quota: Arc<QuotaManager>,
     acl: Arc<crate::server::acl::AclManager>,
-    scram_credentials: Arc<DashMap<String, crate::scram::ScramCredential>>,
+    /// SCRAM credentials keyed by `(username, mechanism)`. A credential is derived under one
+    /// specific hash and cannot verify an exchange under another, so a user may hold a
+    /// SHA-256 and a SHA-512 credential simultaneously and each is stored separately.
+    scram_credentials:
+        Arc<DashMap<(String, crate::scram::ScramMechanism), crate::scram::ScramCredential>>,
     metrics: Arc<crate::server::metrics::MetricsCollector>,
 }
 
@@ -1474,17 +1478,56 @@ impl StorageEngine {
         &self.metrics
     }
 
+    /// Fetches the credential for `username` under `mechanism`.
+    ///
+    /// `None` for the mechanism means the caller has no negotiated preference (e.g. a
+    /// legacy path that predates mechanism selection); in that case the strongest
+    /// credential the user actually has is returned, so adding a SHA-512 credential
+    /// upgrades those callers rather than breaking them.
     pub(crate) fn lookup_scram_credential(
         &self,
         username: &str,
+        mechanism: Option<crate::scram::ScramMechanism>,
     ) -> Option<crate::scram::ScramCredential> {
-        self.scram_credentials
-            .get(username)
-            .map(|entry| entry.value().clone())
+        if let Some(mechanism) = mechanism {
+            return self
+                .scram_credentials
+                .get(&(username.to_string(), mechanism))
+                .map(|entry| entry.value().clone());
+        }
+        for candidate in [
+            crate::scram::ScramMechanism::Sha512,
+            crate::scram::ScramMechanism::Sha256,
+        ] {
+            if let Some(entry) = self
+                .scram_credentials
+                .get(&(username.to_string(), candidate))
+            {
+                return Some(entry.value().clone());
+            }
+        }
+        None
     }
 
+    /// True if `username` has a credential under any mechanism.
     pub fn has_scram_user(&self, username: &str) -> bool {
-        self.scram_credentials.contains_key(username)
+        self.lookup_scram_credential(username, None).is_some()
+    }
+
+    /// Mechanisms `username` currently holds a credential for, strongest first. Empty for
+    /// an unknown user. Lets an operator see which SCRAM mechanisms a user can actually
+    /// authenticate with, rather than only whether the user exists.
+    pub fn scram_user_mechanisms(&self, username: &str) -> Vec<crate::scram::ScramMechanism> {
+        [
+            crate::scram::ScramMechanism::Sha512,
+            crate::scram::ScramMechanism::Sha256,
+        ]
+        .into_iter()
+        .filter(|m| {
+            self.scram_credentials
+                .contains_key(&(username.to_string(), *m))
+        })
+        .collect()
     }
 
     pub(crate) fn apply_scram_credential_state(
@@ -1497,7 +1540,7 @@ impl StorageEngine {
         server_key: Vec<u8>,
     ) {
         self.scram_credentials.insert(
-            username.clone(),
+            (username.clone(), mechanism),
             crate::scram::ScramCredential::new(
                 username,
                 mechanism,
@@ -1509,8 +1552,11 @@ impl StorageEngine {
         );
     }
 
+    /// Removes every credential belonging to `username`, across all mechanisms — deleting
+    /// a user must not leave them able to authenticate under a different hash.
     pub(crate) fn remove_scram_credential_state(&self, username: &str) {
-        self.scram_credentials.remove(username);
+        self.scram_credentials
+            .retain(|(stored_user, _), _| stored_user != username);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1575,7 +1621,7 @@ impl StorageEngine {
     }
 
     pub async fn delete_scram_user(&self, username: &str) -> IoResult<bool> {
-        let existed = self.scram_credentials.contains_key(username);
+        let existed = self.has_scram_user(username);
         let record = crate::replication::MetadataRecord::ScramCredentialDelete {
             username: username.to_string(),
         };
@@ -2472,7 +2518,7 @@ impl StorageEngine {
 
     fn bootstrap_legacy_sasl_users(&self) -> IoResult<()> {
         for (username, password) in &self.config.sasl_users {
-            if self.scram_credentials.contains_key(username) {
+            if self.has_scram_user(username) {
                 continue;
             }
             let credential = crate::scram::ScramCredential::generate(
@@ -2483,7 +2529,7 @@ impl StorageEngine {
             )
             .map_err(|_| std::io::Error::other("Failed to bootstrap SCRAM credential"))?;
             self.scram_credentials
-                .insert(username.clone(), credential.clone());
+                .insert((username.clone(), credential.mechanism), credential.clone());
             if self.is_leader() {
                 let record = crate::replication::MetadataRecord::ScramCredentialUpsert {
                     username: credential.username.clone(),
