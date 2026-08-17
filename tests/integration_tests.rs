@@ -432,7 +432,9 @@ async fn test_scenario_7_milestone3_features() {
 
     tx_mgr.begin_transaction("tx_orders_99", 101).unwrap();
     tx_mgr.prepare_commit("tx_orders_99").unwrap();
-    tx_mgr.complete_commit("tx_orders_99").unwrap();
+    // No partitions were registered on this transaction, so there are no end offsets to
+    // record — commit now takes the same range bookkeeping abort always did.
+    tx_mgr.complete_commit("tx_orders_99", &[]).unwrap();
 
     // 3. High Availability Replication Manager Test
     let cluster_config = hermes::ClusterConfig {
@@ -3502,4 +3504,65 @@ async fn test_scenario_40_join_group_barrier_forms_one_generation() {
         5,
         "every member of the window must be in the group"
     );
+}
+
+/// A malformed config value must be REJECTED, never silently applied as "unset".
+///
+/// `retention.ms` was parsed with `.ok()`, so a typo evaluated to `None` and turned
+/// retention *off* — the topic then grew without bound while the client saw a success
+/// response, and the resulting state was indistinguishable from a deliberate "unlimited".
+#[tokio::test]
+async fn test_scenario_41_alter_configs_rejects_invalid_values() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    engine.create_topic("cfg_topic", 1).await.unwrap();
+
+    // Establish a real retention first, so we can prove a failed update doesn't clear it.
+    engine
+        .alter_configs(
+            "cfg_topic",
+            vec![("retention.ms".to_string(), "60000".to_string())],
+        )
+        .await
+        .expect("valid config should apply");
+
+    for (key, bad_value) in [
+        ("retention.ms", "not_a_number"),
+        ("retention.bytes", "12x"),
+        ("min.insync.replicas", "0"),
+        ("min.cleanable.dirty.ratio", "5.0"),
+        ("cleanup.policy", "recycle"),
+        ("compression.type", "bzip2"),
+    ] {
+        let result = engine
+            .alter_configs("cfg_topic", vec![(key.to_string(), bad_value.to_string())])
+            .await;
+        assert!(
+            result.is_err(),
+            "'{}={}' must be rejected, not silently applied",
+            key,
+            bad_value
+        );
+    }
+
+    // The previously-set value survived every rejected update.
+    let configs = engine.describe_configs("cfg_topic");
+    let retention = configs
+        .iter()
+        .find(|(k, _)| k == "retention.ms")
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        retention,
+        Some("60000".to_string()),
+        "a rejected update must leave the existing value untouched"
+    );
+
+    // An explicitly empty value is still the way to clear a setting.
+    engine
+        .alter_configs(
+            "cfg_topic",
+            vec![("retention.ms".to_string(), String::new())],
+        )
+        .await
+        .expect("clearing a setting with an empty value should be allowed");
 }

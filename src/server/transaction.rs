@@ -17,6 +17,13 @@ pub const CTRL_ABORT: u8 = 0x02;
 
 pub type PartitionRangeList = Vec<(String, u32, u64, u64)>;
 
+/// In-flight transaction start offsets for one partition, ordered ascending. The smallest
+/// key is that partition's Last Stable Offset; the set holds every transaction pinning
+/// that offset, so retiring one doesn't release the LSO while another still holds it.
+type LsoOffsetMap = std::collections::BTreeMap<u64, std::collections::HashSet<String>>;
+/// `(topic, partition) -> ` [`LsoOffsetMap`]. See `TransactionManager::last_stable_offset`.
+type LsoIndex = DashMap<(String, u32), LsoOffsetMap>;
+
 #[derive(Debug, Clone)]
 pub struct TransactionState {
     pub transaction_id: String,
@@ -51,6 +58,14 @@ pub struct TransactionManager {
     producer_sequences: Arc<DashMap<u64, ProducerSequenceEntry>>,
     /// Monotonic tick source for `ProducerSequenceEntry::last_used`.
     sequence_clock: Arc<AtomicU64>,
+    /// Per-partition index of in-flight transaction start offsets, ordered ascending:
+    /// `(topic, partition) -> first_offset -> {transaction_id}`.
+    ///
+    /// The smallest key is the partition's Last Stable Offset, so `last_stable_offset` is
+    /// an O(1) lookup of the first entry instead of a full scan of every transaction on
+    /// every fetch. The inner set handles several transactions legitimately sharing a
+    /// first offset, so retiring one doesn't release the LSO while another still holds it.
+    lso_index: Arc<LsoIndex>,
     /// Active transactions map: transaction_id -> TransactionState
     transactions: Arc<DashMap<String, TransactionState>>,
     /// Transactional-ID coordinator state used to fence old producers and make InitProducerId durable.
@@ -63,6 +78,7 @@ impl TransactionManager {
         Self {
             producer_sequences: Arc::new(DashMap::new()),
             sequence_clock: Arc::new(AtomicU64::new(0)),
+            lso_index: Arc::new(DashMap::new()),
             transactions: Arc::new(DashMap::new()),
             transactional_producers: Arc::new(DashMap::new()),
             next_producer_id: Arc::new(AtomicU64::new(1)),
@@ -346,10 +362,15 @@ impl TransactionManager {
     ) -> Option<(u64, PartitionRangeList)> {
         if let Some(mut state) = self.transactions.get_mut(transaction_id) {
             let mut found = false;
+            // Whether this call is what established the partition's first offset — only
+            // then does a new LSO pin need recording (a later produce in the same
+            // transaction doesn't move the transaction's start).
+            let mut newly_pinned: Option<u64> = None;
             for (t, p, ref mut so, _) in &mut state.partitions {
                 if t == topic && *p == partition {
                     if *so == u64::MAX {
                         *so = start_offset;
+                        newly_pinned = Some(start_offset);
                     }
                     found = true;
                     break;
@@ -359,8 +380,21 @@ impl TransactionManager {
                 state
                     .partitions
                     .push((topic.to_string(), partition, start_offset, u64::MAX));
+                newly_pinned = Some(start_offset);
             }
-            Some((state.producer_id, state.partitions.clone()))
+            let result = Some((state.producer_id, state.partitions.clone()));
+            let is_in_flight = matches!(
+                state.status,
+                TxStatus::Ongoing | TxStatus::PrepareCommit | TxStatus::PrepareAbort
+            );
+            drop(state);
+
+            if is_in_flight {
+                if let Some(first_offset) = newly_pinned {
+                    self.pin_lso(topic, partition, first_offset, transaction_id);
+                }
+            }
+            result
         } else {
             None
         }
@@ -399,13 +433,20 @@ impl TransactionManager {
     }
 
     /// Phase 2 2PC: Transitions transaction to Committed
-    pub fn complete_commit(&self, transaction_id: &str) -> Result<(), String> {
-        if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            state.status = TxStatus::Committed;
-            Ok(())
-        } else {
-            Err(format!("Transaction '{}' not found", transaction_id))
-        }
+    /// Phase 2 2PC: Transitions transaction to Committed.
+    ///
+    /// Takes `end_offsets` for the same reason `complete_abort` does. This used to set the
+    /// status alone and leave every partition's `end` at its initial value, so committed
+    /// and aborted transactions ended up with structurally different records for no reason
+    /// beyond the omission — anything needing a committed transaction's offset extent
+    /// (range bookkeeping, cleanup, LSO accounting) could only reason about aborted ones,
+    /// and a committed transaction's span was unrecoverable without rescanning the log.
+    pub fn complete_commit(
+        &self,
+        transaction_id: &str,
+        end_offsets: &[(String, u32, u64)],
+    ) -> Result<(), String> {
+        self.complete_with_status(transaction_id, TxStatus::Committed, end_offsets)
     }
 
     /// Phase 2 2PC: Transitions transaction to Aborted
@@ -414,38 +455,94 @@ impl TransactionManager {
         transaction_id: &str,
         end_offsets: &[(String, u32, u64)],
     ) -> Result<(), String> {
-        if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            state.status = TxStatus::Aborted;
-            for (topic, part, end_off) in end_offsets {
-                for (t, p, _, ref mut end) in &mut state.partitions {
-                    if t == topic && p == part {
-                        *end = *end_off;
-                    }
-                }
-            }
-            Ok(())
-        } else {
-            Err(format!("Transaction '{}' not found", transaction_id))
-        }
+        self.complete_with_status(transaction_id, TxStatus::Aborted, end_offsets)
     }
 
-    /// Returns the Last Stable Offset (LSO) for a given (topic, partition).
-    pub fn last_stable_offset(&self, topic: &str, partition: u32) -> u64 {
-        let mut lso = u64::MAX;
-        for entry in self.transactions.iter() {
-            let state = entry.value();
-            if state.status == TxStatus::Ongoing
-                || state.status == TxStatus::PrepareCommit
-                || state.status == TxStatus::PrepareAbort
-            {
-                for (t, p, start_offset, _) in &state.partitions {
-                    if t == topic && *p == partition && *start_offset < lso {
-                        lso = *start_offset;
-                    }
+    /// Shared terminal transition for both 2PC outcomes, so the commit and abort paths
+    /// record exactly the same fields and cannot drift apart again.
+    fn complete_with_status(
+        &self,
+        transaction_id: &str,
+        status: TxStatus,
+        end_offsets: &[(String, u32, u64)],
+    ) -> Result<(), String> {
+        let Some(mut state) = self.transactions.get_mut(transaction_id) else {
+            return Err(format!("Transaction '{}' not found", transaction_id));
+        };
+        state.status = status;
+        for (topic, part, end_off) in end_offsets {
+            for (t, p, _, ref mut end) in &mut state.partitions {
+                if t == topic && p == part {
+                    *end = *end_off;
                 }
             }
         }
-        lso
+        drop(state);
+        // A terminal transaction no longer holds the LSO back on any partition it touched.
+        self.retire_from_lso_index(transaction_id);
+        Ok(())
+    }
+
+    /// Returns the Last Stable Offset (LSO) for a given (topic, partition): the lowest
+    /// first-offset among transactions still in flight on it, or `u64::MAX` when none are.
+    ///
+    /// Served from an incrementally-maintained per-partition index rather than recomputed.
+    /// This is on the fetch path, and the previous implementation walked every active
+    /// transaction and every partition within each one on *every fetch request* — a cost
+    /// that scales with concurrent transactional producers multiplied by fetch rate, so it
+    /// grew fastest exactly when the broker was busiest, while holding the transaction map
+    /// locked and thereby making transaction progress and fetch serving contend with each
+    /// other.
+    pub fn last_stable_offset(&self, topic: &str, partition: u32) -> u64 {
+        self.lso_index
+            .get(&(topic.to_string(), partition))
+            .and_then(|entry| entry.value().keys().next().copied())
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Records that `transaction_id` holds `first_offset` on a partition, pinning the LSO
+    /// there until it reaches a terminal state.
+    fn pin_lso(&self, topic: &str, partition: u32, first_offset: u64, transaction_id: &str) {
+        self.lso_index
+            .entry((topic.to_string(), partition))
+            .or_default()
+            .entry(first_offset)
+            .or_default()
+            .insert(transaction_id.to_string());
+    }
+
+    /// Drops every LSO pin held by a transaction that has reached a terminal state.
+    fn retire_from_lso_index(&self, transaction_id: &str) {
+        let Some(state) = self.transactions.get(transaction_id) else {
+            return;
+        };
+        let pins: Vec<(String, u32, u64)> = state
+            .partitions
+            .iter()
+            .map(|(t, p, start, _)| (t.clone(), *p, *start))
+            .collect();
+        drop(state);
+
+        for (topic, partition, first_offset) in pins {
+            let key = (topic, partition);
+            let mut now_empty = false;
+            if let Some(mut per_partition) = self.lso_index.get_mut(&key) {
+                let mut offset_now_empty = false;
+                if let Some(holders) = per_partition.get_mut(&first_offset) {
+                    holders.remove(transaction_id);
+                    offset_now_empty = holders.is_empty();
+                }
+                if offset_now_empty {
+                    per_partition.remove(&first_offset);
+                }
+                now_empty = per_partition.is_empty();
+            }
+            // Drop the whole partition entry once nothing pins it, so the index doesn't
+            // accumulate an entry per partition ever touched by a transaction.
+            if now_empty {
+                self.lso_index.remove_if(&key, |_, v| v.is_empty());
+            }
+        }
     }
 
     /// Collects all transaction IDs that have been Aborted, with their exact per-partition offset ranges (BUG-03).
@@ -519,6 +616,20 @@ impl TransactionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let in_flight = matches!(
+            status,
+            TxStatus::Ongoing | TxStatus::PrepareCommit | TxStatus::PrepareAbort
+        );
+        // Rebuild this transaction's LSO pins, since `last_stable_offset` is served from
+        // the index rather than by scanning. A transaction restored mid-flight still holds
+        // the LSO on every partition it had touched, exactly as it did before the restart.
+        if in_flight {
+            for (topic, partition, first_offset, _) in &partitions {
+                if *first_offset != u64::MAX {
+                    self.pin_lso(topic, *partition, *first_offset, transaction_id);
+                }
+            }
+        }
         self.transactions.insert(
             transaction_id.to_string(),
             TransactionState {

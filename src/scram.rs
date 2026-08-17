@@ -120,15 +120,27 @@ pub(crate) fn sha256(data: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// Constant-time byte comparison for secret material.
+///
+/// Uses `subtle::ConstantTimeEq`, which is purpose-built for this and carries an explicit
+/// guarantee that the comparison stays branch-free. The previous implementation was a
+/// hand-rolled `fold` over the bytes: correct as written, but nothing in the source marked
+/// it timing-sensitive, so the optimizer was free to rewrite it into a short-circuit loop.
+/// If it ever did, the time taken to reject a proof would leak how many leading bytes were
+/// right — turning offline guessing into an online byte-at-a-time attack against the stored
+/// credential.
+///
+/// (`ring::constant_time::verify_slices_are_equal` is *not* the alternative it appears to
+/// be: it is deprecated and documented as an internal helper with no side-channel promise.)
+///
+/// A length mismatch returns `false` immediately. That is not a leak worth avoiding here:
+/// these values are fixed-width digests, so their length is already public.
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
     if left.len() != right.len() {
         return false;
     }
-    let diff = left
-        .iter()
-        .zip(right.iter())
-        .fold(0u8, |acc, (lhs, rhs)| acc | (lhs ^ rhs));
-    diff == 0
+    left.ct_eq(right).into()
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {

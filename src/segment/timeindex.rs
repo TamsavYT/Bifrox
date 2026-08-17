@@ -81,9 +81,26 @@ impl TimeIndexSegment {
         &self.path
     }
 
+    /// Appends an entry, forcing the timestamp column to be non-decreasing.
+    ///
+    /// The stored timestamp is `max(previous_timestamp, timestamp)` rather than the
+    /// record's own value. Lookups binary-search this file, and a binary search over an
+    /// unsorted sequence returns an arbitrary position — so a single out-of-order record
+    /// made `find_offset_for_timestamp` return an offset unrelated to the requested time,
+    /// sometimes *past* it, silently skipping records the caller asked for.
+    ///
+    /// Out-of-order timestamps are ordinary, not exceptional: producer clocks drift,
+    /// batches arrive late, and retries re-send older records. Clamping keeps the index
+    /// searchable while still bounding the answer correctly — the entry for a clamped
+    /// record points at an offset no later than the record itself, so a search lands at or
+    /// before the true position and the caller scans forward from there.
     pub fn append(&mut self, timestamp: u64, logical_offset: u64) -> IoResult<()> {
+        let monotonic_timestamp = match self.entries.last() {
+            Some(last) => timestamp.max(last.timestamp),
+            None => timestamp,
+        };
         let entry = TimeIndexEntry {
-            timestamp,
+            timestamp: monotonic_timestamp,
             logical_offset,
         };
         let encoded = entry.encode();

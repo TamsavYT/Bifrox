@@ -55,6 +55,19 @@ fn remove_dir_all_with_retry(path: &std::path::Path) -> IoResult<()> {
 }
 
 /// Validates topic names to prevent directory traversal and invalid paths (SEC-03)
+/// Parses a numeric topic-config value into the `Option<u64>` its setter expects.
+///
+/// `Some(None)` is an explicit clear (empty value), `Some(Some(n))` a real value, and
+/// `None` means "unparseable — leave the current setting alone", which is what keeps a bad
+/// value from silently disabling a setting.
+fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(None);
+    }
+    trimmed.parse::<u64>().ok().map(Some)
+}
+
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -443,6 +456,25 @@ impl StorageEngine {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    /// Whether this partition carries any transactional data whose visibility depends on
+    /// transaction state — an in-flight transaction pinning its LSO, or a recorded aborted
+    /// range.
+    ///
+    /// Used to keep the zero-copy fetch path (which cannot filter) away from partitions
+    /// where filtering is what makes the answer correct. A partition that has never seen a
+    /// transaction answers `false` and keeps the fast path.
+    pub fn partition_has_transactional_data(&self, topic: &str, partition: u32) -> bool {
+        if self.transactions.last_stable_offset(topic, partition) != u64::MAX {
+            return true;
+        }
+        if !self.transactions.aborted_ranges(topic, partition).is_empty() {
+            return true;
+        }
+        self.get_partition(topic, partition)
+            .map(|pm| pm.has_aborted_transactions())
+            .unwrap_or(false)
     }
 
     /// Looks up an already-open partition without ever creating one.
@@ -898,7 +930,47 @@ impl StorageEngine {
                 leader_epoch,
                 isr,
             } => {
-                let replicas = isr.clone();
+                // Preserve the configured replica set; only the ISR moves here.
+                //
+                // `replicas` is the set of brokers that are *supposed* to hold this
+                // partition; `isr` is the subset currently caught up. This used to assign
+                // `replicas = isr.clone()`, collapsing the former into the latter — so a
+                // replica that fell behind even briefly was not merely dropped from the
+                // ISR, it was erased from the partition's roster entirely. It would then
+                // never be fetched from, never re-admitted, and never counted toward
+                // replication factor again, so every transient lag spike permanently
+                // reduced durability and repeated shrink/expand cycles drove partitions
+                // toward a replica set of one.
+                //
+                // A `PartitionLeadershipChange` record carries no replica set precisely
+                // because it isn't meant to change one — reassignment is a separate
+                // decision. So the existing roster is kept, from the registry if we have
+                // it, else from the live partition, and only falls back to the ISR when
+                // this broker has genuinely never seen the partition before (first
+                // observation, where the ISR is the only roster information available).
+                let known_replicas = self
+                    .topic_registry
+                    .get(&topic)
+                    .and_then(|cfg| cfg.partitions.get(&partition).map(|a| a.replicas.clone()))
+                    .filter(|r| !r.is_empty())
+                    .or_else(|| {
+                        self.get_partition(&topic, partition)
+                            .map(|pm| pm.replicas())
+                            .filter(|r| !r.is_empty())
+                    });
+                let replicas = known_replicas.unwrap_or_else(|| isr.clone());
+
+                // The ISR must always be a subset of the roster. If leadership hands us an
+                // ISR member that isn't currently listed as a replica (e.g. a replica
+                // added by a reassignment this node hasn't applied yet), widen the roster
+                // rather than silently dropping that member.
+                let mut replicas = replicas;
+                for &node in &isr {
+                    if !replicas.contains(&node) {
+                        replicas.push(node);
+                    }
+                }
+
                 let assignment = PartitionAssignment {
                     partition,
                     leader_id,
@@ -977,6 +1049,56 @@ impl StorageEngine {
             .collect()
     }
 
+    /// Validates a topic config map before it is proposed, so a bad value is reported to
+    /// the client instead of being applied.
+    ///
+    /// The whole request is checked before any of it is proposed, so a partially-valid
+    /// request can't leave a half-updated config behind.
+    pub fn validate_topic_configs(configs: &[(String, String)]) -> Result<(), String> {
+        for (key, value) in configs {
+            let trimmed = value.trim();
+            // An explicitly empty value means "clear this setting" and is always allowed.
+            if trimmed.is_empty() {
+                continue;
+            }
+            let invalid = |expected: &str| {
+                Err(format!(
+                    "Invalid value '{}' for '{}': expected {}",
+                    value, key, expected
+                ))
+            };
+            match key.as_str() {
+                "retention.ms" | "retention.bytes" | "delete.retention.ms" | "segment.ms"
+                | "segment.bytes" | "max.message.bytes" => {
+                    if trimmed.parse::<u64>().is_err() {
+                        return invalid("a non-negative integer");
+                    }
+                }
+                "min.insync.replicas" => match trimmed.parse::<usize>() {
+                    Ok(0) => return invalid("an integer >= 1"),
+                    Ok(_) => {}
+                    Err(_) => return invalid("an integer >= 1"),
+                },
+                "min.cleanable.dirty.ratio" => match trimmed.parse::<f64>() {
+                    Ok(r) if (0.0..=1.0).contains(&r) => {}
+                    _ => return invalid("a number between 0.0 and 1.0"),
+                },
+                "cleanup.policy" if trimmed.parse::<crate::config::CleanupPolicy>().is_err() => {
+                    return invalid("'delete', 'compact', or 'compact,delete'");
+                }
+                "compression.type"
+                    if trimmed.parse::<crate::config::CompressionCodec>().is_err() =>
+                {
+                    return invalid("'none', 'lz4', or 'zstd'");
+                }
+                // Unrecognized keys are stored as-is (they may be consumed elsewhere or by
+                // a later version) rather than rejected.
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a full-replace topic config change: updates the stored config map and
     /// pushes recognized keys down to every currently-open partition of this topic.
     fn apply_topic_config_change(&self, topic: &str, configs: Vec<(String, String)>) {
@@ -997,14 +1119,27 @@ impl StorageEngine {
                     pm.set_compression_codec(codec);
                 }
             }
+            // An unparseable numeric value must never reach these setters as `None`.
+            // `parse().ok()` used to do exactly that, so a typo in `retention.ms` didn't
+            // fail — it silently turned retention *off*, and the topic then grew without
+            // bound until the disk filled, with the client having received a success
+            // response and the resulting state indistinguishable from a deliberate
+            // "unlimited". `validate_topic_configs` rejects such values up front; an
+            // explicitly empty value remains the way to clear a setting.
             if let Some(v) = configs_map.get("retention.ms") {
-                pm.set_retention_millis(v.parse::<u64>().ok());
+                if let Some(parsed) = parse_optional_u64_config(v) {
+                    pm.set_retention_millis(parsed);
+                }
             }
             if let Some(v) = configs_map.get("retention.bytes") {
-                pm.set_retention_bytes(v.parse::<u64>().ok());
+                if let Some(parsed) = parse_optional_u64_config(v) {
+                    pm.set_retention_bytes(parsed);
+                }
             }
             if let Some(v) = configs_map.get("delete.retention.ms") {
-                pm.set_delete_retention_millis(v.parse::<u64>().ok());
+                if let Some(parsed) = parse_optional_u64_config(v) {
+                    pm.set_delete_retention_millis(parsed);
+                }
             }
             if let Some(v) = configs_map.get("min.cleanable.dirty.ratio") {
                 if let Ok(ratio) = v.parse::<f64>() {
@@ -1049,6 +1184,10 @@ impl StorageEngine {
                 format!("Unknown topic '{}'", topic),
             ));
         }
+        // Validate the whole request before proposing any of it, so a bad value is
+        // reported rather than silently disabling the setting it names.
+        Self::validate_topic_configs(&configs)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let record = crate::replication::MetadataRecord::TopicConfigChanged {
             topic: topic.to_string(),
             configs,
@@ -1077,6 +1216,12 @@ impl StorageEngine {
             })?
             .configs
             .clone();
+
+        // Validate only what the caller is actually setting. The already-stored values are
+        // left unchecked so a config written by an older build can't make every subsequent
+        // incremental update fail.
+        Self::validate_topic_configs(&upserts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         for key in &deletes {
             merged.remove(key);
@@ -2000,7 +2145,10 @@ impl StorageEngine {
             let _ = tx_pm.produce(&prep_record);
         }
 
-        // Step 3: Write CTRL_COMMIT control markers to all involved data partitions
+        // Step 3: Write CTRL_COMMIT control markers to all involved data partitions,
+        // recording where each partition's transactional range ends — the same bookkeeping
+        // the abort path does, so both terminal states leave a fully-populated record.
+        let mut end_offsets: Vec<(String, u32, u64)> = Vec::with_capacity(partitions.len());
         for (topic, partition, _, _) in &partitions {
             let pm = self
                 .get_or_create_partition(topic, *partition)
@@ -2010,17 +2158,19 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            pm.produce_control_marker(
-                crate::server::transaction::CTRL_COMMIT,
-                producer_id,
-                transaction_id,
-            )
-            .map_err(|e| {
-                format!(
-                    "Failed to write commit marker to {}-{}: {}",
-                    topic, partition, e
+            let marker_frame = pm
+                .produce_control_marker(
+                    crate::server::transaction::CTRL_COMMIT,
+                    producer_id,
+                    transaction_id,
                 )
-            })?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to write commit marker to {}-{}: {}",
+                        topic, partition, e
+                    )
+                })?;
+            end_offsets.push((topic.clone(), *partition, marker_frame.offset));
             tracing::info!(
                 "EOS 2PC: Commit marker written to '{}' partition {}",
                 topic,
@@ -2028,17 +2178,49 @@ impl StorageEngine {
             );
         }
 
-        // Step 4: Transition memory state to Committed & write CompleteCommit to __transaction_state
-        self.transactions.complete_commit(transaction_id)?;
+        // Step 4: Make the commit durable FIRST, then transition memory.
+        //
+        // This order matters and used to be the other way round: memory was set to
+        // `Committed` before the record was written, the write's result was discarded, and
+        // the function returned `Ok(())` regardless. So the broker could tell a producer
+        // its transaction had committed while nothing durable said so — and on restart,
+        // replay would reconstruct the transaction as still in flight and eventually abort
+        // it by timeout. The producer had no way to detect that, which is precisely the
+        // outcome transactional writes exist to prevent.
+        let committed_partitions: crate::server::transaction::PartitionRangeList = partitions
+            .iter()
+            .map(|(topic, partition, start, end)| {
+                let resolved_end = end_offsets
+                    .iter()
+                    .find(|(t, p, _)| t == topic && p == partition)
+                    .map(|(_, _, off)| *off)
+                    .unwrap_or(*end);
+                (topic.clone(), *partition, *start, resolved_end)
+            })
+            .collect();
+
         let commit_record = encode_tx_state_record(
             TxStatus::Committed,
             producer_id,
             transaction_id,
-            &partitions,
+            &committed_partitions,
         );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&commit_record);
-        }
+        let tx_pm = self
+            .get_or_create_partition("__transaction_state", 0)
+            .map_err(|e| format!("Failed to open __transaction_state: {}", e))?;
+        tx_pm
+            .produce(&commit_record)
+            .map_err(|e| format!("Failed to durably record commit of '{}': {}", transaction_id, e))?;
+        tx_pm.flush().map_err(|e| {
+            format!(
+                "Failed to flush commit of '{}' to __transaction_state: {}",
+                transaction_id, e
+            )
+        })?;
+
+        // Only now is it safe to say the transaction committed.
+        self.transactions
+            .complete_commit(transaction_id, &end_offsets)?;
 
         // Step 5: Clean up memory
         self.transactions
@@ -2351,15 +2533,43 @@ impl StorageEngine {
                         .collect();
                     isr_candidates.sort_unstable();
 
-                    let (new_leader_id, new_isr) = match isr_candidates.first().copied() {
-                        Some(id) => (Some(id), isr_candidates.clone()),
+                    // Only the ISR is narrowed here. The partition's configured replica set
+                    // is deliberately NOT touched: `apply_metadata_record` preserves it
+                    // across a `PartitionLeadershipChange`, so replicas that were merely
+                    // offline at this moment stay on the roster and rejoin through the
+                    // normal catch-up path when they return. Previously the roster was
+                    // overwritten with whatever survived the election, which left the
+                    // partition permanently running with a single replica — so the next
+                    // failure lost it outright, with no path back to full replication
+                    // short of a manual reassignment.
+                    let (new_leader_id, new_isr, unclean) = match isr_candidates.first().copied() {
+                        Some(id) => (Some(id), isr_candidates.clone(), false),
                         None if self.config.allow_unclean_leader_election => {
                             let fallback =
                                 replicas.iter().copied().filter(|&r| r != leader_id).min();
-                            (fallback, fallback.into_iter().collect())
+                            (fallback, fallback.into_iter().collect(), true)
                         }
-                        None => (None, Vec::new()),
+                        None => (None, Vec::new(), false),
                     };
+
+                    if unclean {
+                        if let Some(promoted) = new_leader_id {
+                            // Worth surfacing loudly and separately from the ordinary
+                            // failover log line below: an unclean election knowingly
+                            // accepts data loss, promoting a replica that was NOT in the
+                            // ISR and may therefore be missing committed records.
+                            tracing::error!(
+                                "UNCLEAN Failover: {}-{} had no surviving in-sync replica — promoting \
+                                 out-of-sync replica {} (allow_unclean_leader_election is enabled). \
+                                 Records committed on the old leader but absent from this replica are \
+                                 lost. Roster {:?} is retained so the remaining replicas can rejoin.",
+                                topic,
+                                partition,
+                                promoted,
+                                replicas
+                            );
+                        }
+                    }
 
                     match new_leader_id {
                         Some(new_leader_id) => {

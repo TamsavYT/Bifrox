@@ -102,6 +102,12 @@ impl TxnIndexSegment {
         Ok(())
     }
 
+    /// True when this segment records no aborted transaction ranges at all. Lets callers
+    /// skip transaction-aware filtering entirely for partitions that never had one.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn is_aborted(&self, offset: u64) -> bool {
         self.entries
             .iter()

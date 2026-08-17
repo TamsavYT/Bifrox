@@ -597,4 +597,11 @@ impl PartitionManager {
         let seg_guard = self.segment_manager.lock();
         seg_guard.is_offset_aborted(offset)
     }
+
+    /// Whether this partition has any recorded aborted transaction ranges — see
+    /// `SegmentManager::has_aborted_transactions`.
+    pub fn has_aborted_transactions(&self) -> bool {
+        let seg_guard = self.segment_manager.lock();
+        seg_guard.has_aborted_transactions()
+    }
 }

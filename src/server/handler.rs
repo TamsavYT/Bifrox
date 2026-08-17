@@ -1314,6 +1314,22 @@ async fn try_zero_copy_fetch(
         return Ok(false);
     }
 
+    // Never serve a partition with transactional data from the zero-copy path.
+    //
+    // This path streams raw bytes straight from the segment file to the socket, so nothing
+    // inspects the frames: control markers and records belonging to aborted transactions
+    // go out exactly as stored. That silently bypassed every filter the buffered path
+    // applies, and because zero-copy is eligible precisely for the common sequential read,
+    // the *default* behavior was the unfiltered one — the same request could return
+    // different data depending only on which internal path happened to serve it.
+    //
+    // Declining here falls through to the buffered path, which can filter. The cost is
+    // paid only by partitions that actually carry transactional data; a partition that has
+    // never seen a transaction still gets the zero-copy fast path.
+    if engine.partition_has_transactional_data(topic, partition) {
+        return Ok(false);
+    }
+
     let fetch_start = std::time::Instant::now();
     let plan = match engine
         .plan_zero_copy_fetch(topic, partition, offset, max_bytes)

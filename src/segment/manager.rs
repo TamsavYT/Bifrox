@@ -489,8 +489,31 @@ impl SegmentManager {
             return Ok(());
         }
 
-        // Drop whole historical segments that start at/after the truncation point.
-        self.historical.retain(|seg| seg.base_offset < offset);
+        // Drop whole historical segments that start at/after the truncation point, and
+        // delete their files.
+        //
+        // Removing them from `self.historical` alone is not enough: segment discovery on
+        // open scans the directory, so any file left behind is re-adopted on the next
+        // restart and the log silently returns to its pre-truncation length. Since
+        // truncation is precisely how a follower discards a diverged suffix before
+        // rejoining, leaving the files would reintroduce the very records that had to go —
+        // at the moment the replica rejoins the cluster.
+        let (kept, discarded): (Vec<_>, Vec<_>) = std::mem::take(&mut self.historical)
+            .into_iter()
+            .partition(|seg| seg.base_offset < offset);
+        self.historical = kept;
+        for seg in &discarded {
+            crate::segment::log::remove_clean_marker(&seg.log.path);
+            let _ = fs::remove_file(&seg.log.path);
+            let _ = fs::remove_file(seg.index.path());
+            let _ = fs::remove_file(seg.time_index.path());
+            let _ = fs::remove_file(seg.txn_index.path());
+        }
+        if !discarded.is_empty() {
+            // Make the unlinks durable, so a crash right after truncation can't leave the
+            // directory listing still referencing the discarded segments.
+            crate::segment::log::fsync_dir(&self.dir);
+        }
 
         if offset < self.active.base_offset {
             // The truncation point falls inside a historical segment (rare: it means the
@@ -686,6 +709,17 @@ impl SegmentManager {
             }
         }
         false
+    }
+
+    /// Whether any segment of this partition records an aborted transaction range.
+    ///
+    /// Cheap enough to check per fetch (it inspects index sizes, not records), and lets
+    /// the zero-copy path decline partitions whose correct answer depends on filtering.
+    pub fn has_aborted_transactions(&self) -> bool {
+        if !self.active.txn_index.is_empty() {
+            return true;
+        }
+        self.historical.iter().any(|p| !p.txn_index.is_empty())
     }
 
     /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
@@ -1342,8 +1376,25 @@ impl SegmentManager {
     }
 
     /// Finds nearest base_offset for target_timestamp (PARTIAL-02 & NEW-02)
+    /// Lowest offset whose timestamp is >= `target_timestamp`.
+    ///
+    /// Two things here used to be wrong, and the second was the damaging one:
+    ///
+    /// 1. **Search order.** Historical segments were searched newest-to-oldest *before*
+    ///    the active segment, so a timestamp living in the active segment could match an
+    ///    older segment first and return an offset earlier than the true answer.
+    /// 2. **Fallback.** When the target preceded everything indexed, it returned
+    ///    `self.active.base_offset` — the *newest* offset in the log rather than the
+    ///    oldest. So "give me everything since a timestamp older than my retention
+    ///    window", which is the normal way to start a full replay, returned the head of
+    ///    the log: the caller silently skipped the entire history it asked for, with no
+    ///    error indicating anything had been missed.
+    ///
+    /// Now: oldest-to-newest across historical (the first match is by definition the
+    /// lowest qualifying offset), then the active segment, and a fallback to the oldest
+    /// retained offset.
     pub fn find_offset_for_timestamp(&mut self, target_timestamp: u64) -> u64 {
-        for pair in self.historical.iter().rev() {
+        for pair in self.historical.iter() {
             if let Some(offset) = pair.time_index.find_offset_for_timestamp(target_timestamp) {
                 return offset;
             }
@@ -1357,7 +1408,24 @@ impl SegmentManager {
             return offset;
         }
 
-        self.active.base_offset
+        // Nothing at or after the target: the caller is asking for a point past the end of
+        // the log, so the next record to arrive is the answer.
+        if let Some(newest) = self
+            .historical
+            .last()
+            .map(|s| s.time_index.max_timestamp())
+            .unwrap_or_else(|| self.active.time_index.max_timestamp())
+        {
+            if target_timestamp > newest {
+                return self.active.log.next_offset;
+            }
+        }
+
+        // Target precedes all indexed data — start from the oldest offset still retained.
+        self.historical
+            .first()
+            .map(|s| s.base_offset)
+            .unwrap_or(self.active.base_offset)
     }
 
     /// Flushes log and index files to physical disk
@@ -1883,6 +1951,85 @@ mod tests {
         // exactly the one valid frame that was there.
         assert_eq!(mgr2.historical.len(), 1);
         assert_eq!(mgr2.historical[0].log.next_offset, 1);
+    }
+
+    /// A timestamp older than everything retained must return the OLDEST offset, not the
+    /// head of the log. Returning `active.base_offset` meant "replay everything since a
+    /// time before my retention window" — the normal way to start a full replay — silently
+    /// skipped the entire history, with no error to indicate anything was missed.
+    #[test]
+    fn find_offset_for_timestamp_falls_back_to_oldest_not_newest() {
+        let dir = TempDir::new("ts_lookup_fallback");
+        let config = EngineConfig {
+            max_segment_bytes: 200,
+            index_interval_bytes: 1,
+            ..EngineConfig::default()
+        };
+        let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+
+        // Several segments' worth of records, all timestamped well after the epoch.
+        for i in 0..12u64 {
+            mgr.append(format!("k{}:v{}", i, i).as_bytes(), 10_000 + i * 100)
+                .unwrap();
+        }
+        assert!(
+            !mgr.historical.is_empty(),
+            "precondition: the log must have rotated"
+        );
+        let oldest_offset = mgr.historical[0].base_offset;
+
+        // A target older than every record.
+        let found = mgr.find_offset_for_timestamp(1);
+        assert_eq!(
+            found, oldest_offset,
+            "a pre-history timestamp must resolve to the oldest retained offset, not the log head"
+        );
+        assert_ne!(
+            found, mgr.active.base_offset,
+            "must not return the head of the log"
+        );
+    }
+
+    /// Truncation must delete the discarded segments' files, not merely forget them.
+    /// Otherwise startup rediscovers them and the log silently returns to its
+    /// pre-truncation length — resurrecting exactly the diverged records a follower
+    /// truncated in order to rejoin.
+    #[test]
+    fn truncate_after_deletes_files_so_data_stays_gone_across_restart() {
+        let dir = TempDir::new("truncate_file_deletion");
+        let truncate_at;
+        {
+            let config = EngineConfig {
+                max_segment_bytes: 200,
+                index_interval_bytes: 1,
+                ..EngineConfig::default()
+            };
+            let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+            for i in 0..40u64 {
+                mgr.append(format!("key{:03}:value{:03}", i, i).as_bytes(), i)
+                    .unwrap();
+            }
+            mgr.high_watermark = mgr.active.log.next_offset;
+            assert!(
+                mgr.historical.len() >= 2,
+                "precondition: multiple historical segments, got {}",
+                mgr.historical.len()
+            );
+
+            // Truncate away everything from the second historical segment onward.
+            truncate_at = mgr.historical[1].base_offset;
+            mgr.truncate_after(truncate_at).unwrap();
+            assert_eq!(mgr.high_watermark, truncate_at);
+        }
+
+        // Reopen: the truncated records must NOT come back.
+        let mgr = SegmentManager::open(&dir.0, EngineConfig::default()).unwrap();
+        let restored_end = mgr.active.log.next_offset;
+        assert_eq!(
+            restored_end, truncate_at,
+            "truncated records must stay gone across a restart (log end {} vs truncation point {})",
+            restored_end, truncate_at
+        );
     }
 
     /// Simulates a crash between compaction's two renames: the original was moved aside

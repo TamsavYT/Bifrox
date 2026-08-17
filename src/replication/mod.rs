@@ -29,6 +29,31 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const ELECTION_TIMEOUT_BASE_SECS: u64 = 15;
 const ELECTION_TIMEOUT_JITTER_SECS: u64 = 15;
 
+/// Draws a fresh election-timeout jitter, in seconds, for one election timer period.
+///
+/// Deliberately not a pure function of `node_id`: deriving the offset from the node id
+/// alone gives every node a fixed, permanently distinct-but-predictable slot, so two nodes
+/// whose ids happen to collide modulo the jitter range would tie on *every* election
+/// forever rather than just once. Seeding from the clock (mixed with `node_id` and `tick`,
+/// so nodes drawing within the same nanosecond still diverge) re-randomizes each period,
+/// which is what actually breaks repeated split votes.
+///
+/// Uses a SplitMix64 finalizer over the seed rather than pulling in the `rand` crate —
+/// this needs uniform spread across a ~15-value range, not cryptographic quality.
+fn next_election_jitter(node_id: u32, tick: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(tick);
+    let mut z = nanos
+        .wrapping_add((node_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(tick.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    z % ELECTION_TIMEOUT_JITTER_SECS
+}
+
 /// Magic byte for vote-request RPC (Candidate -> Peers)
 pub const VOTE_REQUEST_MAGIC: u8 = 0xAE;
 /// Magic byte for vote-response RPC (Peer -> Candidate)
@@ -625,6 +650,10 @@ impl ReplicationManager {
 
         tokio::spawn(async move {
             let mut tick: u64 = 0;
+            // The heartbeat instant the current jitter draw belongs to, and the draw
+            // itself. Held stable until the election timer actually resets — see below.
+            let mut jitter_anchor = *last_heartbeat.read();
+            let mut current_jitter_secs = next_election_jitter(node_id, tick);
             loop {
                 sleep(Duration::from_secs(1)).await;
                 tick = tick.wrapping_add(1);
@@ -638,13 +667,28 @@ impl ReplicationManager {
                     continue;
                 }
 
-                // Derive jitter: mix node_id with tick using a simple multiplicative hash.
-                // This ensures different nodes time out at different moments.
-                let jitter = (node_id as u64).wrapping_mul(2654435761).wrapping_add(tick)
-                    % ELECTION_TIMEOUT_JITTER_SECS;
-                let timeout_duration = Duration::from_secs(ELECTION_TIMEOUT_BASE_SECS + jitter);
-
+                // Draw the jitter ONCE per election timer, not once per tick.
+                //
+                // This used to mix `tick` into the hash, so the deadline moved every
+                // second: a node fired as soon as the current value happened to dip below
+                // its elapsed time, which collapsed the effective timeout to roughly the
+                // same value on every node — the exact opposite of what jitter is for. All
+                // controllers then timed out together, split the vote, bumped the term and
+                // retried in lockstep, so the cluster could sit for long stretches with no
+                // leader (and, before per-partition epochs, every term bump also
+                // invalidated in-flight replication).
+                //
+                // The deadline is now redrawn only when the timer resets — i.e. when a
+                // heartbeat advances `last_heartbeat`, or after an election concludes.
                 let last = *last_heartbeat.read();
+                if last != jitter_anchor {
+                    // Timer reset since we last looked: pick a fresh deadline and hold it.
+                    jitter_anchor = last;
+                    current_jitter_secs = next_election_jitter(node_id, tick);
+                }
+                let timeout_duration =
+                    Duration::from_secs(ELECTION_TIMEOUT_BASE_SECS + current_jitter_secs);
+
                 if last.elapsed() < timeout_duration {
                     continue; // Leader is alive — no action needed.
                 }
@@ -1188,6 +1232,10 @@ pub async fn send_leader_heartbeat(
 ///
 /// CRIT-01: cluster_id is prepended immediately after the magic byte so followers can authenticate
 /// the sender before touching any partition state.
+// The 0xAA packet genuinely carries this many independent fields; bundling them into a
+// struct purely to satisfy the lint would add indirection without making the call sites
+// clearer.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_replication_push_pooled(
     peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
     peer_addr: &str,

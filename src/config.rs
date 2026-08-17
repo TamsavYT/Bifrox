@@ -77,6 +77,11 @@ pub fn parse_process_role_bytes(bytes: &[u8]) -> Vec<ProcessRole> {
     }
 }
 
+/// Largest segment size the sparse index can address. Index entries hold a 4-byte byte
+/// position within their segment, so anything beyond this would wrap (see
+/// `IndexSegment::append`).
+pub const MAX_ADDRESSABLE_SEGMENT_BYTES: u64 = u32::MAX as u64;
+
 /// WAL Durability Flush Policy
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlushPolicy {
@@ -565,8 +570,21 @@ impl EngineConfig {
                         config.log_file_dir = PathBuf::from(value);
                     }
                     "max.segment.bytes" | "segment.bytes" => {
-                        if let Ok(v) = value.parse() {
-                            config.max_segment_bytes = v;
+                        if let Ok(v) = value.parse::<u64>() {
+                            // Clamp to what a sparse-index entry can address. The index
+                            // stores a 4-byte position within the segment, so a larger
+                            // segment would produce positions that wrap and point at the
+                            // wrong bytes. Clamping (loudly) is better than accepting a
+                            // value that silently corrupts lookups past the 4 GiB mark.
+                            if v > MAX_ADDRESSABLE_SEGMENT_BYTES {
+                                eprintln!(
+                                    "config: segment.bytes {} exceeds the {} byte index limit — clamping",
+                                    v, MAX_ADDRESSABLE_SEGMENT_BYTES
+                                );
+                                config.max_segment_bytes = MAX_ADDRESSABLE_SEGMENT_BYTES;
+                            } else {
+                                config.max_segment_bytes = v;
+                            }
                         }
                     }
                     "segment.ms" => {

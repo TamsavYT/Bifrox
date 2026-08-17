@@ -94,11 +94,34 @@ impl IndexSegment {
     }
 
     /// Append a new index entry to both RAM vector and physical disk
+    /// Maximum byte position representable by an index entry. A segment must never grow
+    /// beyond this, or positions would wrap — see `append`.
+    pub const MAX_ADDRESSABLE_POSITION: u64 = u32::MAX as u64;
+
     pub fn append(&mut self, logical_offset: u64, physical_position: u64) -> IoResult<()> {
         let relative_offset = logical_offset.saturating_sub(self.base_offset) as u32;
+        // Refuse rather than wrap. `physical_position as u32` silently truncated once a
+        // segment passed 4 GiB, so the entry pointed at a byte near the start of the file
+        // instead of the real location — with no error at write time and no checksum
+        // failure. The corruption only surfaced later, when a lookup seeked to the wrong
+        // place and read a partial or unrelated frame, and rebuilding the index from the
+        // log regenerated the same wrapped values rather than repairing them.
+        //
+        // `EngineConfig` caps `max_segment_bytes` at this same limit, so reaching here is
+        // a bug rather than a reachable configuration; failing loudly keeps it that way.
+        let physical_position = u32::try_from(physical_position).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Index position {} exceeds the {} byte addressable limit — segment is too large",
+                    physical_position,
+                    Self::MAX_ADDRESSABLE_POSITION
+                ),
+            )
+        })?;
         let entry = IndexEntry {
             relative_offset,
-            physical_position: physical_position as u32,
+            physical_position,
         };
         let encoded = entry.encode();
         self.file.seek(SeekFrom::End(0))?;

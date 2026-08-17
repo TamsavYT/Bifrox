@@ -26,6 +26,10 @@ lz4_flex = "0.11"
 zstd = "0.13"
 webpki-roots = "0.26"
 ring = "0.17"
+# Vetted constant-time primitives for comparing secret material (SCRAM proofs/keys).
+# Purpose-built to resist the compiler reintroducing an early exit, which a hand-rolled
+# fold cannot promise. See `scram::constant_time_eq`.
+subtle = "2"
 base64 = "0.22"
 
 [dev-dependencies]
