@@ -1588,7 +1588,18 @@ async fn process_request(
                 return WireResponse::error("SCRAM username cannot be empty");
             }
             match engine
-                .upsert_scram_credential(&username, iterations, salt, stored_key, server_key)
+                .upsert_scram_credential(
+                    &username,
+                    // The wire request carries no mechanism field yet, so an
+                    // externally-supplied credential is recorded under the default —
+                    // which is what it was derived with. Mechanism selection is available
+                    // through `upsert_scram_user_with_mechanism`.
+                    crate::scram::ScramMechanism::default(),
+                    iterations,
+                    salt,
+                    stored_key,
+                    server_key,
+                )
                 .await
             {
                 Ok(()) => WireResponse::ok(Vec::new()),

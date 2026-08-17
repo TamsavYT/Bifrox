@@ -455,7 +455,7 @@ async fn test_scenario_7_milestone3_features() {
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
 
     let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
-    let res = repl_mgr.replicate_batch("events", 0, 0, 0, &[frame]).await;
+    let res = repl_mgr.replicate_batch("events", 0, 0, 0, &[], &[frame]).await;
     assert!(res.is_ok());
 
     let _ = std::fs::remove_dir_all(&test_dir);
@@ -3565,4 +3565,52 @@ async fn test_scenario_41_alter_configs_rejects_invalid_values() {
         )
         .await
         .expect("clearing a setting with an empty value should be allowed");
+}
+
+/// Push and pull replication must never both deliver the same records to the same peer.
+///
+/// The two ran unconditionally side by side: every record crossed the wire and hit the
+/// follower's append path twice, a pushed and a pulled batch covering the same offsets
+/// could race on append, and follower progress was written by two independent paths so ISR
+/// decisions read a value neither owned. A peer that pull-fetches a partition is now
+/// excluded from the push for it.
+#[tokio::test]
+async fn test_scenario_42_push_excludes_pull_covered_peers() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    engine.create_topic("dual_path", 1).await.unwrap();
+    let pm = engine.get_or_create_partition("dual_path", 0).unwrap();
+
+    let self_id = engine.config().node_id;
+    let follower = self_id + 7;
+    let follower_addr = "127.0.0.1:19501".to_string();
+    engine.register_broker_address(follower, follower_addr.clone());
+
+    // No replica assignment yet: nothing pull-fetches this partition, so push must still
+    // cover it — this is the auto-created-topic case, where push is the ONLY mechanism.
+    assert!(
+        engine.pull_covered_peers("dual_path", 0).is_empty(),
+        "an unassigned partition has no pull fetcher, so push must not be suppressed"
+    );
+
+    // Assign the follower as a replica. It now runs a fetcher for this partition, so push
+    // must stop targeting it.
+    pm.update_leadership(self_id, 1, vec![self_id, follower], vec![self_id, follower]);
+    let covered = engine.pull_covered_peers("dual_path", 0);
+    assert_eq!(
+        covered,
+        vec![follower_addr],
+        "an assigned replica must be excluded from push once it pull-fetches"
+    );
+    assert!(
+        !covered.iter().any(|a| a == &env.addr.to_string()),
+        "the leader never pushes to itself"
+    );
+
+    // The metadata log is deliberately push-only (no pull fetcher), so nothing is ever
+    // excluded for it — otherwise it would stop replicating entirely.
+    assert!(
+        engine.pull_covered_peers("__cluster_metadata", 0).is_empty(),
+        "__cluster_metadata has no pull fetcher and must keep its push path"
+    );
 }

@@ -458,6 +458,28 @@ impl StorageEngine {
         }
     }
 
+    /// Peer addresses that run a pull fetcher for this partition, i.e. that are assigned
+    /// replicas of it and will therefore fetch these records themselves.
+    ///
+    /// Push replication skips them, so no peer ever receives the same records over both
+    /// mechanisms — see `ReplicationManager::replication_targets` for why push still exists
+    /// at all rather than having been deleted outright.
+    pub fn pull_covered_peers(&self, topic: &str, partition: u32) -> Vec<String> {
+        // The metadata log has no pull fetcher by design (applying its records through two
+        // paths concurrently would race), so nothing is ever pull-covered for it.
+        if Self::is_system_topic(topic) {
+            return Vec::new();
+        }
+        let Some(pm) = self.get_partition(topic, partition) else {
+            return Vec::new();
+        };
+        pm.replicas()
+            .into_iter()
+            .filter(|&r| r != self.config.node_id)
+            .filter_map(|r| self.get_broker_address(r))
+            .collect()
+    }
+
     /// Whether this partition carries any transactional data whose visibility depends on
     /// transaction state — an in-flight transaction pinning its LSO, or a recorded aborted
     /// range.
@@ -748,6 +770,7 @@ impl StorageEngine {
                 salt: cred.salt.clone(),
                 stored_key: cred.stored_key.clone(),
                 server_key: cred.server_key.clone(),
+                mechanism: cred.mechanism.to_byte(),
             });
         }
 
@@ -1011,9 +1034,15 @@ impl StorageEngine {
                 salt,
                 stored_key,
                 server_key,
+                mechanism,
             } => {
                 self.apply_scram_credential_state(
-                    username, iterations, salt, stored_key, server_key,
+                    username,
+                    crate::scram::ScramMechanism::from_byte(mechanism),
+                    iterations,
+                    salt,
+                    stored_key,
+                    server_key,
                 );
             }
             crate::replication::MetadataRecord::ScramCredentialDelete { username } => {
@@ -1343,6 +1372,7 @@ impl StorageEngine {
                         0,
                         fencing_epoch,
                         leader_hw,
+                        &[],
                         std::slice::from_ref(&frame_for_replication),
                     )
                     .await
@@ -1377,6 +1407,7 @@ impl StorageEngine {
                     0,
                     hw_fencing_epoch,
                     committed_hw,
+                    &[],
                 )
                 .await;
             });
@@ -1459,6 +1490,7 @@ impl StorageEngine {
     pub(crate) fn apply_scram_credential_state(
         &self,
         username: String,
+        mechanism: crate::scram::ScramMechanism,
         iterations: u32,
         salt: Vec<u8>,
         stored_key: Vec<u8>,
@@ -1466,7 +1498,14 @@ impl StorageEngine {
     ) {
         self.scram_credentials.insert(
             username.clone(),
-            crate::scram::ScramCredential::new(username, iterations, salt, stored_key, server_key),
+            crate::scram::ScramCredential::new(
+                username,
+                mechanism,
+                iterations,
+                salt,
+                stored_key,
+                server_key,
+            ),
         );
     }
 
@@ -1474,9 +1513,11 @@ impl StorageEngine {
         self.scram_credentials.remove(username);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_scram_credential(
         &self,
         username: &str,
+        mechanism: crate::scram::ScramMechanism,
         iterations: u32,
         salt: Vec<u8>,
         stored_key: Vec<u8>,
@@ -1488,20 +1529,43 @@ impl StorageEngine {
             salt,
             stored_key,
             server_key,
+            mechanism: mechanism.to_byte(),
         };
         self.propose_metadata(record).await?;
         Ok(())
     }
 
+    /// Creates or replaces a user's SCRAM credential under the default mechanism.
     pub async fn upsert_scram_user(&self, username: &str, password: &str) -> IoResult<()> {
+        self.upsert_scram_user_with_mechanism(
+            username,
+            password,
+            crate::scram::ScramMechanism::default(),
+        )
+        .await
+    }
+
+    /// Creates or replaces a user's SCRAM credential under a specific mechanism.
+    ///
+    /// A credential is bound to one hash family — the salted password, stored key and
+    /// server key all depend on it — so re-running this with a different mechanism
+    /// *replaces* the user's credential rather than adding a second one alongside it.
+    pub async fn upsert_scram_user_with_mechanism(
+        &self,
+        username: &str,
+        password: &str,
+        mechanism: crate::scram::ScramMechanism,
+    ) -> IoResult<()> {
         let credential = crate::scram::ScramCredential::generate(
             username,
             password,
+            mechanism,
             crate::scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
         )
         .map_err(|_| std::io::Error::other("Failed to generate SCRAM credential"))?;
         self.upsert_scram_credential(
             &credential.username,
+            credential.mechanism,
             credential.iterations,
             credential.salt,
             credential.stored_key,
@@ -1806,6 +1870,9 @@ impl StorageEngine {
             let leader_hw = pm.high_watermark();
             // A data partition is fenced by its own leader epoch, never the controller term.
             let fencing_epoch = pm.leader_epoch() as u64;
+            // Peers that pull-fetch this partition are excluded from the push, so no peer
+            // ever receives the same records twice (see `pull_covered_peers`).
+            let pull_covered = self.pull_covered_peers(topic, partition_id);
             tokio::spawn(async move {
                 if let Err(e) = repl
                     .replicate_batch(
@@ -1813,6 +1880,7 @@ impl StorageEngine {
                         partition_id,
                         fencing_epoch,
                         leader_hw,
+                        &pull_covered,
                         &frames_clone,
                     )
                     .await
@@ -1844,21 +1912,28 @@ impl StorageEngine {
         // system-partition writes, where there's nothing else to wait on.
         pm.advance_committed_hw(last_offset + 1);
 
-        // Tell the followers about the newly committed point. The push that delivered this
-        // batch necessarily carried the *previous* watermark (a batch isn't committed until
-        // the ISR has it), so without this the records would sit replicated-but-unreadable
-        // on every follower until some later write happened to push the watermark along.
+        // Tell the push-served followers about the newly committed point. The push that
+        // delivered this batch necessarily carried the *previous* watermark (a batch isn't
+        // committed until the ISR has it), so without this the records would sit
+        // replicated-but-unreadable on those followers until some later write happened to
+        // carry the watermark along.
+        //
+        // Pull-served followers need none of this — every fetch response already carries
+        // `leader_watermark` — so they are excluded here for the same reason they are
+        // excluded from the push itself.
         if self.is_partition_leader(topic, partition_id) && !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
             let topic_for_hw = topic.to_string();
             let committed_hw = pm.high_watermark();
             let fencing_epoch = pm.leader_epoch() as u64;
+            let pull_covered = self.pull_covered_peers(topic, partition_id);
             tokio::spawn(async move {
                 repl.broadcast_high_watermark(
                     &topic_for_hw,
                     partition_id,
                     fencing_epoch,
                     committed_hw,
+                    &pull_covered,
                 )
                 .await;
             });
@@ -2403,6 +2478,7 @@ impl StorageEngine {
             let credential = crate::scram::ScramCredential::generate(
                 username,
                 password,
+                crate::scram::ScramMechanism::default(),
                 crate::scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
             )
             .map_err(|_| std::io::Error::other("Failed to bootstrap SCRAM credential"))?;
@@ -2415,6 +2491,7 @@ impl StorageEngine {
                     salt: credential.salt.clone(),
                     stored_key: credential.stored_key.clone(),
                     server_key: credential.server_key.clone(),
+                    mechanism: credential.mechanism.to_byte(),
                 };
                 let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
                 meta_pm.produce(&record.encode())?;

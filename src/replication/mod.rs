@@ -469,6 +469,10 @@ impl ReplicationManager {
                                             // forever, since the outer management loop only
                                             // tears a fetcher down when this node stops
                                             // being a follower, not when the leader changes.
+                                            // Whether this round actually applied records —
+                                            // drives whether the loop re-fetches at once or
+                                            // backs off (see the end of the loop body).
+                                            let mut made_progress = false;
                                             let current_leader_id = engine_c
                                                 .partition_leader_id(&topic_c, p_id)
                                                 .unwrap_or(leader_id);
@@ -586,11 +590,25 @@ impl ReplicationManager {
                                                             .leader_watermark
                                                             .min(local_leo);
                                                         pm.advance_committed_hw(follower_hw);
+                                                        made_progress = applied_any;
                                                     }
                                                 }
                                             }
 
-                                            sleep(Duration::from_millis(50)).await;
+                                            // Re-fetch immediately after a productive round
+                                            // instead of always sleeping.
+                                            //
+                                            // The leader learns a follower's progress from
+                                            // that follower's *next* fetch offset, so an
+                                            // unconditional sleep put a fixed delay between
+                                            // "follower has the data" and "leader knows it"
+                                            // — which is exactly the wait an `acks=all`
+                                            // produce blocks on. Polling only when idle
+                                            // keeps the catch-up loop tight while leaving
+                                            // an idle follower cheap.
+                                            if !made_progress {
+                                                sleep(Duration::from_millis(50)).await;
+                                            }
                                         }
                                     });
 
@@ -842,8 +860,30 @@ impl ReplicationManager {
     /// data-topic partitions, though, should never be pushed to a controller-only peer,
     /// since it was never eligible to be assigned as a replica for one in the first place
     /// (see `StorageEngine::available_broker_ids`) and has no business storing that data.
-    fn replication_targets(&self, topic: &str, _partition: u32) -> Vec<String> {
+    /// `pull_covered` lists peers that run a pull fetcher for this partition, i.e. that are
+    /// assigned replicas of it. They are excluded from push, so **no peer ever receives the
+    /// same records over both mechanisms**.
+    ///
+    /// Push and pull used to run unconditionally side by side, which meant every record
+    /// crossed the wire and hit the follower's append path twice, a pushed and a pulled
+    /// batch covering the same offsets could race on append, and follower progress was
+    /// written by two independent paths so ISR decisions read a value neither owned.
+    ///
+    /// Push is not deleted outright because it is currently the *only* mechanism covering
+    /// the common case: `get_or_create_partition` proposes no partition assignment, so an
+    /// auto-created topic has no replica set and therefore no pull fetcher, and
+    /// `default_replication_factor` is 1 so even an explicitly created topic usually has
+    /// none either. Deleting push before assignment is universal would silently stop
+    /// replicating those partitions altogether. Once every partition carries a real replica
+    /// set, `pull_covered` covers every peer, this filter empties the push target list on
+    /// its own, and the push path can be removed with no behavior change.
+    fn replication_targets(&self, topic: &str, _partition: u32, pull_covered: &[String]) -> Vec<String> {
+        let exclude: std::collections::HashSet<&str> =
+            pull_covered.iter().map(|s| s.as_str()).collect();
         if topic == "__cluster_metadata" {
+            // The metadata log is deliberately excluded from the pull fetcher (applying its
+            // records through two paths at once would race), so it is push-only and never
+            // duplicated.
             return self.config.peer_addrs.clone();
         }
         let controller_only_addrs: std::collections::HashSet<String> = self
@@ -865,6 +905,7 @@ impl ReplicationManager {
             .peer_addrs
             .iter()
             .filter(|addr| !controller_only_addrs.contains(*addr))
+            .filter(|addr| !exclude.contains(addr.as_str()))
             .cloned()
             .collect()
     }
@@ -888,8 +929,9 @@ impl ReplicationManager {
         partition: u32,
         fencing_epoch: u64,
         leader_hw: u64,
+        pull_covered: &[String],
     ) {
-        let target_peers = self.replication_targets(topic, partition);
+        let target_peers = self.replication_targets(topic, partition, pull_covered);
         if target_peers.is_empty() {
             return;
         }
@@ -956,13 +998,14 @@ impl ReplicationManager {
         partition: u32,
         fencing_epoch: u64,
         leader_hw: u64,
+        pull_covered: &[String],
         frames: &[RecordFrame],
     ) -> IoResult<()> {
         if self.config.peer_addrs.is_empty() || frames.is_empty() {
             return Ok(());
         }
 
-        let target_peers = self.replication_targets(topic, partition);
+        let target_peers = self.replication_targets(topic, partition, pull_covered);
         if target_peers.is_empty() {
             return Ok(());
         }

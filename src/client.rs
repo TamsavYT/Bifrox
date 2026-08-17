@@ -1514,6 +1514,7 @@ impl TestClient {
         let credential = scram::ScramCredential::generate(
             username,
             password,
+            scram::ScramMechanism::default(),
             scram::DEFAULT_SCRAM_SHA256_ITERATIONS,
         )
         .map_err(|_| std::io::Error::other("Failed to generate SCRAM credential"))?;

@@ -417,7 +417,11 @@ impl Default for EngineConfig {
             ssl_key_path: None,
             ssl_ca_path: None,
             ssl_client_auth: "none".to_string(),
-            sasl_mechanisms: vec!["PLAIN".to_string(), "SCRAM-SHA-256".to_string()],
+            sasl_mechanisms: vec![
+                "PLAIN".to_string(),
+                "SCRAM-SHA-256".to_string(),
+                "SCRAM-SHA-512".to_string(),
+            ],
             sasl_users: std::collections::HashMap::new(),
             acls_enabled: false,
             super_users: Vec::new(),

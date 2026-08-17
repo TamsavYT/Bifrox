@@ -48,6 +48,10 @@ pub enum MetadataRecord {
         salt: Vec<u8>,
         stored_key: Vec<u8>,
         server_key: Vec<u8>,
+        /// SCRAM hash family discriminant (see `scram::ScramMechanism::to_byte`). Absent
+        /// from records written before mechanisms existed, which decode as SHA-256 —
+        /// which is what they were.
+        mechanism: u8,
     },
     ScramCredentialDelete {
         username: String,
@@ -158,6 +162,7 @@ impl MetadataRecord {
                 salt,
                 stored_key,
                 server_key,
+                mechanism,
             } => {
                 buf.put_u8(0x09); // record type
                 crate::protocol::wire::write_pascal_string(&mut buf, username);
@@ -168,6 +173,10 @@ impl MetadataRecord {
                 buf.extend_from_slice(stored_key);
                 buf.put_u16(server_key.len() as u16);
                 buf.extend_from_slice(server_key);
+                // Mechanism is appended last, and the decoder treats its absence as
+                // SHA-256. Records written before mechanisms existed were SHA-256, so old
+                // metadata logs replay correctly without a format version bump.
+                buf.put_u8(*mechanism);
             }
             MetadataRecord::ScramCredentialDelete { username } => {
                 buf.put_u8(0x0A); // record type
@@ -375,12 +384,16 @@ impl MetadataRecord {
                 let salt = read_len_prefixed_bytes(&mut src, "salt")?;
                 let stored_key = read_len_prefixed_bytes(&mut src, "stored_key")?;
                 let server_key = read_len_prefixed_bytes(&mut src, "server_key")?;
+                // Trailing mechanism byte; its absence means a record written before
+                // mechanisms existed, which was necessarily SHA-256.
+                let mechanism = if src.is_empty() { 0 } else { src.get_u8() };
                 Ok(MetadataRecord::ScramCredentialUpsert {
                     username,
                     iterations,
                     salt,
                     stored_key,
                     server_key,
+                    mechanism,
                 })
             }
             0x0A => {
