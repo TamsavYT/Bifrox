@@ -169,7 +169,9 @@ impl StorageEngine {
             broker_addrs.clone(),
             broker_roles.clone(),
         );
-        let group_coordinator = Arc::new(GroupCoordinator::new());
+        let group_coordinator = Arc::new(GroupCoordinator::with_rebalance_delay(
+            std::time::Duration::from_millis(config.group_initial_rebalance_delay_ms),
+        ));
         let quota = Arc::new(QuotaManager::new(
             config.produce_quota_bytes_per_sec,
             config.fetch_quota_bytes_per_sec,
@@ -337,6 +339,183 @@ impl StorageEngine {
     }
 
     /// Retrieve existing partition or dynamically initialize directory `data/{topic}-{partition}` on demand (RACE-02, SEC-03)
+    /// Waits until **every replica currently in the ISR** has acknowledged `target_offset`.
+    ///
+    /// This is what `acks=all` has to mean. The previous behavior counted acknowledgements
+    /// until it reached `min_insync_replicas` and then returned success, which inverts the
+    /// purpose of that setting: `min.insync.replicas` is a *floor* that makes a write fail
+    /// when the ISR has shrunk too far, not a target that lets the write succeed early.
+    /// With an ISR of 5 and a floor of 2, the old code acknowledged a write to the producer
+    /// once any 2 replicas had it — so losing those 2 lost data the producer had been told
+    /// was fully replicated.
+    ///
+    /// The ISR is re-read on every poll rather than snapshotted, so a write blocked on a
+    /// replica that the ISR sweep subsequently evicts unblocks as soon as that replica
+    /// leaves the ISR, instead of waiting out the full timeout.
+    ///
+    /// Returns `Ok(())` once committed, or an error describing which requirement failed.
+    pub async fn await_full_isr_ack(
+        &self,
+        pm: &Arc<PartitionManager>,
+        topic: &str,
+        partition: u32,
+        target_offset: u64,
+        timeout: std::time::Duration,
+    ) -> IoResult<()> {
+        let min_isr = self.effective_min_insync_replicas(topic);
+        let start = std::time::Instant::now();
+
+        loop {
+            let isr = pm.isr();
+
+            // No ISR metadata has ever been applied to this partition (no leadership
+            // record yet). There is no authoritative in-sync set to wait on, so fall back
+            // to the configured peers and the `min_insync_replicas` floor — the pre-
+            // existing behavior — rather than inventing a stricter requirement that would
+            // reject writes on a cluster that simply hasn't published assignments yet.
+            if isr.is_empty() {
+                let mut acked = 1usize; // this leader holds the record
+                for peer in &self.config.peer_addrs {
+                    if self
+                        .replication
+                        .replica_watermark(topic, partition, peer)
+                        .is_some_and(|w| w >= target_offset)
+                    {
+                        acked += 1;
+                    }
+                }
+                if acked >= min_isr {
+                    return Ok(());
+                }
+                if start.elapsed() >= timeout {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "Only {} of the required {} replicas acknowledged {}-{} at offset {}",
+                            acked, min_isr, topic, partition, target_offset
+                        ),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+
+            // The floor: refuse the write outright when the ISR has shrunk below
+            // `min.insync.replicas`. Failing fast is the point — waiting cannot help,
+            // because there are not enough in-sync replicas for the write to ever be
+            // as durable as `acks=all` promises.
+            if isr.len() < min_isr {
+                return Err(std::io::Error::other(format!(
+                    "NOT_ENOUGH_REPLICAS: {}-{} ISR has {} replica(s), min.insync.replicas is {}",
+                    topic,
+                    partition,
+                    isr.len(),
+                    min_isr
+                )));
+            }
+
+            let mut pending: Vec<u32> = Vec::new();
+            for &node_id in &isr {
+                if node_id == self.config.node_id {
+                    continue; // the leader necessarily holds it
+                }
+                let acked = self
+                    .get_broker_address(node_id)
+                    .and_then(|addr| self.replication.replica_watermark(topic, partition, &addr))
+                    .is_some_and(|w| w >= target_offset);
+                if !acked {
+                    pending.push(node_id);
+                }
+            }
+
+            if pending.is_empty() {
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "ISR replicas {:?} did not acknowledge {}-{} at offset {} within {:?}",
+                        pending, topic, partition, target_offset, timeout
+                    ),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Looks up an already-open partition without ever creating one.
+    ///
+    /// Read/probe paths must use this rather than `get_or_create_partition`: those are
+    /// reachable by any client naming any topic, and creating on a read means a request
+    /// that should have been a lookup instead materializes on-disk state.
+    pub fn get_partition(&self, topic: &str, partition: u32) -> Option<Arc<PartitionManager>> {
+        self.partitions
+            .get(&(topic.to_string(), partition))
+            .map(|e| e.clone())
+    }
+
+    /// Whether `topic` is an internal system topic (`__cluster_metadata`,
+    /// `__consumer_offsets`, `__transaction_state`, …). These are created by the broker
+    /// itself, never by client request, and are exempt from the auto-create policy and
+    /// the partition caps — refusing to create them would break the broker's own bookkeeping.
+    fn is_system_topic(topic: &str) -> bool {
+        topic.starts_with("__")
+    }
+
+    /// Partition creation on behalf of a **client request**, subject to
+    /// `auto.create.topics.enable`.
+    ///
+    /// Implicit creation is allowed only when the topic is already known (explicitly
+    /// created, or assigned to this node through the replicated metadata log) or when the
+    /// operator has opted into auto-creation. Without this gate, any client that can reach
+    /// the broker can materialize unbounded topic/partition directories just by naming
+    /// them in a request, exhausting inodes and leaving state behind that outlives the
+    /// connection.
+    pub fn get_or_create_partition_for_client(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> IoResult<Arc<PartitionManager>> {
+        if let Some(pm) = self.get_partition(topic, partition) {
+            return Ok(pm);
+        }
+        let known = Self::is_system_topic(topic) || self.topic_registry.contains_key(topic);
+        if !known && !self.config.auto_create_topics_enable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Unknown topic '{}' (auto.create.topics.enable is false)",
+                    topic
+                ),
+            ));
+        }
+        self.get_or_create_partition(topic, partition)
+    }
+
+    /// Resolves a partition for a **read** path.
+    ///
+    /// Returns the open partition if there is one; opens it if the topic is genuinely
+    /// known (a system topic, or one assigned to this broker through the replicated
+    /// metadata log — in which case this node is supposed to host it and opening is just
+    /// deferred initialization); and returns `None` for a topic this broker has never
+    /// heard of, rather than bringing a directory tree into existence to serve a read that
+    /// can only ever come back empty.
+    fn partition_for_read(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> IoResult<Option<Arc<PartitionManager>>> {
+        if let Some(pm) = self.get_partition(topic, partition) {
+            return Ok(Some(pm));
+        }
+        if Self::is_system_topic(topic) || self.topic_registry.contains_key(topic) {
+            return self.get_or_create_partition(topic, partition).map(Some);
+        }
+        Ok(None)
+    }
+
     pub fn get_or_create_partition(
         &self,
         topic: &str,
@@ -351,7 +530,36 @@ impl StorageEngine {
             )));
         }
 
+        if partition >= self.config.max_partitions_per_topic && !Self::is_system_topic(topic) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Partition {} for topic '{}' exceeds max.partitions.per.topic ({})",
+                    partition, topic, self.config.max_partitions_per_topic
+                ),
+            ));
+        }
+
         let key = (topic.to_string(), partition);
+
+        // Broker-wide backstop, enforced regardless of how creation was reached (client
+        // request, metadata replay, admin call). System topics are exempt so the broker
+        // can always maintain its own bookkeeping.
+        //
+        // This MUST be evaluated before taking the `entry()` below, never inside the
+        // `Vacant` arm: `entry()` holds a write guard on one DashMap shard, while `len()`
+        // reads every shard — including the one already held — which self-deadlocks the
+        // moment a partition actually needs creating.
+        if !Self::is_system_topic(topic)
+            && !self.partitions.contains_key(&key)
+            && self.partitions.len() >= self.config.max_partitions_per_broker
+        {
+            return Err(std::io::Error::other(format!(
+                "Cannot create {}-{}: broker is at max.partitions.per.broker ({})",
+                topic, partition, self.config.max_partitions_per_broker
+            )));
+        }
+
         use dashmap::mapref::entry::Entry;
 
         match self.partitions.entry(key) {
@@ -979,11 +1187,17 @@ impl StorageEngine {
         if !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
             let frame_for_replication = frame.clone();
+            let leader_hw = meta_pm.high_watermark();
+            // The metadata log is fenced by the controller's Raft term: leadership of this
+            // log *is* controller leadership.
+            let fencing_epoch = self.replication.get_epoch();
             tokio::spawn(async move {
                 if let Err(e) = repl
                     .replicate_batch(
                         "__cluster_metadata",
                         0,
+                        fencing_epoch,
+                        leader_hw,
                         std::slice::from_ref(&frame_for_replication),
                     )
                     .await
@@ -993,25 +1207,87 @@ impl StorageEngine {
             });
 
             if self.config.min_insync_replicas > 1 {
-                let quorum_ok = self
-                    .replication
-                    .await_isr_quorum(
-                        "__cluster_metadata",
-                        0,
-                        frame.offset,
-                        std::time::Duration::from_secs(5),
-                    )
-                    .await;
-                if !quorum_ok {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "ISR quorum not reached for metadata proposal",
-                    ));
-                }
+                self.await_full_isr_ack(
+                    &meta_pm,
+                    "__cluster_metadata",
+                    0,
+                    frame.offset,
+                    std::time::Duration::from_secs(5),
+                )
+                .await?;
             }
+
+            // Same reasoning as the produce path: the push carried the pre-commit
+            // watermark, so followers need the committed point delivered after the fact.
+            // `__cluster_metadata` has no pull fetcher at all (it is deliberately excluded,
+            // to avoid applying records through two paths at once), so this broadcast is
+            // the only thing that ever advances a follower's metadata watermark.
+            meta_pm.advance_committed_hw(frame.offset + 1);
+            let repl = self.replication.clone();
+            let committed_hw = meta_pm.high_watermark();
+            let hw_fencing_epoch = self.replication.get_epoch();
+            tokio::spawn(async move {
+                repl.broadcast_high_watermark(
+                    "__cluster_metadata",
+                    0,
+                    hw_fencing_epoch,
+                    committed_hw,
+                )
+                .await;
+            });
         }
 
         Ok(frame.offset)
+    }
+
+    /// `JoinGroup` with the rebalance barrier applied: registers the member, then holds
+    /// the response until the group's join window closes.
+    ///
+    /// Returning immediately — as this used to — meant a member's assignment only ever
+    /// covered whoever happened to have joined at that instant. Because each arrival
+    /// formed its own generation and bumped `generation_id`, it invalidated the assignment
+    /// just handed to the previous joiner and forced it to rejoin, so a group starting up
+    /// produced roughly one rebalance per member and under churn could fail to converge at
+    /// all, leaving partitions unassigned and consumption stalled.
+    ///
+    /// The group lock is never held across an await: the coordinator is polled for the
+    /// remaining window, this sleeps outside the lock, then re-checks.
+    pub async fn join_group_awaited(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        protocols: Vec<String>,
+    ) -> Result<(String, u32, bool, String), String> {
+        let coordinator = self.group_coordinator();
+        let (m_id, generation_id, is_leader, protocol_name) =
+            coordinator.join_group(group_id, member_id, protocols)?;
+
+        // Bound the total wait so a pathological extension chain can't pin a connection.
+        let max_wait = coordinator.initial_rebalance_delay() * 3;
+        let started = std::time::Instant::now();
+        while let Some(remaining) = coordinator.join_window_remaining(group_id) {
+            if started.elapsed() >= max_wait {
+                break;
+            }
+            // Wake at least every 25ms so a window extended by a late joiner is observed
+            // promptly rather than slept through.
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(25))).await;
+        }
+        coordinator.close_join_window(group_id);
+
+        // Re-read after the barrier: the generation this member ends up in is the window's
+        // generation, which may have been formed by an earlier joiner, and leadership may
+        // have settled on a different member.
+        match coordinator.join_result(group_id, &m_id) {
+            Some((final_generation, final_is_leader, final_protocol)) => Ok((
+                m_id,
+                final_generation,
+                final_is_leader,
+                final_protocol,
+            )),
+            // Group vanished while we waited (every member's session expired).
+            None => Ok((m_id, generation_id, is_leader, protocol_name)),
+        }
     }
 
     pub fn acl(&self) -> &crate::server::acl::AclManager {
@@ -1275,13 +1551,25 @@ impl StorageEngine {
             }
         }
 
+        if num_partitions > self.config.max_partitions_per_topic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Requested {} partitions for topic '{}' exceeds max.partitions.per.topic ({})",
+                    num_partitions, topic, self.config.max_partitions_per_topic
+                ),
+            ));
+        }
+
         let partition_id = if !key.is_empty() && num_partitions > 0 {
             hash_key(key.as_bytes(), num_partitions as usize)
         } else {
             0
         };
 
-        let pm = self.get_or_create_partition(topic, partition_id)?;
+        // Client-driven creation: honors `auto.create.topics.enable` (see
+        // `get_or_create_partition_for_client`).
+        let pm = self.get_or_create_partition_for_client(topic, partition_id)?;
 
         // The actual disk work (segment append per record, plus the batch's group-commit
         // fsync) is synchronous, lock-and-syscall-heavy I/O. Running it inline in this
@@ -1370,9 +1658,18 @@ impl StorageEngine {
             let topic_str = topic.to_string();
             let topic_for_spawn = topic_str.clone();
             let frames_clone = frames.clone();
+            let leader_hw = pm.high_watermark();
+            // A data partition is fenced by its own leader epoch, never the controller term.
+            let fencing_epoch = pm.leader_epoch() as u64;
             tokio::spawn(async move {
                 if let Err(e) = repl
-                    .replicate_batch(&topic_for_spawn, partition_id, &frames_clone)
+                    .replicate_batch(
+                        &topic_for_spawn,
+                        partition_id,
+                        fencing_epoch,
+                        leader_hw,
+                        &frames_clone,
+                    )
                     .await
                 {
                     tracing::error!("HA Replication: replicate_batch failed: {}", e);
@@ -1386,21 +1683,14 @@ impl StorageEngine {
             // the quorum wait times out here, the record stays durably on this leader but
             // is never exposed as committed (no false "it's safe to read" signal).
             if self.effective_min_insync_replicas(topic) > 1 {
-                let quorum_ok = self
-                    .replication
-                    .await_isr_quorum(
-                        &topic_str,
-                        partition_id,
-                        last_offset,
-                        std::time::Duration::from_secs(5),
-                    )
-                    .await;
-                if !quorum_ok {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "ISR quorum not reached for min_insync_replicas requirement",
-                    ));
-                }
+                self.await_full_isr_ack(
+                    &pm,
+                    &topic_str,
+                    partition_id,
+                    last_offset,
+                    std::time::Duration::from_secs(5),
+                )
+                .await?;
             }
         }
 
@@ -1408,6 +1698,26 @@ impl StorageEngine {
         // immediately for single-node/no-peer deployments and non-partition-leader
         // system-partition writes, where there's nothing else to wait on.
         pm.advance_committed_hw(last_offset + 1);
+
+        // Tell the followers about the newly committed point. The push that delivered this
+        // batch necessarily carried the *previous* watermark (a batch isn't committed until
+        // the ISR has it), so without this the records would sit replicated-but-unreadable
+        // on every follower until some later write happened to push the watermark along.
+        if self.is_partition_leader(topic, partition_id) && !self.config.peer_addrs.is_empty() {
+            let repl = self.replication.clone();
+            let topic_for_hw = topic.to_string();
+            let committed_hw = pm.high_watermark();
+            let fencing_epoch = pm.leader_epoch() as u64;
+            tokio::spawn(async move {
+                repl.broadcast_high_watermark(
+                    &topic_for_hw,
+                    partition_id,
+                    fencing_epoch,
+                    committed_hw,
+                )
+                .await;
+            });
+        }
 
         Ok((partition_id, first_offset, last_offset))
     }
@@ -1419,7 +1729,9 @@ impl StorageEngine {
         offset: u64,
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
-        let pm = self.get_or_create_partition(topic, partition)?;
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(Vec::new()); // unknown topic — empty, without creating it
+        };
         // Clamp to the committed high watermark, not LEO: consumers must never be shown
         // data that isn't yet guaranteed replicated to the ISR (previously `fetch` exposed
         // everything up to LEO unconditionally, so a leader crash right after an
@@ -1465,7 +1777,9 @@ impl StorageEngine {
         offset: u64,
         max_bytes: u32,
     ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
-        let pm = self.get_or_create_partition(topic, partition)?;
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(None); // unknown topic — nothing to stream, and nothing to create
+        };
         tokio::task::spawn_blocking(move || pm.plan_zero_copy_fetch(offset, max_bytes))
             .await
             .map_err(|e| std::io::Error::other(format!("plan_zero_copy_fetch join error: {}", e)))?
@@ -1479,7 +1793,9 @@ impl StorageEngine {
         target_timestamp: u64,
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
-        let pm = self.get_or_create_partition(topic, partition)?;
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(Vec::new());
+        };
         tokio::task::spawn_blocking(move || pm.fetch_by_timestamp(target_timestamp, max_bytes))
             .await
             .map_err(|e| std::io::Error::other(format!("fetch_by_timestamp join error: {}", e)))?
@@ -1492,7 +1808,9 @@ impl StorageEngine {
         offset: u64,
         max_bytes: u32,
     ) -> IoResult<Vec<RecordFrame>> {
-        let pm = self.get_or_create_partition(topic, partition)?;
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(Vec::new());
+        };
         let lso = self.transactions.last_stable_offset(topic, partition);
         let aborted = self.transactions.aborted_ranges(topic, partition);
         let all_frames = self.fetch(topic, partition, offset, max_bytes).await?;
@@ -1527,13 +1845,17 @@ impl StorageEngine {
     }
 
     pub fn seek(&self, topic: &str, partition: u32, offset: u64) -> IoResult<Option<(u64, u64)>> {
-        let pm = self.get_or_create_partition(topic, partition)?;
-        Ok(pm.seek(offset))
+        match self.partition_for_read(topic, partition)? {
+            Some(pm) => Ok(pm.seek(offset)),
+            None => Ok(None),
+        }
     }
 
     pub fn latest_offset(&self, topic: &str, partition: u32) -> IoResult<u64> {
-        let pm = self.get_or_create_partition(topic, partition)?;
-        Ok(pm.latest_offset())
+        match self.partition_for_read(topic, partition)? {
+            Some(pm) => Ok(pm.latest_offset()),
+            None => Ok(0),
+        }
     }
 
     /// Commits a consumer group offset. `ConsumerGroupManager::commit_offset` does a
@@ -2180,21 +2502,39 @@ impl StorageEngine {
         vec
     }
 
-    /// Returns true if this broker node is the active leader for the specified partition
+    /// Resolves the leader for a partition **without creating anything**: from the open
+    /// partition if there is one, else from the replicated topic assignment, else `None`
+    /// for a topic this broker has never heard of.
+    ///
+    /// These predicates are reachable by any client naming any topic (every `Fetch` calls
+    /// one), so they must not have the side effect of materializing partition directories
+    /// on disk — that turned a read of a nonexistent topic into a write.
+    fn resolve_partition_leader(&self, topic: &str, partition: u32) -> Option<u32> {
+        if let Some(pm) = self.get_partition(topic, partition) {
+            return Some(pm.leader_id());
+        }
+        self.topic_registry
+            .get(topic)
+            .and_then(|cfg| cfg.partitions.get(&partition).map(|a| a.leader_id))
+    }
+
+    /// Returns true if this broker node is the active leader for the specified partition.
+    ///
+    /// A topic that is entirely unknown (not open, not in the registry) resolves to this
+    /// node, preserving the single-broker default where the local node leads anything it
+    /// is asked about — the produce path is what then decides, via
+    /// `get_or_create_partition_for_client`, whether the topic may actually be created.
     pub fn is_partition_leader(&self, topic: &str, partition: u32) -> bool {
-        if let Ok(pm) = self.get_or_create_partition(topic, partition) {
-            pm.is_leader(self.config.node_id)
-        } else {
-            false
+        match self.resolve_partition_leader(topic, partition) {
+            Some(leader_id) => leader_id == self.config.node_id,
+            None => true,
         }
     }
 
     /// Returns the node_id currently registered as leader for the specified partition,
-    /// if the partition has been initialized locally.
+    /// if the partition has been initialized locally or is assigned in cluster metadata.
     pub fn partition_leader_id(&self, topic: &str, partition: u32) -> Option<u32> {
-        self.get_or_create_partition(topic, partition)
-            .ok()
-            .map(|pm| pm.leader_id())
+        self.resolve_partition_leader(topic, partition)
     }
 
     /// Registers a broker socket address mapping (node_id -> bind_addr)
@@ -2285,13 +2625,22 @@ impl StorageEngine {
         ids
     }
 
-    /// Returns true if this broker node is a leader or registered replica hosting the specified partition (KIP-392 Follower Fetch)
+    /// Returns true if this broker node is a leader or registered replica hosting the
+    /// specified partition (KIP-392 Follower Fetch). Non-creating, for the same reason as
+    /// `is_partition_leader` — this is on the `Fetch` path.
     pub fn is_partition_replica(&self, topic: &str, partition: u32) -> bool {
-        if let Ok(pm) = self.get_or_create_partition(topic, partition) {
-            pm.is_leader(self.config.node_id) || pm.replicas().contains(&self.config.node_id)
-        } else {
-            false
+        if let Some(pm) = self.get_partition(topic, partition) {
+            return pm.is_leader(self.config.node_id)
+                || pm.replicas().contains(&self.config.node_id);
         }
+        if let Some(cfg) = self.topic_registry.get(topic) {
+            if let Some(assign) = cfg.partitions.get(&partition) {
+                return assign.leader_id == self.config.node_id
+                    || assign.replicas.contains(&self.config.node_id);
+            }
+        }
+        // Entirely unknown topic: treat as local, same rationale as `is_partition_leader`.
+        true
     }
 
     /// Returns metadata and initialized partition high watermarks for a topic.

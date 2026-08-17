@@ -92,6 +92,10 @@ async fn start_test_server_with_quota(
         retention_check_interval: Duration::from_secs(60),
         produce_quota_bytes_per_sec,
         fetch_quota_bytes_per_sec,
+        // The production default (3s, matching Kafka) would add that much latency to
+        // every JoinGroup in the suite. The barrier's behavior is what's under test, not
+        // its duration, so keep the window short here.
+        group_initial_rebalance_delay_ms: 60,
         ..EngineConfig::default()
     };
 
@@ -449,7 +453,7 @@ async fn test_scenario_7_milestone3_features() {
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
 
     let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
-    let res = repl_mgr.replicate_batch("events", 0, &[frame]).await;
+    let res = repl_mgr.replicate_batch("events", 0, 0, 0, &[frame]).await;
     assert!(res.is_ok());
 
     let _ = std::fs::remove_dir_all(&test_dir);
@@ -488,28 +492,20 @@ async fn test_scenario_8_kraft_grpc_isr() {
         std::sync::Arc::new(dashmap::DashMap::new()),
     );
 
-    // Before follower watermark update, ISR quorum check times out
-    let quorum_before = repl_mgr
-        .await_isr_quorum(
-            "orders_stream",
-            1,
-            100,
-            std::time::Duration::from_millis(50),
-        )
-        .await;
-    assert!(!quorum_before);
-
-    // Follower node 2 updates its watermark to 100
+    // Watermark bookkeeping is still owned by the replication manager, but the decision
+    // of *who must acknowledge* now lives with the engine, which is what knows the live
+    // ISR (see `test_scenario_39_acks_all_waits_for_every_isr_member`).
+    assert_eq!(
+        repl_mgr.replica_watermark("orders_stream", 1, "127.0.0.1:9093"),
+        None,
+        "no ack observed yet"
+    );
     repl_mgr.update_replica_watermark("orders_stream", 1, "127.0.0.1:9093", 100);
-    let quorum_after = repl_mgr
-        .await_isr_quorum(
-            "orders_stream",
-            1,
-            100,
-            std::time::Duration::from_millis(50),
-        )
-        .await;
-    assert!(quorum_after); // Quorum satisfied!
+    assert_eq!(
+        repl_mgr.replica_watermark("orders_stream", 1, "127.0.0.1:9093"),
+        Some(100),
+        "watermark must be recorded for the acking replica"
+    );
 
     // 3. Hermes Consensus Leader Election Test
     let consensus = hermes::HermesConsensus::new(2, 3);
@@ -3320,4 +3316,190 @@ where
         stream.read_exact(&mut payload).await.unwrap();
     }
     hermes::WireResponse { status, payload }
+}
+
+/// A read must never bring a topic into existence. `Fetch` (and the offset/seek probes
+/// that share its path) used to run through `get_or_create_partition`, so simply naming a
+/// topic that had never been produced to created its directory tree on disk — turning an
+/// unauthenticated read of a nonexistent topic into a write, and letting a request loop
+/// exhaust inodes with state that outlived the connection.
+#[tokio::test]
+async fn test_scenario_38_fetch_of_unknown_topic_creates_no_state() {
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    // Fetch, seek and latest-offset against a topic that was never created.
+    let fetched = client.fetch("never_created_topic", 0, 0, 4096).await.unwrap();
+    assert!(fetched.is_empty(), "unknown topic must read back empty");
+
+    // Nothing on disk, and nothing registered in the engine's partition map.
+    let stray: Vec<_> = std::fs::read_dir(&env.data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("never_created_topic"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a read must not create partition directories, found: {:?}",
+        stray
+    );
+    assert!(
+        !env.engine.list_topics().contains(&"never_created_topic".to_string()),
+        "a read must not register the topic"
+    );
+
+    // A produce to the same topic still works (auto-creation is a write-path decision).
+    client
+        .produce_single("never_created_topic", "k", None, 1, "v")
+        .await
+        .unwrap();
+    assert!(
+        env.engine.list_topics().contains(&"never_created_topic".to_string()),
+        "producing should create the topic"
+    );
+}
+
+/// `acks=all` must wait for **every** replica currently in the ISR, not merely until
+/// `min_insync_replicas` acknowledgements have arrived.
+///
+/// The old behavior counted acks and returned as soon as it hit the `min.insync.replicas`
+/// floor, which inverts what that setting is for: with an ISR of 3 and a floor of 2, a
+/// write was acknowledged to the producer once any 2 replicas had it, so losing those 2
+/// lost data the producer had been told was fully replicated.
+#[tokio::test]
+async fn test_scenario_39_acks_all_waits_for_every_isr_member() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    engine.create_topic("isr_topic", 1).await.unwrap();
+    let pm = engine.get_or_create_partition("isr_topic", 0).unwrap();
+
+    let self_id = engine.config().node_id;
+    let (follower_a, follower_b) = (self_id + 10, self_id + 20);
+    let addr_a = "127.0.0.1:19301".to_string();
+    let addr_b = "127.0.0.1:19302".to_string();
+    engine.register_broker_address(follower_a, addr_a.clone());
+    engine.register_broker_address(follower_b, addr_b.clone());
+
+    // An ISR of three (this leader plus two followers) with a floor of 2. Reaching the
+    // floor must NOT be enough to commit.
+    pm.update_leadership(
+        self_id,
+        1,
+        vec![self_id, follower_a, follower_b],
+        vec![self_id, follower_a, follower_b],
+    );
+
+    let target_offset = 42u64;
+    let short = std::time::Duration::from_millis(150);
+
+    // Only follower A has acknowledged: 2 of 3 ISR members hold the record, which
+    // satisfies min.insync.replicas=2 but is NOT the full ISR.
+    engine
+        .replication()
+        .update_replica_watermark("isr_topic", 0, &addr_a, target_offset);
+    let reached_floor_only = engine
+        .await_full_isr_ack(&pm, "isr_topic", 0, target_offset, short)
+        .await;
+    assert!(
+        reached_floor_only.is_err(),
+        "hitting min.insync.replicas must not commit while an ISR member is still behind"
+    );
+
+    // Once the last ISR member acknowledges, the write commits.
+    engine
+        .replication()
+        .update_replica_watermark("isr_topic", 0, &addr_b, target_offset);
+    let full_isr = engine
+        .await_full_isr_ack(&pm, "isr_topic", 0, target_offset, short)
+        .await;
+    assert!(
+        full_isr.is_ok(),
+        "commit once every ISR member has acknowledged: {:?}",
+        full_isr.err()
+    );
+
+    // Shrinking the ISR below the floor must fail fast rather than wait out the timeout —
+    // no amount of waiting can make the write as durable as acks=all promises. Raise the
+    // topic's floor to 2 so a single-member ISR is genuinely under-replicated.
+    engine
+        .alter_configs(
+            "isr_topic",
+            vec![("min.insync.replicas".to_string(), "2".to_string())],
+        )
+        .await
+        .expect("failed to set min.insync.replicas");
+    pm.update_leadership(
+        self_id,
+        2,
+        vec![self_id, follower_a, follower_b],
+        vec![self_id],
+    );
+    let started = std::time::Instant::now();
+    let below_floor = engine
+        .await_full_isr_ack(&pm, "isr_topic", 0, target_offset + 1, short)
+        .await;
+    assert!(below_floor.is_err(), "ISR below min.insync.replicas must be rejected");
+    assert!(
+        started.elapsed() < short,
+        "an under-replicated ISR should fail fast, not block for the timeout"
+    );
+}
+
+/// Members that join together must land in ONE generation.
+///
+/// `JoinGroup` used to reply immediately and form a fresh generation per arrival, so each
+/// new member invalidated the assignment just handed to the previous one and forced it to
+/// rejoin — a group of N members starting together produced roughly N rebalances, and
+/// members could be knocked out of a generation before processing a single record.
+#[tokio::test]
+async fn test_scenario_40_join_group_barrier_forms_one_generation() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+
+    // Five members join concurrently, exactly as a consumer group does on startup.
+    let mut joins = Vec::new();
+    for i in 0..5 {
+        let engine = engine.clone();
+        joins.push(tokio::spawn(async move {
+            engine
+                .join_group_awaited("barrier_group", &format!("member-{}", i), vec![
+                    "range".to_string(),
+                ])
+                .await
+        }));
+    }
+
+    let mut generations = Vec::new();
+    let mut leaders = 0usize;
+    for join in joins {
+        let (_member_id, generation, is_leader, _protocol) = join.await.unwrap().unwrap();
+        generations.push(generation);
+        if is_leader {
+            leaders += 1;
+        }
+    }
+
+    let first = generations[0];
+    assert!(
+        generations.iter().all(|g| *g == first),
+        "all members joining the same window must share one generation, got {:?}",
+        generations
+    );
+    assert_eq!(
+        leaders, 1,
+        "exactly one member must be told it is the group leader, got {}",
+        leaders
+    );
+
+    // And the group really does hold all five members in that generation.
+    let described = engine
+        .group_coordinator()
+        .describe_group("barrier_group")
+        .expect("group should exist");
+    assert_eq!(
+        described.members.len(),
+        5,
+        "every member of the window must be in the group"
+    );
 }

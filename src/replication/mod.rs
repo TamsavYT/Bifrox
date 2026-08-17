@@ -92,6 +92,11 @@ pub struct ReplicationManager {
     /// `replica.lag.time.max.ms`), independent of whether it happens to be caught up on
     /// the specific offset that triggered the check.
     replica_ack_time: Arc<DashMap<(String, u32, String), std::time::Instant>>,
+    /// Data partitions whose last replication push was rejected as stale, with when that
+    /// happened. Scoped per `(topic, partition)` precisely so a rejection on one partition
+    /// cannot affect any other partition or the cluster consensus group — see the
+    /// `STALE_EPOCH` handling in `replicate_batch`.
+    stale_partitions: Arc<DashMap<(String, u32), std::time::Instant>>,
     /// Wall-clock time this node (as cluster leader) last received a heartbeat ACK from
     /// each peer broker — used to detect a dead broker so any partition it leads can be
     /// failed over to a surviving in-sync replica.
@@ -166,6 +171,7 @@ impl ReplicationManager {
             bind_addr,
             replica_watermarks: Arc::new(DashMap::new()),
             replica_ack_time: Arc::new(DashMap::new()),
+            stale_partitions: Arc::new(DashMap::new()),
             broker_last_seen: Arc::new(DashMap::new()),
             consensus,
             leader_addr,
@@ -285,6 +291,14 @@ impl ReplicationManager {
             (topic.to_string(), partition, peer_addr.to_string()),
             std::time::Instant::now(),
         );
+    }
+
+    /// Highest offset `peer_addr` has confirmed it holds for this partition, if any.
+    /// `None` means this leader has never observed an ack from that replica.
+    pub fn replica_watermark(&self, topic: &str, partition: u32, peer_addr: &str) -> Option<u64> {
+        self.replica_watermarks
+            .get(&(topic.to_string(), partition, peer_addr.to_string()))
+            .map(|w| *w.value())
     }
 
     /// Returns how long ago `peer_addr` last acknowledged a replicated write for this
@@ -514,6 +528,39 @@ impl ReplicationManager {
                                                         if applied_any {
                                                             let _ = pm.flush_if_sync_policy();
                                                         }
+
+                                                        // Adopt the leader's committed
+                                                        // watermark, clamped to what this
+                                                        // replica actually holds.
+                                                        //
+                                                        // The response has always carried
+                                                        // `leader_watermark` and this loop
+                                                        // used to ignore it entirely,
+                                                        // leaving the follower to advance
+                                                        // its own HW to its LEO as it
+                                                        // appended. That marks records
+                                                        // committed on the follower that
+                                                        // the leader has NOT yet committed
+                                                        // — so a follower-fetch read could
+                                                        // return records that are still
+                                                        // uncommitted cluster-wide, and a
+                                                        // follower promoted to leader
+                                                        // would start out claiming a
+                                                        // higher committed point than the
+                                                        // data warrants.
+                                                        //
+                                                        // The clamp matters in both
+                                                        // directions: `min` with the local
+                                                        // LEO so we never claim to have
+                                                        // committed data we haven't
+                                                        // received, and the leader's value
+                                                        // so we never outrun the cluster's
+                                                        // committed point.
+                                                        let local_leo = pm.latest_offset();
+                                                        let follower_hw = resp
+                                                            .leader_watermark
+                                                            .min(local_leo);
+                                                        pm.advance_committed_hw(follower_hw);
                                                     }
                                                 }
                                             }
@@ -740,96 +787,144 @@ impl ReplicationManager {
         });
     }
 
-    /// In-Sync Replicas (ISR) Quorum Gating.
-    /// Blocks client acknowledgment until min_insync_replicas report watermark >= target_offset.
-    pub async fn await_isr_quorum(
-        &self,
-        topic: &str,
-        partition: u32,
-        target_offset: u64,
-        quorum_timeout: Duration,
-    ) -> bool {
-        let start = std::time::Instant::now();
-        let needed_replicas = self.config.min_insync_replicas;
-
-        if needed_replicas <= 1 || self.config.peer_addrs.is_empty() {
-            return true;
-        }
-
-        while start.elapsed() < quorum_timeout {
-            let mut acked = 1usize; // Count self (leader) as 1
-            for peer in &self.config.peer_addrs {
-                if let Some(w) =
-                    self.replica_watermarks
-                        .get(&(topic.to_string(), partition, peer.clone()))
-                {
-                    if *w.value() >= target_offset {
-                        acked += 1;
-                    }
-                }
-            }
-
-            if acked >= needed_replicas {
-                return true;
-            }
-
-            sleep(Duration::from_millis(5)).await;
-        }
-
-        false
-    }
-
     /// Streams produced record batch to all follower peer nodes over TCP.
     /// Called from a tokio::spawn task in engine.rs — replicates concurrently to all peers.
     /// P3: If a peer returns a stale-epoch ACK (0x01), triggers leader step-down.
     /// CRIT-01: cluster_id is now included in the wire packet so followers can authenticate the sender.
+    /// Peers that should receive replication traffic for this partition.
+    ///
+    /// `__cluster_metadata` still replicates to every peer — brokers need to learn
+    /// topics/ACLs/broker registrations too, even though they never vote on it. Real
+    /// data-topic partitions, though, should never be pushed to a controller-only peer,
+    /// since it was never eligible to be assigned as a replica for one in the first place
+    /// (see `StorageEngine::available_broker_ids`) and has no business storing that data.
+    fn replication_targets(&self, topic: &str, _partition: u32) -> Vec<String> {
+        if topic == "__cluster_metadata" {
+            return self.config.peer_addrs.clone();
+        }
+        let controller_only_addrs: std::collections::HashSet<String> = self
+            .broker_addrs
+            .iter()
+            .filter(|entry| {
+                let node_id = *entry.key();
+                self.broker_roles
+                    .get(&node_id)
+                    .map(|roles| {
+                        roles.contains(&crate::config::ProcessRole::Controller)
+                            && !roles.contains(&crate::config::ProcessRole::Broker)
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+        self.config
+            .peer_addrs
+            .iter()
+            .filter(|addr| !controller_only_addrs.contains(*addr))
+            .cloned()
+            .collect()
+    }
+
+    /// Tells every follower the leader's newly-advanced committed high watermark.
+    ///
+    /// A batch is pushed *before* it is committed (commit requires the ISR to acknowledge
+    /// it first), so the `leader_hw` carried by that push is necessarily behind the batch
+    /// it delivers. Something has to deliver the updated committed point afterwards, or a
+    /// follower would sit indefinitely holding replicated-but-not-readable records — with
+    /// no pull fetcher to converge it, which is exactly the case for `__cluster_metadata`
+    /// and for any partition whose fetcher hasn't started.
+    ///
+    /// This sends the same 0xAA packet carrying zero frames: the follower's decoder skips
+    /// the (empty) record loop and applies the watermark clamp. Failures are logged, not
+    /// propagated — the write is already durable and committed on the leader, and the next
+    /// push or fetch carries the watermark again.
+    pub async fn broadcast_high_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        fencing_epoch: u64,
+        leader_hw: u64,
+    ) {
+        let target_peers = self.replication_targets(topic, partition);
+        if target_peers.is_empty() {
+            return;
+        }
+        let epoch = fencing_epoch;
+        let cluster_id = self.config.cluster_id.clone();
+
+        let mut handles = Vec::with_capacity(target_peers.len());
+        for peer_addr in target_peers {
+            let cid = cluster_id.clone();
+            let topic_name = topic.to_string();
+            let peer_conn = self.get_or_connect_peer(&peer_addr);
+            handles.push(tokio::spawn(async move {
+                let result = send_replication_push_pooled(
+                    &peer_conn,
+                    &peer_addr,
+                    &cid,
+                    &topic_name,
+                    partition,
+                    epoch,
+                    leader_hw,
+                    &[],
+                )
+                .await;
+                (peer_addr, result)
+            }));
+        }
+
+        for handle in handles {
+            if let Ok((peer_addr, Err(e))) = handle.await {
+                tracing::debug!(
+                    "HW Propagation: failed to send watermark {} for {}-{} to {}: {}",
+                    leader_hw,
+                    topic,
+                    partition,
+                    peer_addr,
+                    e
+                );
+            }
+        }
+    }
+
+    /// `leader_hw` is this leader's committed high watermark at call time. It is normally
+    /// *behind* the batch being pushed — the batch commits only once the ISR acknowledges
+    /// it — which is exactly the point: followers must not treat in-flight records as
+    /// committed. They pick up the newer committed point on a subsequent push or pull.
+    ///
+    /// `fencing_epoch` is what the follower validates this push against, and its meaning
+    /// is per-topic by design:
+    ///
+    /// - `__cluster_metadata` — the controller's Raft term. Leadership of the metadata log
+    ///   *is* controller leadership, so the term is the right fence.
+    /// - any data partition — that partition's own `leader_epoch`.
+    ///
+    /// Data partitions used to be stamped with the controller term as well, which is wrong
+    /// in both directions. Controller elections and partition leadership change for
+    /// unrelated reasons, so every controller election invalidated in-flight pushes for
+    /// *every* partition in the cluster (followers rejecting them as stale even though no
+    /// partition leadership had changed), while a partition leader that had actually been
+    /// superseded stayed unfenced as long as the controller term happened to be unchanged
+    /// — a split-brain window on that partition.
     pub async fn replicate_batch(
         &self,
         topic: &str,
         partition: u32,
+        fencing_epoch: u64,
+        leader_hw: u64,
         frames: &[RecordFrame],
     ) -> IoResult<()> {
         if self.config.peer_addrs.is_empty() || frames.is_empty() {
             return Ok(());
         }
 
-        // `__cluster_metadata` still replicates to every peer — brokers need to learn
-        // topics/ACLs/broker registrations too, even though they never vote on it. Real
-        // data-topic partitions, though, should never be pushed to a controller-only
-        // peer, since it was never eligible to be assigned as a replica for one in the
-        // first place (see `StorageEngine::available_broker_ids`) and has no business
-        // storing that data.
-        let target_peers: Vec<String> = if topic == "__cluster_metadata" {
-            self.config.peer_addrs.clone()
-        } else {
-            let controller_only_addrs: std::collections::HashSet<String> = self
-                .broker_addrs
-                .iter()
-                .filter(|entry| {
-                    let node_id = *entry.key();
-                    self.broker_roles
-                        .get(&node_id)
-                        .map(|roles| {
-                            roles.contains(&crate::config::ProcessRole::Controller)
-                                && !roles.contains(&crate::config::ProcessRole::Broker)
-                        })
-                        .unwrap_or(false)
-                })
-                .map(|entry| entry.value().clone())
-                .collect();
-            self.config
-                .peer_addrs
-                .iter()
-                .filter(|addr| !controller_only_addrs.contains(*addr))
-                .cloned()
-                .collect()
-        };
+        let target_peers = self.replication_targets(topic, partition);
         if target_peers.is_empty() {
             return Ok(());
         }
 
         let last_offset = frames.last().unwrap().offset;
-        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let epoch = fencing_epoch;
         let cluster_id = self.config.cluster_id.clone();
 
         // Replicate to each peer concurrently over persistent pooled TCP streams
@@ -849,6 +944,7 @@ impl ReplicationManager {
                     &topic_name,
                     partition,
                     epoch,
+                    leader_hw,
                     &frames_vec,
                 )
                 .await;
@@ -872,16 +968,46 @@ impl ReplicationManager {
                     // Check if the error string indicates a stale-epoch rejection
                     let err_str = e.to_string();
                     if err_str.contains("STALE_EPOCH") {
-                        // P3: Peer has higher epoch — step down to follower
-                        let peer_epoch = self.consensus.current_term() + 1;
-                        self.consensus.step_down_to_follower(peer_epoch);
-                        // Clear leader_addr so produce forwarding re-discovers new leader
-                        let mut la = self.leader_addr.write();
-                        *la = None;
-                        tracing::warn!(
-                            "P3 Fencing: Node stepping down to Follower — peer {} reported stale epoch.",
-                            peer_addr
-                        );
+                        // A rejected push for ONE data partition is handled locally: this
+                        // node is no longer the accepted leader for that partition, so it
+                        // stops pushing and lets the metadata layer tell it who is.
+                        //
+                        // It must NOT resign from cluster consensus. That is what this
+                        // used to do (`consensus.step_down_to_follower`), which resigned
+                        // the broker from the *cluster metadata* Raft group over a single
+                        // data-partition rejection — taking down the controller for the
+                        // whole cluster and forcing a cluster-wide re-election. Since a
+                        // controller term change is itself one of the things that causes
+                        // these rejections, the failure was self-reinforcing and could
+                        // leave the cluster flapping between controllers under ordinary
+                        // produce load. Cluster step-down belongs to the consensus layer's
+                        // own messages (`handle_vote_request`/heartbeat), never to the
+                        // data plane.
+                        if topic != "__cluster_metadata" {
+                            self.stale_partitions
+                                .insert((topic.to_string(), partition), std::time::Instant::now());
+                            tracing::warn!(
+                                "Partition Fencing: peer {} rejected a push for {}-{} as stale — \
+                                 pausing replication for this partition pending a metadata refresh \
+                                 (cluster consensus untouched).",
+                                peer_addr,
+                                topic,
+                                partition
+                            );
+                        } else {
+                            // A stale-epoch rejection on the metadata partition genuinely
+                            // is a consensus-level signal: someone else is a newer
+                            // controller, so stepping down is the correct response.
+                            let peer_epoch = self.consensus.current_term() + 1;
+                            self.consensus.step_down_to_follower(peer_epoch);
+                            let mut la = self.leader_addr.write();
+                            *la = None;
+                            tracing::warn!(
+                                "Controller Fencing: stepping down — peer {} reported a stale epoch \
+                                 on __cluster_metadata.",
+                                peer_addr
+                            );
+                        }
                     } else {
                         tracing::error!(
                             "HA Replication: Failed to replicate to peer {}: {}",
@@ -1069,6 +1195,7 @@ pub async fn send_replication_push_pooled(
     topic: &str,
     partition: u32,
     epoch: u64,
+    leader_hw: u64,
     frames: &[RecordFrame],
 ) -> IoResult<()> {
     let mut buf = Vec::with_capacity(256 + frames.len() * 64);
@@ -1077,6 +1204,14 @@ pub async fn send_replication_push_pooled(
     crate::protocol::wire::write_pascal_string(&mut buf, topic);
     buf.put_u32(partition);
     buf.put_u64(epoch);
+    // The leader's committed high watermark at push time. Followers clamp their own HW to
+    // this (see the 0xAA decoder) instead of assuming everything they were pushed is
+    // committed — a pushed record is not committed until the ISR has acknowledged it, so a
+    // follower that advanced its HW on append was marking uncommitted data as readable.
+    //
+    // NOTE: this is an inter-node wire change. All brokers in a cluster must run a build
+    // that agrees on this layout; there is no version negotiation on this path yet.
+    buf.put_u64(leader_hw);
     buf.put_u32(frames.len() as u32);
     for frame in frames {
         frame.encode_into(&mut buf);

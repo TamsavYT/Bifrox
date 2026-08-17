@@ -376,11 +376,21 @@ impl PartitionManager {
         if result == crate::segment::VerbatimAppendResult::Appended {
             self.log_end_offset
                 .store(frame.offset + 1, Ordering::Release);
-            // A follower's own durably-written data is immediately safe for it to serve
-            // to directly-connected consumers (KIP-392 follower fetch) — unlike the
-            // leader, a follower never has to guess whether anyone else has the data,
-            // since committing was the leader's job before this push was ever sent.
-            self.advance_committed_hw(frame.offset + 1);
+            // Deliberately does NOT advance the committed high watermark.
+            //
+            // It used to, on the reasoning that "committing was the leader's job before
+            // this push was ever sent" — but that isn't true of either replication path.
+            // The leader pushes as soon as it appends and only commits after the ISR
+            // acknowledges, so a record can be in flight here while still uncommitted;
+            // the pull fetcher likewise reads ahead of the leader's committed point. A
+            // follower that advanced its HW per appended frame therefore marked
+            // uncommitted records as committed, which exposes them to follower-fetch
+            // reads and inflates the committed offset this replica would claim if it were
+            // promoted to leader.
+            //
+            // The committed point comes from the leader instead, clamped to the local LEO:
+            // the 0xAA decoder applies `leader_hw`, and the pull fetcher applies
+            // `resp.leader_watermark`.
 
             // Same group-commit reasoning as `produce_frame_eos`: this is called once per
             // frame from a replication-push batch that may contain many frames (see

@@ -337,6 +337,34 @@ pub struct EngineConfig {
     /// handling threads the way Kafka does, so this sizes the whole async runtime).
     /// `None` uses Tokio's own default (one per logical CPU).
     pub num_network_threads: Option<usize>,
+    /// How long a consumer group's join window stays open for further members to arrive
+    /// before the coordinator forms the generation and replies to everyone waiting
+    /// (Kafka `group.initial.rebalance.delay.ms`).
+    ///
+    /// Raising it lets a larger group settle into a single generation at the cost of
+    /// slower first assignment; 0 disables the barrier entirely and restores the old
+    /// join-immediately behavior.
+    pub group_initial_rebalance_delay_ms: u64,
+    /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
+    /// exist yet (Kafka `auto.create.topics.enable`). Defaults to **true**, matching both
+    /// Kafka's own default and Hermes's long-standing behavior.
+    ///
+    /// This is deliberately not the whole answer to unbounded topic creation, and is not
+    /// the part doing the security work. The two changes that actually bound it are:
+    /// read paths never create anything at all (a `Fetch` for an unknown topic is a
+    /// lookup, not a write — see `StorageEngine::partition_for_read`), and
+    /// `max_partitions_per_topic`/`max_partitions_per_broker` cap how much can exist no
+    /// matter who asks. With those in place, implicit creation is a bounded, operator-
+    /// visible resource rather than an unbounded one, so defaulting it off would break
+    /// every existing deployment for no remaining security benefit. Operators who want
+    /// creation to be strictly explicit can still set this to false.
+    pub auto_create_topics_enable: bool,
+    /// Maximum partitions accepted for a single topic (Kafka `num.partitions` upper
+    /// bound). Requests asking for more are rejected rather than creating the directories.
+    pub max_partitions_per_topic: u32,
+    /// Maximum total partitions this broker will host across all topics. Once reached,
+    /// creating a new partition fails instead of consuming more inodes.
+    pub max_partitions_per_broker: usize,
     /// How long a transaction restored from `__transaction_state` on startup (still
     /// `Ongoing`/`PrepareCommit`/`PrepareAbort` — i.e. never reached a terminal state
     /// before the last shutdown) is given before it's presumed abandoned and aborted to
@@ -370,6 +398,10 @@ impl Default for EngineConfig {
             segment_ms: None,
             message_max_bytes: None,
             num_network_threads: None,
+            group_initial_rebalance_delay_ms: 3_000,
+            auto_create_topics_enable: true,
+            max_partitions_per_topic: 10_000,
+            max_partitions_per_broker: 200_000,
             transaction_timeout_ms: 60_000, // matches Kafka's transaction.timeout.ms default
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),     // 24 hours retention
@@ -550,6 +582,26 @@ impl EngineConfig {
                     "num.network.threads" => {
                         if let Ok(v) = value.parse::<usize>() {
                             config.num_network_threads = Some(v.max(1));
+                        }
+                    }
+                    "group.initial.rebalance.delay.ms" => {
+                        if let Ok(v) = value.parse::<u64>() {
+                            config.group_initial_rebalance_delay_ms = v;
+                        }
+                    }
+                    "auto.create.topics.enable" => {
+                        if let Ok(v) = value.parse::<bool>() {
+                            config.auto_create_topics_enable = v;
+                        }
+                    }
+                    "max.partitions.per.topic" => {
+                        if let Ok(v) = value.parse::<u32>() {
+                            config.max_partitions_per_topic = v.max(1);
+                        }
+                    }
+                    "max.partitions.per.broker" => {
+                        if let Ok(v) = value.parse::<usize>() {
+                            config.max_partitions_per_broker = v.max(1);
                         }
                     }
                     "transaction.timeout.ms" | "transaction.max.timeout.ms" => {

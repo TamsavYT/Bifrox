@@ -158,10 +158,95 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Sibling `<name>.deleted` path used to hold a segment file aside during compaction's
+/// crash-safe swap (see `compact_segments`).
+fn deleted_backup_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".deleted");
+    PathBuf::from(s)
+}
+
+/// Resolves any half-finished compaction swap left behind by a crash, before the segments
+/// in `dir` are opened.
+///
+/// Compaction moves each live file to `<name>.deleted`, renames the compacted `<name>
+/// .compact` into place, fsyncs, then unlinks the backups. A crash can therefore leave:
+///
+/// - a `.deleted` backup with **no** live file — the crash landed between the two renames,
+///   so the compacted copy was never installed. Restore the backup; the segment reverts to
+///   its pre-compaction (still fully valid) contents.
+/// - a `.deleted` backup **and** a live file — the swap completed and only the cleanup
+///   unlink was lost. Drop the backup.
+///
+/// Leftover `.compact` temporaries are always discarded: they're only meaningful within
+/// the single `compact_segments` call that created them, and that call did not complete.
+fn recover_interrupted_compaction(dir: &Path) -> IoResult<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+
+    let mut backups = Vec::new();
+    let mut temporaries = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("deleted") => backups.push(path),
+            Some("compact") => temporaries.push(path),
+            _ => {}
+        }
+    }
+
+    for tmp in temporaries {
+        tracing::warn!(
+            "Compaction recovery: discarding leftover temporary {}",
+            tmp.display()
+        );
+        let _ = fs::remove_file(&tmp);
+    }
+
+    let mut restored = 0usize;
+    let mut dropped = 0usize;
+    for backup in backups {
+        // Strip the trailing `.deleted` to get the live path it was taken from.
+        let live = PathBuf::from(backup.as_os_str().to_string_lossy().trim_end_matches(".deleted").to_string());
+        if live.exists() {
+            let _ = fs::remove_file(&backup);
+            dropped += 1;
+        } else {
+            tracing::warn!(
+                "Compaction recovery: restoring {} from interrupted compaction",
+                live.display()
+            );
+            fs::rename(&backup, &live)?;
+            // The restored file is the pre-compaction original, whose recorded clean-size
+            // marker no longer necessarily matches — force a full verifying scan.
+            crate::segment::log::remove_clean_marker(&live);
+            restored += 1;
+        }
+    }
+
+    if restored > 0 || dropped > 0 {
+        tracing::info!(
+            "Compaction recovery in {}: restored {} file(s), dropped {} stale backup(s)",
+            dir.display(),
+            restored,
+            dropped
+        );
+        crate::segment::log::fsync_dir(dir);
+    }
+    Ok(())
+}
+
 impl SegmentManager {
     pub fn open(dir: impl AsRef<Path>, config: EngineConfig) -> IoResult<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+
+        // Finish or roll back any compaction swap a crash interrupted, before segment
+        // discovery below — otherwise a segment whose live file is momentarily absent
+        // (backup taken, replacement not yet renamed in) would simply be missed and its
+        // data silently lost from the log.
+        recover_interrupted_compaction(&dir)?;
 
         // Discover existing log segments
         let mut base_offsets = Vec::new();
@@ -1030,18 +1115,55 @@ impl SegmentManager {
 
             drop(pair_to_replace);
 
-            let _ = fs::remove_file(&log_path);
-            let _ = fs::remove_file(&index_path);
-            let _ = fs::remove_file(&time_index_path);
-            let _ = fs::remove_file(&txn_index_path);
-            // The old segment's `.clean` marker (if any) describes its pre-compaction
-            // size — stale the instant the file it describes is replaced below.
+            // Crash-safe swap. The original files must never be unlinked before their
+            // replacements are in place: doing so leaves a window in which the segment
+            // does not exist on disk under its real name at all, so a crash (or a failing
+            // rename) in that window destroys the data permanently — the original is gone
+            // and the compacted copy was never installed, and startup recovery has
+            // nothing left to recover from.
+            //
+            // Instead, move the originals aside to `.deleted`, move the compacted files
+            // into place, fsync the directory so both renames are durable, and only then
+            // unlink the `.deleted` files. At every instant a complete copy of the
+            // segment exists under one name or the other, and `recover_interrupted_
+            // compaction` (called on open) can finish or roll back whatever a crash
+            // interrupted.
+            let backup_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
+                &log_path,
+                &index_path,
+                &time_index_path,
+                &txn_index_path,
+            ]
+            .iter()
+            .map(|p| ((*p).clone(), deleted_backup_path(p)))
+            .collect();
+
+            for (live, backup) in &backup_paths {
+                let _ = fs::remove_file(backup);
+                match fs::rename(live, backup) {
+                    Ok(()) => {}
+                    // A missing original is fine (e.g. an index file that was never
+                    // created); there's simply nothing to move aside.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // The old segment's `.clean` marker describes its pre-compaction size — stale
+            // the instant the file it describes is replaced.
             crate::segment::log::remove_clean_marker(&log_path);
 
             fs::rename(&tmp_log_path, &log_path)?;
             fs::rename(&tmp_index_path, &index_path)?;
             fs::rename(&tmp_timeindex_path, &time_index_path)?;
             fs::rename(&tmp_txnindex_path, &txn_index_path)?;
+            // Make both halves of the swap durable before dropping the backups, so a
+            // crash can never leave the directory with neither the old nor the new file.
+            crate::segment::log::fsync_dir(&self.dir);
+
+            for (_, backup) in &backup_paths {
+                let _ = fs::remove_file(backup);
+            }
             crate::segment::log::fsync_dir(&self.dir);
 
             let mut new_index = IndexSegment::open(&index_path, base_offset)?;
@@ -1761,6 +1883,73 @@ mod tests {
         // exactly the one valid frame that was there.
         assert_eq!(mgr2.historical.len(), 1);
         assert_eq!(mgr2.historical[0].log.next_offset, 1);
+    }
+
+    /// Simulates a crash between compaction's two renames: the original was moved aside
+    /// to `.deleted` and the compacted replacement was never installed. Startup must
+    /// restore the original rather than silently losing the whole segment.
+    #[test]
+    fn interrupted_compaction_restores_backup_when_replacement_missing() {
+        let dir = TempDir::new("compaction_crash_restore");
+        {
+            let config = EngineConfig {
+                max_segment_bytes: 4096,
+                ..EngineConfig::default()
+            };
+            let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+            for i in 0..4u64 {
+                mgr.append(format!("k{}:v{}", i, i).as_bytes(), i).unwrap();
+            }
+            mgr.rotate_segment().unwrap();
+        }
+
+        // Move segment 0's files aside exactly as the swap's first phase does, then stop
+        // — leaving no live `.log` at all.
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+        let backup_path = deleted_backup_path(&log_path);
+        fs::rename(&log_path, &backup_path).unwrap();
+        assert!(!log_path.exists(), "precondition: live log is absent");
+
+        let mut mgr = SegmentManager::open(&dir.0, EngineConfig::default()).unwrap();
+        assert!(
+            log_path.exists(),
+            "startup must restore the backup, not leave the segment missing"
+        );
+        assert!(!backup_path.exists(), "backup should be consumed by the restore");
+        assert_eq!(mgr.historical.len(), 1);
+        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 4);
+    }
+
+    /// Simulates a crash after both renames but before the backup cleanup: the live file
+    /// is the new compacted one and the `.deleted` backup is just garbage to drop.
+    #[test]
+    fn interrupted_compaction_drops_backup_when_replacement_present() {
+        let dir = TempDir::new("compaction_crash_drop");
+        {
+            let config = EngineConfig {
+                max_segment_bytes: 4096,
+                ..EngineConfig::default()
+            };
+            let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
+            for i in 0..3u64 {
+                mgr.append(format!("k{}:v{}", i, i).as_bytes(), i).unwrap();
+            }
+            mgr.rotate_segment().unwrap();
+        }
+
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+        let backup_path = deleted_backup_path(&log_path);
+        // Both present: stale backup alongside the real, current file.
+        fs::copy(&log_path, &backup_path).unwrap();
+        // A leftover `.compact` temporary from the same interrupted run must also go.
+        let tmp_path = dir.0.join(format!("{}.log.compact", format_segment_filename(0)));
+        fs::write(&tmp_path, b"partial garbage").unwrap();
+
+        let mut mgr = SegmentManager::open(&dir.0, EngineConfig::default()).unwrap();
+        assert!(log_path.exists(), "the live file must be left untouched");
+        assert!(!backup_path.exists(), "stale backup should be dropped");
+        assert!(!tmp_path.exists(), "leftover .compact temporary should be discarded");
+        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 3);
     }
 
     #[test]

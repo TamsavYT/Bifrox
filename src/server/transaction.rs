@@ -34,10 +34,23 @@ pub struct TransactionalProducerState {
 }
 
 /// Idempotent Producer and Transaction State Tracker
+#[derive(Debug, Clone, Copy)]
+pub struct ProducerSequenceEntry {
+    pub last_sequence: u32,
+    /// Monotonic tick of the most recent `record_sequence` for this producer, used purely
+    /// as an LRU recency key (see `record_sequence`). A counter rather than an `Instant`
+    /// so eviction ordering is exact and cheap to compare.
+    pub last_used: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TransactionManager {
-    /// Tracking producer_id -> last_sequence_number to reject duplicate retries
-    producer_sequences: Arc<DashMap<u64, u32>>,
+    /// Tracking producer_id -> (last_sequence_number, LRU recency) to reject duplicate
+    /// retries. Bounded by LRU eviction rather than a wholesale clear — see
+    /// `record_sequence`.
+    producer_sequences: Arc<DashMap<u64, ProducerSequenceEntry>>,
+    /// Monotonic tick source for `ProducerSequenceEntry::last_used`.
+    sequence_clock: Arc<AtomicU64>,
     /// Active transactions map: transaction_id -> TransactionState
     transactions: Arc<DashMap<String, TransactionState>>,
     /// Transactional-ID coordinator state used to fence old producers and make InitProducerId durable.
@@ -49,11 +62,19 @@ impl TransactionManager {
     pub fn new() -> Self {
         Self {
             producer_sequences: Arc::new(DashMap::new()),
+            sequence_clock: Arc::new(AtomicU64::new(0)),
             transactions: Arc::new(DashMap::new()),
             transactional_producers: Arc::new(DashMap::new()),
             next_producer_id: Arc::new(AtomicU64::new(1)),
         }
     }
+
+    /// Maximum number of producers whose idempotence sequence state is retained.
+    pub const MAX_PRODUCER_SEQUENCES: usize = 100_000;
+    /// How many entries a single eviction pass reclaims once the cap is hit. Evicting a
+    /// batch rather than exactly one keeps eviction amortized — otherwise every insert
+    /// past the cap would pay for its own scan.
+    const SEQUENCE_EVICT_BATCH: usize = 1_000;
 
     /// Checks if a record batch from a producer is a duplicate network retry
     pub fn is_duplicate(&self, producer_id: u64, seq_num: u32) -> bool {
@@ -61,24 +82,91 @@ impl TransactionManager {
             return false; // Idempotence disabled
         }
 
-        if let Some(last_seq) = self.producer_sequences.get(&producer_id) {
-            if seq_num <= *last_seq.value() {
+        if let Some(entry) = self.producer_sequences.get(&producer_id) {
+            if seq_num <= entry.value().last_sequence {
                 return true; // Duplicate retry detected
             }
         }
         false
     }
 
-    /// Records sequence number for idempotent producer
+    /// Records sequence number for an idempotent producer, bounding the map by evicting
+    /// the least recently used entries when it is full.
+    ///
+    /// This deliberately does NOT clear the whole map on overflow, which is what it used
+    /// to do. A wholesale clear discarded the sequence state of every *active* producer at
+    /// once, so the very next retry from any of them no longer matched a known sequence
+    /// and was accepted as a brand new record — silently duplicating data, with no error
+    /// and no log line, at exactly the moment the broker was busiest (a full map means
+    /// many active producers). LRU eviction instead sheds only the producers that have
+    /// been idle longest, which are the ones least likely to retry.
     pub fn record_sequence(&self, producer_id: u64, seq_num: u32) {
-        if producer_id > 0 {
-            if self.producer_sequences.len() >= 100_000
-                && !self.producer_sequences.contains_key(&producer_id)
-            {
-                self.producer_sequences.clear();
-            }
-            self.producer_sequences.insert(producer_id, seq_num);
+        if producer_id == 0 {
+            return;
         }
+        let tick = self.sequence_clock.fetch_add(1, Ordering::Relaxed);
+
+        if self.producer_sequences.len() >= Self::MAX_PRODUCER_SEQUENCES
+            && !self.producer_sequences.contains_key(&producer_id)
+        {
+            self.evict_lru_sequences(Self::SEQUENCE_EVICT_BATCH);
+        }
+
+        self.producer_sequences.insert(
+            producer_id,
+            ProducerSequenceEntry {
+                last_sequence: seq_num,
+                last_used: tick,
+            },
+        );
+    }
+
+    /// Removes up to `count` least-recently-used producer sequence entries. Producers
+    /// with an in-flight (non-terminal) transaction are never evicted: dropping their
+    /// sequence state mid-transaction is precisely the duplicate-acceptance failure this
+    /// bound is meant to avoid.
+    fn evict_lru_sequences(&self, count: usize) {
+        let protected: std::collections::HashSet<u64> = self
+            .transactions
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.value().status,
+                    TxStatus::Ongoing | TxStatus::PrepareCommit | TxStatus::PrepareAbort
+                )
+            })
+            .map(|e| e.value().producer_id)
+            .collect();
+
+        let mut candidates: Vec<(u64, u64)> = self
+            .producer_sequences
+            .iter()
+            .filter(|e| !protected.contains(e.key()))
+            .map(|e| (e.value().last_used, *e.key()))
+            .collect();
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Partial selection of the `count` oldest by recency tick — O(n), no full sort.
+        let take = count.min(candidates.len());
+        candidates.select_nth_unstable_by_key(take - 1, |(last_used, _)| *last_used);
+
+        for (_, producer_id) in candidates.into_iter().take(take) {
+            self.producer_sequences.remove(&producer_id);
+        }
+
+        tracing::debug!(
+            "Idempotence: evicted {} least-recently-used producer sequence entries (cap {})",
+            take,
+            Self::MAX_PRODUCER_SEQUENCES
+        );
+    }
+
+    /// Number of producers currently tracked for idempotence.
+    pub fn tracked_producer_count(&self) -> usize {
+        self.producer_sequences.len()
     }
 
     pub fn generate_producer_id(&self) -> u64 {
@@ -581,4 +669,74 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
         _ => return None,
     };
     Some((status, producer_id, tx_id, partitions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bound on `producer_sequences` must shed only idle producers. It used to clear
+    /// the entire map, which dropped the sequence state of every *active* producer at the
+    /// same time — so their next retry no longer matched a known sequence and was accepted
+    /// as new data, silently duplicating records.
+    #[test]
+    fn sequence_eviction_preserves_recently_used_producers() {
+        let mgr = TransactionManager::new();
+
+        // Fill past the cap. Producer ids are recorded in ascending order, so the lowest
+        // ids are the least recently used.
+        for pid in 1..=TransactionManager::MAX_PRODUCER_SEQUENCES as u64 {
+            mgr.record_sequence(pid, 10);
+        }
+        assert_eq!(
+            mgr.tracked_producer_count(),
+            TransactionManager::MAX_PRODUCER_SEQUENCES
+        );
+
+        // Touch a low-numbered producer so it becomes the most recently used despite
+        // having been inserted first.
+        let hot_producer = 1u64;
+        mgr.record_sequence(hot_producer, 11);
+
+        // Insert a new producer, which must trigger eviction rather than a wholesale clear.
+        let newcomer = TransactionManager::MAX_PRODUCER_SEQUENCES as u64 + 1;
+        mgr.record_sequence(newcomer, 1);
+
+        // The map stayed bounded but was NOT emptied.
+        assert!(
+            mgr.tracked_producer_count() > TransactionManager::MAX_PRODUCER_SEQUENCES / 2,
+            "eviction should shed a batch, not wipe the map (got {})",
+            mgr.tracked_producer_count()
+        );
+
+        // The recently-touched producer survived, so its retries are still deduplicated.
+        assert!(
+            mgr.is_duplicate(hot_producer, 11),
+            "recently used producer must retain its sequence state"
+        );
+        assert!(mgr.is_duplicate(newcomer, 1), "newcomer must be tracked");
+    }
+
+    /// A producer inside an ongoing transaction must never be evicted, however idle it
+    /// looks — losing its sequence state mid-transaction is exactly the duplicate-
+    /// acceptance failure the bound exists to avoid.
+    #[test]
+    fn sequence_eviction_never_drops_producer_in_ongoing_transaction() {
+        let mgr = TransactionManager::new();
+        let protected_pid = 7u64;
+
+        mgr.begin_transaction("tx-protected", protected_pid).unwrap();
+        mgr.record_sequence(protected_pid, 5);
+
+        // Fill the map so eviction runs repeatedly, always with `protected_pid` among the
+        // oldest entries by recency.
+        for pid in 1000..(1000 + TransactionManager::MAX_PRODUCER_SEQUENCES as u64 + 2_000) {
+            mgr.record_sequence(pid, 1);
+        }
+
+        assert!(
+            mgr.is_duplicate(protected_pid, 5),
+            "producer with an ongoing transaction must survive eviction"
+        );
+    }
 }

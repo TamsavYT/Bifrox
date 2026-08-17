@@ -940,6 +940,9 @@ fn decode_replication_packet(
     let partition = src.get_u32();
     // Epoch (term) from leader
     let incoming_epoch = src.get_u64();
+    // Leader's committed high watermark at the time of this push (see
+    // `send_replication_push_pooled`).
+    let leader_hw = src.get_u64();
     // Record count
     let count = src.get_u32() as usize;
 
@@ -956,8 +959,21 @@ fn decode_replication_packet(
         )));
     }
 
-    // Epoch fencing: reject stale leader writes and signal STALE_EPOCH so leader steps down
-    let current_epoch = engine.replication().get_epoch();
+    // Epoch fencing. Which epoch is authoritative depends on what is being replicated
+    // (see `ReplicationManager::replicate_batch`): the metadata log is fenced by the
+    // controller's Raft term, while a data partition is fenced by its own leader epoch.
+    // Using the controller term for data partitions — as this used to — made every
+    // controller election spuriously invalidate in-flight pushes for every partition,
+    // while failing to fence a partition leader that had genuinely been superseded.
+    let is_cluster_meta_topic = topic == "__cluster_metadata";
+    let current_epoch = if is_cluster_meta_topic {
+        engine.replication().get_epoch()
+    } else {
+        engine
+            .get_partition(&topic, partition)
+            .map(|pm| pm.leader_epoch() as u64)
+            .unwrap_or(0)
+    };
     if incoming_epoch < current_epoch {
         tracing::warn!(
             "HA Replication: Stale epoch {} (current {}) from leader for topic '{}' partition {} – rejecting",
@@ -970,10 +986,16 @@ fn decode_replication_packet(
         // step-down.
         return Ok((original_len - src.len(), vec![0x02]));
     }
-    if incoming_epoch > current_epoch {
+    if incoming_epoch > current_epoch && is_cluster_meta_topic {
+        // Only the controller term is adopted from the data path. A data partition's
+        // leader epoch is owned by the replicated metadata log (`PartitionLeadershipChange`)
+        // — letting a push mutate it here would make the fence self-certifying, since the
+        // sender would be declaring the very epoch it is then validated against. A push
+        // carrying a newer partition epoch is simply accepted; the authoritative leadership
+        // record follows through the metadata log.
         engine.replication().set_epoch(incoming_epoch);
         tracing::info!(
-            "HA Replication: Updated epoch to {} from leader for topic '{}' partition {}",
+            "HA Replication: Updated controller epoch to {} from leader for topic '{}' partition {}",
             incoming_epoch,
             topic,
             partition
@@ -1079,6 +1101,13 @@ fn decode_replication_packet(
             }
         }
     }
+
+    // Adopt the leader's committed point, clamped to what this replica actually holds.
+    // Never the local LEO: the records just appended are not committed until the ISR has
+    // acknowledged them on the leader, so treating them as committed here would expose
+    // uncommitted data to follower-fetch reads and would let this replica claim a
+    // too-high committed offset if it were promoted.
+    pm.advance_committed_hw(leader_hw.min(pm.latest_offset()));
 
     // Group commit: one fsync for the whole replicated batch instead of one per frame
     // (see `PartitionManager::flush_if_sync_policy`).
@@ -2129,10 +2158,10 @@ async fn process_request(
             ) {
                 return WireResponse::error("GroupAuthorizationFailed");
             }
-            match engine
-                .group_coordinator()
-                .join_group(&group_id, &member_id, protocols)
-            {
+            // `join_group_awaited` holds the response until the group's join window
+            // closes, so every member that joined the same window is handed the same
+            // generation (see `GroupCoordinator::join_group`).
+            match engine.join_group_awaited(&group_id, &member_id, protocols).await {
                 Ok((m_id, generation_id, is_leader, protocol_name)) => {
                     let mut buf = Vec::new();
                     crate::protocol::wire::write_pascal_string(&mut buf, &m_id);

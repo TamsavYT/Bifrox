@@ -35,6 +35,10 @@ pub struct ConsumerGroup {
     /// hard failure for members that haven't rejoined yet when the group opted into a
     /// cooperative protocol. See `is_cooperative`/`heartbeat`.
     pub protocol_name: Option<String>,
+    /// When the currently-open join window closes. While this is `Some(deadline)` in the
+    /// future, the group is collecting joiners into a single generation instead of forming
+    /// a new one per arrival — see `GroupCoordinator::join_group`.
+    pub rebalance_deadline: Option<Instant>,
 }
 
 impl ConsumerGroup {
@@ -46,7 +50,15 @@ impl ConsumerGroup {
             leader: None,
             members: HashMap::new(),
             protocol_name: None,
+            rebalance_deadline: None,
         }
+    }
+
+    /// True while this group's join window is still open.
+    pub fn join_window_open(&self) -> bool {
+        self.rebalance_deadline
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false)
     }
 
     /// True if the group negotiated a cooperative assignor (name containing
@@ -63,6 +75,9 @@ impl ConsumerGroup {
 #[derive(Debug)]
 pub struct GroupCoordinator {
     groups: Mutex<HashMap<String, ConsumerGroup>>,
+    /// How long a join window stays open for additional members to arrive
+    /// (`group.initial.rebalance.delay.ms`).
+    initial_rebalance_delay: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -104,9 +119,63 @@ impl GroupCoordinator {
     }
 
     pub fn new() -> Self {
+        Self::with_rebalance_delay(Duration::from_millis(3_000))
+    }
+
+    pub fn with_rebalance_delay(initial_rebalance_delay: Duration) -> Self {
         Self {
             groups: Mutex::new(HashMap::new()),
+            initial_rebalance_delay,
         }
+    }
+
+    pub fn initial_rebalance_delay(&self) -> Duration {
+        self.initial_rebalance_delay
+    }
+
+    /// How long until this group's open join window closes, or `None` if it is already
+    /// closed. Drives `StorageEngine::join_group`'s wait without holding the group lock
+    /// across an await.
+    pub fn join_window_remaining(&self, group_id: &str) -> Option<Duration> {
+        let groups = self.groups.lock().unwrap();
+        let group = groups.get(group_id)?;
+        let deadline = group.rebalance_deadline?;
+        let now = Instant::now();
+        if now < deadline {
+            Some(deadline - now)
+        } else {
+            None
+        }
+    }
+
+    /// Closes an elapsed join window and moves the group on to assignment. Idempotent.
+    pub fn close_join_window(&self, group_id: &str) {
+        let mut groups = self.groups.lock().unwrap();
+        if let Some(group) = groups.get_mut(group_id) {
+            if group
+                .rebalance_deadline
+                .map(|d| Instant::now() >= d)
+                .unwrap_or(false)
+            {
+                group.rebalance_deadline = None;
+                if group.state == GroupState::PreparingRebalance {
+                    group.state = GroupState::CompletingRebalance;
+                }
+            }
+        }
+    }
+
+    /// Returns the group's current generation and whether `member_id` leads it — read
+    /// after the join window closes, so every member of the window reports the same
+    /// generation.
+    pub fn join_result(&self, group_id: &str, member_id: &str) -> Option<(u32, bool, String)> {
+        let groups = self.groups.lock().unwrap();
+        let group = groups.get(group_id)?;
+        Some((
+            group.generation_id,
+            group.leader.as_deref() == Some(member_id),
+            group.protocol_name.clone().unwrap_or_default(),
+        ))
     }
 
     /// Returns `(member_id, generation_id, is_leader, protocol_name)` on success. The
@@ -162,9 +231,39 @@ impl GroupCoordinator {
             group.protocol_name = protocols.into_iter().next();
         }
 
+        // Join barrier (`group.initial.rebalance.delay.ms`).
+        //
+        // A new member only forms a NEW generation if no join window is currently open;
+        // otherwise it joins the window already in progress. Without this, every arrival
+        // formed its own generation and immediately bumped `generation_id`, which
+        // invalidated the assignment just handed to the previous joiner and forced it to
+        // rejoin — so a group of N members starting together produced ~N rebalances and
+        // could fail to converge at all under churn, leaving partitions unassigned.
+        //
+        // The window is opened by the first joiner of a rebalance and *extended* by each
+        // subsequent one (capped below), so a group whose members trickle in still settles
+        // into a single generation. The caller waits for the window to close before
+        // reporting the result — see `StorageEngine::join_group`.
         if rebalance_needed || was_empty {
-            group.state = GroupState::PreparingRebalance;
-            group.generation_id = group.generation_id.saturating_add(1);
+            let now = Instant::now();
+            // Each straggler buys the window a little more time, not a full fresh delay.
+            let extension = self.initial_rebalance_delay / 4;
+            match group.rebalance_deadline {
+                // A window is already open: this member joins that generation. Extend the
+                // deadline a little so a straggler still lands in the same generation,
+                // but never past `max_window` — otherwise a steady arrival rate could keep
+                // pushing the deadline out and the group would never stabilize.
+                Some(deadline) if now < deadline => {
+                    let max_window = now + self.initial_rebalance_delay * 2;
+                    group.rebalance_deadline = Some((deadline + extension).min(max_window));
+                }
+                // No open window: start one and form the new generation.
+                _ => {
+                    group.state = GroupState::PreparingRebalance;
+                    group.generation_id = group.generation_id.saturating_add(1);
+                    group.rebalance_deadline = Some(now + self.initial_rebalance_delay);
+                }
+            }
         }
         if group.leader.is_none() {
             group.leader = Some(m_id.clone());
