@@ -68,6 +68,88 @@ fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
     trimmed.parse::<u64>().ok().map(Some)
 }
 
+/// Kafka-style striped replica placement (`AdminUtils.assignReplicasToBrokers` /
+/// `StripedReplicaPlacer`).
+///
+/// Plain round-robin — `replicas[i] = brokers[(partition + i) % n]`, which is what this
+/// used to do — makes broker *i*'s follower always broker *i+1*. Losing two adjacent
+/// brokers then loses whole partitions outright, and every partition led by a given broker
+/// piles its followers onto the same peers. Striping shifts the non-leader replicas by a
+/// stride that advances every `n` partitions, so consecutive partitions place their
+/// followers on different brokers and the loss of any two brokers costs far fewer
+/// partitions.
+///
+/// `seed` replaces Kafka's random start index. Kafka randomizes so that every topic does
+/// not begin at broker 0; deriving the offset from the topic name instead gives the same
+/// spread across topics while keeping a single topic's layout reproducible — which matters
+/// because assignment here can be recomputed by a sweep rather than only at creation.
+///
+/// `pinned_leader` forces `replicas[0]`, used when assigning a partition that already holds
+/// data: its current holder must remain leader so assignment never moves bytes. Followers
+/// are still striped around it.
+fn striped_replicas(
+    brokers: &[u32],
+    partition: u32,
+    replication_factor: usize,
+    seed: u64,
+    pinned_leader: Option<u32>,
+) -> Vec<u32> {
+    let n = brokers.len();
+    if n == 0 || replication_factor == 0 {
+        return Vec::new();
+    }
+    let rf = replication_factor.min(n);
+
+    let start_index = (seed % n as u64) as usize;
+    let first_index = match pinned_leader.and_then(|l| brokers.iter().position(|&b| b == l)) {
+        Some(idx) => idx,
+        None => (partition as usize + start_index) % n,
+    };
+
+    let mut replicas = Vec::with_capacity(rf);
+    replicas.push(brokers[first_index]);
+    if n == 1 {
+        return replicas; // no other broker to place a follower on
+    }
+
+    // Advances every `n` partitions so that the follower stride differs between
+    // consecutive rounds rather than repeating the same leader/follower pairing.
+    let shift_round = (partition as usize / n) + (seed / n as u64) as usize;
+    for j in 0..rf.saturating_sub(1) {
+        let shift = 1 + (shift_round + j) % (n - 1);
+        let replica = brokers[(first_index + shift) % n];
+        if !replicas.contains(&replica) {
+            replicas.push(replica);
+        }
+    }
+
+    // A stride collision can leave us short of the requested factor; fill deterministically
+    // rather than silently returning fewer replicas than the caller asked for.
+    if replicas.len() < rf {
+        for &b in brokers {
+            if replicas.len() >= rf {
+                break;
+            }
+            if !replicas.contains(&b) {
+                replicas.push(b);
+            }
+        }
+    }
+    replicas
+}
+
+/// Stable per-topic seed for `striped_replicas`, so different topics start at different
+/// brokers while one topic's layout stays reproducible.
+fn topic_placement_seed(topic: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    for byte in topic.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -2670,18 +2752,18 @@ impl StorageEngine {
                 self.config.default_replication_factor.max(1) as usize,
                 brokers.len(),
             );
-            // Leader first, then the remaining brokers in id order, so assignment is
-            // deterministic and every partition of a topic doesn't pile onto one follower.
-            let mut replicas = Vec::with_capacity(rf);
-            replicas.push(leader_id);
-            for &b in &brokers {
-                if replicas.len() >= rf {
-                    break;
-                }
-                if b != leader_id {
-                    replicas.push(b);
-                }
-            }
+            // Leader is pinned to whoever already holds the data, so this assignment moves
+            // no bytes; the followers are still striped around it. Appending brokers in id
+            // order instead — which is what this did first — gave every partition led by a
+            // given broker the identical follower set, so losing one pair of brokers took
+            // out far more partitions than necessary.
+            let replicas = striped_replicas(
+                &brokers,
+                partition,
+                rf,
+                topic_placement_seed(&topic),
+                Some(leader_id),
+            );
 
             // Register the topic first if this broker only ever knew it implicitly —
             // `PartitionLeadershipChange` is applied into `topic_registry[topic]`, so
@@ -2901,8 +2983,56 @@ impl StorageEngine {
         }
     }
 
+    /// Creates a topic with an **explicitly requested** replication factor.
+    ///
+    /// Unlike `create_topic`, which treats the configured default as a preference and
+    /// clamps it to the cluster size, an explicit factor is a durability contract: if the
+    /// cluster cannot satisfy it the topic is not created at all, matching Kafka's
+    /// `INVALID_REPLICATION_FACTOR`. Silently returning fewer replicas than the caller
+    /// asked for would leave them believing data is replicated when it isn't — and because
+    /// replication factor is fixed at creation and never raised automatically, that belief
+    /// would persist for the life of the topic.
+    pub async fn create_topic_with_replication_factor(
+        &self,
+        topic: &str,
+        num_partitions: u32,
+        replication_factor: u16,
+    ) -> IoResult<()> {
+        if replication_factor == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "replication factor must be at least 1",
+            ));
+        }
+        let available = self.available_broker_ids().len();
+        if replication_factor as usize > available {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "INVALID_REPLICATION_FACTOR: topic '{}' requested replication factor {} \
+                     but only {} broker(s) are available",
+                    topic, replication_factor, available
+                ),
+            ));
+        }
+        self.create_topic_inner(topic, num_partitions, Some(replication_factor))
+            .await
+    }
+
     /// Creates a topic by writing a TopicCreated record to __cluster_metadata and populating registry
     pub async fn create_topic(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
+        self.create_topic_inner(topic, num_partitions, None).await
+    }
+
+    /// Shared creation path. `explicit_rf` is `Some` when the caller stated a replication
+    /// factor (already validated as satisfiable) and `None` when the configured default
+    /// should be used and clamped.
+    async fn create_topic_inner(
+        &self,
+        topic: &str,
+        num_partitions: u32,
+        explicit_rf: Option<u16>,
+    ) -> IoResult<()> {
         validate_topic_name(topic)?;
         if self.deleting_topics.contains(topic) {
             return Err(std::io::Error::other(format!(
@@ -2917,10 +3047,28 @@ impl StorageEngine {
                 "No brokers available for topic assignment",
             ));
         }
-        let replication_factor = std::cmp::min(
-            self.config.default_replication_factor.max(1),
-            broker_ids.len() as u16,
-        );
+        // Implicit (default) replication factor: clamp to what the cluster can satisfy,
+        // but say so. Kafka instead rejects the whole creation with
+        // INVALID_REPLICATION_FACTOR and never degrades silently — the right instinct, but
+        // adopting it wholesale would leave a single-broker deployment unable to create any
+        // topic at all, since our default is 3 rather than Kafka's 1.
+        //
+        // So the contract is split by intent: a *default* RF is a preference and gets
+        // clamped loudly, while an explicitly requested one is a durability contract and
+        // fails outright (see `create_topic_with_replication_factor`).
+        let requested_rf = explicit_rf.unwrap_or(self.config.default_replication_factor.max(1));
+        let replication_factor = std::cmp::min(requested_rf, broker_ids.len() as u16);
+        if explicit_rf.is_none() && replication_factor < requested_rf {
+            tracing::warn!(
+                "Topic '{}': default.replication.factor is {} but only {} broker(s) are \
+                 available — creating with replication factor {}. This topic will NOT gain \
+                 replicas automatically when more brokers join.",
+                topic,
+                requested_rf,
+                broker_ids.len(),
+                replication_factor
+            );
+        }
 
         let record = crate::replication::MetadataRecord::TopicCreated {
             topic: topic.to_string(),
@@ -2932,18 +3080,19 @@ impl StorageEngine {
         // there's no separate direct topic_registry.insert here anymore.
         self.propose_metadata(record).await?;
 
-        let total_nodes = broker_ids.len();
         let rf_usize = replication_factor as usize;
+        let seed = topic_placement_seed(topic);
 
         for p in 0..num_partitions {
-            let leader_idx = (p as usize) % total_nodes;
-            let leader_id = broker_ids[leader_idx];
-
-            let mut replicas = Vec::with_capacity(rf_usize);
-            for i in 0..rf_usize {
-                let idx = (leader_idx + i) % total_nodes;
-                replicas.push(broker_ids[idx]);
-            }
+            let replicas = striped_replicas(&broker_ids, p, rf_usize, seed, None);
+            // The "preferred replica": leadership defaults to the head of the list, and
+            // striping is what keeps that from concentrating on one broker.
+            let leader_id = replicas[0];
+            // Every replica of a brand-new partition is at LEO = HW = 0, so they are all
+            // genuinely in sync — there is nothing to catch up on. That is only sound
+            // because assignment happens before the partition holds a single byte; the
+            // sweep that retrofits an assignment onto a partition which *already* has data
+            // must start with the leader alone (see `reconcile_unassigned_partitions`).
             let isr = replicas.clone();
 
             let plc_record = crate::replication::MetadataRecord::PartitionLeadershipChange {
@@ -3414,5 +3563,105 @@ impl StorageEngine {
             }
         };
         self.share_groups.sweep_lock_timeouts(Some(&dlq_writer));
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    /// Plain round-robin makes broker i's follower always broker i+1, so consecutive
+    /// partitions share a follower pairing and losing two adjacent brokers takes out whole
+    /// partitions. Striping must produce more than one distinct follower per leader.
+    #[test]
+    fn striping_spreads_followers_across_brokers() {
+        let brokers = vec![1, 2, 3, 4, 5];
+        let seed = topic_placement_seed("orders");
+
+        let mut followers_by_leader: std::collections::HashMap<u32, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        for p in 0..25u32 {
+            let replicas = striped_replicas(&brokers, p, 3, seed, None);
+            assert_eq!(replicas.len(), 3, "partition {} short of RF: {:?}", p, replicas);
+            let mut seen = std::collections::HashSet::new();
+            for r in &replicas {
+                assert!(seen.insert(*r), "duplicate replica in {:?}", replicas);
+            }
+            followers_by_leader
+                .entry(replicas[0])
+                .or_default()
+                .extend(replicas[1..].iter().copied());
+        }
+
+        for (leader, followers) in &followers_by_leader {
+            assert!(
+                followers.len() > 1,
+                "leader {} always uses the same followers {:?} — that is round-robin, not striping",
+                leader,
+                followers
+            );
+        }
+    }
+
+    /// Leadership must spread too, or one broker takes every partition's write traffic.
+    #[test]
+    fn striping_spreads_leadership() {
+        let brokers = vec![1, 2, 3, 4];
+        let seed = topic_placement_seed("events");
+        let mut leaders = std::collections::HashSet::new();
+        for p in 0..12u32 {
+            leaders.insert(striped_replicas(&brokers, p, 2, seed, None)[0]);
+        }
+        assert_eq!(leaders.len(), brokers.len(), "every broker should lead some partition");
+    }
+
+    /// Retrofitting an assignment must never move data: the broker already holding the
+    /// partition stays leader, and only the followers are chosen.
+    #[test]
+    fn pinned_leader_is_preserved_and_followers_still_stripe() {
+        let brokers = vec![1, 2, 3, 4];
+        let seed = topic_placement_seed("retrofit");
+        let mut follower_sets = std::collections::HashSet::new();
+        for p in 0..8u32 {
+            let replicas = striped_replicas(&brokers, p, 3, seed, Some(2));
+            assert_eq!(replicas[0], 2, "the pinned leader must lead");
+            assert_eq!(replicas.len(), 3);
+            follower_sets.insert(replicas[1..].to_vec());
+        }
+        assert!(
+            follower_sets.len() > 1,
+            "a pinned leader should still get varied followers, got {:?}",
+            follower_sets
+        );
+    }
+
+    /// Degenerate inputs must not panic — a single broker has no peer to place a follower
+    /// on, and the modulo arithmetic divides by `n - 1`.
+    #[test]
+    fn single_broker_and_oversized_factor_are_handled() {
+        assert_eq!(striped_replicas(&[7], 0, 3, 42, None), vec![7]);
+        assert_eq!(striped_replicas(&[7], 5, 1, 0, Some(7)), vec![7]);
+        assert!(striped_replicas(&[], 0, 3, 1, None).is_empty());
+        // Requesting more replicas than brokers yields every broker exactly once.
+        let all = striped_replicas(&[1, 2, 3], 0, 9, 5, None);
+        assert_eq!(all.len(), 3);
+    }
+
+    /// Different topics must not all start on the same broker, but one topic's layout must
+    /// be reproducible — the sweep can recompute it.
+    #[test]
+    fn placement_seed_varies_by_topic_but_is_stable() {
+        assert_eq!(topic_placement_seed("a"), topic_placement_seed("a"));
+        assert_ne!(topic_placement_seed("a"), topic_placement_seed("b"));
+
+        let brokers = vec![1, 2, 3, 4, 5];
+        let first_leaders: std::collections::HashSet<u32> = ["alpha", "beta", "gamma", "delta"]
+            .iter()
+            .map(|t| striped_replicas(&brokers, 0, 2, topic_placement_seed(t), None)[0])
+            .collect();
+        assert!(
+            first_leaders.len() > 1,
+            "every topic started its partition 0 on the same broker"
+        );
     }
 }

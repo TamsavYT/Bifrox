@@ -3881,3 +3881,44 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
     task2.abort();
     let _ = std::fs::remove_dir_all(&base_dir);
 }
+
+/// An explicitly requested replication factor is a durability contract: if the cluster
+/// cannot satisfy it the topic must not be created, rather than silently degrading to
+/// fewer replicas. Replication factor is fixed at creation and never raised automatically,
+/// so a silent downgrade would leave the caller believing data is replicated for the whole
+/// life of the topic.
+#[tokio::test]
+async fn test_scenario_46_explicit_replication_factor_is_not_silently_degraded() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+
+    // Single broker: RF 3 cannot be satisfied.
+    let rejected = engine
+        .create_topic_with_replication_factor("rf_strict", 1, 3)
+        .await;
+    let err = rejected.expect_err("RF above the broker count must be rejected");
+    assert!(
+        err.to_string().contains("INVALID_REPLICATION_FACTOR"),
+        "expected an explicit replication-factor error, got: {}",
+        err
+    );
+    assert!(
+        !engine.list_topics().contains(&"rf_strict".to_string()),
+        "a rejected creation must not leave the topic half-created"
+    );
+
+    // A satisfiable factor succeeds.
+    engine
+        .create_topic_with_replication_factor("rf_ok", 1, 1)
+        .await
+        .expect("RF within the broker count should be accepted");
+    assert!(engine.list_topics().contains(&"rf_ok".to_string()));
+
+    // The implicit path still clamps rather than failing, so a single-node deployment can
+    // create topics with the default factor of 3.
+    engine
+        .create_topic("rf_default", 1)
+        .await
+        .expect("the default factor must be clamped, not rejected");
+    assert!(engine.list_topics().contains(&"rf_default".to_string()));
+}
