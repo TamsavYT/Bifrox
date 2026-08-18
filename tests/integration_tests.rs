@@ -3834,22 +3834,27 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
     engine_node1.register_broker_address(2, addr_node2.to_string());
     engine_node2.register_broker_address(1, addr_node1.to_string());
 
-    // 1. Produce BEFORE any assignment exists — the implicit-creation path.
+    // 1. Produce to a topic that does not exist yet. Because this lands on the controller,
+    //    the auto-create hook registers the topic and assigns replicas *before* the record
+    //    is written — so unlike when this test was first written, the partition is already
+    //    assigned by the time the produce returns.
     let mut client = TestClient::connect(addr_node1).await.unwrap();
     client
         .produce_single("pull_topic", "k1", None, 1, "before-assignment")
         .await
         .unwrap();
-    assert!(
-        !engine_node1.has_partition_assignment("pull_topic", 0),
-        "precondition: implicitly created partitions start unassigned"
-    );
 
-    // 2. The controller sweep publishes a replica set spanning both brokers.
+    // 2. The sweep is idempotent here: it has nothing left to assign. Running it anyway
+    //    keeps this test honest about the end state rather than about which path produced
+    //    it, since a produce landing on a non-controller would still arrive unassigned and
+    //    be repaired by exactly this sweep.
     engine_node1
         .reconcile_unassigned_partitions_for_test()
         .await;
-    assert!(engine_node1.has_partition_assignment("pull_topic", 0));
+    assert!(
+        engine_node1.has_partition_assignment("pull_topic", 0),
+        "the partition must carry a replica assignment before pull can engage"
+    );
     let replicas = engine_node1
         .get_or_create_partition("pull_topic", 0)
         .unwrap()
@@ -4093,4 +4098,66 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
 
     task_f.abort();
     let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// A produce to an unknown topic on the controller must create it *through the metadata
+/// path*, with replicas assigned before the partition holds any data.
+///
+/// Implicit creation used to call `get_or_create_partition` and nothing else: the local
+/// directories appeared but no metadata record was written, so cluster metadata never
+/// learned the partition existed. No follower knew to replicate it, the ISR sweep had no
+/// membership to manage, and failover had nothing to promote. Assigning before byte one is
+/// also what makes the full-ISR start correct — every replica is at LEO = HW = 0, so they
+/// are all genuinely in sync.
+#[tokio::test]
+async fn test_scenario_48_controller_assigns_new_topics_before_first_write() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    assert!(engine.is_leader(), "the test broker is its own controller");
+
+    assert!(!engine.topic_is_registered("born_assigned"));
+
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+    client
+        .produce_single("born_assigned", "k", None, 1, "first record")
+        .await
+        .unwrap();
+
+    // Registered in cluster metadata, not merely present as directories on disk.
+    assert!(
+        engine.topic_is_registered("born_assigned"),
+        "a produce to an unknown topic must register it through the metadata path"
+    );
+    assert!(
+        engine.has_partition_assignment("born_assigned", 0),
+        "the partition must carry a replica assignment, not just exist locally"
+    );
+
+    // The assignment names a real leader and a non-empty roster.
+    let pm = engine.get_or_create_partition("born_assigned", 0).unwrap();
+    assert_eq!(pm.leader_id(), engine.config().node_id);
+    assert!(!pm.replicas().is_empty(), "roster must not be empty");
+    assert_eq!(
+        pm.isr(),
+        pm.replicas(),
+        "a brand-new partition starts with every replica in the ISR: all are at LEO = HW = 0 \
+         and therefore genuinely in sync"
+    );
+
+    // And the record itself landed.
+    let fetched = client.fetch("born_assigned", 0, 0, 65536).await.unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(&fetched[0].payload[..], b"first record");
+
+    // Idempotent: producing again must not re-create or re-assign the topic.
+    let epoch_before = pm.leader_epoch();
+    client
+        .produce_single("born_assigned", "k", None, 1, "second record")
+        .await
+        .unwrap();
+    assert_eq!(
+        pm.leader_epoch(),
+        epoch_before,
+        "an existing topic must not be re-created on every produce"
+    );
 }
