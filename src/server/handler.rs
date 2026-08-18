@@ -1326,6 +1326,9 @@ fn decode_heartbeat_packet(
 /// caller must close the connection rather than fall back, since a partial response would
 /// otherwise corrupt the client's read stream.
 #[cfg(any(windows, target_os = "linux"))]
+// The parameters are the fetch request's fields plus the connection identity needed to
+// authorize it; grouping them into a struct would just move the same list behind a name.
+#[allow(clippy::too_many_arguments)]
 async fn try_zero_copy_fetch(
     engine: &StorageEngine,
     socket: &mut TcpStream,
@@ -1387,10 +1390,15 @@ async fn try_zero_copy_fetch(
     // near-empty on exactly the workload it's most needed for. Timed before the throttle
     // sleep and the socket write so the metric reflects broker-side read cost rather than
     // deliberate quota delay or client-side backpressure.
-    engine.metrics().fetch_latency_ms.record(fetch_start.elapsed());
+    engine
+        .metrics()
+        .fetch_latency_ms
+        .record(fetch_start.elapsed());
 
     let quota_key = resolve_quota_key(principal, logical_client_id.as_deref(), client_key);
-    engine.throttle_fetch(topic, &quota_key, plan.physical_len).await;
+    engine
+        .throttle_fetch(topic, &quota_key, plan.physical_len)
+        .await;
 
     let mut header = Vec::with_capacity(9);
     header.put_u8(0u8); // WireResponse status = OK
@@ -1451,7 +1459,8 @@ async fn process_request(
             // `SaslAuthenticate` validates against the credential derived under that same
             // hash — a SHA-256 credential cannot verify a SHA-512 exchange.
             if supported {
-                *negotiated_scram_mechanism = mechanism.parse::<crate::scram::ScramMechanism>().ok();
+                *negotiated_scram_mechanism =
+                    mechanism.parse::<crate::scram::ScramMechanism>().ok();
             }
             let mut buf = Vec::new();
             buf.put_i16(error_code);
@@ -1490,18 +1499,19 @@ async fn process_request(
                         }
                     };
 
-                let credential = match engine.lookup_scram_credential(&username, *negotiated_scram_mechanism) {
-                    Some(credential) => credential,
-                    None => {
-                        scram_session.take();
-                        return build_sasl_auth_response(
-                            58,
-                            Some("SASL Authentication Failed"),
-                            &[],
-                            0,
-                        );
-                    }
-                };
+                let credential =
+                    match engine.lookup_scram_credential(&username, *negotiated_scram_mechanism) {
+                        Some(credential) => credential,
+                        None => {
+                            scram_session.take();
+                            return build_sasl_auth_response(
+                                58,
+                                Some("SASL Authentication Failed"),
+                                &[],
+                                0,
+                            );
+                        }
+                    };
 
                 let server_nonce = match generate_scram_server_nonce() {
                     Ok(nonce) => nonce,
@@ -1549,7 +1559,9 @@ async fn process_request(
                     }
                 };
 
-                let credential = match engine.lookup_scram_credential(&session.username, Some(session.mechanism)) {
+                let credential = match engine
+                    .lookup_scram_credential(&session.username, Some(session.mechanism))
+                {
                     Some(credential) => credential,
                     None => {
                         scram_session.take();
@@ -1595,7 +1607,9 @@ async fn process_request(
             }
 
             let (username, password) = parse_plain_auth(auth_text);
-            let auth_ok = if let Some(credential) = engine.lookup_scram_credential(&username, *negotiated_scram_mechanism) {
+            let auth_ok = if let Some(credential) =
+                engine.lookup_scram_credential(&username, *negotiated_scram_mechanism)
+            {
                 credential.verify_password(&password)
             } else if let Some(ref tok) = engine.config().auth_token {
                 tok == &password || tok == &username
@@ -1841,7 +1855,10 @@ async fn process_request(
                 .await
             {
                 Ok((assigned_partition, first_offset, last_offset)) => {
-                    engine.metrics().produce_latency_ms.record(produce_start.elapsed());
+                    engine
+                        .metrics()
+                        .produce_latency_ms
+                        .record(produce_start.elapsed());
                     engine.record_produce_metrics(&topic, produced_bytes, records.len() as u64);
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
@@ -1873,7 +1890,10 @@ async fn process_request(
             let fetch_start = std::time::Instant::now();
             match engine.fetch(&topic, partition, offset, max_bytes).await {
                 Ok(frames) => {
-                    engine.metrics().fetch_latency_ms.record(fetch_start.elapsed());
+                    engine
+                        .metrics()
+                        .fetch_latency_ms
+                        .record(fetch_start.elapsed());
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
                     let mut fetched_bytes: u64 = 0;
@@ -1881,7 +1901,9 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
+                    engine
+                        .throttle_fetch(&topic, &quota_key, fetched_bytes)
+                        .await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("Fetch failed: {}", e)),
@@ -1905,7 +1927,10 @@ async fn process_request(
             if !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
-            match engine.fetch_committed(&topic, partition, offset, max_bytes).await {
+            match engine
+                .fetch_committed(&topic, partition, offset, max_bytes)
+                .await
+            {
                 Ok(frames) => {
                     let mut buf = Vec::new();
                     buf.put_u32(frames.len() as u32);
@@ -1914,7 +1939,9 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
+                    engine
+                        .throttle_fetch(&topic, &quota_key, fetched_bytes)
+                        .await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchCommitted failed: {}", e)),
@@ -1935,7 +1962,10 @@ async fn process_request(
             ) {
                 return WireResponse::error("GroupAuthorizationFailed");
             }
-            match engine.commit_offset(&group_id, &topic, partition, offset).await {
+            match engine
+                .commit_offset(&group_id, &topic, partition, offset)
+                .await
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("CommitOffset failed: {}", e)),
             }
@@ -2152,7 +2182,9 @@ async fn process_request(
                         fetched_bytes += frame.encoded_size() as u64;
                         frame.encode_into(&mut buf);
                     }
-                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
+                    engine
+                        .throttle_fetch(&topic, &quota_key, fetched_bytes)
+                        .await;
                     WireResponse::ok(buf)
                 }
                 Err(e) => WireResponse::error(&format!("FetchByTimestamp failed: {}", e)),
@@ -2239,7 +2271,10 @@ async fn process_request(
             // `join_group_awaited` holds the response until the group's join window
             // closes, so every member that joined the same window is handed the same
             // generation (see `GroupCoordinator::join_group`).
-            match engine.join_group_awaited(&group_id, &member_id, protocols).await {
+            match engine
+                .join_group_awaited(&group_id, &member_id, protocols)
+                .await
+            {
                 Ok((m_id, generation_id, is_leader, protocol_name)) => {
                     let mut buf = Vec::new();
                     crate::protocol::wire::write_pascal_string(&mut buf, &m_id);
@@ -2540,7 +2575,9 @@ async fn process_request(
                         }
                     }
                     let payload = crate::protocol::wire::encode_share_fetch_response(&batches);
-                    engine.throttle_fetch(&topic, &quota_key, fetched_bytes).await;
+                    engine
+                        .throttle_fetch(&topic, &quota_key, fetched_bytes)
+                        .await;
                     WireResponse::ok(payload)
                 }
                 Err(e) => WireResponse::error(&format!("ShareFetch failed: {}", e)),
@@ -2886,7 +2923,11 @@ mod grpc_replication_fetch_tests {
         assert_eq!(bytes_consumed, framed.len());
 
         let resp = decode_response(&response_bytes);
-        assert_eq!(resp.frames.len(), 2, "expected offsets 1 and 2 (fetch_offset=1)");
+        assert_eq!(
+            resp.frames.len(),
+            2,
+            "expected offsets 1 and 2 (fetch_offset=1)"
+        );
         assert_eq!(resp.frames[0].offset, 1);
         assert_eq!(resp.frames[0].payload.as_ref(), b"rec1");
         assert_eq!(resp.frames[1].offset, 2);
@@ -2917,12 +2958,11 @@ mod grpc_replication_fetch_tests {
         let framed = frame_request(&req);
         decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
 
-        assert_eq!(
+        assert!(
             engine
                 .replication()
                 .replica_ack_age("t", 0, "127.0.0.1:9999")
                 .is_some(),
-            true,
             "a fetch request should record this follower's progress the same way a push ack does"
         );
     }

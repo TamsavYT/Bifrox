@@ -1,9 +1,9 @@
-use bytes::Bytes;
 use crate::config::EngineConfig;
 use crate::protocol::{RecordFrame, HEADER_SIZE};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
 use crate::segment::timeindex::TimeIndexSegment;
+use bytes::Bytes;
 use std::fs;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
@@ -208,7 +208,13 @@ fn recover_interrupted_compaction(dir: &Path) -> IoResult<()> {
     let mut dropped = 0usize;
     for backup in backups {
         // Strip the trailing `.deleted` to get the live path it was taken from.
-        let live = PathBuf::from(backup.as_os_str().to_string_lossy().trim_end_matches(".deleted").to_string());
+        let live = PathBuf::from(
+            backup
+                .as_os_str()
+                .to_string_lossy()
+                .trim_end_matches(".deleted")
+                .to_string(),
+        );
         if live.exists() {
             let _ = fs::remove_file(&backup);
             dropped += 1;
@@ -943,10 +949,18 @@ impl SegmentManager {
                 .entry(key.to_vec())
                 .and_modify(|rec| {
                     if offset > rec.offset {
-                        *rec = LatestRecord { offset, timestamp, is_tombstone };
+                        *rec = LatestRecord {
+                            offset,
+                            timestamp,
+                            is_tombstone,
+                        };
                     }
                 })
-                .or_insert(LatestRecord { offset, timestamp, is_tombstone });
+                .or_insert(LatestRecord {
+                    offset,
+                    timestamp,
+                    is_tombstone,
+                });
         };
 
         for pair in &mut self.historical {
@@ -982,6 +996,12 @@ impl SegmentManager {
             let is_tombstone = value.is_some_and(|v| v.is_empty());
             observe(key, frame.offset, frame.timestamp, is_tombstone);
         }
+        // Load-bearing despite the closure having no `Drop` impl: `observe` holds a mutable
+        // borrow of `latest`, and moving it here is what releases that borrow so `latest`
+        // can be read below. Clippy's `drop_non_drop` only considers `Drop` semantics, not
+        // the borrow ending, so it flags this as pointless when removing it would not
+        // compile.
+        #[allow(clippy::drop_non_drop)]
         drop(observe);
 
         if latest.is_empty() {
@@ -992,27 +1012,25 @@ impl SegmentManager {
         // `delete_retention_millis` are fully purged — the key disappears from `latest`
         // entirely, which Phase 2 below reads as "discard every frame for this key,
         // including what would otherwise be the kept tombstone."
-        let purged_keys: std::collections::HashSet<Vec<u8>> =
-            if let Some(delete_retention_ms) = self.config.delete_retention_millis {
-                let purged: std::collections::HashSet<Vec<u8>> = latest
-                    .iter()
-                    .filter(|(_, rec)| {
-                        rec.is_tombstone
-                            && now_ms.saturating_sub(rec.timestamp) > delete_retention_ms
-                    })
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for k in &purged {
-                    latest.remove(k);
-                }
-                purged
-            } else {
-                std::collections::HashSet::new()
-            };
-        let latest_offsets: std::collections::HashMap<Vec<u8>, u64> = latest
-            .into_iter()
-            .map(|(k, rec)| (k, rec.offset))
-            .collect();
+        let purged_keys: std::collections::HashSet<Vec<u8>> = if let Some(delete_retention_ms) =
+            self.config.delete_retention_millis
+        {
+            let purged: std::collections::HashSet<Vec<u8>> = latest
+                .iter()
+                .filter(|(_, rec)| {
+                    rec.is_tombstone && now_ms.saturating_sub(rec.timestamp) > delete_retention_ms
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &purged {
+                latest.remove(k);
+            }
+            purged
+        } else {
+            std::collections::HashSet::new()
+        };
+        let latest_offsets: std::collections::HashMap<Vec<u8>, u64> =
+            latest.into_iter().map(|(k, rec)| (k, rec.offset)).collect();
 
         let mut total_compacted_frames = 0;
         let mut segments_compacted = 0usize;
@@ -1162,15 +1180,11 @@ impl SegmentManager {
             // segment exists under one name or the other, and `recover_interrupted_
             // compaction` (called on open) can finish or roll back whatever a crash
             // interrupted.
-            let backup_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = [
-                &log_path,
-                &index_path,
-                &time_index_path,
-                &txn_index_path,
-            ]
-            .iter()
-            .map(|p| ((*p).clone(), deleted_backup_path(p)))
-            .collect();
+            let backup_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+                [&log_path, &index_path, &time_index_path, &txn_index_path]
+                    .iter()
+                    .map(|p| ((*p).clone(), deleted_backup_path(p)))
+                    .collect();
 
             for (live, backup) in &backup_paths {
                 let _ = fs::remove_file(backup);
@@ -1739,7 +1753,10 @@ mod tests {
         assert!(mgr.plan_zero_copy_fetch(0, 4096, 0).unwrap().is_none());
     }
 
-    fn compact_config(delete_retention_millis: Option<u64>, min_cleanable_dirty_ratio: f64) -> EngineConfig {
+    fn compact_config(
+        delete_retention_millis: Option<u64>,
+        min_cleanable_dirty_ratio: f64,
+    ) -> EngineConfig {
         EngineConfig {
             cleanup_policy: crate::config::CleanupPolicy::Compact,
             delete_retention_millis,
@@ -1753,7 +1770,8 @@ mod tests {
         let dir = TempDir::new("tombstone_kept");
         // min_cleanable_dirty_ratio: 0.0 so this test only exercises tombstone semantics,
         // not the separate dirty-ratio gate.
-        let mut mgr = SegmentManager::open(&dir.0, compact_config(Some(24 * 60 * 60 * 1000), 0.0)).unwrap();
+        let mut mgr =
+            SegmentManager::open(&dir.0, compact_config(Some(24 * 60 * 60 * 1000), 0.0)).unwrap();
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1787,7 +1805,10 @@ mod tests {
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
-        assert_eq!(n, 2, "offset 0 (stale) and offset 2 (expired tombstone) should be dropped");
+        assert_eq!(
+            n, 2,
+            "offset 0 (stale) and offset 2 (expired tombstone) should be dropped"
+        );
 
         let remaining = mgr.fetch(0, 4096).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -1810,7 +1831,10 @@ mod tests {
         mgr.append(b"k0:v1", 100).unwrap();
 
         let n = mgr.apply_retention().unwrap();
-        assert_eq!(n, 0, "10% dirty is below the 50% min_cleanable_dirty_ratio gate");
+        assert_eq!(
+            n, 0,
+            "10% dirty is below the 50% min_cleanable_dirty_ratio gate"
+        );
         assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 10);
 
         // Lowering the gate below the segment's actual dirty ratio lets it compact.
@@ -1843,7 +1867,10 @@ mod tests {
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
-        assert_eq!(n, 1, "the stale compressed user1:val_1 record should be dropped");
+        assert_eq!(
+            n, 1,
+            "the stale compressed user1:val_1 record should be dropped"
+        );
 
         let remaining = mgr.fetch(0, 4096).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -2062,7 +2089,10 @@ mod tests {
             log_path.exists(),
             "startup must restore the backup, not leave the segment missing"
         );
-        assert!(!backup_path.exists(), "backup should be consumed by the restore");
+        assert!(
+            !backup_path.exists(),
+            "backup should be consumed by the restore"
+        );
         assert_eq!(mgr.historical.len(), 1);
         assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 4);
     }
@@ -2089,13 +2119,18 @@ mod tests {
         // Both present: stale backup alongside the real, current file.
         fs::copy(&log_path, &backup_path).unwrap();
         // A leftover `.compact` temporary from the same interrupted run must also go.
-        let tmp_path = dir.0.join(format!("{}.log.compact", format_segment_filename(0)));
+        let tmp_path = dir
+            .0
+            .join(format!("{}.log.compact", format_segment_filename(0)));
         fs::write(&tmp_path, b"partial garbage").unwrap();
 
         let mut mgr = SegmentManager::open(&dir.0, EngineConfig::default()).unwrap();
         assert!(log_path.exists(), "the live file must be left untouched");
         assert!(!backup_path.exists(), "stale backup should be dropped");
-        assert!(!tmp_path.exists(), "leftover .compact temporary should be discarded");
+        assert!(
+            !tmp_path.exists(),
+            "leftover .compact temporary should be discarded"
+        );
         assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 3);
     }
 
@@ -2110,7 +2145,11 @@ mod tests {
         let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
 
         mgr.append(b"first", 1).unwrap();
-        assert_eq!(mgr.historical.len(), 0, "fresh segment shouldn't roll instantly");
+        assert_eq!(
+            mgr.historical.len(),
+            0,
+            "fresh segment shouldn't roll instantly"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         mgr.append(b"second", 2).unwrap();

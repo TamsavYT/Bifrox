@@ -93,14 +93,17 @@ impl RecordFrame {
     pub fn decompress_payload(&self) -> Result<Bytes, std::io::Error> {
         match self.magic {
             COMPRESSED_LZ4_MAGIC_BYTE => {
-                let decompressed = lz4_flex::decompress_size_prepended(&self.payload).map_err(
-                    |e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-                )?;
+                let decompressed =
+                    lz4_flex::decompress_size_prepended(&self.payload).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
                 Ok(Bytes::from(decompressed))
             }
             COMPRESSED_ZSTD_MAGIC_BYTE => {
-                let decompressed = zstd::stream::decode_all(self.payload.as_ref())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                let decompressed =
+                    zstd::stream::decode_all(self.payload.as_ref()).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
                 Ok(Bytes::from(decompressed))
             }
             _ => Ok(self.payload.clone()),
@@ -252,7 +255,8 @@ mod tests {
 
     #[test]
     fn zstd_frame_round_trips_through_encode_decode_and_decompress() {
-        let raw = b"the quick brown fox jumps over the lazy dog, repeated for compressibility ".repeat(8);
+        let raw =
+            b"the quick brown fox jumps over the lazy dog, repeated for compressibility ".repeat(8);
         let frame = RecordFrame::create_compressed_zstd(42, 123_456, &raw);
         assert_eq!(frame.magic, COMPRESSED_ZSTD_MAGIC_BYTE);
         // A reasonably repetitive payload should actually shrink.
@@ -279,7 +283,10 @@ mod tests {
         let mut encoded = Vec::new();
         frame.encode_into(&mut encoded);
         let (decoded, _) = RecordFrame::decode(&encoded).unwrap();
-        assert_eq!(decoded.decompress_payload().unwrap().as_ref(), raw.as_slice());
+        assert_eq!(
+            decoded.decompress_payload().unwrap().as_ref(),
+            raw.as_slice()
+        );
     }
 
     #[test]

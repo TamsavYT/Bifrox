@@ -69,7 +69,10 @@ pub fn roles_to_bytes(roles: &[ProcessRole]) -> Vec<u8> {
 /// to combined mode (both roles) — matches how `BrokerRegister` records written before
 /// this field existed are interpreted on replay.
 pub fn parse_process_role_bytes(bytes: &[u8]) -> Vec<ProcessRole> {
-    let roles: Vec<ProcessRole> = bytes.iter().filter_map(|&b| ProcessRole::from_byte(b)).collect();
+    let roles: Vec<ProcessRole> = bytes
+        .iter()
+        .filter_map(|&b| ProcessRole::from_byte(b))
+        .collect();
     if roles.is_empty() {
         vec![ProcessRole::Controller, ProcessRole::Broker]
     } else {
@@ -424,7 +427,7 @@ impl Default for EngineConfig {
             max_partitions_per_broker: 200_000,
             transaction_timeout_ms: 60_000, // matches Kafka's transaction.timeout.ms default
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
-            retention_millis: Some(86400 * 1000),     // 24 hours retention
+            retention_millis: Some(86400 * 1000), // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
             cleanup_policy: CleanupPolicy::Delete,
             security_protocol: SecurityProtocol::Plaintext,
@@ -484,8 +487,8 @@ impl EngineConfig {
     /// with only broker-only peers correctly computes a quorum of one instead of
     /// mistaking its brokers for fellow voters.
     pub fn effective_controller_peer_addrs(&self) -> Vec<String> {
-        let is_default_combined_roles =
-            self.roles.contains(&ProcessRole::Controller) && self.roles.contains(&ProcessRole::Broker);
+        let is_default_combined_roles = self.roles.contains(&ProcessRole::Controller)
+            && self.roles.contains(&ProcessRole::Broker);
         if self.controller_peer_addrs.is_empty() && is_default_combined_roles {
             self.peer_addrs.clone()
         } else {

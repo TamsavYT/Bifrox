@@ -836,7 +836,8 @@ mod tests {
         let mgr = TransactionManager::new();
         let protected_pid = 7u64;
 
-        mgr.begin_transaction("tx-protected", protected_pid).unwrap();
+        mgr.begin_transaction("tx-protected", protected_pid)
+            .unwrap();
         mgr.record_sequence(protected_pid, 5);
 
         // Fill the map so eviction runs repeatedly, always with `protected_pid` among the

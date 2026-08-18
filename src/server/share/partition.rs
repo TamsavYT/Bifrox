@@ -330,7 +330,8 @@ impl SharePartition {
                     // and re-register fresh timers (same `expire_at`, narrower ranges) for
                     // whichever remainder pieces are still `Acquired` after the split.
                     let original_expire_at = batch.acquired_at.map(|at| at + batch.lock_timeout);
-                    if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                    if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by)
+                    {
                         timers.remove(&ExpiryTimer {
                             expire_at,
                             first_offset: batch.first_offset,
@@ -353,7 +354,9 @@ impl SharePartition {
                                 delivery_count: batch.delivery_count,
                             },
                         );
-                        if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                        if let (Some(expire_at), Some(owner)) =
+                            (original_expire_at, &batch.acquired_by)
+                        {
                             timers.insert(ExpiryTimer {
                                 expire_at,
                                 first_offset: batch.first_offset,
@@ -419,7 +422,9 @@ impl SharePartition {
                                 delivery_count: batch.delivery_count,
                             },
                         );
-                        if let (Some(expire_at), Some(owner)) = (original_expire_at, &batch.acquired_by) {
+                        if let (Some(expire_at), Some(owner)) =
+                            (original_expire_at, &batch.acquired_by)
+                        {
                             timers.insert(ExpiryTimer {
                                 expire_at,
                                 first_offset: overlap_end + 1,
@@ -566,8 +571,8 @@ mod tests {
     /// the owning `TempDir` (which must stay alive for the partition's files to persist).
     fn partition_with_records(label: &str, count: u64) -> (TempDir, PartitionManager) {
         let dir = TempDir::new(label);
-        let pm = PartitionManager::open(&dir.0, "share-test-topic", 0, EngineConfig::default())
-            .unwrap();
+        let pm =
+            PartitionManager::open(&dir.0, "share-test-topic", 0, EngineConfig::default()).unwrap();
         for i in 0..count {
             pm.produce(format!("record-{}", i).as_bytes()).unwrap();
         }
@@ -586,9 +591,7 @@ mod tests {
             0,
         );
 
-        let acquired = sp
-            .acquire_records("member-1", 3, None, &pm)
-            .unwrap();
+        let acquired = sp.acquire_records("member-1", 3, None, &pm).unwrap();
         assert_eq!(acquired.len(), 3);
         assert_eq!(
             sp.timers.read().len(),
@@ -628,9 +631,7 @@ mod tests {
             0,
         );
 
-        let acquired = sp
-            .acquire_records("member-1", 5, None, &pm)
-            .unwrap();
+        let acquired = sp.acquire_records("member-1", 5, None, &pm).unwrap();
         assert_eq!(acquired.len(), 5);
 
         // Acknowledge only the middle offset — the timer for the original full [0,4]
@@ -680,7 +681,11 @@ mod tests {
         sp.acquire_records("member-1", 1, None, &pm).unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let dlq = sp.check_lock_timeouts();
-        assert_eq!(dlq, vec![0], "delivery limit exceeded — should route to DLQ");
+        assert_eq!(
+            dlq,
+            vec![0],
+            "delivery limit exceeded — should route to DLQ"
+        );
         assert_eq!(sp.timers.read().len(), 0);
     }
 }

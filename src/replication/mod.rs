@@ -12,8 +12,8 @@ pub use metadata::MetadataRecord;
 use crate::protocol::RecordFrame;
 use bytes::BufMut;
 use dashmap::DashMap;
-use std::io::Result as IoResult;
 use parking_lot::RwLock;
+use std::io::Result as IoResult;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -174,8 +174,7 @@ impl ReplicationManager {
         // leaders start immediately accepting writes without running an election. Gated
         // on `is_controller()` too: a broker-only node must never bootstrap (or remain)
         // as the metadata Raft leader even if `role` is misconfigured as `Leader`.
-        let initial_consensus_state = if config.role == NodeRole::Leader && config.is_controller()
-        {
+        let initial_consensus_state = if config.role == NodeRole::Leader && config.is_controller() {
             ConsensusState::Leader
         } else {
             ConsensusState::Follower
@@ -586,9 +585,8 @@ impl ReplicationManager {
                                                         // so we never outrun the cluster's
                                                         // committed point.
                                                         let local_leo = pm.latest_offset();
-                                                        let follower_hw = resp
-                                                            .leader_watermark
-                                                            .min(local_leo);
+                                                        let follower_hw =
+                                                            resp.leader_watermark.min(local_leo);
                                                         pm.advance_committed_hw(follower_hw);
                                                         made_progress = applied_any;
                                                     }
@@ -877,7 +875,12 @@ impl ReplicationManager {
     /// replicating those partitions altogether. Once every partition carries a real replica
     /// set, `pull_covered` covers every peer, this filter empties the push target list on
     /// its own, and the push path can be removed with no behavior change.
-    fn replication_targets(&self, topic: &str, _partition: u32, pull_covered: &[String]) -> Vec<String> {
+    fn replication_targets(
+        &self,
+        topic: &str,
+        _partition: u32,
+        pull_covered: &[String],
+    ) -> Vec<String> {
         let exclude: std::collections::HashSet<&str> =
             pull_covered.iter().map(|s| s.as_str()).collect();
         if topic == "__cluster_metadata" {
@@ -923,6 +926,43 @@ impl ReplicationManager {
     /// the (empty) record loop and applies the watermark clamp. Failures are logged, not
     /// propagated — the write is already durable and committed on the leader, and the next
     /// push or fetch carries the watermark again.
+    /// Pushes frames to a single peer, rather than to every replication target.
+    ///
+    /// Used by the metadata catch-up sweep, which needs to send one lagging follower the
+    /// specific range it is missing — the fan-out path would re-send that range to peers
+    /// that are already current.
+    ///
+    /// On success the peer's watermark is recorded exactly as the fan-out path does, so a
+    /// caught-up follower stops being selected for catch-up on the next sweep.
+    pub async fn push_frames_to_peer(
+        &self,
+        peer_addr: &str,
+        topic: &str,
+        partition: u32,
+        fencing_epoch: u64,
+        leader_hw: u64,
+        frames: &[RecordFrame],
+    ) -> IoResult<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let last_offset = frames.last().unwrap().offset;
+        let peer_conn = self.get_or_connect_peer(peer_addr);
+        send_replication_push_pooled(
+            &peer_conn,
+            peer_addr,
+            &self.config.cluster_id,
+            topic,
+            partition,
+            fencing_epoch,
+            leader_hw,
+            frames,
+        )
+        .await?;
+        self.update_replica_watermark(topic, partition, peer_addr, last_offset);
+        Ok(())
+    }
+
     pub async fn broadcast_high_watermark(
         &self,
         topic: &str,

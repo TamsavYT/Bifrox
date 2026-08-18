@@ -1,7 +1,7 @@
-use bytes::Bytes;
 use crate::config::EngineConfig;
 use crate::protocol::RecordFrame;
 use crate::segment::SegmentManager;
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

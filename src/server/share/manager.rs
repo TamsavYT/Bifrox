@@ -351,7 +351,12 @@ impl ShareGroupManager {
         for item in self.persisted_watermarks.iter() {
             let (group_id, topic, partition) = item.key();
             let start_offset = *item.value();
-            entry_bytes.extend_from_slice(&Self::encode_entry(group_id, topic, *partition, start_offset));
+            entry_bytes.extend_from_slice(&Self::encode_entry(
+                group_id,
+                topic,
+                *partition,
+                start_offset,
+            ));
         }
 
         let tmp_path = self.state_path.with_extension("log.tmp");

@@ -44,3 +44,5 @@ plan*.md
 !packaging/**/*.md
 !docs/**/*.md
 
+# Internal docs kept out of the repo (must follow the !docs/**/*.md negation above)
+docs/HERMES_JAVA_SDK_ROADMAP.md
