@@ -319,6 +319,40 @@ where
                                     | RequestPayload::IncrementalAlterConfigs { .. }
                             );
 
+                            // Controller-mediated topic creation, deliberately *before* the
+                            // leadership check below.
+                            //
+                            // A produce naming an unregistered topic used to create a local
+                            // partition directory on whichever broker caught the request,
+                            // with no metadata record — so cluster metadata never learned
+                            // the partition existed, no follower knew to replicate it, and
+                            // neither ISR management nor failover had anything to work with.
+                            //
+                            // Creating it here means replicas are assigned before the
+                            // partition holds a single byte, and the existing forwarding
+                            // logic below then routes the produce to the assigned leader
+                            // like any other partition. Non-controllers skip this and
+                            // forward to the controller instead (see `is_partition_leader`).
+                            if let Some((topic, _)) = &target_partition {
+                                if engine.is_leader() && !engine.topic_is_registered(topic) {
+                                    let partitions = match &req.payload {
+                                        RequestPayload::ProduceBatch { num_partitions, .. } => {
+                                            *num_partitions
+                                        }
+                                        _ => 1,
+                                    };
+                                    if let Err(e) =
+                                        engine.ensure_topic_created(topic, partitions).await
+                                    {
+                                        tracing::debug!(
+                                            "Auto-create: could not create topic '{}': {}",
+                                            topic,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
                             if let Some((topic, partition)) = target_partition {
                                 if !engine.is_partition_leader(&topic, partition) {
                                     let raw_request = slice[..bytes_used].to_vec();

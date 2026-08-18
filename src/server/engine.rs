@@ -2699,6 +2699,48 @@ impl StorageEngine {
         });
     }
 
+    /// Whether cluster metadata knows this topic at all (i.e. a `TopicCreated` record has
+    /// been applied). A topic can exist as local directories without being registered —
+    /// that is exactly the state controller-mediated creation exists to prevent.
+    pub fn topic_is_registered(&self, topic: &str) -> bool {
+        self.topic_registry.contains_key(topic)
+    }
+
+    /// Creates `topic` through the controller if cluster metadata does not know it yet,
+    /// assigning replicas **before** the partition holds any data.
+    ///
+    /// This is what makes the standard full-ISR start correct: every replica of a brand-new
+    /// partition is at LEO = HW = 0, so all of them are genuinely in sync and there is no
+    /// catch-up phase to model. Creating the partition first and assigning later inverts
+    /// that ordering, which is why `reconcile_unassigned_partitions` — the repair path for
+    /// partitions created before this existed — must start the ISR with the leader alone.
+    ///
+    /// Idempotent and safe to call on every produce: a registered topic returns
+    /// immediately without proposing anything.
+    pub async fn ensure_topic_created(&self, topic: &str, num_partitions: u32) -> IoResult<()> {
+        if Self::is_system_topic(topic) || self.topic_is_registered(topic) {
+            return Ok(());
+        }
+        if !self.config.auto_create_topics_enable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Unknown topic '{}' (auto.create.topics.enable is false)",
+                    topic
+                ),
+            ));
+        }
+        if !self.is_leader() {
+            // Only the controller may propose metadata. Callers route produces for unknown
+            // topics to it (see `is_partition_leader`), so reaching here off-controller
+            // means the request arrived by another path and should not create anything.
+            return Err(std::io::Error::other(
+                "NOT_CONTROLLER: only the cluster leader may create a topic",
+            ));
+        }
+        self.create_topic(topic, num_partitions.max(1)).await
+    }
+
     /// Whether cluster metadata carries a replica assignment for this partition. A
     /// partition can exist locally (and hold data) without one — see
     /// `reconcile_unassigned_partitions`.
@@ -3293,10 +3335,21 @@ impl StorageEngine {
 
     /// Returns true if this broker node is the active leader for the specified partition.
     ///
-    /// A topic that is entirely unknown (not open, not in the registry) resolves to this
-    /// node, preserving the single-broker default where the local node leads anything it
-    /// is asked about — the produce path is what then decides, via
-    /// `get_or_create_partition_for_client`, whether the topic may actually be created.
+    /// A topic cluster metadata has never heard of resolves to this node.
+    ///
+    /// It is tempting to answer "yes" only on the controller, so that produces for new
+    /// topics route there and creation happens once in one place. That does not work while
+    /// a forwarded request is indistinguishable from an original one: the controller
+    /// creates the topic, forwards to the newly assigned leader, and that leader — which
+    /// has not yet received the assignment through the metadata log — sees an unknown topic,
+    /// concludes it is not the leader, and forwards straight back. The request ping-pongs.
+    ///
+    /// So an unknown topic is served locally, and controller-mediated creation is applied
+    /// where it is safe: on the controller, before the leadership check (see the auto-create
+    /// hook in `handler.rs`). A produce that lands directly on a non-controller still
+    /// creates an unassigned partition, which `reconcile_unassigned_partitions` repairs.
+    /// Closing that last gap needs forwarded requests to be marked as such, so the assigned
+    /// leader serves them instead of bouncing them.
     pub fn is_partition_leader(&self, topic: &str, partition: u32) -> bool {
         match self.resolve_partition_leader(topic, partition) {
             Some(leader_id) => leader_id == self.config.node_id,
