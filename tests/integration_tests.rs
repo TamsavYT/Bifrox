@@ -3797,31 +3797,13 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
         replicas
     );
 
-    // 3. Deliver the leader's full metadata log to the follower.
+    // 3. The leader back-fills the metadata the follower is missing.
     //
-    // Bootstrap records are written directly via `meta_pm.produce()` during
-    // `StorageEngine::new` (which is synchronous and so cannot call the async
-    // `propose_metadata`), meaning they are never replicated. A follower that joins after
-    // them therefore sits at offset 0, rejects the next pushed record as a Gap, and — with
-    // no pull fetcher for `__cluster_metadata` — can never catch up. That is a separate
-    // defect; this test pushes the whole log so it can get on with verifying pull.
-    let meta_frames = engine_node1
-        .get_or_create_partition("__cluster_metadata", 0)
-        .unwrap()
-        .fetch(0, 1 << 20)
-        .unwrap_or_default();
-    engine_node1
-        .replication()
-        .replicate_batch(
-            "__cluster_metadata",
-            0,
-            engine_node1.replication().get_epoch(),
-            0,
-            &[],
-            &meta_frames,
-        )
-        .await
-        .expect("metadata catch-up push should succeed");
+    // The follower joined after the leader had already written bootstrap records, which
+    // are produced locally and never replicated, so its metadata log is empty and it
+    // rejects any later record as a Gap. The catch-up sweep re-sends from the follower's
+    // last acked offset (offset 0 here, since it has never acked) and heals it.
+    engine_node1.catch_up_follower_metadata_for_test().await;
 
     // Re-assert the real addresses: the replayed `BrokerRegister` records carry each node's
     // *configured* bind address, which is "127.0.0.1:0" under an ephemeral-port test setup,
@@ -3921,4 +3903,111 @@ async fn test_scenario_46_explicit_replication_factor_is_not_silently_degraded()
         .await
         .expect("the default factor must be clamped, not rejected");
     assert!(engine.list_topics().contains(&"rf_default".to_string()));
+}
+
+/// A follower that joins a leader which has already written metadata must still receive
+/// all of it.
+///
+/// The leader's bootstrap records are produced locally and never replicated (they are
+/// written in the synchronous `StorageEngine::new`, which cannot call the async
+/// `propose_metadata`), so a fresh follower sits at offset 0 while the leader is further
+/// along. The next pushed record then lands at a non-zero offset, the follower reports a
+/// Gap and rejects it, and — with no pull fetcher for `__cluster_metadata` — nothing could
+/// ever re-send the missing prefix. The gap was permanent, which meant followers never
+/// learned partition assignments and data-topic replication silently did not happen.
+#[tokio::test]
+async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let base_dir = std::env::temp_dir().join(format!("meta_catchup_{}_{}", std::process::id(), count));
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    let engine_follower = StorageEngine::new(EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: base_dir.join("f"),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let server_f = Server::new(engine_follower.clone());
+    let (listener_f, addr_f) = server_f.bind().unwrap();
+    let task_f = tokio::spawn(async move {
+        let _ = server_f.run_with_listener(listener_f).await;
+    });
+
+    let engine_leader = StorageEngine::new(EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: base_dir.join("l"),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_f.to_string()],
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    // The leader has bootstrap metadata; the follower has none of it.
+    let leader_leo = engine_leader.latest_offset("__cluster_metadata", 0).unwrap();
+    assert!(
+        leader_leo > 0,
+        "precondition: the leader must have written bootstrap metadata"
+    );
+    assert_eq!(
+        engine_follower.latest_offset("__cluster_metadata", 0).unwrap(),
+        0,
+        "precondition: the follower joined with an empty metadata log"
+    );
+
+    // A record proposed now lands at a non-zero offset — the Gap the follower cannot bridge.
+    engine_leader
+        .create_topic("gap_topic", 1)
+        .await
+        .expect("topic creation should succeed on the leader");
+
+    // The catch-up sweep re-sends from the follower's last acked offset (never acked → 0).
+    engine_leader.catch_up_follower_metadata_for_test().await;
+
+    let mut healed = false;
+    for _ in 0..40 {
+        if engine_follower.latest_offset("__cluster_metadata", 0).unwrap_or(0) > 0 {
+            healed = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        healed,
+        "the follower must receive the metadata prefix it was missing"
+    );
+
+    // It caught up on the *content*, not merely on some offset: the topic created after it
+    // joined is now known to it.
+    let mut knows_topic = false;
+    for _ in 0..40 {
+        if engine_follower.list_topics().contains(&"gap_topic".to_string()) {
+            knows_topic = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        knows_topic,
+        "the follower should know about a topic created before it caught up; \
+         follower metadata LEO {} vs leader {}",
+        engine_follower.latest_offset("__cluster_metadata", 0).unwrap_or(0),
+        engine_leader.latest_offset("__cluster_metadata", 0).unwrap_or(0)
+    );
+
+    // Idempotent: a second pass must not re-send anything already applied.
+    let before = engine_follower.latest_offset("__cluster_metadata", 0).unwrap();
+    engine_leader.catch_up_follower_metadata_for_test().await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        engine_follower.latest_offset("__cluster_metadata", 0).unwrap(),
+        before,
+        "re-running catch-up must not duplicate records"
+    );
+
+    task_f.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
 }

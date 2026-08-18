@@ -923,6 +923,43 @@ impl ReplicationManager {
     /// the (empty) record loop and applies the watermark clamp. Failures are logged, not
     /// propagated — the write is already durable and committed on the leader, and the next
     /// push or fetch carries the watermark again.
+    /// Pushes frames to a single peer, rather than to every replication target.
+    ///
+    /// Used by the metadata catch-up sweep, which needs to send one lagging follower the
+    /// specific range it is missing — the fan-out path would re-send that range to peers
+    /// that are already current.
+    ///
+    /// On success the peer's watermark is recorded exactly as the fan-out path does, so a
+    /// caught-up follower stops being selected for catch-up on the next sweep.
+    pub async fn push_frames_to_peer(
+        &self,
+        peer_addr: &str,
+        topic: &str,
+        partition: u32,
+        fencing_epoch: u64,
+        leader_hw: u64,
+        frames: &[RecordFrame],
+    ) -> IoResult<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let last_offset = frames.last().unwrap().offset;
+        let peer_conn = self.get_or_connect_peer(peer_addr);
+        send_replication_push_pooled(
+            &peer_conn,
+            peer_addr,
+            &self.config.cluster_id,
+            topic,
+            partition,
+            fencing_epoch,
+            leader_hw,
+            frames,
+        )
+        .await?;
+        self.update_replica_watermark(topic, partition, peer_addr, last_offset);
+        Ok(())
+    }
+
     pub async fn broadcast_high_watermark(
         &self,
         topic: &str,

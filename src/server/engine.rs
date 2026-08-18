@@ -2652,6 +2652,8 @@ impl StorageEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+                // Metadata first: a follower cannot act on an assignment it never received.
+                engine.catch_up_follower_metadata().await;
                 engine.reconcile_unassigned_partitions().await;
                 engine.run_isr_and_failover_sweep_once().await;
 
@@ -2678,10 +2680,106 @@ impl StorageEngine {
             .unwrap_or(false)
     }
 
+    /// Runs one metadata catch-up pass. Exposed so tests can drive it deterministically
+    /// rather than waiting on the background timer.
+    pub async fn catch_up_follower_metadata_for_test(&self) {
+        self.catch_up_follower_metadata().await;
+    }
+
     /// Runs one assignment sweep. Exposed so tests can drive it deterministically rather
     /// than waiting on the background timer.
     pub async fn reconcile_unassigned_partitions_for_test(&self) {
         self.reconcile_unassigned_partitions().await;
+    }
+
+    /// Re-sends any `__cluster_metadata` a follower is missing.
+    ///
+    /// Without this, a follower that joins a leader which has already written metadata
+    /// receives **none of it, ever**. Two things combine to cause that:
+    ///
+    /// 1. The leader's bootstrap records (broker registration, legacy SASL users) are
+    ///    written with a direct `meta_pm.produce()` in `StorageEngine::new`, which is
+    ///    synchronous and so cannot call the async `propose_metadata` — they are appended
+    ///    locally and never pushed.
+    /// 2. The follower's log is therefore still at offset 0 when the leader pushes its next
+    ///    record at a higher offset. `append_replica_frame_verbatim` correctly reports a
+    ///    `Gap` and the batch is rejected — and since `__cluster_metadata` is deliberately
+    ///    excluded from the pull fetcher (applying its records through two paths at once
+    ///    would race), nothing could ever re-send the missing prefix.
+    ///
+    /// The gap was permanent, and because partition assignments travel through this log it
+    /// meant followers never learned they were replicas — so data-topic replication
+    /// silently did not happen, and ISR and failover had nothing to work with.
+    ///
+    /// This closes it without a wire change: the leader already records each peer's acked
+    /// metadata offset, and `append_verbatim` treats an already-applied offset as a no-op,
+    /// so re-sending from the peer's last known position is both sufficient and safe. A
+    /// peer that has never acked is sent the log from offset 0.
+    async fn catch_up_follower_metadata(&self) {
+        if !self.is_leader() || self.config.peer_addrs.is_empty() {
+            return;
+        }
+        let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) else {
+            return;
+        };
+        let leo = meta_pm.latest_offset();
+        if leo == 0 {
+            return; // nothing written yet
+        }
+
+        // Bound the per-sweep work: the first catch-up after a follower joins could
+        // otherwise ship an entire metadata history in one batch.
+        const MAX_CATCHUP_BYTES: u32 = 1 << 20;
+
+        let fencing_epoch = self.replication.get_epoch();
+        let leader_hw = meta_pm.high_watermark();
+
+        for peer in &self.config.peer_addrs {
+            // `Some(w)` is the highest offset this peer has confirmed; `None` means it has
+            // never acked anything, so it needs the log from the very beginning.
+            let from = match self
+                .replication
+                .replica_watermark("__cluster_metadata", 0, peer)
+            {
+                Some(acked) => acked + 1,
+                None => 0,
+            };
+            if from >= leo {
+                continue; // already current
+            }
+
+            let frames = match meta_pm.fetch(from, MAX_CATCHUP_BYTES) {
+                Ok(frames) if !frames.is_empty() => frames,
+                _ => continue,
+            };
+
+            match self
+                .replication
+                .push_frames_to_peer(
+                    peer,
+                    "__cluster_metadata",
+                    0,
+                    fencing_epoch,
+                    leader_hw,
+                    &frames,
+                )
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    "Metadata catch-up: sent {} record(s) from offset {} to {} (leader LEO {})",
+                    frames.len(),
+                    from,
+                    peer,
+                    leo
+                ),
+                Err(e) => tracing::debug!(
+                    "Metadata catch-up: failed to back-fill {} from offset {}: {}",
+                    peer,
+                    from,
+                    e
+                ),
+            }
+        }
     }
 
     /// Publishes a replica assignment for partitions that don't have one.
