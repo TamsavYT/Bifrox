@@ -32,6 +32,15 @@ pub enum MetadataRecord {
         leader_id: u32,
         leader_epoch: u32,
         isr: Vec<u32>,
+        /// The partition's full replica set, when this record is establishing one.
+        ///
+        /// `None` means "leave the existing roster alone, this record only moves the ISR"
+        /// — which is what every leadership/ISR update should do, and how records written
+        /// before this field existed decode. `Some` is used when assigning a roster to a
+        /// partition that had none (see `StorageEngine::reconcile_unassigned_partitions`);
+        /// without it there would be no way to publish a replica set at all, since the
+        /// record otherwise carries only the ISR.
+        replicas: Option<Vec<u32>>,
     },
     AclCreated {
         binding: crate::server::acl::AclBinding,
@@ -121,6 +130,7 @@ impl MetadataRecord {
                 leader_id,
                 leader_epoch,
                 isr,
+                replicas,
             } => {
                 buf.put_u8(0x05); // record type
                 crate::protocol::wire::write_pascal_string(&mut buf, topic);
@@ -130,6 +140,15 @@ impl MetadataRecord {
                 buf.put_u32(isr.len() as u32);
                 for &id in isr {
                     buf.put_u32(id);
+                }
+                // Optional trailing replica set. Absent means "don't touch the roster",
+                // which is what records written before this field existed meant, so old
+                // metadata logs replay unchanged.
+                if let Some(replicas) = replicas {
+                    buf.put_u32(replicas.len() as u32);
+                    for &id in replicas {
+                        buf.put_u32(id);
+                    }
                 }
             }
             MetadataRecord::AclCreated { binding } => {
@@ -313,12 +332,31 @@ impl MetadataRecord {
                 for _ in 0..isr_len {
                     isr.push(src.get_u32());
                 }
+                // Optional trailing replica set; absent in records written before the
+                // field existed, which means "leave the roster alone".
+                let replicas = if src.len() >= 4 {
+                    let replica_len = src.get_u32() as usize;
+                    if src.len() < replica_len * 4 {
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete replica list",
+                        ));
+                    }
+                    let mut replicas = Vec::with_capacity(replica_len);
+                    for _ in 0..replica_len {
+                        replicas.push(src.get_u32());
+                    }
+                    Some(replicas)
+                } else {
+                    None
+                };
                 Ok(MetadataRecord::PartitionLeadershipChange {
                     topic,
                     partition,
                     leader_id,
                     leader_epoch,
                     isr,
+                    replicas,
                 })
             }
             0x06 | 0x07 => {

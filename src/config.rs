@@ -342,6 +342,18 @@ pub struct EngineConfig {
     /// handling threads the way Kafka does, so this sizes the whole async runtime).
     /// `None` uses Tokio's own default (one per logical CPU).
     pub num_network_threads: Option<usize>,
+    /// Whether the controller publishes a replica assignment for partitions that don't
+    /// have one (see `StorageEngine::reconcile_unassigned_partitions`).
+    ///
+    /// A partition created implicitly by a produce gets no `PartitionLeadershipChange`
+    /// record, so cluster metadata never learns who should hold it. Such a partition has
+    /// no ISR to manage and nothing to fail over to — a follower may physically hold a
+    /// complete copy while metadata does not consider it a replica at all. This sweep
+    /// retrofits an assignment onto those partitions without moving any data.
+    ///
+    /// Turning it off leaves implicitly-created partitions unreplicated and unable to fail
+    /// over, which is the pre-existing behavior.
+    pub auto_assign_partitions_enable: bool,
     /// How long a consumer group's join window stays open for further members to arrive
     /// before the coordinator forms the generation and replies to everyone waiting
     /// (Kafka `group.initial.rebalance.delay.ms`).
@@ -399,10 +411,13 @@ impl Default for EngineConfig {
             bind_addr: "127.0.0.1:9092".to_string(),
             peer_addrs: Vec::new(),
             min_insync_replicas: 1,
-            default_replication_factor: 1,
+            // Clamped to the number of available brokers at assignment time, so a
+            // single-node deployment still lands on 1.
+            default_replication_factor: 3,
             segment_ms: None,
             message_max_bytes: None,
             num_network_threads: None,
+            auto_assign_partitions_enable: true,
             group_initial_rebalance_delay_ms: 3_000,
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
@@ -609,6 +624,11 @@ impl EngineConfig {
                     "group.initial.rebalance.delay.ms" => {
                         if let Ok(v) = value.parse::<u64>() {
                             config.group_initial_rebalance_delay_ms = v;
+                        }
+                    }
+                    "auto.assign.partitions.enable" => {
+                        if let Ok(v) = value.parse::<bool>() {
+                            config.auto_assign_partitions_enable = v;
                         }
                     }
                     "auto.create.topics.enable" => {

@@ -742,6 +742,7 @@ impl StorageEngine {
                     leader_id: assign.leader_id,
                     leader_epoch: assign.leader_epoch,
                     isr: assign.isr.clone(),
+                    replicas: Some(assign.replicas.clone()),
                 });
             }
             if !cfg.configs.is_empty() {
@@ -956,6 +957,7 @@ impl StorageEngine {
                 leader_id,
                 leader_epoch,
                 isr,
+                replicas,
             } => {
                 // Preserve the configured replica set; only the ISR moves here.
                 //
@@ -975,16 +977,20 @@ impl StorageEngine {
                 // it, else from the live partition, and only falls back to the ISR when
                 // this broker has genuinely never seen the partition before (first
                 // observation, where the ISR is the only roster information available).
-                let known_replicas = self
-                    .topic_registry
-                    .get(&topic)
-                    .and_then(|cfg| cfg.partitions.get(&partition).map(|a| a.replicas.clone()))
-                    .filter(|r| !r.is_empty())
-                    .or_else(|| {
-                        self.get_partition(&topic, partition)
-                            .map(|pm| pm.replicas())
-                            .filter(|r| !r.is_empty())
-                    });
+                // An explicit roster on the record wins: that is the record *establishing*
+                // a replica set (assignment or reassignment). Otherwise this is an
+                // ordinary leadership/ISR update, which must leave the roster untouched.
+                let known_replicas = replicas.filter(|r| !r.is_empty()).or_else(|| {
+                    self.topic_registry
+                        .get(&topic)
+                        .and_then(|cfg| cfg.partitions.get(&partition).map(|a| a.replicas.clone()))
+                        .filter(|r| !r.is_empty())
+                        .or_else(|| {
+                            self.get_partition(&topic, partition)
+                                .map(|pm| pm.replicas())
+                                .filter(|r| !r.is_empty())
+                        })
+                });
                 let replicas = known_replicas.unwrap_or_else(|| isr.clone());
 
                 // The ISR must always be a subset of the roster. If leadership hands us an
@@ -1320,6 +1326,8 @@ impl StorageEngine {
             leader_id,
             leader_epoch,
             isr,
+            // ISR-only update: the roster is deliberately left alone.
+            replicas: None,
         };
         self.propose_metadata_unchecked(record).await
     }
@@ -1348,6 +1356,9 @@ impl StorageEngine {
             leader_id: new_leader_id,
             leader_epoch: new_leader_epoch,
             isr,
+            // Failover moves leadership, never the roster — offline replicas must stay
+            // on it so they can rejoin when they return.
+            replicas: None,
         };
         self.propose_metadata_unchecked(record).await
     }
@@ -2559,6 +2570,7 @@ impl StorageEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+                engine.reconcile_unassigned_partitions().await;
                 engine.run_isr_and_failover_sweep_once().await;
 
                 // Piggybacked on the same tick rather than a dedicated task: cheap to
@@ -2572,6 +2584,157 @@ impl StorageEngine {
                 .await;
             }
         });
+    }
+
+    /// Whether cluster metadata carries a replica assignment for this partition. A
+    /// partition can exist locally (and hold data) without one — see
+    /// `reconcile_unassigned_partitions`.
+    pub fn has_partition_assignment(&self, topic: &str, partition: u32) -> bool {
+        self.topic_registry
+            .get(topic)
+            .map(|cfg| cfg.partitions.contains_key(&partition))
+            .unwrap_or(false)
+    }
+
+    /// Runs one assignment sweep. Exposed so tests can drive it deterministically rather
+    /// than waiting on the background timer.
+    pub async fn reconcile_unassigned_partitions_for_test(&self) {
+        self.reconcile_unassigned_partitions().await;
+    }
+
+    /// Publishes a replica assignment for partitions that don't have one.
+    ///
+    /// A partition created implicitly by a produce never gets a `PartitionLeadershipChange`
+    /// record: `get_or_create_partition` opens the local log and nothing else. Cluster
+    /// metadata therefore has no idea the partition exists, which disables three things at
+    /// once — no follower knows to fetch it (so it is never really replicated), the ISR
+    /// sweep has no membership to manage, and failover has nothing to promote if the holder
+    /// dies. A follower can end up physically holding a complete copy while metadata does
+    /// not consider it a replica at all.
+    ///
+    /// This retrofits an assignment onto such partitions **without moving any data**: the
+    /// broker currently holding the partition is named leader, and the ISR starts as just
+    /// that broker. The other replicas join through the normal catch-up path once their
+    /// fetchers start, exactly as they would after falling behind.
+    ///
+    /// Detection is by absence from `topic_registry[topic].partitions`, not by an empty
+    /// replica list — a freshly opened `PartitionManager` defaults to `leader_id = self`
+    /// and `replicas = [self]`, so an unassigned partition looks locally "owned" and its
+    /// replica list is never empty.
+    async fn reconcile_unassigned_partitions(&self) {
+        if !self.config.auto_assign_partitions_enable || !self.is_leader() {
+            return;
+        }
+        let brokers = self.available_broker_ids();
+        if brokers.is_empty() {
+            return;
+        }
+
+        // Bound the work per sweep. The first run after enabling this on an existing
+        // cluster could otherwise propose thousands of metadata records back to back,
+        // and every proposal is a replicated write.
+        const MAX_ASSIGNMENTS_PER_SWEEP: usize = 50;
+
+        let unassigned: Vec<(String, u32)> = self
+            .partitions
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|(topic, partition)| {
+                if Self::is_system_topic(topic) {
+                    return false;
+                }
+                !self
+                    .topic_registry
+                    .get(topic)
+                    .map(|cfg| cfg.partitions.contains_key(partition))
+                    .unwrap_or(false)
+            })
+            .take(MAX_ASSIGNMENTS_PER_SWEEP)
+            .collect();
+
+        for (topic, partition) in unassigned {
+            let Some(pm) = self.get_partition(&topic, partition) else {
+                continue;
+            };
+
+            // Keep the current holder as leader where it is a broker we can still see;
+            // otherwise fall back to this node, which is the one doing the assigning.
+            let current_leader = pm.leader_id();
+            let leader_id = if brokers.contains(&current_leader) {
+                current_leader
+            } else {
+                self.config.node_id
+            };
+
+            let rf = std::cmp::min(
+                self.config.default_replication_factor.max(1) as usize,
+                brokers.len(),
+            );
+            // Leader first, then the remaining brokers in id order, so assignment is
+            // deterministic and every partition of a topic doesn't pile onto one follower.
+            let mut replicas = Vec::with_capacity(rf);
+            replicas.push(leader_id);
+            for &b in &brokers {
+                if replicas.len() >= rf {
+                    break;
+                }
+                if b != leader_id {
+                    replicas.push(b);
+                }
+            }
+
+            // Register the topic first if this broker only ever knew it implicitly —
+            // `PartitionLeadershipChange` is applied into `topic_registry[topic]`, so
+            // without a `TopicCreated` record there is nothing to apply it into.
+            if !self.topic_registry.contains_key(&topic) {
+                let num_partitions = self
+                    .topic_partitions
+                    .get(&topic)
+                    .map(|set| set.len() as u32)
+                    .unwrap_or(1)
+                    .max(partition + 1);
+                let record = crate::replication::MetadataRecord::TopicCreated {
+                    topic: topic.clone(),
+                    num_partitions,
+                    replication_factor: rf as u16,
+                };
+                if let Err(e) = self.propose_metadata(record).await {
+                    tracing::warn!(
+                        "Assignment sweep: failed to register implicitly-created topic '{}': {}",
+                        topic,
+                        e
+                    );
+                    continue;
+                }
+            }
+
+            let record = crate::replication::MetadataRecord::PartitionLeadershipChange {
+                topic: topic.clone(),
+                partition,
+                leader_id,
+                leader_epoch: pm.leader_epoch(),
+                // Only the leader is in-sync to begin with. The new replicas have none of
+                // the data yet; claiming otherwise would let `acks=all` succeed against
+                // brokers that hold nothing.
+                isr: vec![leader_id],
+                replicas: Some(replicas.clone()),
+            };
+            match self.propose_metadata(record).await {
+                Ok(_) => tracing::info!(
+                    "Assignment sweep: {}-{} had no replica assignment — assigned leader {} with replicas {:?}",
+                    topic,
+                    partition,
+                    leader_id,
+                    replicas
+                ),
+                Err(e) => tracing::warn!(
+                    "Assignment sweep: failed to assign {}-{}: {}",
+                    topic,
+                    partition,
+                    e
+                ),
+            }
+        }
     }
 
     async fn run_isr_and_failover_sweep_once(&self) {
@@ -2789,6 +2952,7 @@ impl StorageEngine {
                 leader_id,
                 leader_epoch: 0,
                 isr,
+                replicas: Some(replicas.clone()),
             };
             // Likewise applies topic_registry.partitions + pm.update_leadership itself.
             self.propose_metadata(plc_record).await?;

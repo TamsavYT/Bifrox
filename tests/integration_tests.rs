@@ -3651,3 +3651,70 @@ async fn test_scenario_43_scram_credentials_are_per_mechanism() {
         "deleting a user must not leave them able to authenticate under another hash"
     );
 }
+
+/// A partition created implicitly by a produce must end up with a real replica assignment.
+///
+/// `get_or_create_partition` opens the local log and writes no metadata, so cluster
+/// metadata never learned such a partition existed: no follower knew to fetch it, the ISR
+/// sweep had no membership to manage, and failover had nothing to promote. The controller
+/// now retrofits an assignment onto it without moving data.
+#[tokio::test]
+async fn test_scenario_44_unassigned_partitions_get_a_replica_assignment() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    let self_id = engine.config().node_id;
+
+    // Two extra brokers, so a replication factor above 1 is actually satisfiable.
+    engine.register_broker_address(self_id + 1, "127.0.0.1:19601".to_string());
+    engine.register_broker_address(self_id + 2, "127.0.0.1:19602".to_string());
+
+    // Implicit creation: exactly what a produce to an unknown topic does.
+    let pm = engine.get_or_create_partition("implicit_topic", 0).unwrap();
+    assert!(
+        engine.describe_topic("implicit_topic").is_some(),
+        "the partition exists locally"
+    );
+    // ...but cluster metadata has no assignment for it yet.
+    assert!(
+        !engine.has_partition_assignment("implicit_topic", 0),
+        "precondition: an implicitly created partition starts unassigned"
+    );
+
+    engine.reconcile_unassigned_partitions_for_test().await;
+
+    assert!(
+        engine.has_partition_assignment("implicit_topic", 0),
+        "the sweep must publish an assignment for an unassigned partition"
+    );
+
+    // Leadership stayed put — assignment must not move data.
+    assert_eq!(
+        pm.leader_id(),
+        self_id,
+        "the broker already holding the partition must remain its leader"
+    );
+
+    // A real roster spanning the available brokers, with only the leader in-sync: the new
+    // replicas hold none of the data yet.
+    let replicas = pm.replicas();
+    assert!(
+        replicas.len() > 1,
+        "expected a multi-broker roster, got {:?}",
+        replicas
+    );
+    assert!(replicas.contains(&self_id), "the leader must be on the roster");
+    assert_eq!(
+        pm.isr(),
+        vec![self_id],
+        "only the leader is in-sync immediately after assignment"
+    );
+
+    // Idempotent: a second sweep must not churn the assignment.
+    let epoch_before = pm.leader_epoch();
+    engine.reconcile_unassigned_partitions_for_test().await;
+    assert_eq!(
+        pm.leader_epoch(),
+        epoch_before,
+        "an already-assigned partition must not be reassigned on every sweep"
+    );
+}
