@@ -1326,6 +1326,9 @@ fn decode_heartbeat_packet(
 /// caller must close the connection rather than fall back, since a partial response would
 /// otherwise corrupt the client's read stream.
 #[cfg(any(windows, target_os = "linux"))]
+// The parameters are the fetch request's fields plus the connection identity needed to
+// authorize it; grouping them into a struct would just move the same list behind a name.
+#[allow(clippy::too_many_arguments)]
 async fn try_zero_copy_fetch(
     engine: &StorageEngine,
     socket: &mut TcpStream,
@@ -2917,12 +2920,11 @@ mod grpc_replication_fetch_tests {
         let framed = frame_request(&req);
         decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
 
-        assert_eq!(
+        assert!(
             engine
                 .replication()
                 .replica_ack_age("t", 0, "127.0.0.1:9999")
                 .is_some(),
-            true,
             "a fetch request should record this follower's progress the same way a push ack does"
         );
     }

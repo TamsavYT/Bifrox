@@ -982,6 +982,12 @@ impl SegmentManager {
             let is_tombstone = value.is_some_and(|v| v.is_empty());
             observe(key, frame.offset, frame.timestamp, is_tombstone);
         }
+        // Load-bearing despite the closure having no `Drop` impl: `observe` holds a mutable
+        // borrow of `latest`, and moving it here is what releases that borrow so `latest`
+        // can be read below. Clippy's `drop_non_drop` only considers `Drop` semantics, not
+        // the borrow ending, so it flags this as pointless when removing it would not
+        // compile.
+        #[allow(clippy::drop_non_drop)]
         drop(observe);
 
         if latest.is_empty() {

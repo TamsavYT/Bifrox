@@ -240,9 +240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             while sent < num_records {
                 let this_batch = batch_size.min(num_records - sent) as usize;
-                let records: Vec<&[u8]> = std::iter::repeat(payload.as_slice())
-                    .take(this_batch)
-                    .collect();
+                let records: Vec<&[u8]> =
+                    std::iter::repeat_n(payload.as_slice(), this_batch).collect();
 
                 let req_start = std::time::Instant::now();
                 let res = client
@@ -328,20 +327,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let target_messages: u64 = get_arg_val(&args, "--messages")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10_000);
-            let from_beginning = has_flag(&args, "--from-beginning");
+            // `--from-beginning` is accepted for symmetry with the other consume commands
+            // but needs no binding here: this path already starts at 0 unless `--offset`
+            // says otherwise.
             let max_bytes: u32 = get_arg_val(&args, "--max-bytes")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1024 * 1024);
 
-            let mut next_offset: u64 = if let Some(explicit) =
-                get_arg_val(&args, "--offset").and_then(|s| s.parse().ok())
-            {
-                explicit
-            } else if from_beginning {
-                0
-            } else {
-                0
-            };
+            // `--from-beginning` and the no-flag default both start at 0, so only an
+            // explicit `--offset` changes the starting point.
+            let mut next_offset: u64 = get_arg_val(&args, "--offset")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
 
             println!("============================================================");
             println!("   HERMES CONSUMER PERFORMANCE TEST");
