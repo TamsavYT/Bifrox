@@ -280,8 +280,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if since_report >= 1.0 {
                     let interval_records = sent - last_report_count;
                     let rate = interval_records as f64 / since_report;
-                    let mb_rate =
-                        (interval_records * record_size as u64) as f64 / (1024.0 * 1024.0) / since_report;
+                    let mb_rate = (interval_records * record_size as u64) as f64
+                        / (1024.0 * 1024.0)
+                        / since_report;
                     println!(
                         "  {:>10} records sent, {:>10.1} records/sec ({:>6.2} MB/sec)",
                         sent, rate, mb_rate
@@ -362,7 +363,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             const MAX_EMPTY_FETCH_STREAK: u32 = 20;
 
             while consumed < target_messages {
-                match client.fetch(&topic, partition, next_offset, max_bytes).await {
+                match client
+                    .fetch(&topic, partition, next_offset, max_bytes)
+                    .await
+                {
                     Ok(frames) if !frames.is_empty() => {
                         empty_fetch_streak = 0;
                         for frame in &frames {
@@ -398,7 +402,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if since_report >= 1.0 {
                     let interval_records = consumed - last_report_count;
                     let rate = interval_records as f64 / since_report;
-                    println!("  {:>10} messages consumed, {:>10.1} msg/sec", consumed, rate);
+                    println!(
+                        "  {:>10} messages consumed, {:>10.1} msg/sec",
+                        consumed, rate
+                    );
                     last_report = now;
                     last_report_count = consumed;
                 }
@@ -688,7 +695,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let group_id =
                 get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
             let (state, members) = client.describe_group(&group_id).await?;
-            println!("👥 Consumer Group '{}' on Server {}:", group_id, server_addr);
+            println!(
+                "👥 Consumer Group '{}' on Server {}:",
+                group_id, server_addr
+            );
             println!("  State:   {}", state);
             println!("  Members: {}", members.len());
             println!("------------------------------------------------------------------");
@@ -913,15 +923,11 @@ fn print_usage() {
     println!(
         "                  --topic <NAME> [--messages a,b,c | --stdin] [--key <KEY>] [--partitions <N>] [--tx-id <ID>]"
     );
-    println!(
-        "  perf-produce    Producer performance test (like kafka-producer-perf-test.sh)"
-    );
+    println!("  perf-produce    Producer performance test (like kafka-producer-perf-test.sh)");
     println!(
         "                  --topic <NAME> [--num-records <N>] [--record-size <BYTES>] [--batch-size <N>] [--throughput <N>] [--partitions <N>]"
     );
-    println!(
-        "  perf-consume    Consumer performance test (like kafka-consumer-perf-test.sh)"
-    );
+    println!("  perf-consume    Consumer performance test (like kafka-consumer-perf-test.sh)");
     println!(
         "                  --topic <NAME> [--partition <ID>] [--messages <N>] [--offset <N> | --from-beginning] [--max-bytes <N>]"
     );

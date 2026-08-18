@@ -155,8 +155,7 @@ impl Server {
                     // blocking fsync I/O across every partition.
                     let engine_for_blocking = engine_clone.clone();
                     let result =
-                        tokio::task::spawn_blocking(move || engine_for_blocking.flush_all())
-                            .await;
+                        tokio::task::spawn_blocking(move || engine_for_blocking.flush_all()).await;
                     match result {
                         Ok(Err(err)) => {
                             tracing::error!("Background WAL periodic flush error: {}", err);

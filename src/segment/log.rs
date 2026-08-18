@@ -58,11 +58,19 @@ pub fn fsync_dir(dir: impl AsRef<Path>) {
         match std::fs::File::open(dir) {
             Ok(f) => {
                 if let Err(e) = f.sync_all() {
-                    tracing::warn!("fsync_dir: failed to sync directory {}: {}", dir.display(), e);
+                    tracing::warn!(
+                        "fsync_dir: failed to sync directory {}: {}",
+                        dir.display(),
+                        e
+                    );
                 }
             }
             Err(e) => {
-                tracing::warn!("fsync_dir: failed to open directory {}: {}", dir.display(), e);
+                tracing::warn!(
+                    "fsync_dir: failed to open directory {}: {}",
+                    dir.display(),
+                    e
+                );
             }
         }
     }
@@ -72,7 +80,9 @@ pub fn fsync_dir(dir: impl AsRef<Path>) {
         // FILE_FLAG_BACKUP_SEMANTICS), so this goes through the Win32 API directly.
         // NTFS still allows flushing a directory handle's metadata this way.
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
             FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -134,7 +144,15 @@ impl LogSegment {
         preallocate: bool,
         index_segment: &mut IndexSegment,
     ) -> IoResult<Self> {
-        Self::open_with_trust(dir, base_offset, max_bytes, index_interval, preallocate, index_segment, false)
+        Self::open_with_trust(
+            dir,
+            base_offset,
+            max_bytes,
+            index_interval,
+            preallocate,
+            index_segment,
+            false,
+        )
     }
 
     /// Same as `open`, but lets the caller assert that `index_segment`'s persisted entries
@@ -478,7 +496,6 @@ impl LogSegment {
             .unwrap_or_default()
             .as_millis() as u64)
     }
-
 }
 
 /// OS-native zero-copy transmit of `physical_len` bytes starting at `physical_start` in
@@ -569,10 +586,9 @@ pub async fn transmit_zero_copy(
 
     let raw_file = file.as_raw_fd();
     let raw_socket = socket.as_raw_fd();
-    let end = physical_start
-        .checked_add(physical_len)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero-copy range overflow"))?
-        as libc::off_t;
+    let end = physical_start.checked_add(physical_len).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero-copy range overflow")
+    })? as libc::off_t;
     let mut offset = physical_start as libc::off_t;
 
     while offset < end {
@@ -582,7 +598,11 @@ pub async fn transmit_zero_copy(
         let (sent, new_offset, io_err) = tokio::task::spawn_blocking(move || {
             let mut off = offset;
             let n = unsafe { libc::sendfile(raw_socket, raw_file, &mut off, remaining) };
-            let err = if n < 0 { Some(std::io::Error::last_os_error()) } else { None };
+            let err = if n < 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
             (n, off, err)
         })
         .await

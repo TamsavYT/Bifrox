@@ -160,7 +160,8 @@ impl AclManager {
     /// literal-looking `"*"` binding must still land in `patterned` — keying it under the
     /// literal string `"*"` would make it invisible to a lookup for any other name.
     fn bucket_key(binding: &AclBinding) -> Option<(u8, String)> {
-        if binding.pattern_type == ResourcePatternType::Literal as u8 && binding.resource_name != "*"
+        if binding.pattern_type == ResourcePatternType::Literal as u8
+            && binding.resource_name != "*"
         {
             Some((binding.resource_type, binding.resource_name.clone()))
         } else {
@@ -243,15 +244,19 @@ impl AclManager {
             let match_principal = filter.principal.is_empty()
                 || filter.principal == "*"
                 || filter.principal == b.principal;
-            let match_host =
-                filter.host.is_empty() || filter.host == "*" || filter.host == b.host;
-            let match_op = filter.operation == 1
-                || filter.operation == 0
-                || filter.operation == b.operation;
+            let match_host = filter.host.is_empty() || filter.host == "*" || filter.host == b.host;
+            let match_op =
+                filter.operation == 1 || filter.operation == 0 || filter.operation == b.operation;
             let match_perm = filter.permission_type == 1
                 || filter.permission_type == 0
                 || filter.permission_type == b.permission_type;
-            if match_res_type && match_res_name && match_principal && match_host && match_op && match_perm {
+            if match_res_type
+                && match_res_name
+                && match_principal
+                && match_host
+                && match_op
+                && match_perm
+            {
                 out.push(b.clone());
             }
         });
@@ -605,7 +610,10 @@ mod tests {
         );
         assert!(mgr.add_acl(literal.clone()));
         assert!(mgr.add_acl(prefixed.clone()));
-        assert!(!mgr.add_acl(literal.clone()), "duplicate insert should report false");
+        assert!(
+            !mgr.add_acl(literal.clone()),
+            "duplicate insert should report false"
+        );
 
         let all = mgr.list_acls(&binding(
             ResourceType::Any,

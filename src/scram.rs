@@ -168,7 +168,8 @@ impl ScramCredential {
     }
 
     pub(crate) fn verify_client_proof(&self, auth_message: &str, proof: &[u8]) -> bool {
-        let client_signature = scram_hmac(self.mechanism, &self.stored_key, auth_message.as_bytes());
+        let client_signature =
+            scram_hmac(self.mechanism, &self.stored_key, auth_message.as_bytes());
         if client_signature.len() != proof.len() {
             return false;
         }
@@ -183,7 +184,8 @@ impl ScramCredential {
     }
 
     pub(crate) fn build_server_final(&self, auth_message: &str) -> String {
-        let server_signature = scram_hmac(self.mechanism, &self.server_key, auth_message.as_bytes());
+        let server_signature =
+            scram_hmac(self.mechanism, &self.server_key, auth_message.as_bytes());
         format!("v={}", BASE64_STANDARD.encode(server_signature))
     }
 }
@@ -297,8 +299,7 @@ mod tests {
         let salt = vec![7u8; 16];
         let sha256 =
             ScramCredential::from_password("u", "pw", ScramMechanism::Sha256, 4096, salt.clone());
-        let sha512 =
-            ScramCredential::from_password("u", "pw", ScramMechanism::Sha512, 4096, salt);
+        let sha512 = ScramCredential::from_password("u", "pw", ScramMechanism::Sha512, 4096, salt);
 
         assert_eq!(sha256.stored_key.len(), 32);
         assert_eq!(sha512.stored_key.len(), 64);
@@ -314,7 +315,8 @@ mod tests {
     #[test]
     fn credential_verifies_only_under_its_own_mechanism() {
         for mechanism in [ScramMechanism::Sha256, ScramMechanism::Sha512] {
-            let cred = ScramCredential::generate("alice", "correct horse", mechanism, 4096).unwrap();
+            let cred =
+                ScramCredential::generate("alice", "correct horse", mechanism, 4096).unwrap();
             assert_eq!(cred.mechanism, mechanism);
             assert!(cred.verify_password("correct horse"));
             assert!(!cred.verify_password("wrong horse"));

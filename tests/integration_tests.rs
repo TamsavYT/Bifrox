@@ -443,7 +443,10 @@ async fn test_scenario_7_milestone3_features() {
         role: hermes::NodeRole::Leader,
         peer_addrs: Vec::new(),
         min_insync_replicas: 1,
-        roles: vec![hermes::config::ProcessRole::Controller, hermes::config::ProcessRole::Broker],
+        roles: vec![
+            hermes::config::ProcessRole::Controller,
+            hermes::config::ProcessRole::Broker,
+        ],
         controller_peer_addrs: Vec::new(),
     };
     let repl_mgr = hermes::ReplicationManager::new(
@@ -455,7 +458,9 @@ async fn test_scenario_7_milestone3_features() {
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
 
     let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
-    let res = repl_mgr.replicate_batch("events", 0, 0, 0, &[], &[frame]).await;
+    let res = repl_mgr
+        .replicate_batch("events", 0, 0, 0, &[], &[frame])
+        .await;
     assert!(res.is_ok());
 
     let _ = std::fs::remove_dir_all(&test_dir);
@@ -484,7 +489,10 @@ async fn test_scenario_8_kraft_grpc_isr() {
         role: hermes::NodeRole::Leader,
         peer_addrs: vec!["127.0.0.1:9093".to_string()],
         min_insync_replicas: 2,
-        roles: vec![hermes::config::ProcessRole::Controller, hermes::config::ProcessRole::Broker],
+        roles: vec![
+            hermes::config::ProcessRole::Controller,
+            hermes::config::ProcessRole::Broker,
+        ],
         controller_peer_addrs: Vec::new(),
     };
     let repl_mgr = hermes::ReplicationManager::new(
@@ -2333,7 +2341,10 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
         .join("00000000000000000000.log");
     let log_bytes = std::fs::read(&log_file_path).unwrap();
     let (disk_frame, _) = hermes::protocol::RecordFrame::decode(&log_bytes).unwrap();
-    assert_eq!(disk_frame.magic, hermes::protocol::COMPRESSED_ZSTD_MAGIC_BYTE);
+    assert_eq!(
+        disk_frame.magic,
+        hermes::protocol::COMPRESSED_ZSTD_MAGIC_BYTE
+    );
 }
 
 #[tokio::test]
@@ -2486,9 +2497,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
 
 #[tokio::test]
 async fn test_scenario_31_share_consumer_and_queue_semantics() {
-    use hermes::{
-        AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest,
-    };
+    use hermes::{AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -2755,10 +2764,7 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
         .share_groups()
         .get_or_create_partition(group_id, topic, 0);
     // All offsets 0..=5 were acknowledged or archived, so start_offset is 6
-    assert_eq!(
-        sp.start_offset.load(std::sync::atomic::Ordering::SeqCst),
-        6
-    );
+    assert_eq!(sp.start_offset.load(std::sync::atomic::Ordering::SeqCst), 6);
 }
 
 #[tokio::test]
@@ -2787,8 +2793,14 @@ async fn test_scenario_32_dynamic_topic_configs() {
 
     let after_alter = client.describe_configs(topic).await.unwrap();
     let as_map: std::collections::HashMap<String, String> = after_alter.into_iter().collect();
-    assert_eq!(as_map.get("cleanup.policy").map(String::as_str), Some("compact"));
-    assert_eq!(as_map.get("retention.ms").map(String::as_str), Some("3600000"));
+    assert_eq!(
+        as_map.get("cleanup.policy").map(String::as_str),
+        Some("compact")
+    );
+    assert_eq!(
+        as_map.get("retention.ms").map(String::as_str),
+        Some("3600000")
+    );
 
     // The recognized keys must actually take effect on the live partition, not just be
     // stored — this is what distinguishes a real dynamic-config API from a no-op one.
@@ -2825,7 +2837,10 @@ async fn test_scenario_32_dynamic_topic_configs() {
     // 4. AlterConfigs/DescribeConfigs against an unknown topic is rejected, not silently
     // accepted.
     let err = client
-        .alter_configs("no-such-topic", &[("retention.ms".to_string(), "1".to_string())])
+        .alter_configs(
+            "no-such-topic",
+            &[("retention.ms".to_string(), "1".to_string())],
+        )
         .await;
     assert!(err.is_err());
 }
@@ -2917,7 +2932,12 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
         },
     ];
     let a_assignment_gen2 = client_a
-        .sync_group(group_id, rejoin_a.generation_id, "member-a", &assignment_gen2)
+        .sync_group(
+            group_id,
+            rejoin_a.generation_id,
+            "member-a",
+            &assignment_gen2,
+        )
         .await
         .expect("leader sync for generation 2 should succeed");
     assert_eq!(a_assignment_gen2, vec![(topic.to_string(), vec![0])]);
@@ -2961,7 +2981,9 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
         .await
         .expect("second eager join should succeed");
 
-    let eager_stale_heartbeat = client_c.heartbeat(eager_group, join_c.generation_id, "member-c").await;
+    let eager_stale_heartbeat = client_c
+        .heartbeat(eager_group, join_c.generation_id, "member-c")
+        .await;
     assert!(eager_stale_heartbeat.is_err());
     assert!(eager_stale_heartbeat
         .unwrap_err()
@@ -3066,7 +3088,13 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
     // Producing via the controller-only node must transparently forward to the actual
     // (broker-only) partition leader rather than failing or mishandling the write.
     let prod_res = client_controller
-        .produce_single(topic, "", None, 2, "hello from a controller-only entrypoint")
+        .produce_single(
+            topic,
+            "",
+            None,
+            2,
+            "hello from a controller-only entrypoint",
+        )
         .await
         .expect("produce forwarded through the controller-only node should succeed");
     assert_eq!(prod_res.first_offset, 0);
@@ -3122,7 +3150,11 @@ async fn test_scenario_35_zero_copy_fetch_end_to_end() {
         assert_eq!(frame.payload, records[i].as_bytes());
         let calculated_crc =
             RecordFrame::calculate_crc(frame.offset, frame.timestamp, &frame.payload);
-        assert_eq!(frame.crc, calculated_crc, "zero-copy frame CRC mismatch at offset {}", i);
+        assert_eq!(
+            frame.crc, calculated_crc,
+            "zero-copy frame CRC mismatch at offset {}",
+            i
+        );
     }
 
     // 2. Tight max_bytes budget forcing a multi-round consume loop — reconstructs the
@@ -3212,10 +3244,22 @@ async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
         .await
         .expect("AlterConfigs should succeed");
 
-    client.produce_single(topic, "", None, 1, "userA:v1").await.unwrap(); // offset 0 — stale
-    client.produce_single(topic, "", None, 1, "userA:v2").await.unwrap(); // offset 1 — current value for userA
-    client.produce_single(topic, "", None, 1, "userB:").await.unwrap(); // offset 2 — tombstone for userB
-    client.produce_single(topic, "", None, 1, "zzz:filler").await.unwrap(); // offset 3 — pushes offset 2's segment into history
+    client
+        .produce_single(topic, "", None, 1, "userA:v1")
+        .await
+        .unwrap(); // offset 0 — stale
+    client
+        .produce_single(topic, "", None, 1, "userA:v2")
+        .await
+        .unwrap(); // offset 1 — current value for userA
+    client
+        .produce_single(topic, "", None, 1, "userB:")
+        .await
+        .unwrap(); // offset 2 — tombstone for userB
+    client
+        .produce_single(topic, "", None, 1, "zzz:filler")
+        .await
+        .unwrap(); // offset 3 — pushes offset 2's segment into history
 
     // delete.retention.ms=1 means the tombstone is expired almost as soon as it's
     // written; this sleep just makes that unambiguous regardless of scheduling jitter.
@@ -3331,7 +3375,10 @@ async fn test_scenario_38_fetch_of_unknown_topic_creates_no_state() {
     let mut client = TestClient::connect(env.addr).await.unwrap();
 
     // Fetch, seek and latest-offset against a topic that was never created.
-    let fetched = client.fetch("never_created_topic", 0, 0, 4096).await.unwrap();
+    let fetched = client
+        .fetch("never_created_topic", 0, 0, 4096)
+        .await
+        .unwrap();
     assert!(fetched.is_empty(), "unknown topic must read back empty");
 
     // Nothing on disk, and nothing registered in the engine's partition map.
@@ -3347,7 +3394,9 @@ async fn test_scenario_38_fetch_of_unknown_topic_creates_no_state() {
         stray
     );
     assert!(
-        !env.engine.list_topics().contains(&"never_created_topic".to_string()),
+        !env.engine
+            .list_topics()
+            .contains(&"never_created_topic".to_string()),
         "a read must not register the topic"
     );
 
@@ -3357,7 +3406,9 @@ async fn test_scenario_38_fetch_of_unknown_topic_creates_no_state() {
         .await
         .unwrap();
     assert!(
-        env.engine.list_topics().contains(&"never_created_topic".to_string()),
+        env.engine
+            .list_topics()
+            .contains(&"never_created_topic".to_string()),
         "producing should create the topic"
     );
 }
@@ -3441,7 +3492,10 @@ async fn test_scenario_39_acks_all_waits_for_every_isr_member() {
     let below_floor = engine
         .await_full_isr_ack(&pm, "isr_topic", 0, target_offset + 1, short)
         .await;
-    assert!(below_floor.is_err(), "ISR below min.insync.replicas must be rejected");
+    assert!(
+        below_floor.is_err(),
+        "ISR below min.insync.replicas must be rejected"
+    );
     assert!(
         started.elapsed() < short,
         "an under-replicated ISR should fail fast, not block for the timeout"
@@ -3465,9 +3519,11 @@ async fn test_scenario_40_join_group_barrier_forms_one_generation() {
         let engine = engine.clone();
         joins.push(tokio::spawn(async move {
             engine
-                .join_group_awaited("barrier_group", &format!("member-{}", i), vec![
-                    "range".to_string(),
-                ])
+                .join_group_awaited(
+                    "barrier_group",
+                    &format!("member-{}", i),
+                    vec!["range".to_string()],
+                )
                 .await
         }));
     }
@@ -3610,7 +3666,9 @@ async fn test_scenario_42_push_excludes_pull_covered_peers() {
     // The metadata log is deliberately push-only (no pull fetcher), so nothing is ever
     // excluded for it — otherwise it would stop replicating entirely.
     assert!(
-        engine.pull_covered_peers("__cluster_metadata", 0).is_empty(),
+        engine
+            .pull_covered_peers("__cluster_metadata", 0)
+            .is_empty(),
         "__cluster_metadata has no pull fetcher and must keep its push path"
     );
 }
@@ -3702,7 +3760,10 @@ async fn test_scenario_44_unassigned_partitions_get_a_replica_assignment() {
         "expected a multi-broker roster, got {:?}",
         replicas
     );
-    assert!(replicas.contains(&self_id), "the leader must be on the roster");
+    assert!(
+        replicas.contains(&self_id),
+        "the leader must be on the roster"
+    );
     assert_eq!(
         pm.isr(),
         vec![self_id],
@@ -3785,7 +3846,9 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
     );
 
     // 2. The controller sweep publishes a replica set spanning both brokers.
-    engine_node1.reconcile_unassigned_partitions_for_test().await;
+    engine_node1
+        .reconcile_unassigned_partitions_for_test()
+        .await;
     assert!(engine_node1.has_partition_assignment("pull_topic", 0));
     let replicas = engine_node1
         .get_or_create_partition("pull_topic", 0)
@@ -3918,7 +3981,8 @@ async fn test_scenario_46_explicit_replication_factor_is_not_silently_degraded()
 #[tokio::test]
 async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
     let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let base_dir = std::env::temp_dir().join(format!("meta_catchup_{}_{}", std::process::id(), count));
+    let base_dir =
+        std::env::temp_dir().join(format!("meta_catchup_{}_{}", std::process::id(), count));
     let _ = std::fs::remove_dir_all(&base_dir);
 
     let engine_follower = StorageEngine::new(EngineConfig {
@@ -3947,13 +4011,17 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
     sleep(Duration::from_millis(150)).await;
 
     // The leader has bootstrap metadata; the follower has none of it.
-    let leader_leo = engine_leader.latest_offset("__cluster_metadata", 0).unwrap();
+    let leader_leo = engine_leader
+        .latest_offset("__cluster_metadata", 0)
+        .unwrap();
     assert!(
         leader_leo > 0,
         "precondition: the leader must have written bootstrap metadata"
     );
     assert_eq!(
-        engine_follower.latest_offset("__cluster_metadata", 0).unwrap(),
+        engine_follower
+            .latest_offset("__cluster_metadata", 0)
+            .unwrap(),
         0,
         "precondition: the follower joined with an empty metadata log"
     );
@@ -3969,7 +4037,11 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
 
     let mut healed = false;
     for _ in 0..40 {
-        if engine_follower.latest_offset("__cluster_metadata", 0).unwrap_or(0) > 0 {
+        if engine_follower
+            .latest_offset("__cluster_metadata", 0)
+            .unwrap_or(0)
+            > 0
+        {
             healed = true;
             break;
         }
@@ -3984,7 +4056,10 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
     // joined is now known to it.
     let mut knows_topic = false;
     for _ in 0..40 {
-        if engine_follower.list_topics().contains(&"gap_topic".to_string()) {
+        if engine_follower
+            .list_topics()
+            .contains(&"gap_topic".to_string())
+        {
             knows_topic = true;
             break;
         }
@@ -3994,16 +4069,24 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
         knows_topic,
         "the follower should know about a topic created before it caught up; \
          follower metadata LEO {} vs leader {}",
-        engine_follower.latest_offset("__cluster_metadata", 0).unwrap_or(0),
-        engine_leader.latest_offset("__cluster_metadata", 0).unwrap_or(0)
+        engine_follower
+            .latest_offset("__cluster_metadata", 0)
+            .unwrap_or(0),
+        engine_leader
+            .latest_offset("__cluster_metadata", 0)
+            .unwrap_or(0)
     );
 
     // Idempotent: a second pass must not re-send anything already applied.
-    let before = engine_follower.latest_offset("__cluster_metadata", 0).unwrap();
+    let before = engine_follower
+        .latest_offset("__cluster_metadata", 0)
+        .unwrap();
     engine_leader.catch_up_follower_metadata_for_test().await;
     sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        engine_follower.latest_offset("__cluster_metadata", 0).unwrap(),
+        engine_follower
+            .latest_offset("__cluster_metadata", 0)
+            .unwrap(),
         before,
         "re-running catch-up must not duplicate records"
     );

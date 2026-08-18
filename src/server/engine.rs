@@ -149,7 +149,6 @@ fn topic_placement_seed(topic: &str) -> u64 {
     hash
 }
 
-
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -358,7 +357,9 @@ impl StorageEngine {
         // trip isn't worth it. `handler.rs`'s connection dispatch now has a real 0xBB case
         // (`decode_grpc_replication_fetch_packet`), so — unlike when this loop was
         // previously disabled — fetch requests actually succeed against a real peer.
-        engine.replication.start_per_partition_fetcher_manager(engine.clone());
+        engine
+            .replication
+            .start_per_partition_fetcher_manager(engine.clone());
 
         engine.start_isr_and_failover_sweep();
 
@@ -577,7 +578,11 @@ impl StorageEngine {
         if self.transactions.last_stable_offset(topic, partition) != u64::MAX {
             return true;
         }
-        if !self.transactions.aborted_ranges(topic, partition).is_empty() {
+        if !self
+            .transactions
+            .aborted_ranges(topic, partition)
+            .is_empty()
+        {
             return true;
         }
         self.get_partition(topic, partition)
@@ -830,7 +835,11 @@ impl StorageEngine {
             if !cfg.configs.is_empty() {
                 records.push(MetadataRecord::TopicConfigChanged {
                     topic: cfg.topic.clone(),
-                    configs: cfg.configs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    configs: cfg
+                        .configs
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                 });
             }
         }
@@ -959,8 +968,7 @@ impl StorageEngine {
             }
         };
 
-        if leo <= last_snapshot_offset
-            || leo - last_snapshot_offset < MIN_NEW_RECORDS_FOR_SNAPSHOT
+        if leo <= last_snapshot_offset || leo - last_snapshot_offset < MIN_NEW_RECORDS_FOR_SNAPSHOT
         {
             return;
         }
@@ -979,7 +987,10 @@ impl StorageEngine {
                 );
             }
             Err(e) => {
-                tracing::error!("Metadata Snapshot: Failed to trim log after snapshot: {}", e);
+                tracing::error!(
+                    "Metadata Snapshot: Failed to trim log after snapshot: {}",
+                    e
+                );
             }
             _ => {}
         }
@@ -1166,7 +1177,11 @@ impl StorageEngine {
         };
         partition_ids
             .iter()
-            .filter_map(|p| self.partitions.get(&(topic.to_string(), *p)).map(|e| e.clone()))
+            .filter_map(|p| {
+                self.partitions
+                    .get(&(topic.to_string(), *p))
+                    .map(|e| e.clone())
+            })
             .collect()
     }
 
@@ -1189,8 +1204,12 @@ impl StorageEngine {
                 ))
             };
             match key.as_str() {
-                "retention.ms" | "retention.bytes" | "delete.retention.ms" | "segment.ms"
-                | "segment.bytes" | "max.message.bytes" => {
+                "retention.ms"
+                | "retention.bytes"
+                | "delete.retention.ms"
+                | "segment.ms"
+                | "segment.bytes"
+                | "max.message.bytes" => {
                     if trimmed.parse::<u64>().is_err() {
                         return invalid("a non-negative integer");
                     }
@@ -1287,18 +1306,19 @@ impl StorageEngine {
     pub fn describe_configs(&self, topic: &str) -> Vec<(String, String)> {
         self.topic_registry
             .get(topic)
-            .map(|cfg| cfg.configs.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|cfg| {
+                cfg.configs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Full-replace config update (Kafka `AlterConfigs`). Only the cluster leader may
     /// propose — routes through the same `propose_metadata` gate as every other
     /// controller-plane mutation.
-    pub async fn alter_configs(
-        &self,
-        topic: &str,
-        configs: Vec<(String, String)>,
-    ) -> IoResult<()> {
+    pub async fn alter_configs(&self, topic: &str, configs: Vec<(String, String)>) -> IoResult<()> {
         if self.topic_registry.get(topic).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1552,12 +1572,9 @@ impl StorageEngine {
         // generation, which may have been formed by an earlier joiner, and leadership may
         // have settled on a different member.
         match coordinator.join_result(group_id, &m_id) {
-            Some((final_generation, final_is_leader, final_protocol)) => Ok((
-                m_id,
-                final_generation,
-                final_is_leader,
-                final_protocol,
-            )),
+            Some((final_generation, final_is_leader, final_protocol)) => {
+                Ok((m_id, final_generation, final_is_leader, final_protocol))
+            }
             // Group vanished while we waited (every member's session expired).
             None => Ok((m_id, generation_id, is_leader, protocol_name)),
         }
@@ -1635,12 +1652,7 @@ impl StorageEngine {
         self.scram_credentials.insert(
             (username.clone(), mechanism),
             crate::scram::ScramCredential::new(
-                username,
-                mechanism,
-                iterations,
-                salt,
-                stored_key,
-                server_key,
+                username, mechanism, iterations, salt, stored_key, server_key,
             ),
         );
     }
@@ -1848,7 +1860,11 @@ impl StorageEngine {
                 self.config.transaction_timeout_ms
             );
             if let Err(e) = self.abort_transaction(&tx_id) {
-                tracing::error!("TxTimeout: failed to abort expired transaction '{}': {}", tx_id, e);
+                tracing::error!(
+                    "TxTimeout: failed to abort expired transaction '{}': {}",
+                    tx_id,
+                    e
+                );
             }
         }
     }
@@ -2253,10 +2269,13 @@ impl StorageEngine {
         let topic = topic.to_string();
         let metadata = metadata.to_string();
         tokio::task::spawn_blocking(move || {
-            consumer_groups.commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
+            consumer_groups
+                .commit_offset_with_metadata(&group_id, &topic, partition, offset, &metadata)
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("commit_offset_with_metadata join error: {}", e)))?
+        .map_err(|e| {
+            std::io::Error::other(format!("commit_offset_with_metadata join error: {}", e))
+        })?
     }
 
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: u32) -> Option<u64> {
@@ -2422,9 +2441,12 @@ impl StorageEngine {
         let tx_pm = self
             .get_or_create_partition("__transaction_state", 0)
             .map_err(|e| format!("Failed to open __transaction_state: {}", e))?;
-        tx_pm
-            .produce(&commit_record)
-            .map_err(|e| format!("Failed to durably record commit of '{}': {}", transaction_id, e))?;
+        tx_pm.produce(&commit_record).map_err(|e| {
+            format!(
+                "Failed to durably record commit of '{}': {}",
+                transaction_id, e
+            )
+        })?;
         tx_pm.flush().map_err(|e| {
             format!(
                 "Failed to flush commit of '{}' to __transaction_state: {}",
@@ -2572,8 +2594,11 @@ impl StorageEngine {
         let concurrency = self.config.compaction_worker_threads.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
-        let partition_managers: Vec<Arc<PartitionManager>> =
-            self.partitions.iter().map(|entry| entry.value().clone()).collect();
+        let partition_managers: Vec<Arc<PartitionManager>> = self
+            .partitions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
 
         let mut join_set = tokio::task::JoinSet::new();
         for pm in partition_managers {
@@ -2585,7 +2610,9 @@ impl StorageEngine {
                     .expect("compaction worker semaphore is never closed");
                 tokio::task::spawn_blocking(move || pm.apply_retention())
                     .await
-                    .map_err(|e| std::io::Error::other(format!("apply_retention join error: {}", e)))?
+                    .map_err(|e| {
+                        std::io::Error::other(format!("apply_retention join error: {}", e))
+                    })?
             });
         }
 
@@ -2594,7 +2621,9 @@ impl StorageEngine {
             match result {
                 Ok(Ok(n)) => total_removed += n,
                 Ok(Err(e)) => tracing::error!("Retention GC: partition compaction failed: {}", e),
-                Err(e) => tracing::error!("Retention GC: partition compaction task panicked: {}", e),
+                Err(e) => {
+                    tracing::error!("Retention GC: partition compaction task panicked: {}", e)
+                }
             }
         }
 
@@ -3676,11 +3705,19 @@ mod placement_tests {
         let brokers = vec![1, 2, 3, 4, 5];
         let seed = topic_placement_seed("orders");
 
-        let mut followers_by_leader: std::collections::HashMap<u32, std::collections::HashSet<u32>> =
-            std::collections::HashMap::new();
+        let mut followers_by_leader: std::collections::HashMap<
+            u32,
+            std::collections::HashSet<u32>,
+        > = std::collections::HashMap::new();
         for p in 0..25u32 {
             let replicas = striped_replicas(&brokers, p, 3, seed, None);
-            assert_eq!(replicas.len(), 3, "partition {} short of RF: {:?}", p, replicas);
+            assert_eq!(
+                replicas.len(),
+                3,
+                "partition {} short of RF: {:?}",
+                p,
+                replicas
+            );
             let mut seen = std::collections::HashSet::new();
             for r in &replicas {
                 assert!(seen.insert(*r), "duplicate replica in {:?}", replicas);
@@ -3710,7 +3747,11 @@ mod placement_tests {
         for p in 0..12u32 {
             leaders.insert(striped_replicas(&brokers, p, 2, seed, None)[0]);
         }
-        assert_eq!(leaders.len(), brokers.len(), "every broker should lead some partition");
+        assert_eq!(
+            leaders.len(),
+            brokers.len(),
+            "every broker should lead some partition"
+        );
     }
 
     /// Retrofitting an assignment must never move data: the broker already holding the

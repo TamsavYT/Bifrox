@@ -124,7 +124,9 @@ impl MetricsCollector {
     pub fn record_produce_topic(&self, topic: &str, bytes: u64, records_count: u64) {
         self.record_produce(bytes, records_count);
         let entry = self.per_topic.entry(topic.to_string()).or_default();
-        entry.produce_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        entry
+            .produce_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
         entry
             .produce_records_total
             .fetch_add(records_count, Ordering::Relaxed);
