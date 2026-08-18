@@ -3718,3 +3718,166 @@ async fn test_scenario_44_unassigned_partitions_get_a_replica_assignment() {
         "an already-assigned partition must not be reassigned on every sweep"
     );
 }
+
+/// End-to-end proof that pull replication takes over once a partition is assigned.
+///
+/// This is the behavior push deletion depends on: an implicitly-created partition gets a
+/// replica assignment from the controller sweep, the follower's fetcher starts as a result,
+/// and records produced *after* the assignment reach the follower even though push
+/// deliberately excludes pull-covered peers.
+#[tokio::test]
+async fn test_scenario_45_follower_pulls_after_assignment() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let base_dir = std::env::temp_dir().join(format!(
+        "pull_after_assign_{}_{}",
+        std::process::id(),
+        count
+    ));
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // Follower (node 2)
+    let engine_node2 = StorageEngine::new(EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: base_dir.join("node2"),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let server_node2 = Server::new(engine_node2.clone());
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+    let task2 = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // Leader (node 1), with node 2 as its peer
+    let engine_node1 = StorageEngine::new(EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: base_dir.join("node1"),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let server_node1 = Server::new(engine_node1.clone());
+    let (listener_node1, addr_node1) = server_node1.bind().unwrap();
+    let task1 = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    sleep(Duration::from_millis(150)).await;
+
+    // Each node needs the other's address to replicate. Normally learned from heartbeat
+    // ACKs, which run on a 10s interval — far too slow for a test, so seed it directly.
+    engine_node1.register_broker_address(2, addr_node2.to_string());
+    engine_node2.register_broker_address(1, addr_node1.to_string());
+
+    // 1. Produce BEFORE any assignment exists — the implicit-creation path.
+    let mut client = TestClient::connect(addr_node1).await.unwrap();
+    client
+        .produce_single("pull_topic", "k1", None, 1, "before-assignment")
+        .await
+        .unwrap();
+    assert!(
+        !engine_node1.has_partition_assignment("pull_topic", 0),
+        "precondition: implicitly created partitions start unassigned"
+    );
+
+    // 2. The controller sweep publishes a replica set spanning both brokers.
+    engine_node1.reconcile_unassigned_partitions_for_test().await;
+    assert!(engine_node1.has_partition_assignment("pull_topic", 0));
+    let replicas = engine_node1
+        .get_or_create_partition("pull_topic", 0)
+        .unwrap()
+        .replicas();
+    assert!(
+        replicas.contains(&2),
+        "the follower must be assigned as a replica, got {:?}",
+        replicas
+    );
+
+    // 3. Deliver the leader's full metadata log to the follower.
+    //
+    // Bootstrap records are written directly via `meta_pm.produce()` during
+    // `StorageEngine::new` (which is synchronous and so cannot call the async
+    // `propose_metadata`), meaning they are never replicated. A follower that joins after
+    // them therefore sits at offset 0, rejects the next pushed record as a Gap, and — with
+    // no pull fetcher for `__cluster_metadata` — can never catch up. That is a separate
+    // defect; this test pushes the whole log so it can get on with verifying pull.
+    let meta_frames = engine_node1
+        .get_or_create_partition("__cluster_metadata", 0)
+        .unwrap()
+        .fetch(0, 1 << 20)
+        .unwrap_or_default();
+    engine_node1
+        .replication()
+        .replicate_batch(
+            "__cluster_metadata",
+            0,
+            engine_node1.replication().get_epoch(),
+            0,
+            &[],
+            &meta_frames,
+        )
+        .await
+        .expect("metadata catch-up push should succeed");
+
+    // Re-assert the real addresses: the replayed `BrokerRegister` records carry each node's
+    // *configured* bind address, which is "127.0.0.1:0" under an ephemeral-port test setup,
+    // and applying them overwrites the resolved ones.
+    engine_node1.register_broker_address(2, addr_node2.to_string());
+    engine_node2.register_broker_address(1, addr_node1.to_string());
+
+    let mut assigned_on_follower = false;
+    for _ in 0..80 {
+        if engine_node2.has_partition_assignment("pull_topic", 0) {
+            assigned_on_follower = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        assigned_on_follower,
+        "the follower must receive the assignment via replicated __cluster_metadata"
+    );
+    assert!(
+        engine_node1
+            .pull_covered_peers("pull_topic", 0)
+            .contains(&addr_node2.to_string()),
+        "with the follower assigned, push must exclude it in favour of pull"
+    );
+
+    // 4. Produce AFTER assignment. Push now skips node 2, so this record can only reach
+    //    the follower by being pulled.
+    client
+        .produce_single("pull_topic", "k2", None, 1, "after-assignment")
+        .await
+        .unwrap();
+
+    let mut pulled = Vec::new();
+    for _ in 0..100 {
+        pulled = engine_node2
+            .fetch("pull_topic", 0, 0, 65536)
+            .await
+            .unwrap_or_default();
+        if pulled.len() >= 2 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let payloads: Vec<String> = pulled
+        .iter()
+        .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+        .collect();
+    assert!(
+        payloads.iter().any(|p| p.contains("after-assignment")),
+        "the post-assignment record must reach the follower by pull; follower has {:?}",
+        payloads
+    );
+
+    task1.abort();
+    task2.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
