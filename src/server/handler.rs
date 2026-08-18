@@ -264,8 +264,8 @@ where
 
                 // Client wire protocol commands (0x01..0x0A)
                 _ => {
-                    match WireRequest::decode(slice) {
-                        Ok((req, bytes_used)) => {
+                    match WireRequest::decode_framed(slice) {
+                        Ok((req, framing, bytes_used)) => {
                             // Produce Forwarding: if this node is not the leader for the target
                             // partition, transparently proxy the raw request bytes to the actual
                             // partition leader broker and relay its response, rather than making
@@ -391,7 +391,7 @@ where
                                                         "Failed to forward produce to leader: {}",
                                                         e
                                                     ))
-                                                    .encode()
+                                                    .encode_framed(framing)
                                                 }
                                             }
                                         }
@@ -402,7 +402,7 @@ where
                                             );
                                             WireResponse::error(
                                                 "NOT_LEADER: No leader elected for this partition. Retry later."
-                                            ).encode()
+                                            ).encode_framed(framing)
                                         }
                                     };
 
@@ -428,7 +428,7 @@ where
                                     )
                                     .await;
                                     response_scratch.clear();
-                                    response.encode_into(&mut response_scratch);
+                                    response.encode_framed_into(framing, &mut response_scratch);
                                     if let Err(e) = socket.write_all(&response_scratch).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",
@@ -467,7 +467,7 @@ where
                                                     "Failed to forward request to cluster leader: {}",
                                                     e
                                                 ))
-                                                .encode()
+                                                .encode_framed(framing)
                                             }
                                         }
                                     }
@@ -479,7 +479,7 @@ where
                                         WireResponse::error(
                                             "NOT_CONTROLLER: No cluster leader elected. Retry later.",
                                         )
-                                        .encode()
+                                        .encode_framed(framing)
                                     }
                                 };
 
@@ -554,7 +554,7 @@ where
                                     )
                                     .await;
                                     response_scratch.clear();
-                                    response.encode_into(&mut response_scratch);
+                                    response.encode_framed_into(framing, &mut response_scratch);
                                     if let Err(e) = socket.write_all(&response_scratch).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",

@@ -109,10 +109,56 @@ impl TryFrom<u8> for CommandCode {
 
 pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 64 * 1024 * 1024; // 64MB cap (SEC-01)
 
+/// Introduces a versioned request envelope. Chosen from the range no `CommandCode` uses
+/// (codes run 0x01..=0x2E) and no inter-node magic uses (0xAA/0xAC/0xAE/0xAF/0xBB), so a
+/// broker can tell the two framings apart from the very first byte.
+///
+/// This is what makes the versioned framing addable without a flag day: a client that
+/// knows nothing about it keeps sending a bare command code and is still understood, while
+/// a newer client opts in per request.
+pub const VERSIONED_ENVELOPE_MAGIC: u8 = 0xF1;
+
+/// Oldest envelope version this broker accepts.
+pub const PROTOCOL_VERSION_MIN: u16 = 1;
+/// Newest envelope version this broker understands. Bump when the envelope itself gains a
+/// field; individual requests carry their own shape inside the payload.
+pub const PROTOCOL_VERSION_MAX: u16 = 1;
+
+/// How a request arrived, which determines how its response must be framed.
+///
+/// The wire format had no version field at all: a broker and client built from different
+/// revisions could not detect a mismatch and would silently misinterpret each other's
+/// bytes, and every layout change was a hard break requiring every broker and client to be
+/// upgraded together. This is the mechanism that ends that — see `VERSIONED_ENVELOPE_MAGIC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFraming {
+    /// Bare `[cmd][len][payload]`, from a client that predates the envelope. Responses go
+    /// back unwrapped, exactly as before.
+    Legacy,
+    /// Carries a protocol version and a correlation id.
+    Versioned {
+        api_version: u16,
+        /// Echoed in the response so a client can match replies to requests — the
+        /// prerequisite for having more than one request in flight per connection.
+        correlation_id: u32,
+    },
+}
+
+impl RequestFraming {
+    pub fn correlation_id(&self) -> Option<u32> {
+        match self {
+            RequestFraming::Legacy => None,
+            RequestFraming::Versioned { correlation_id, .. } => Some(*correlation_id),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WireError {
     #[error("Unknown wire command code: 0x{0:02X}")]
     UnknownCommand(u8),
+    #[error("Unsupported protocol version {requested}; this broker supports {min}..={max}")]
+    UnsupportedVersion { requested: u16, min: u16, max: u16 },
     #[error("Insufficient wire buffer bytes: needed {needed}, available {available}")]
     Incomplete { needed: usize, available: usize },
     #[error("Protocol error: {0}")]
@@ -397,7 +443,88 @@ pub struct WireRequest {
 
 impl WireRequest {
     /// Decode wire request from buffer: `[Cmd: 1b] | [Payload Len: 4b] | [Payload Bytes]`
-    pub fn decode(mut src: &[u8]) -> Result<(Self, usize), WireError> {
+    ///
+    /// Accepts the versioned envelope too, discarding its metadata. Callers that need to
+    /// echo a correlation id — i.e. anything writing a response — should use
+    /// `decode_framed` instead.
+    pub fn decode(src: &[u8]) -> Result<(Self, usize), WireError> {
+        Self::decode_framed(src).map(|(req, _, used)| (req, used))
+    }
+
+    /// Decode a request, reporting how it was framed.
+    ///
+    /// Two framings are accepted from the same socket:
+    ///
+    /// - **Legacy**: `[cmd: 1b][payload_len: 4b][payload]` — what every existing client
+    ///   sends. Left working exactly as-is.
+    /// - **Versioned**: `[0xF1][api_version: 2b][correlation_id: 4b][tagged_count: 1b]
+    ///   (repeated [tag: 1b][len: 2b][bytes])[cmd: 1b][payload_len: 4b][payload]`
+    ///
+    /// The magic byte is outside the command-code range, so the two are distinguishable
+    /// from the first byte and no negotiation round trip is required before sending a
+    /// request. The tagged-field section is the forward-compatibility hook: a newer client
+    /// can add fields an older broker will skip rather than misparse.
+    pub fn decode_framed(mut src: &[u8]) -> Result<(Self, RequestFraming, usize), WireError> {
+        let original_len = src.len();
+        if src.is_empty() {
+            return Err(WireError::Incomplete {
+                needed: 1,
+                available: 0,
+            });
+        }
+
+        let framing = if src[0] == VERSIONED_ENVELOPE_MAGIC {
+            // [magic][api_version: 2][correlation_id: 4][tagged_count: 1]
+            if src.len() < 8 {
+                return Err(WireError::Incomplete {
+                    needed: 8,
+                    available: src.len(),
+                });
+            }
+            src.get_u8(); // magic
+            let api_version = src.get_u16();
+            let correlation_id = src.get_u32();
+
+            if !(PROTOCOL_VERSION_MIN..=PROTOCOL_VERSION_MAX).contains(&api_version) {
+                // Refused explicitly rather than parsed on a guess. Silently attempting a
+                // version we do not implement is how a mismatch turns into misread bytes
+                // instead of a clear error.
+                return Err(WireError::UnsupportedVersion {
+                    requested: api_version,
+                    min: PROTOCOL_VERSION_MIN,
+                    max: PROTOCOL_VERSION_MAX,
+                });
+            }
+
+            let tagged_count = src.get_u8() as usize;
+            for _ in 0..tagged_count {
+                if src.len() < 3 {
+                    return Err(WireError::Incomplete {
+                        needed: 3,
+                        available: src.len(),
+                    });
+                }
+                let _tag = src.get_u8();
+                let len = src.get_u16() as usize;
+                if src.len() < len {
+                    return Err(WireError::Incomplete {
+                        needed: len,
+                        available: src.len(),
+                    });
+                }
+                // Unknown tags are skipped, not rejected — that is the whole point of the
+                // section, and why a future field can be added without breaking this build.
+                src = &src[len..];
+            }
+
+            RequestFraming::Versioned {
+                api_version,
+                correlation_id,
+            }
+        } else {
+            RequestFraming::Legacy
+        };
+
         if src.len() < 5 {
             return Err(WireError::Incomplete {
                 needed: 5,
@@ -1165,12 +1292,16 @@ impl WireRequest {
             }
         };
 
-        let total_consumed = 5 + payload_len;
+        // Measured against the original buffer rather than assumed to be `5 + payload_len`,
+        // so the envelope's own bytes (magic, version, correlation id, tagged fields) are
+        // included and the connection loop advances past the whole request.
+        let total_consumed = original_len - (src.len() - payload_len);
         Ok((
             WireRequest {
                 cmd,
                 payload: req_payload,
             },
+            framing,
             total_consumed,
         ))
     }
@@ -1374,5 +1505,172 @@ impl WireResponse {
         buf.put_u8(self.status);
         buf.put_u32(self.payload.len() as u32);
         buf.put_slice(&self.payload);
+    }
+
+    /// Encodes the response in the framing its request arrived in.
+    ///
+    /// A legacy request gets a bare response, byte-for-byte as before. A versioned request
+    /// gets `[0xF1][correlation_id: 4b]` first, so the client can match this reply to the
+    /// request that produced it — which is what allows more than one request in flight per
+    /// connection instead of forcing a strict request/response lockstep.
+    /// Allocating form of `encode_framed_into`, for the paths that build a response
+    /// buffer rather than writing into the connection's scratch buffer.
+    pub fn encode_framed(&self, framing: RequestFraming) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(10 + self.payload.len());
+        self.encode_framed_into(framing, &mut buf);
+        buf
+    }
+
+    pub fn encode_framed_into(&self, framing: RequestFraming, buf: &mut impl BufMut) {
+        if let RequestFraming::Versioned { correlation_id, .. } = framing {
+            buf.put_u8(VERSIONED_ENVELOPE_MAGIC);
+            buf.put_u32(correlation_id);
+        }
+        self.encode_into(buf);
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn legacy_ping() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.put_u8(CommandCode::Ping as u8);
+        b.put_u32(0);
+        b
+    }
+
+    /// A client that knows nothing about the envelope must keep working byte-for-byte.
+    /// The whole point of introducing the framing behind a magic byte is that it needs no
+    /// flag day.
+    #[test]
+    fn legacy_framing_still_decodes_untouched() {
+        let bytes = legacy_ping();
+        let (req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(req.cmd, CommandCode::Ping);
+        assert_eq!(framing, RequestFraming::Legacy);
+        assert_eq!(used, bytes.len(), "must consume exactly the request");
+        assert_eq!(framing.correlation_id(), None);
+    }
+
+    /// A legacy response must stay unwrapped, so an old client sees exactly what it did
+    /// before.
+    #[test]
+    fn legacy_response_is_not_wrapped() {
+        let resp = WireResponse::ok(vec![1, 2, 3]);
+        assert_eq!(
+            resp.encode_framed(RequestFraming::Legacy),
+            resp.encode(),
+            "legacy responses must be byte-identical to the pre-envelope encoding"
+        );
+    }
+
+    /// The envelope carries a version and a correlation id, and the request inside it
+    /// decodes the same as if it had been sent bare.
+    #[test]
+    fn versioned_envelope_round_trips_and_reports_correlation() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(0xDEAD_BEEF);
+        bytes.put_u8(0); // no tagged fields
+        bytes.extend_from_slice(&legacy_ping());
+
+        let (req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(req.cmd, CommandCode::Ping);
+        assert_eq!(
+            framing,
+            RequestFraming::Versioned {
+                api_version: PROTOCOL_VERSION_MAX,
+                correlation_id: 0xDEAD_BEEF,
+            }
+        );
+        assert_eq!(
+            used,
+            bytes.len(),
+            "the envelope's own bytes must be counted as consumed"
+        );
+
+        // The response echoes the correlation id so a client can match it to this request.
+        let encoded = WireResponse::ok(vec![]).encode_framed(framing);
+        assert_eq!(encoded[0], VERSIONED_ENVELOPE_MAGIC);
+        assert_eq!(
+            u32::from_be_bytes(encoded[1..5].try_into().unwrap()),
+            0xDEAD_BEEF
+        );
+    }
+
+    /// Unknown tagged fields are skipped rather than rejected. This is the forward-
+    /// compatibility hook: a newer client can add a field and an older broker still
+    /// understands the request instead of misreading it.
+    #[test]
+    fn unknown_tagged_fields_are_skipped_not_rejected() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(7);
+        bytes.put_u8(2); // two tagged fields this build has never heard of
+        bytes.put_u8(0x40);
+        bytes.put_u16(3);
+        bytes.extend_from_slice(&[9, 9, 9]);
+        bytes.put_u8(0x41);
+        bytes.put_u16(1);
+        bytes.push(1);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let (req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(req.cmd, CommandCode::Ping);
+        assert_eq!(framing.correlation_id(), Some(7));
+        assert_eq!(used, bytes.len());
+    }
+
+    /// A version this broker does not implement is refused explicitly. Guessing at it is
+    /// how a mismatch becomes silently misread bytes instead of a clear error.
+    #[test]
+    fn unsupported_version_is_rejected_explicitly() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX + 1);
+        bytes.put_u32(1);
+        bytes.put_u8(0);
+        bytes.extend_from_slice(&legacy_ping());
+
+        match WireRequest::decode_framed(&bytes) {
+            Err(WireError::UnsupportedVersion {
+                requested,
+                min,
+                max,
+            }) => {
+                assert_eq!(requested, PROTOCOL_VERSION_MAX + 1);
+                assert_eq!(min, PROTOCOL_VERSION_MIN);
+                assert_eq!(max, PROTOCOL_VERSION_MAX);
+            }
+            other => panic!(
+                "expected UnsupportedVersion, got {:?}",
+                other.map(|(r, _, _)| r.cmd)
+            ),
+        }
+    }
+
+    /// A truncated envelope must report "need more data" so the connection loop waits for
+    /// the rest, rather than being treated as a fatal protocol error that drops the
+    /// connection.
+    #[test]
+    fn truncated_envelope_asks_for_more_data() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        assert!(matches!(
+            WireRequest::decode_framed(&bytes),
+            Err(WireError::Incomplete { .. })
+        ));
+    }
+
+    /// The magic byte must not collide with any command code, or a legacy request would be
+    /// mistaken for an envelope.
+    #[test]
+    fn envelope_magic_is_not_a_command_code() {
+        assert!(CommandCode::try_from(VERSIONED_ENVELOPE_MAGIC).is_err());
     }
 }
