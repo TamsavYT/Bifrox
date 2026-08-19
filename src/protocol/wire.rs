@@ -50,6 +50,11 @@ pub enum CommandCode {
     DescribeConfigs = 0x2B,
     AlterConfigs = 0x2C,
     IncrementalAlterConfigs = 0x2D,
+    /// Returns the protocol versions and command codes this broker supports, so a client
+    /// can discover them before sending a request rather than probing and handling
+    /// rejection. Deliberately answerable under the legacy framing, since a client that
+    /// does not yet know the envelope exists is exactly who needs to ask.
+    NegotiateProtocol = 0x2E,
 }
 
 impl TryFrom<u8> for CommandCode {
@@ -102,6 +107,7 @@ impl TryFrom<u8> for CommandCode {
             0x2B => Ok(CommandCode::DescribeConfigs),
             0x2C => Ok(CommandCode::AlterConfigs),
             0x2D => Ok(CommandCode::IncrementalAlterConfigs),
+            0x2E => Ok(CommandCode::NegotiateProtocol),
             _ => Err(WireError::UnknownCommand(value)),
         }
     }
@@ -123,6 +129,17 @@ pub const PROTOCOL_VERSION_MIN: u16 = 1;
 /// Newest envelope version this broker understands. Bump when the envelope itself gains a
 /// field; individual requests carry their own shape inside the payload.
 pub const PROTOCOL_VERSION_MAX: u16 = 1;
+
+/// Every command code this build accepts, ascending.
+///
+/// Reported by `NegotiateProtocol` so a client can tell in advance whether a command
+/// exists here, rather than sending it and interpreting the resulting error — which is
+/// indistinguishable from the command failing for an ordinary reason.
+pub fn supported_command_codes() -> Vec<u8> {
+    (0x01u8..=0xFF)
+        .filter(|code| CommandCode::try_from(*code).is_ok())
+        .collect()
+}
 
 /// Tagged-field identifiers carried in a versioned request envelope.
 ///
@@ -300,6 +317,8 @@ pub enum RequestPayload {
         max_bytes: u32,
     },
     Ping,
+    /// Asks the broker which protocol versions and commands it supports.
+    NegotiateProtocol,
     ListTopics,
     DescribeCluster,
     DeleteTopic {
@@ -820,6 +839,7 @@ impl WireRequest {
                 }
             }
             CommandCode::Ping => RequestPayload::Ping,
+            CommandCode::NegotiateProtocol => RequestPayload::NegotiateProtocol,
             CommandCode::ListTopics => RequestPayload::ListTopics,
             CommandCode::DescribeCluster => RequestPayload::DescribeCluster,
             CommandCode::DeleteTopic => {

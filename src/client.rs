@@ -622,6 +622,40 @@ impl TestClient {
         Ok(frames)
     }
 
+    /// Asks the broker which protocol versions and commands it supports.
+    ///
+    /// Returns `(min_version, max_version, supported_command_codes)`. Sent under the legacy
+    /// framing on purpose: a client that does not yet know whether this broker understands
+    /// the versioned envelope is exactly the caller who needs to ask, so the question must
+    /// be answerable without already speaking the thing being negotiated.
+    pub async fn negotiate_protocol(&mut self) -> IoResult<(u16, u16, Vec<u8>)> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::NegotiateProtocol as u8);
+        req_buf.put_u32(0);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        if resp.payload.len() < 6 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "NegotiateProtocol response too short",
+            ));
+        }
+        let min = u16::from_be_bytes(resp.payload[0..2].try_into().unwrap());
+        let max = u16::from_be_bytes(resp.payload[2..4].try_into().unwrap());
+        let count = u16::from_be_bytes(resp.payload[4..6].try_into().unwrap()) as usize;
+        let codes = resp.payload[6..].iter().take(count).copied().collect();
+        Ok((min, max, codes))
+    }
+
     pub async fn commit_offset(
         &mut self,
         group_id: &str,

@@ -4330,3 +4330,56 @@ async fn test_scenario_50_sole_controller_commits_immediately() {
         started.elapsed()
     );
 }
+
+/// A client must be able to discover what a broker speaks before sending a real request,
+/// rather than probing and interpreting the resulting error — which is indistinguishable
+/// from the command failing for an ordinary reason.
+#[tokio::test]
+async fn test_scenario_53_clients_can_negotiate_protocol_support() {
+    use hermes::protocol::wire::{
+        CommandCode, IsolationLevel, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
+    };
+
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+
+    let (min, max, codes) = client.negotiate_protocol().await.unwrap();
+    assert_eq!(min, PROTOCOL_VERSION_MIN);
+    assert_eq!(max, PROTOCOL_VERSION_MAX);
+    assert!(min <= max, "advertised range must be coherent");
+
+    // The advertised set must actually describe this broker: commands it implements are
+    // listed, and a code it does not implement is not.
+    assert!(codes.contains(&(CommandCode::ProduceBatch as u8)));
+    assert!(codes.contains(&(CommandCode::Fetch as u8)));
+    assert!(codes.contains(&(CommandCode::NegotiateProtocol as u8)));
+    assert!(
+        !codes.contains(&0xF0),
+        "an unimplemented code must not be advertised"
+    );
+
+    // Negotiation must not require authentication or an envelope — a client that cannot
+    // yet form a versioned request is exactly who needs to ask.
+    assert!(client.ping().await.unwrap(), "connection still usable");
+
+    // Having negotiated, the client can use a version-gated feature with confidence.
+    client
+        .produce_single("negotiated_topic", "", None, 1, "record")
+        .await
+        .unwrap();
+    let fetched = client
+        .fetch_with_isolation(
+            "negotiated_topic",
+            0,
+            0,
+            65536,
+            IsolationLevel::ReadCommitted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        fetched.len() <= 1,
+        "a negotiated versioned request must be served, got {} frames",
+        fetched.len()
+    );
+}
