@@ -5226,3 +5226,96 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
         redelivered
     );
 }
+
+/// `auto.create.topics.enable = false` must still be honored now that implicit creation
+/// is routed through `StorageEngine::ensure_topic_created` — the controller-mediated path
+/// added to fix unassigned auto-created partitions must not reopen the door that gate was
+/// there to close.
+///
+/// Covers the flip side of `test_scenario_48_controller_assigns_new_topics_before_first_write`:
+/// that test proves an unknown topic is born fully assigned when auto-creation is allowed,
+/// this one proves nothing is born — on disk or in cluster metadata — when it isn't.
+#[tokio::test]
+async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_registering_it() {
+    use hermes::config::EngineConfig;
+
+    struct TestDataDirGuard {
+        pub path: std::path::PathBuf,
+    }
+
+    impl TestDataDirGuard {
+        fn new(prefix: &str) -> Self {
+            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
+            let _ = std::fs::create_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDataDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    let dir_guard = TestDataDirGuard::new("auto_create_disabled_test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let cfg = EngineConfig {
+        node_id: 1,
+        data_dir: dir_guard.path.clone(),
+        bind_addr: addr.to_string(),
+        auto_create_topics_enable: false,
+        ..Default::default()
+    };
+
+    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+    assert!(engine.is_leader(), "the test broker is its own controller");
+    let server = hermes::server::Server::new(engine.clone());
+
+    tokio::spawn(async move {
+        server.run_with_listener(listener).await.unwrap();
+    });
+
+    let mut client = TestClient::connect(addr).await.unwrap();
+
+    let err = client
+        .produce_single("never_allowed_topic", "k", None, 1, "v")
+        .await
+        .expect_err("a produce to an unknown topic must be rejected when auto-create is off");
+    assert!(
+        err.to_string()
+            .contains("auto.create.topics.enable is false"),
+        "unexpected error message: {}",
+        err
+    );
+
+    // Rejected before the controller-mediated path ever proposes a `TopicCreated` record —
+    // cluster metadata must not know this topic.
+    assert!(
+        !engine.topic_is_registered("never_allowed_topic"),
+        "a rejected auto-create must not register the topic in cluster metadata"
+    );
+    assert!(
+        !engine
+            .list_topics()
+            .contains(&"never_allowed_topic".to_string()),
+        "a rejected auto-create must not appear in ListTopics"
+    );
+
+    // Nor must it leave an orphan partition directory on disk — the exact failure mode
+    // this issue exists to prevent, just reached from the other direction (creation
+    // refused outright rather than retrofitted later).
+    let stray: Vec<_> = std::fs::read_dir(&dir_guard.path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("never_allowed_topic"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a rejected auto-create must not create partition directories, found: {:?}",
+        stray
+    );
+}
