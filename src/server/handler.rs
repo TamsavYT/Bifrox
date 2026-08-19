@@ -560,6 +560,7 @@ where
                                             &client_principal,
                                             &client_key,
                                             &logical_client_id,
+                                            framing,
                                         )
                                         .await
                                         {
@@ -1458,6 +1459,7 @@ async fn try_zero_copy_fetch(
     principal: &str,
     client_key: &str,
     logical_client_id: &Option<String>,
+    framing: crate::protocol::wire::RequestFraming,
 ) -> std::io::Result<bool> {
     if !engine.authorize(
         principal,
@@ -1519,7 +1521,17 @@ async fn try_zero_copy_fetch(
         .throttle_fetch(topic, &quota_key, plan.physical_len)
         .await;
 
-    let mut header = Vec::with_capacity(9);
+    // The zero-copy path writes its response straight to the socket rather than going
+    // through `WireResponse`, so it has to apply the request's framing itself. Without
+    // this, a versioned request gets an unwrapped reply here — and only here — so the
+    // client reads the status byte as the envelope magic it was expecting. It only shows
+    // up on partitions with no transactional data, since anything transactional makes this
+    // path decline and fall through to the buffered one.
+    let mut header = Vec::with_capacity(14);
+    if let crate::protocol::wire::RequestFraming::Versioned { correlation_id, .. } = framing {
+        header.put_u8(crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
+        header.put_u32(correlation_id);
+    }
     header.put_u8(0u8); // WireResponse status = OK
     header.put_u32(payload_len as u32);
     header.put_u32(plan.frame_count);
@@ -2334,6 +2346,23 @@ async fn process_request(
             }
         }
         RequestPayload::Ping => WireResponse::ok(b"PONG".to_vec()),
+        RequestPayload::NegotiateProtocol => {
+            // Answered without authorization on purpose: a client has to learn what this
+            // broker speaks before it can construct a request that would carry credentials,
+            // and the reply exposes only protocol shape — never cluster or topic data.
+            //
+            // Encoded as [min: 2b][max: 2b][command_count: 2b][codes...] so a client can
+            // both pick a version and avoid sending a command this broker would reject.
+            let mut buf = Vec::new();
+            buf.put_u16(crate::protocol::wire::PROTOCOL_VERSION_MIN);
+            buf.put_u16(crate::protocol::wire::PROTOCOL_VERSION_MAX);
+            let codes = crate::protocol::wire::supported_command_codes();
+            buf.put_u16(codes.len() as u16);
+            for code in codes {
+                buf.put_u8(code);
+            }
+            WireResponse::ok(buf)
+        }
         RequestPayload::ListTopics => {
             if !engine.authorize(
                 principal,
