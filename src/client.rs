@@ -514,6 +514,114 @@ impl TestClient {
         }
     }
 
+    /// Fetch with an explicit read isolation.
+    ///
+    /// Sends the request inside a versioned envelope carrying an isolation-level tagged
+    /// field. Committed-only reads previously required calling a *different command*
+    /// (`fetch_committed`), so isolation could not be varied per request on the ordinary
+    /// fetch path; it is now a property of the fetch itself.
+    ///
+    /// `fetch` is deliberately left on the legacy framing so existing callers are
+    /// completely unaffected.
+    pub async fn fetch_with_isolation(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        isolation: crate::protocol::wire::IsolationLevel,
+    ) -> IoResult<Vec<RecordFrame>> {
+        use crate::protocol::wire::{tags, PROTOCOL_VERSION_MAX, VERSIONED_ENVELOPE_MAGIC};
+
+        // A process-wide counter rather than per-connection state: the id only has to be
+        // distinguishable within a connection's in-flight window, and this keeps the
+        // client struct and its constructors untouched.
+        static NEXT_CORRELATION_ID: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(1);
+        let correlation_id = NEXT_CORRELATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        req_buf.put_u16(PROTOCOL_VERSION_MAX);
+        req_buf.put_u32(correlation_id);
+        req_buf.put_u8(1); // one tagged field
+        req_buf.put_u8(tags::ISOLATION_LEVEL);
+        req_buf.put_u16(1);
+        req_buf.put_u8(isolation.to_byte());
+
+        req_buf.put_u8(CommandCode::Fetch as u8);
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u64(offset);
+        inner.put_u32(max_bytes);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+
+        // A versioned request is answered with a versioned response: the magic byte and
+        // the echoed correlation id precede the usual status/length/payload.
+        let mut prefix = [0u8; 5];
+        stream.read_exact(&mut prefix).await?;
+        if prefix[0] != VERSIONED_ENVELOPE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "broker answered a versioned request with an unframed response",
+            ));
+        }
+        let echoed = u32::from_be_bytes(prefix[1..5].try_into().unwrap());
+        if echoed != correlation_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "correlation id mismatch: sent {}, received {}",
+                    correlation_id, echoed
+                ),
+            ));
+        }
+
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_fetch_frames(&resp.payload)
+    }
+
+    /// Shared decoder for a fetch response payload: `[count: 4b]` then that many frames.
+    fn decode_fetch_frames(payload: &[u8]) -> IoResult<Vec<RecordFrame>> {
+        if payload.len() < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Payload too short",
+            ));
+        }
+        let count = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut frames = Vec::with_capacity(count);
+        let mut cursor = 4usize;
+        for _ in 0..count {
+            if cursor >= payload.len() {
+                break;
+            }
+            match RecordFrame::decode(&payload[cursor..]) {
+                Ok((mut frame, consumed)) => {
+                    cursor += consumed;
+                    if let Ok(decompressed) = frame.decompress_payload() {
+                        frame.payload = decompressed;
+                    }
+                    frames.push(frame);
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(frames)
+    }
+
     pub async fn commit_offset(
         &mut self,
         group_id: &str,
