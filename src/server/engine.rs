@@ -3000,18 +3000,26 @@ impl StorageEngine {
 
     /// Publishes a replica assignment for partitions that don't have one.
     ///
-    /// A partition created implicitly by a produce never gets a `PartitionLeadershipChange`
-    /// record: `get_or_create_partition` opens the local log and nothing else. Cluster
-    /// metadata therefore has no idea the partition exists, which disables three things at
-    /// once — no follower knows to fetch it (so it is never really replicated), the ISR
-    /// sweep has no membership to manage, and failover has nothing to promote if the holder
-    /// dies. A follower can end up physically holding a complete copy while metadata does
-    /// not consider it a replica at all.
+    /// `ensure_topic_created` now assigns replicas to an implicitly-created topic through
+    /// the controller *before* the first byte is produced, which is the sound way to do
+    /// it and is what every produce to a genuinely new topic goes through. This sweep is
+    /// the repair path for the cases that don't: partitions created before this existed,
+    /// and the one deliberate gap `ensure_topic_created` leaves — a topic auto-created
+    /// while peers are configured but not yet discovered, where publishing an assignment
+    /// immediately would mean writing a single-replica (or otherwise premature) roster.
+    /// Either way, a partition can end up with data on disk that cluster metadata has no
+    /// record of, which disables three things at once — no follower knows to fetch it (so
+    /// it is never really replicated), the ISR sweep has no membership to manage, and
+    /// failover has nothing to promote if the holder dies. A follower can end up
+    /// physically holding a complete copy while metadata does not consider it a replica
+    /// at all.
     ///
     /// This retrofits an assignment onto such partitions **without moving any data**: the
     /// broker currently holding the partition is named leader, and the ISR starts as just
-    /// that broker. The other replicas join through the normal catch-up path once their
-    /// fetchers start, exactly as they would after falling behind.
+    /// that broker — unlike `ensure_topic_created`'s full-ISR start, because here the
+    /// partition may already hold data other replicas have not caught up on. The other
+    /// replicas join through the normal catch-up path once their fetchers start, exactly
+    /// as they would after falling behind.
     ///
     /// Detection is by absence from `topic_registry[topic].partitions`, not by an empty
     /// replica list — a freshly opened `PartitionManager` defaults to `leader_id = self`
