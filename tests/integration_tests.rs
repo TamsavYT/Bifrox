@@ -1,4 +1,7 @@
-use hermes::{hash_key, EngineConfig, FlushPolicy, RecordFrame, Server, StorageEngine, TestClient};
+use hermes::{
+    hash_key, EngineConfig, FlushPolicy, GroupConsumer, GroupConsumerConfig, RecordFrame, Server,
+    StorageEngine, TestClient,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -4746,5 +4749,480 @@ async fn test_scenario_57_static_membership_survives_a_reconnect() {
             .await
             .is_err(),
         "the pre-restart member id must be fenced"
+    );
+}
+
+/// Finds a produce key that `hash_key` routes to `target` out of `num_partitions`
+/// partitions, so a test can deterministically produce records to every partition of a
+/// topic without depending on how many keys it takes to land on each one.
+fn key_for_partition(target: u32, num_partitions: u32) -> String {
+    for i in 0u32..100_000 {
+        let candidate = format!("k{}", i);
+        if hash_key(candidate.as_bytes(), num_partitions as usize) == target {
+            return candidate;
+        }
+    }
+    panic!(
+        "could not find a key hashing to partition {} of {}",
+        target, num_partitions
+    );
+}
+
+/// A `GroupConsumer`'s assignment — not a `--partition` flag — must be what decides which
+/// partitions get consumed. This is the fix for issue #51: a consumer that never joined its
+/// group used to just fetch whatever partition it was told to, silently ignoring everything
+/// else in the topic. This proves the sole member of a 4-partition topic's group ends up
+/// owning every partition, and that polling it actually surfaces every record produced
+/// across all four.
+#[tokio::test]
+async fn test_scenario_58_consumer_group_assignment_drives_what_is_consumed() {
+    let env = start_test_server().await;
+    let topic = "assignment_drives_topic";
+    let group_id = "assignment_drives_group";
+    let num_partitions = 4u32;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client
+        .create_topic(topic, num_partitions)
+        .await
+        .unwrap();
+
+    let mut expected_payloads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        for i in 0..3 {
+            let payload = format!("p{}-r{}", partition, i);
+            setup_client
+                .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+                .await
+                .unwrap();
+            expected_payloads.insert(payload);
+        }
+    }
+
+    let consumer_client = TestClient::connect(env.addr).await.unwrap();
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        ..GroupConsumerConfig::default()
+    };
+    let mut consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
+
+    assert_eq!(
+        consumer.assignment().to_vec(),
+        vec![0u32, 1, 2, 3],
+        "the sole member of the group must own every partition of the topic"
+    );
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.len() < expected_payloads.len() && std::time::Instant::now() < deadline {
+        let records = consumer.poll().await.unwrap();
+        for (_, frame) in records {
+            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        if seen.len() < expected_payloads.len() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    assert_eq!(
+        seen, expected_payloads,
+        "every produced payload across all 4 partitions must eventually be consumed; saw {:?}",
+        seen
+    );
+
+    consumer.commit().await.unwrap();
+}
+
+/// Two members of the same group on the same topic must not both read the same partition:
+/// each ends up with a disjoint, non-empty slice of the assignment that together covers
+/// every partition, and neither ever receives a record from a partition it does not own.
+#[tokio::test]
+async fn test_scenario_59_two_consumers_split_the_partitions_disjointly() {
+    let env = start_test_server().await;
+    let topic = "split_partitions_topic";
+    let group_id = "split_partitions_group";
+    let num_partitions = 4u32;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client
+        .create_topic(topic, num_partitions)
+        .await
+        .unwrap();
+
+    let mut payloads_by_partition: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        let mut payloads = Vec::new();
+        for i in 0..3 {
+            let payload = format!("p{}-r{}", partition, i);
+            setup_client
+                .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+                .await
+                .unwrap();
+            payloads.push(payload);
+        }
+        payloads_by_partition.insert(partition, payloads);
+    }
+
+    let client1 = TestClient::connect(env.addr).await.unwrap();
+    let client2 = TestClient::connect(env.addr).await.unwrap();
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        ..GroupConsumerConfig::default()
+    };
+
+    // Both members join at once so they land in the same rebalance window and generation
+    // (see `start_test_server`'s short `group_initial_rebalance_delay_ms`), producing a
+    // genuine two-way split rather than one member owning everything followed by a later
+    // rebalance — that sequencing is scenario 60.
+    let (c1, c2) = tokio::join!(
+        GroupConsumer::join(client1, config.clone()),
+        GroupConsumer::join(client2, config),
+    );
+    let mut c1 = c1.unwrap();
+    let mut c2 = c2.unwrap();
+
+    let mut a1 = c1.assignment().to_vec();
+    let mut a2 = c2.assignment().to_vec();
+    a1.sort_unstable();
+    a2.sort_unstable();
+
+    assert!(
+        !a1.is_empty(),
+        "consumer 1 must own at least one partition, got {:?}",
+        a1
+    );
+    assert!(
+        !a2.is_empty(),
+        "consumer 2 must own at least one partition, got {:?}",
+        a2
+    );
+    let a1_set: std::collections::HashSet<u32> = a1.iter().copied().collect();
+    let a2_set: std::collections::HashSet<u32> = a2.iter().copied().collect();
+    assert!(
+        a1_set.is_disjoint(&a2_set),
+        "the two consumers' assignments must not overlap: {:?} vs {:?}",
+        a1,
+        a2
+    );
+    let mut combined: Vec<u32> = a1.iter().chain(a2.iter()).copied().collect();
+    combined.sort_unstable();
+    assert_eq!(
+        combined,
+        vec![0, 1, 2, 3],
+        "together the two consumers must cover every partition"
+    );
+
+    let expected1: std::collections::HashSet<String> = a1
+        .iter()
+        .flat_map(|p| payloads_by_partition[p].clone())
+        .collect();
+    let expected2: std::collections::HashSet<String> = a2
+        .iter()
+        .flat_map(|p| payloads_by_partition[p].clone())
+        .collect();
+    let mut seen1: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen2: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (seen1.len() < expected1.len() || seen2.len() < expected2.len())
+        && std::time::Instant::now() < deadline
+    {
+        for (partition, frame) in c1.poll().await.unwrap() {
+            assert!(
+                a1.contains(&partition),
+                "consumer 1 received a record from partition {} which it does not own ({:?})",
+                partition,
+                a1
+            );
+            seen1.insert(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        for (partition, frame) in c2.poll().await.unwrap() {
+            assert!(
+                a2.contains(&partition),
+                "consumer 2 received a record from partition {} which it does not own ({:?})",
+                partition,
+                a2
+            );
+            seen2.insert(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        if seen1.len() < expected1.len() || seen2.len() < expected2.len() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    assert_eq!(
+        seen1, expected1,
+        "consumer 1 must see every payload from its owned partitions; saw {:?}",
+        seen1
+    );
+    assert_eq!(
+        seen2, expected2,
+        "consumer 2 must see every payload from its owned partitions; saw {:?}",
+        seen2
+    );
+}
+
+/// A member that stops noticing the group has moved on must catch up on its own — and must
+/// hand back what it already processed on the partitions it loses, not just abandon it. This
+/// joins one consumer alone (it owns everything), has it consume every produced record
+/// *without* explicitly committing (so the offsets sit in `pending_commits`), lets its
+/// generation settle, then joins a second — which bumps the generation the first member is
+/// still heartbeating under. The first member's `poll()` must notice its heartbeat failing,
+/// rejoin by itself, end up with a shrunk assignment that is disjoint from (and together with
+/// the second member's, covers) the whole topic, and — the point of this scenario — must have
+/// committed the partitions it gave up on the way out, so whoever inherits them does not
+/// re-read what the first member already consumed.
+#[tokio::test]
+async fn test_scenario_60_a_stale_generation_makes_a_consumer_rejoin() {
+    let env = start_test_server().await;
+    let topic = "stale_generation_topic";
+    let group_id = "stale_generation_group";
+    let num_partitions = 4u32;
+    let records_per_partition = 3u64;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client
+        .create_topic(topic, num_partitions)
+        .await
+        .unwrap();
+
+    // Produce a few records to every partition before anyone joins, so c1's initial
+    // assignment has something real to consume (and later, to commit on revoke).
+    let mut expected_payloads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        for i in 0..records_per_partition {
+            let payload = format!("p{}-r{}", partition, i);
+            setup_client
+                .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+                .await
+                .unwrap();
+            expected_payloads.insert(payload);
+        }
+    }
+
+    let client1 = TestClient::connect(env.addr).await.unwrap();
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        ..GroupConsumerConfig::default()
+    };
+    let mut c1 = GroupConsumer::join(client1, config.clone()).await.unwrap();
+    assert_eq!(
+        c1.assignment().to_vec(),
+        vec![0u32, 1, 2, 3],
+        "the sole member must start out owning every partition"
+    );
+
+    // Consume everything without ever calling `commit()` — the point is to leave the
+    // offsets sitting in `pending_commits` so the later revoke has something to flush.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.len() < expected_payloads.len() && std::time::Instant::now() < deadline {
+        let records = c1.poll().await.unwrap();
+        for (_, frame) in records {
+            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        if seen.len() < expected_payloads.len() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    assert_eq!(
+        seen, expected_payloads,
+        "consumer 1 must see every produced payload before anything is revoked; saw {:?}",
+        seen
+    );
+
+    // Nothing has been committed yet — every partition's committed offset is still
+    // untouched (u64::MAX == nothing committed).
+    for partition in 0..num_partitions {
+        let committed = setup_client
+            .fetch_offset(group_id, topic, partition)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed,
+            u64::MAX,
+            "partition {} must have nothing committed yet, since commit() was never called",
+            partition
+        );
+    }
+
+    // Let the first member's generation fully settle before the second arrives, so the two
+    // do not land in the same rebalance window (that would just be scenario 59 again).
+    sleep(Duration::from_millis(150)).await;
+
+    // The second member's join opens a new rebalance window and bumps the generation
+    // immediately. Its own `SyncGroup` cannot complete until the (still-)leader — c1 — has
+    // submitted the new assignment, which only happens once c1 calls `poll()` again and
+    // notices its heartbeat failing. So the two must run concurrently.
+    let client2 = TestClient::connect(env.addr).await.unwrap();
+    let join_config = config.clone();
+    let c2_handle = tokio::spawn(async move { GroupConsumer::join(client2, join_config).await });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while c1.assignment().len() == num_partitions as usize && std::time::Instant::now() < deadline {
+        let _ = c1.poll().await.unwrap();
+        if c1.assignment().len() == num_partitions as usize {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let c2 = c2_handle
+        .await
+        .unwrap()
+        .expect("the second member must be able to join and sync");
+
+    let mut a1 = c1.assignment().to_vec();
+    let mut a2 = c2.assignment().to_vec();
+    a1.sort_unstable();
+    a2.sort_unstable();
+
+    assert!(
+        a1.len() < num_partitions as usize,
+        "consumer 1's assignment must shrink once it notices the stale generation and \
+         rejoins, got {:?}",
+        a1
+    );
+    let a1_set: std::collections::HashSet<u32> = a1.iter().copied().collect();
+    let a2_set: std::collections::HashSet<u32> = a2.iter().copied().collect();
+    assert!(
+        a1_set.is_disjoint(&a2_set),
+        "after the rejoin the two consumers' assignments must not overlap: {:?} vs {:?}",
+        a1,
+        a2
+    );
+    let mut combined: Vec<u32> = a1.iter().chain(a2.iter()).copied().collect();
+    combined.sort_unstable();
+    assert_eq!(
+        combined,
+        vec![0, 1, 2, 3],
+        "together the two consumers must still cover every partition after the rejoin"
+    );
+
+    // The point of this scenario: every partition consumer 1 gave up must have been
+    // committed at the last offset it actually consumed on the way out, not abandoned at
+    // whatever it had committed before (nothing) or silently dropped.
+    let revoked: Vec<u32> = (0..num_partitions).filter(|p| !a1.contains(p)).collect();
+    assert!(
+        !revoked.is_empty(),
+        "consumer 1 must have given up at least one partition, got {:?}",
+        a1
+    );
+    for partition in revoked {
+        let committed = setup_client
+            .fetch_offset(group_id, topic, partition)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed,
+            records_per_partition - 1,
+            "partition {} was revoked from consumer 1 but its committed offset ({}) does not \
+             match the last offset consumer 1 actually consumed ({}) — it was abandoned \
+             instead of committed on the way out",
+            partition,
+            committed,
+            records_per_partition - 1
+        );
+    }
+}
+
+/// A fresh consumer joining the same group on the same topic must resume from committed
+/// offsets, not from the beginning — otherwise every restart of a consumer group re-reads
+/// its whole backlog.
+#[tokio::test]
+async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
+    let env = start_test_server().await;
+    let topic = "resume_committed_topic";
+    let group_id = "resume_committed_group";
+    let num_partitions = 4u32;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client
+        .create_topic(topic, num_partitions)
+        .await
+        .unwrap();
+
+    let mut all_payloads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        for i in 0..3 {
+            let payload = format!("p{}-r{}", partition, i);
+            setup_client
+                .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+                .await
+                .unwrap();
+            all_payloads.insert(payload);
+        }
+    }
+
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        ..GroupConsumerConfig::default()
+    };
+
+    let client1 = TestClient::connect(env.addr).await.unwrap();
+    let mut c1 = GroupConsumer::join(client1, config.clone()).await.unwrap();
+    assert_eq!(c1.assignment().to_vec(), vec![0u32, 1, 2, 3]);
+
+    // Consume and commit every record.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.len() < all_payloads.len() && std::time::Instant::now() < deadline {
+        let records = c1.poll().await.unwrap();
+        for (_, frame) in &records {
+            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        if !records.is_empty() {
+            c1.commit().await.unwrap();
+        } else {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    assert_eq!(
+        seen, all_payloads,
+        "the first consumer must see every produced payload before committing; saw {:?}",
+        seen
+    );
+
+    // Leave outright rather than just dropping the connection: the group's session timeout
+    // is a fixed 10s, so a bare disconnect would leave this member's slot (and leadership)
+    // lingering for that long, and a fresh dynamic member joining in the meantime would
+    // only get a share of the partitions rather than the whole topic. Leaving releases the
+    // slot immediately, which is what actually exercises "a fresh consumer resumes cleanly"
+    // rather than "a fresh consumer waits out a stale predecessor".
+    c1.leave().await.unwrap();
+    drop(c1);
+
+    // A fresh consumer, same group, same topic — resumes from committed offsets.
+    let client2 = TestClient::connect(env.addr).await.unwrap();
+    let mut c2 = GroupConsumer::join(client2, config).await.unwrap();
+    assert_eq!(
+        c2.assignment().to_vec(),
+        vec![0u32, 1, 2, 3],
+        "the sole member must again own every partition"
+    );
+
+    // There is nothing left to wait for — the assertion is that delivery never happens, so
+    // unlike the positive checks above this is a bounded number of polls rather than a
+    // deadline loop waiting on a condition that must not occur.
+    let mut redelivered: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let records = c2.poll().await.unwrap();
+        for (_, frame) in records {
+            redelivered.push(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        redelivered.is_empty(),
+        "a fresh consumer must not re-deliver already-committed records, but got {:?}",
+        redelivered
     );
 }

@@ -46,3 +46,6 @@ plan*.md
 
 # Internal docs kept out of the repo (must follow the !docs/**/*.md negation above)
 docs/HERMES_JAVA_SDK_ROADMAP.md
+
+# Local Claude Code config (orchestrator/subagent setup)
+.claude/
