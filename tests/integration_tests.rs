@@ -4381,6 +4381,9 @@ async fn test_scenario_53_clients_can_negotiate_protocol_support() {
         fetched.len() <= 1,
         "a negotiated versioned request must be served, got {} frames",
         fetched.len()
+    );
+}
+
 /// A forwarded request must be served where it lands, never relayed onward.
 ///
 /// Without this, forwarding ping-pongs: the controller creates a topic and forwards to the
