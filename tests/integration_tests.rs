@@ -4161,3 +4161,85 @@ async fn test_scenario_48_controller_assigns_new_topics_before_first_write() {
         "an existing topic must not be re-created on every produce"
     );
 }
+
+/// Read isolation must be selectable on the ordinary `Fetch` path, not only by calling a
+/// different command.
+///
+/// `Fetch` had no isolation level at all: committed-only reads required `FetchCommitted`,
+/// so a client had to decide which command to use up front and could not express isolation
+/// as the per-request property it actually is. It is now a tagged field on the request
+/// envelope, which is exactly the kind of optional per-request field the envelope exists to
+/// carry — an older broker skips the tag rather than misparsing the request.
+#[tokio::test]
+async fn test_scenario_51_fetch_honours_requested_isolation_level() {
+    use hermes::protocol::wire::IsolationLevel;
+
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+    let topic = "isolation_flag_topic";
+
+    client
+        .produce_single(topic, "", None, 1, "committed_record")
+        .await
+        .unwrap();
+
+    client.begin_transaction("tx_iso", 77).await.unwrap();
+    client
+        .produce_single(topic, "", Some("tx_iso"), 1, "aborted_record")
+        .await
+        .unwrap();
+    client.abort_transaction("tx_iso").await.unwrap();
+
+    // Read-uncommitted is the historical behavior and stays the default: an unset tag must
+    // behave exactly as a legacy `Fetch` always did.
+    let legacy = client.fetch(topic, 0, 0, 65536).await.unwrap();
+    let explicit_uncommitted = client
+        .fetch_with_isolation(topic, 0, 0, 65536, IsolationLevel::ReadUncommitted)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy.len(),
+        explicit_uncommitted.len(),
+        "an explicit read-uncommitted must match legacy Fetch exactly"
+    );
+    assert!(
+        legacy.len() >= 2,
+        "read-uncommitted should expose the aborted record, got {} frames",
+        legacy.len()
+    );
+
+    // Read-committed over the same command must hide what the abort invalidated.
+    let committed = client
+        .fetch_with_isolation(topic, 0, 0, 65536, IsolationLevel::ReadCommitted)
+        .await
+        .unwrap();
+    let payloads: Vec<String> = committed
+        .iter()
+        .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+        .collect();
+    assert!(
+        !payloads.iter().any(|p| p.contains("aborted_record")),
+        "read-committed must not return an aborted record, got {:?}",
+        payloads
+    );
+    for frame in &committed {
+        assert_ne!(
+            frame.magic, 0xAD,
+            "read-committed must not return control markers"
+        );
+    }
+    assert!(
+        committed.len() < legacy.len(),
+        "read-committed ({}) must be strictly narrower than read-uncommitted ({})",
+        committed.len(),
+        legacy.len()
+    );
+
+    // And it agrees with the dedicated command it replaces.
+    let via_command = client.fetch_committed(topic, 0, 0, 65536).await.unwrap();
+    assert_eq!(
+        committed.len(),
+        via_command.len(),
+        "the isolation flag must agree with the FetchCommitted command"
+    );
+}

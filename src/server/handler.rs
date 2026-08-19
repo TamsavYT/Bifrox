@@ -425,6 +425,7 @@ where
                                         &mut logical_client_id,
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
+                                        framing,
                                     )
                                     .await;
                                     response_scratch.clear();
@@ -551,6 +552,7 @@ where
                                         &mut logical_client_id,
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
+                                        framing,
                                     )
                                     .await;
                                     response_scratch.clear();
@@ -1457,6 +1459,9 @@ async fn process_request(
     logical_client_id: &mut Option<String>,
     scram_session: &mut Option<ScramSession>,
     negotiated_scram_mechanism: &mut Option<crate::scram::ScramMechanism>,
+    // How this request was framed, so per-request options carried as envelope tagged
+    // fields (e.g. fetch isolation) are visible to the handlers that act on them.
+    framing: crate::protocol::wire::RequestFraming,
 ) -> WireResponse {
     let quota_key = resolve_quota_key(principal.as_str(), logical_client_id.as_deref(), client_key);
 
@@ -1922,7 +1927,24 @@ async fn process_request(
                 return WireResponse::error("NotLeaderForPartition");
             }
             let fetch_start = std::time::Instant::now();
-            match engine.fetch(&topic, partition, offset, max_bytes).await {
+            // Isolation is a per-request property, expressed as a tagged field on the
+            // request envelope. Committed-only reads previously required calling a
+            // *different command* (`FetchCommitted`), so a client had to decide which
+            // command to use up front and could not vary isolation per fetch. An absent
+            // tag — including every legacy-framed request — means read-uncommitted, which
+            // is exactly what `Fetch` has always done.
+            let isolation = framing.isolation_level();
+            let result = match isolation {
+                crate::protocol::wire::IsolationLevel::ReadCommitted => {
+                    engine
+                        .fetch_committed(&topic, partition, offset, max_bytes)
+                        .await
+                }
+                crate::protocol::wire::IsolationLevel::ReadUncommitted => {
+                    engine.fetch(&topic, partition, offset, max_bytes).await
+                }
+            };
+            match result {
                 Ok(frames) => {
                     engine
                         .metrics()

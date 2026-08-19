@@ -124,6 +124,63 @@ pub const PROTOCOL_VERSION_MIN: u16 = 1;
 /// field; individual requests carry their own shape inside the payload.
 pub const PROTOCOL_VERSION_MAX: u16 = 1;
 
+/// Tagged-field identifiers carried in a versioned request envelope.
+///
+/// A tag is how an optional per-request field is added without changing any existing
+/// layout: brokers that know a tag act on it, brokers that don't skip it. Values are
+/// permanent once assigned.
+pub mod tags {
+    /// Read isolation for a fetch. Payload is one byte — see [`super::IsolationLevel`].
+    pub const ISOLATION_LEVEL: u8 = 0x01;
+}
+
+/// Read isolation requested by a fetch.
+///
+/// Committed-only reads previously required calling a *different command*
+/// (`FetchCommitted`) rather than setting a flag on the ordinary fetch path, so a client
+/// had to know in advance which command to use and could not express isolation as the
+/// per-request property it actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// Serves everything up to the high watermark, including records from transactions
+    /// that were later aborted. The historical behavior of `Fetch`, and still the default
+    /// so an unset tag means exactly what it always did.
+    #[default]
+    ReadUncommitted,
+    /// Bounds the read at the last stable offset and filters aborted ranges and control
+    /// markers.
+    ReadCommitted,
+}
+
+impl IsolationLevel {
+    pub fn to_byte(self) -> u8 {
+        match self {
+            IsolationLevel::ReadUncommitted => 0,
+            IsolationLevel::ReadCommitted => 1,
+        }
+    }
+
+    /// Unknown values decode as `ReadUncommitted` rather than erroring: an unrecognised
+    /// isolation from a newer client must not fail the fetch outright, and the permissive
+    /// value is also the historical default.
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => IsolationLevel::ReadCommitted,
+            _ => IsolationLevel::ReadUncommitted,
+        }
+    }
+}
+
+/// Recognised tagged fields from a request envelope.
+///
+/// Deliberately a small `Copy` struct of *known* tags rather than a list of raw ones:
+/// unknown tags are still skipped during decode, so this stays cheap to pass around and
+/// gains a field only when a tag is actually implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestTags {
+    pub isolation_level: Option<IsolationLevel>,
+}
+
 /// How a request arrived, which determines how its response must be framed.
 ///
 /// The wire format had no version field at all: a broker and client built from different
@@ -135,12 +192,13 @@ pub enum RequestFraming {
     /// Bare `[cmd][len][payload]`, from a client that predates the envelope. Responses go
     /// back unwrapped, exactly as before.
     Legacy,
-    /// Carries a protocol version and a correlation id.
+    /// Carries a protocol version, a correlation id, and any recognised tagged fields.
     Versioned {
         api_version: u16,
         /// Echoed in the response so a client can match replies to requests — the
         /// prerequisite for having more than one request in flight per connection.
         correlation_id: u32,
+        tags: RequestTags,
     },
 }
 
@@ -150,6 +208,20 @@ impl RequestFraming {
             RequestFraming::Legacy => None,
             RequestFraming::Versioned { correlation_id, .. } => Some(*correlation_id),
         }
+    }
+
+    /// Recognised tagged fields, or the defaults for a legacy request — which had no way
+    /// to express them at all.
+    pub fn tags(&self) -> RequestTags {
+        match self {
+            RequestFraming::Legacy => RequestTags::default(),
+            RequestFraming::Versioned { tags, .. } => *tags,
+        }
+    }
+
+    /// Isolation the request asked for, defaulting to the historical behavior when unset.
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.tags().isolation_level.unwrap_or_default()
     }
 }
 
@@ -497,6 +569,7 @@ impl WireRequest {
             }
 
             let tagged_count = src.get_u8() as usize;
+            let mut tags = RequestTags::default();
             for _ in 0..tagged_count {
                 if src.len() < 3 {
                     return Err(WireError::Incomplete {
@@ -504,7 +577,7 @@ impl WireRequest {
                         available: src.len(),
                     });
                 }
-                let _tag = src.get_u8();
+                let tag = src.get_u8();
                 let len = src.get_u16() as usize;
                 if src.len() < len {
                     return Err(WireError::Incomplete {
@@ -512,14 +585,24 @@ impl WireRequest {
                         available: src.len(),
                     });
                 }
-                // Unknown tags are skipped, not rejected — that is the whole point of the
-                // section, and why a future field can be added without breaking this build.
+                let value = &src[..len];
+                match tag {
+                    tags::ISOLATION_LEVEL if len >= 1 => {
+                        tags.isolation_level = Some(IsolationLevel::from_byte(value[0]));
+                    }
+                    // Unknown tags are skipped, not rejected — that is the whole point of
+                    // the section, and why a future field can be added without breaking
+                    // this build. A known tag with an unusable length is skipped for the
+                    // same reason rather than failing the whole request.
+                    _ => {}
+                }
                 src = &src[len..];
             }
 
             RequestFraming::Versioned {
                 api_version,
                 correlation_id,
+                tags,
             }
         } else {
             RequestFraming::Legacy
@@ -1584,6 +1667,7 @@ mod envelope_tests {
             RequestFraming::Versioned {
                 api_version: PROTOCOL_VERSION_MAX,
                 correlation_id: 0xDEAD_BEEF,
+                tags: RequestTags::default(),
             }
         );
         assert_eq!(
@@ -1665,6 +1749,49 @@ mod envelope_tests {
             WireRequest::decode_framed(&bytes),
             Err(WireError::Incomplete { .. })
         ));
+    }
+
+    /// A recognised tag is surfaced to handlers, while unknown tags around it are still
+    /// skipped — both behaviors have to hold at once for the section to be useful.
+    #[test]
+    fn isolation_tag_is_parsed_alongside_unknown_tags() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(11);
+        bytes.put_u8(3);
+        bytes.put_u8(0x7E); // unknown, before
+        bytes.put_u16(2);
+        bytes.extend_from_slice(&[1, 2]);
+        bytes.put_u8(tags::ISOLATION_LEVEL);
+        bytes.put_u16(1);
+        bytes.put_u8(IsolationLevel::ReadCommitted.to_byte());
+        bytes.put_u8(0x7F); // unknown, after
+        bytes.put_u16(1);
+        bytes.put_u8(9);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let (_req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(framing.isolation_level(), IsolationLevel::ReadCommitted);
+        assert_eq!(used, bytes.len());
+    }
+
+    /// No tag means read-uncommitted — the behavior `Fetch` has always had, so legacy
+    /// clients are unaffected by isolation existing.
+    #[test]
+    fn absent_isolation_tag_defaults_to_read_uncommitted() {
+        let (_req, legacy, _) = WireRequest::decode_framed(&legacy_ping()).unwrap();
+        assert_eq!(legacy.isolation_level(), IsolationLevel::ReadUncommitted);
+        assert_eq!(legacy.tags().isolation_level, None);
+
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(1);
+        bytes.put_u8(0);
+        bytes.extend_from_slice(&legacy_ping());
+        let (_req, versioned, _) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(versioned.isolation_level(), IsolationLevel::ReadUncommitted);
     }
 
     /// The magic byte must not collide with any command code, or a legacy request would be
