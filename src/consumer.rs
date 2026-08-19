@@ -44,6 +44,90 @@ pub fn assign_range(partition_count: u32, member_ids: &[String]) -> Vec<(String,
     result
 }
 
+/// Kafka-style round-robin assignor: deals `partition_count` partitions out one at a time
+/// across `member_ids`, in order, wrapping back to the first member after the last. Members
+/// are sorted first for the same reason as [`assign_range`] — only the leader runs this, and
+/// every follower has to trust the result without recomputing it, so the answer must be
+/// deterministic from the same inputs.
+///
+/// Unlike `assign_range`, a member's partitions are scattered rather than a contiguous
+/// block: member 0 gets `0, k, 2k, ...`, member 1 gets `1, k+1, 2k+1, ...`, and so on. This
+/// spreads load more evenly when partitions vary in size, at the cost of losing the key
+/// locality a contiguous range gives.
+///
+/// Every member id passed in is present in the output, even one that lands past the
+/// partition count and so gets an empty `Vec` — same contract as `assign_range`. An empty
+/// `member_ids`, or a `partition_count` of zero, produces an empty result rather than
+/// panicking.
+pub fn assign_roundrobin(partition_count: u32, member_ids: &[String]) -> Vec<(String, Vec<u32>)> {
+    if member_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted_ids: Vec<String> = member_ids.to_vec();
+    sorted_ids.sort();
+
+    let mut result: Vec<(String, Vec<u32>)> = sorted_ids
+        .into_iter()
+        .map(|member_id| (member_id, Vec::new()))
+        .collect();
+
+    let member_count = result.len();
+    for partition in 0..partition_count {
+        result[partition as usize % member_count].1.push(partition);
+    }
+    result
+}
+
+/// Which partition assignment strategy the group negotiated, per [`assign_range`] vs.
+/// [`assign_roundrobin`].
+///
+/// This mirrors [`crate::protocol::IsolationLevel`]'s house style: a small `Copy` enum, a
+/// permissive `from_*` constructor that never fails on an unrecognised input, and a default
+/// that matches the strategy this crate always used before the strategy became selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssignmentStrategy {
+    /// Contiguous blocks per member. The historical, and still default, behavior — see
+    /// [`assign_range`].
+    #[default]
+    Range,
+    /// Partitions dealt out one at a time across members — see [`assign_roundrobin`].
+    RoundRobin,
+}
+
+impl AssignmentStrategy {
+    /// Maps a negotiated `protocol_name` (as returned by `JoinGroup` /
+    /// `DescribeGroup`) to a strategy.
+    ///
+    /// An empty or unrecognised name — an older client, a newer client offering a strategy
+    /// this build does not know, or a group that has not negotiated one yet — falls back to
+    /// `Range` rather than failing the join outright, mirroring how
+    /// `IsolationLevel::from_byte` treats an unknown byte.
+    pub fn from_protocol_name(name: &str) -> Self {
+        match name {
+            "roundrobin" => AssignmentStrategy::RoundRobin,
+            "range" => AssignmentStrategy::Range,
+            other => {
+                if !other.is_empty() {
+                    tracing::warn!(
+                        protocol = other,
+                        "unrecognised partition assignment protocol, defaulting to range"
+                    );
+                }
+                AssignmentStrategy::Range
+            }
+        }
+    }
+
+    /// Runs this strategy's assignment function.
+    pub fn assign(self, partition_count: u32, member_ids: &[String]) -> Vec<(String, Vec<u32>)> {
+        match self {
+            AssignmentStrategy::Range => assign_range(partition_count, member_ids),
+            AssignmentStrategy::RoundRobin => assign_roundrobin(partition_count, member_ids),
+        }
+    }
+}
+
 /// Configuration for a [`GroupConsumer`].
 #[derive(Debug, Clone)]
 pub struct GroupConsumerConfig {
@@ -53,6 +137,10 @@ pub struct GroupConsumerConfig {
     /// dynamically — every process start is a new arrival and the group rebalances around
     /// it. See `TestClient::join_group_static` for what setting this buys.
     pub instance_id: Option<String>,
+    /// Assignment protocols this member offers, most preferred first. The group as a whole
+    /// negotiates one name (see `GroupCoordinator::join_group`) — offering both `"range"`
+    /// and `"roundrobin"` here, rather than only the default, lets a group actually pick
+    /// either instead of `"range"` being the sole option a member could ever propose.
     pub protocols: Vec<String>,
     pub fetch_max_bytes: u32,
     /// How long a follower keeps retrying a `REBALANCE_IN_PROGRESS` `SyncGroup` response
@@ -73,7 +161,7 @@ impl Default for GroupConsumerConfig {
             group_id: String::new(),
             topic: String::new(),
             instance_id: None,
-            protocols: vec!["range".to_string()],
+            protocols: vec!["range".to_string(), "roundrobin".to_string()],
             fetch_max_bytes: 64 * 1024,
             sync_retry_timeout: Duration::from_secs(5),
             sync_retry_interval: Duration::from_millis(50),
@@ -199,7 +287,14 @@ impl GroupConsumer {
             let (_, partitions) = self.client.describe_topic(&self.config.topic).await?;
             let partition_count = partitions.len() as u32;
 
-            let assignments = assign_range(partition_count, &member_ids);
+            // `join.protocol_name` is what the group actually negotiated (the first
+            // protocol offered by the first member to join the generation — see
+            // `GroupCoordinator::join_group`), not necessarily the first entry in this
+            // member's own `protocols` list. Using it here, rather than always calling
+            // `assign_range`, is the point of this method: a group that negotiated
+            // `roundrobin` must actually get round-robin.
+            let strategy = AssignmentStrategy::from_protocol_name(&join.protocol_name);
+            let assignments = strategy.assign(partition_count, &member_ids);
             let member_assignments: Vec<MemberAssignment> = assignments
                 .into_iter()
                 .map(|(member_id, partitions)| MemberAssignment {
@@ -455,6 +550,161 @@ mod tests {
         assert_eq!(
             result,
             vec![("a".to_string(), vec![]), ("b".to_string(), vec![])]
+        );
+    }
+
+    // --- assign_roundrobin ---
+
+    #[test]
+    fn roundrobin_deals_partitions_one_at_a_time() {
+        let members = ids(&["a", "b", "c"]);
+        let result = assign_roundrobin(7, &members);
+        assert_eq!(
+            result,
+            vec![
+                ("a".to_string(), vec![0, 3, 6]),
+                ("b".to_string(), vec![1, 4]),
+                ("c".to_string(), vec![2, 5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn roundrobin_more_members_than_partitions_leaves_some_empty() {
+        let members = ids(&["a", "b", "c", "d", "e"]);
+        let result = assign_roundrobin(2, &members);
+        assert_eq!(
+            result,
+            vec![
+                ("a".to_string(), vec![0]),
+                ("b".to_string(), vec![1]),
+                ("c".to_string(), vec![]),
+                ("d".to_string(), vec![]),
+                ("e".to_string(), vec![]),
+            ]
+        );
+        assert_eq!(result.len(), 5, "every member must still be present");
+    }
+
+    #[test]
+    fn roundrobin_every_partition_is_assigned_exactly_once() {
+        let members = ids(&["m1", "m2", "m3", "m4", "m5", "m6", "m7"]);
+        let partition_count = 23;
+        let result = assign_roundrobin(partition_count, &members);
+
+        let mut all_partitions: Vec<u32> = result
+            .iter()
+            .flat_map(|(_, partitions)| partitions.clone())
+            .collect();
+        all_partitions.sort_unstable();
+
+        let expected: Vec<u32> = (0..partition_count).collect();
+        assert_eq!(
+            all_partitions, expected,
+            "every partition must be assigned to exactly one member"
+        );
+    }
+
+    #[test]
+    fn roundrobin_empty_member_ids_produces_empty_result() {
+        assert_eq!(assign_roundrobin(10, &[]), Vec::new());
+    }
+
+    #[test]
+    fn roundrobin_zero_partitions_produces_empty_assignments_for_every_member() {
+        let members = ids(&["a", "b"]);
+        let result = assign_roundrobin(0, &members);
+        assert_eq!(
+            result,
+            vec![("a".to_string(), vec![]), ("b".to_string(), vec![])]
+        );
+    }
+
+    #[test]
+    fn roundrobin_membership_change_redistributes_partitions() {
+        let before = assign_roundrobin(6, &ids(&["a", "b", "c"]));
+        assert_eq!(before[0].1, vec![0, 3]);
+
+        // "d" joins: every member's slice changes shape, proving a join redistributes
+        // rather than only handing the newcomer whatever was left over.
+        let after = assign_roundrobin(6, &ids(&["a", "b", "c", "d"]));
+        assert_eq!(
+            after,
+            vec![
+                ("a".to_string(), vec![0, 4]),
+                ("b".to_string(), vec![1, 5]),
+                ("c".to_string(), vec![2]),
+                ("d".to_string(), vec![3]),
+            ]
+        );
+    }
+
+    // --- AssignmentStrategy ---
+
+    #[test]
+    fn strategy_defaults_to_range() {
+        assert_eq!(AssignmentStrategy::default(), AssignmentStrategy::Range);
+    }
+
+    #[test]
+    fn strategy_from_protocol_name_recognises_range() {
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name("range"),
+            AssignmentStrategy::Range
+        );
+    }
+
+    #[test]
+    fn strategy_from_protocol_name_recognises_roundrobin() {
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name("roundrobin"),
+            AssignmentStrategy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn strategy_from_protocol_name_falls_back_to_range_for_unknown_or_empty() {
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name("sticky"),
+            AssignmentStrategy::Range
+        );
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name(""),
+            AssignmentStrategy::Range
+        );
+    }
+
+    #[test]
+    fn negotiated_roundrobin_protocol_name_selects_roundrobin_assignment() {
+        // Simulates what consumer.rs does at the SyncGroup call site: take the
+        // negotiated `protocol_name` from the join response and use it to pick the
+        // strategy, rather than always calling `assign_range`.
+        let negotiated_protocol_name = "roundrobin".to_string();
+        let members = ids(&["a", "b", "c"]);
+
+        let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
+        let result = strategy.assign(7, &members);
+
+        assert_eq!(result, assign_roundrobin(7, &members));
+        assert_ne!(
+            result,
+            assign_range(7, &members),
+            "a negotiated roundrobin protocol must not silently produce a range assignment"
+        );
+    }
+
+    #[test]
+    fn unrecognised_negotiated_protocol_name_falls_back_to_range_assignment() {
+        let negotiated_protocol_name = "sticky".to_string();
+        let members = ids(&["a", "b", "c"]);
+
+        let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
+        let result = strategy.assign(7, &members);
+
+        assert_eq!(
+            result,
+            assign_range(7, &members),
+            "an unrecognised protocol name must default rather than error"
         );
     }
 }
