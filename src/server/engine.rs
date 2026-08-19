@@ -1671,11 +1671,12 @@ impl StorageEngine {
         &self,
         group_id: &str,
         member_id: &str,
+        group_instance_id: Option<&str>,
         protocols: Vec<String>,
     ) -> Result<(String, u32, bool, String), String> {
         let coordinator = self.group_coordinator();
         let (m_id, generation_id, is_leader, protocol_name) =
-            coordinator.join_group(group_id, member_id, protocols)?;
+            coordinator.join_group(group_id, member_id, group_instance_id, protocols)?;
 
         // Bound the total wait so a pathological extension chain can't pin a connection.
         let max_wait = coordinator.initial_rebalance_delay() * 3;

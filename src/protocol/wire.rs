@@ -454,6 +454,10 @@ pub enum RequestPayload {
         group_id: String,
         member_id: String,
         protocols: Vec<String>,
+        /// A consumer's stable identity across restarts (`group.instance.id`), if it
+        /// declared one. Trails the protocol list, so a client that never sends it
+        /// produces exactly the bytes it always did — see [`read_trailing_pascal_string`].
+        group_instance_id: Option<String>,
     },
     SyncGroup {
         group_id: String,
@@ -469,6 +473,11 @@ pub enum RequestPayload {
     LeaveGroup {
         group_id: String,
         member_id: String,
+        /// Identifies a static member by its `group.instance.id` instead of by the member
+        /// id it happens to hold this generation. A restarting static consumer does not
+        /// know its current member id; this is how it — or an operator — retires the
+        /// instance for real rather than leaving a slot that only expires on timeout.
+        group_instance_id: Option<String>,
     },
     CreateTopic {
         topic: String,
@@ -987,10 +996,12 @@ impl WireRequest {
                 for _ in 0..proto_count {
                     protocols.push(read_pascal_string(&mut payload_buf)?);
                 }
+                let group_instance_id = read_trailing_pascal_string(&mut payload_buf)?;
                 RequestPayload::JoinGroup {
                     group_id,
                     member_id,
                     protocols,
+                    group_instance_id,
                 }
             }
             CommandCode::SyncGroup => {
@@ -1064,9 +1075,11 @@ impl WireRequest {
             CommandCode::LeaveGroup => {
                 let group_id = read_pascal_string(&mut payload_buf)?;
                 let member_id = read_pascal_string(&mut payload_buf)?;
+                let group_instance_id = read_trailing_pascal_string(&mut payload_buf)?;
                 RequestPayload::LeaveGroup {
                     group_id,
                     member_id,
+                    group_instance_id,
                 }
             }
             CommandCode::CreateTopic => {
@@ -1556,6 +1569,24 @@ impl WireRequest {
     }
 }
 
+/// Reads an optional pascal string appended after a request's historical fields.
+///
+/// This is how a request payload gains a field without a flag day: the frame already
+/// delimits the payload exactly, so an older client simply leaves nothing here and gets
+/// `None`, while a newer one appends the field. An empty string reads as `None` too, so a
+/// client may unconditionally write the field and let "unset" be the empty value rather
+/// than having to vary its encoding.
+///
+/// Only valid for a field that trails everything else — anything written after it could no
+/// longer be told apart from its absence.
+fn read_trailing_pascal_string(buf: &mut &[u8]) -> Result<Option<String>, WireError> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let value = read_pascal_string(buf)?;
+    Ok(if value.is_empty() { None } else { Some(value) })
+}
+
 /// Helper function to read pascal-style strings: `[Len: 2b] | [UTF-8 bytes]`
 fn read_pascal_string(buf: &mut &[u8]) -> Result<String, WireError> {
     if buf.len() < 2 {
@@ -1946,5 +1977,79 @@ mod envelope_tests {
     #[test]
     fn envelope_magic_is_not_a_command_code() {
         assert!(CommandCode::try_from(VERSIONED_ENVELOPE_MAGIC).is_err());
+    }
+
+    fn join_group_request(protocols: &[&str], trailing: Option<&str>) -> Vec<u8> {
+        let mut inner = Vec::new();
+        write_pascal_string(&mut inner, "g");
+        write_pascal_string(&mut inner, "m");
+        inner.put_u32(protocols.len() as u32);
+        for p in protocols {
+            write_pascal_string(&mut inner, p);
+        }
+        if let Some(trailing) = trailing {
+            write_pascal_string(&mut inner, trailing);
+        }
+        let mut bytes = Vec::new();
+        bytes.put_u8(CommandCode::JoinGroup as u8);
+        bytes.put_u32(inner.len() as u32);
+        bytes.extend_from_slice(&inner);
+        bytes
+    }
+
+    /// The field a static member needs is appended after the request's existing ones, so a
+    /// client that predates it sends the identical bytes and must still decode — as a
+    /// dynamic member, which is what it is.
+    #[test]
+    fn join_group_without_instance_id_is_dynamic() {
+        let bytes = join_group_request(&["range"], None);
+        let (req, _, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(used, bytes.len(), "must consume exactly the request");
+        match req.payload {
+            RequestPayload::JoinGroup {
+                group_instance_id,
+                protocols,
+                ..
+            } => {
+                assert_eq!(protocols, vec!["range".to_string()]);
+                assert_eq!(group_instance_id, None);
+            }
+            other => panic!("expected JoinGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn join_group_carries_instance_id_when_present() {
+        let bytes = join_group_request(&["range", "roundrobin"], Some("worker-3"));
+        let (req, _, _) = WireRequest::decode_framed(&bytes).unwrap();
+        match req.payload {
+            RequestPayload::JoinGroup {
+                group_instance_id,
+                protocols,
+                ..
+            } => {
+                assert_eq!(
+                    protocols,
+                    vec!["range".to_string(), "roundrobin".to_string()],
+                    "the instance id must not be mistaken for another protocol"
+                );
+                assert_eq!(group_instance_id, Some("worker-3".to_string()));
+            }
+            other => panic!("expected JoinGroup, got {:?}", other),
+        }
+    }
+
+    /// A client may write the field unconditionally and leave it empty when unset, rather
+    /// than having to send structurally different bytes for the two cases.
+    #[test]
+    fn empty_instance_id_reads_as_unset() {
+        let bytes = join_group_request(&["range"], Some(""));
+        let (req, _, _) = WireRequest::decode_framed(&bytes).unwrap();
+        match req.payload {
+            RequestPayload::JoinGroup {
+                group_instance_id, ..
+            } => assert_eq!(group_instance_id, None),
+            other => panic!("expected JoinGroup, got {:?}", other),
+        }
     }
 }

@@ -2475,6 +2475,7 @@ async fn process_request(
             group_id,
             member_id,
             protocols,
+            group_instance_id,
         } => {
             if !engine.authorize(
                 principal,
@@ -2489,7 +2490,12 @@ async fn process_request(
             // closes, so every member that joined the same window is handed the same
             // generation (see `GroupCoordinator::join_group`).
             match engine
-                .join_group_awaited(&group_id, &member_id, protocols)
+                .join_group_awaited(
+                    &group_id,
+                    &member_id,
+                    group_instance_id.as_deref(),
+                    protocols,
+                )
                 .await
             {
                 Ok((m_id, generation_id, is_leader, protocol_name)) => {
@@ -2564,6 +2570,7 @@ async fn process_request(
         RequestPayload::LeaveGroup {
             group_id,
             member_id,
+            group_instance_id,
         } => {
             if !engine.authorize(
                 principal,
@@ -2574,10 +2581,11 @@ async fn process_request(
             ) {
                 return WireResponse::error("GroupAuthorizationFailed");
             }
-            match engine
-                .group_coordinator()
-                .leave_group(&group_id, &member_id)
-            {
+            match engine.group_coordinator().leave_group(
+                &group_id,
+                &member_id,
+                group_instance_id.as_deref(),
+            ) {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&e),
             }

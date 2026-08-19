@@ -18,6 +18,10 @@ pub struct MemberState {
     pub session_timeout: Duration,
     pub assigned_partitions: HashMap<String, Vec<u32>>,
     pub last_heartbeat: Instant,
+    /// Set when this member declared a `group.instance.id` — i.e. it is a *static* member
+    /// whose slot survives its own process. Kept here so pruning can retire the
+    /// instance-to-member mapping along with the member itself.
+    pub group_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,21 @@ pub struct ConsumerGroup {
     /// future, the group is collecting joiners into a single generation instead of forming
     /// a new one per arrival — see `GroupCoordinator::join_group`.
     pub rebalance_deadline: Option<Instant>,
+    /// `group.instance.id` -> the member id that instance currently holds (KIP-345 static
+    /// membership).
+    ///
+    /// A consumer that declares an instance id keeps its slot — and therefore its
+    /// assignment and the group's generation — across a restart, because the coordinator
+    /// recognises the returning process as the member already in the group rather than as
+    /// a new arrival. Without this, every restart of every member is an arrival and a
+    /// departure, so a rolling bounce of an N-member group costs 2N rebalances and stops
+    /// the group's progress each time; with it, a bounce that completes inside
+    /// `session.timeout` costs none.
+    pub static_members: HashMap<String, String>,
+    /// Monotonic per-group counter behind static members' generated member ids. See
+    /// `GroupCoordinator::join_group` for why a returning static member is issued a *new*
+    /// member id rather than handed back its previous one.
+    pub member_id_seq: u64,
 }
 
 impl ConsumerGroup {
@@ -51,6 +70,8 @@ impl ConsumerGroup {
             members: HashMap::new(),
             protocol_name: None,
             rebalance_deadline: None,
+            static_members: HashMap::new(),
+            member_id_seq: 0,
         }
     }
 
@@ -106,7 +127,16 @@ impl GroupCoordinator {
             .collect();
 
         for member_id in expired {
-            group.members.remove(&member_id);
+            // A static member is not exempt from the session timeout — it just gets its
+            // slot back for free if it returns inside one. Past that the instance is
+            // genuinely gone, so drop its reservation too; keeping it would let a member
+            // that has been down for hours reclaim an assignment the group has since
+            // redistributed.
+            if let Some(member) = group.members.remove(&member_id) {
+                if let Some(instance_id) = member.group_instance_id {
+                    group.static_members.remove(&instance_id);
+                }
+            }
             if group.leader.as_deref() == Some(&member_id) {
                 group.leader = group.members.keys().next().cloned();
             }
@@ -116,6 +146,57 @@ impl GroupCoordinator {
             group.state = GroupState::Empty;
             group.leader = None;
         }
+    }
+
+    /// Hands an instance's existing slot to a returning static member, or `None` if this
+    /// instance id isn't one the group is holding a slot for.
+    ///
+    /// The slot — its assignment, its leadership, and the group's generation — is left
+    /// exactly as it was, which is the entire point: the group does not rebalance for a
+    /// member it never considered gone.
+    ///
+    /// What does change is the member id. The returning process is issued a fresh one and
+    /// the old one stops existing, which fences a predecessor that is still running: a
+    /// half-dead process whose replacement has already started would otherwise keep
+    /// heartbeating and consuming under an identity two processes now share, and the two
+    /// would double-consume the same partitions while each believed it owned them.
+    /// Rotating costs the returning member nothing, since it is told its member id in the
+    /// join response either way.
+    ///
+    /// Note that a subscription change cannot be detected here and so cannot force the
+    /// rebalance it should: `JoinGroup` carries assignor names, not the member's topic
+    /// list, so the coordinator has nothing to compare. A static member that returns
+    /// subscribed to different topics keeps its previous assignment until something else
+    /// rebalances the group.
+    fn rejoin_static(
+        group: &mut ConsumerGroup,
+        instance_id: &str,
+    ) -> Option<(String, u32, bool, String)> {
+        let previous_member_id = group.static_members.get(instance_id)?.clone();
+        let mut member = group.members.remove(&previous_member_id)?;
+
+        group.member_id_seq = group.member_id_seq.saturating_add(1);
+        let new_member_id = format!("{}-{}", instance_id, group.member_id_seq);
+
+        member.member_id = new_member_id.clone();
+        member.client_id = new_member_id.clone();
+        member.last_heartbeat = Instant::now();
+        group.members.insert(new_member_id.clone(), member);
+        group
+            .static_members
+            .insert(instance_id.to_string(), new_member_id.clone());
+
+        let is_leader = group.leader.as_deref() == Some(previous_member_id.as_str());
+        if is_leader {
+            group.leader = Some(new_member_id.clone());
+        }
+
+        Some((
+            new_member_id,
+            group.generation_id,
+            is_leader,
+            group.protocol_name.clone().unwrap_or_default(),
+        ))
     }
 
     pub fn new() -> Self {
@@ -184,10 +265,13 @@ impl GroupCoordinator {
     /// group's assignment via `SyncGroup` — both were previously not returned at all
     /// (callers had to hardcode generation 1 and had no way to discover leadership),
     /// which meant this protocol only actually worked for a group's very first join.
+    ///
+    /// `group_instance_id` opts the caller into static membership: see `rejoin_static`.
     pub fn join_group(
         &self,
         group_id: &str,
         member_id: &str,
+        group_instance_id: Option<&str>,
         protocols: Vec<String>,
     ) -> Result<(String, u32, bool, String), String> {
         let mut groups = self.groups.lock().unwrap();
@@ -196,7 +280,21 @@ impl GroupCoordinator {
             .or_insert_with(|| ConsumerGroup::new(group_id.to_string()));
         Self::prune_expired_members(group);
 
-        let m_id = if member_id.is_empty() {
+        // A known instance id short-circuits everything below: the caller is a member the
+        // group already has, so it takes its slot back without the group rebalancing.
+        if let Some(instance_id) = group_instance_id {
+            if let Some(result) = Self::rejoin_static(group, instance_id) {
+                return Ok(result);
+            }
+        }
+
+        let m_id = if let Some(instance_id) = group_instance_id {
+            // First sighting of this instance. Name its member id after the instance so a
+            // static member is identifiable in `describe_group` output, and so the
+            // sequence below can hand out a fresh one on every rejoin.
+            group.member_id_seq = group.member_id_seq.saturating_add(1);
+            format!("{}-{}", instance_id, group.member_id_seq)
+        } else if member_id.is_empty() {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -217,8 +315,14 @@ impl GroupCoordinator {
                     session_timeout: Duration::from_secs(10),
                     assigned_partitions: HashMap::new(),
                     last_heartbeat: Instant::now(),
+                    group_instance_id: group_instance_id.map(str::to_string),
                 },
             );
+            if let Some(instance_id) = group_instance_id {
+                group
+                    .static_members
+                    .insert(instance_id.to_string(), m_id.clone());
+            }
             rebalance_needed = true;
         } else if let Some(member) = group.members.get_mut(&m_id) {
             member.last_heartbeat = Instant::now();
@@ -385,10 +489,37 @@ impl GroupCoordinator {
         Err("Group or member not found".to_string())
     }
 
-    pub fn leave_group(&self, group_id: &str, member_id: &str) -> Result<(), String> {
+    /// Removes a member from the group.
+    ///
+    /// `group_instance_id`, when given, identifies the member instead of `member_id` —
+    /// a static member's id is rotated on every rejoin, so a caller that has restarted (or
+    /// an operator retiring an instance from outside) has no way to name it otherwise.
+    /// Leaving this way is what actually retires the instance: it releases the reservation
+    /// that would otherwise let the instance return and reclaim its assignment.
+    pub fn leave_group(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<(), String> {
         let mut groups = self.groups.lock().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
-            group.members.remove(member_id);
+            let member_id = match group_instance_id {
+                Some(instance_id) => match group.static_members.remove(instance_id) {
+                    Some(resolved) => resolved,
+                    // The instance holds no slot here. Fall back to the member id given,
+                    // so an explicit id still works even if the instance id is stale.
+                    None => member_id.to_string(),
+                },
+                None => member_id.to_string(),
+            };
+            let member_id = member_id.as_str();
+
+            if let Some(member) = group.members.remove(member_id) {
+                if let Some(instance_id) = member.group_instance_id {
+                    group.static_members.remove(&instance_id);
+                }
+            }
             if group.members.is_empty() {
                 group.state = GroupState::Empty;
                 group.leader = None;
