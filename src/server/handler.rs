@@ -2489,12 +2489,18 @@ async fn process_request(
             // `join_group_awaited` holds the response until the group's join window
             // closes, so every member that joined the same window is handed the same
             // generation (see `GroupCoordinator::join_group`).
+            //
+            // `session_timeout_ms` — when the client sent the tag — lets the coordinator
+            // use the timeout the client actually asked for instead of its historical
+            // hardcoded default, clamped to a sane range (see
+            // `GroupCoordinator::resolve_session_timeout`).
             match engine
-                .join_group_awaited(
+                .join_group_awaited_with_session_timeout(
                     &group_id,
                     &member_id,
                     group_instance_id.as_deref(),
                     protocols,
+                    framing.session_timeout_ms(),
                 )
                 .await
             {

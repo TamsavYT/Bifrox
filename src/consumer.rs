@@ -161,11 +161,13 @@ pub struct GroupConsumerConfig {
     /// the background task rather than from this loop finishing quickly.
     pub sync_retry_timeout: Duration,
     pub sync_retry_interval: Duration,
-    /// `session.timeout.ms` equivalent: how long the group coordinator will wait for a
-    /// heartbeat before considering this member dead and evicting it
-    /// (`GroupCoordinator::prune_expired_members`). The coordinator's own timeout is
-    /// currently a fixed 10s, so this exists mainly to size `heartbeat_interval` against —
-    /// see [`GroupConsumerConfig::validate`].
+    /// `session.timeout.ms`: how long the group coordinator will wait for a heartbeat
+    /// before considering this member dead and evicting it
+    /// (`GroupCoordinator::prune_expired_members`). Sent on `JoinGroup` as the
+    /// `SESSION_TIMEOUT_MS` tagged field and honored by the coordinator — clamped to its
+    /// own sane range (`MIN_SESSION_TIMEOUT`..=`MAX_SESSION_TIMEOUT`) rather than trusted
+    /// outright — instead of the historical hardcoded 10s. Also sizes `heartbeat_interval`
+    /// against, per [`GroupConsumerConfig::validate`].
     pub session_timeout: Duration,
     /// How often the background heartbeat task (see [`GroupConsumer`]) sends a heartbeat,
     /// independent of whether the application is calling [`GroupConsumer::poll`]. Must be
@@ -421,13 +423,18 @@ impl GroupConsumer {
         let protocol_refs: Vec<&str> = self.config.protocols.iter().map(String::as_str).collect();
         // Pass the member id currently held (empty string on the very first join) so a
         // dynamic member rejoins as itself rather than as a brand new arrival.
+        //
+        // `config.session_timeout` rides along as the `SESSION_TIMEOUT_MS` tagged field —
+        // the coordinator now actually uses it (clamped to its own sane range) as this
+        // member's eviction threshold, rather than the historical hardcoded 10s.
         let join = self
             .client
-            .join_group_static(
+            .join_group_with_session_timeout(
                 &self.config.group_id,
                 &self.member_id,
                 self.config.instance_id.as_deref(),
                 &protocol_refs,
+                Some(self.config.session_timeout),
             )
             .await?;
         self.member_id = join.member_id;

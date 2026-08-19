@@ -5323,9 +5323,15 @@ async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_reg
 /// Issue #53: liveness must no longer be a side effect of the application calling
 /// `poll()`. This is the core claim of the fix — a consumer that never polls at all must
 /// still be a live group member once the background heartbeat task takes over, for at
-/// least as long as the coordinator's session timeout (a fixed 10s,
-/// `GroupCoordinator::join_group`). Before this change, `poll()` was the only thing that
-/// ever sent a heartbeat, so this exact scenario would have gotten the consumer evicted.
+/// least as long as its session timeout (`GroupCoordinator::join_group`). Before this
+/// change, `poll()` was the only thing that ever sent a heartbeat, so this exact scenario
+/// would have gotten the consumer evicted.
+///
+/// Uses a short, explicitly configured `session_timeout` rather than the 10s default: the
+/// coordinator now actually honors what a member asks for (issue #53 follow-up — see
+/// `GroupCoordinator::resolve_session_timeout`), which is what lets this scenario prove
+/// the same property in just over a second of real time instead of the ~11s it used to
+/// take waiting out a timeout the client had no way to shorten.
 #[tokio::test]
 async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_polling() {
     let env = start_test_server().await;
@@ -5339,6 +5345,11 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
     let config = GroupConsumerConfig {
         group_id: group_id.to_string(),
         topic: topic.to_string(),
+        // Comfortably inside the coordinator's [200ms, 300s] clamp range, and a 5x
+        // margin over `heartbeat_interval` (well past `validate`'s minimum 3x) so
+        // ordinary scheduling jitter under CI load can't false-fail this.
+        session_timeout: Duration::from_secs(1),
+        heartbeat_interval: Duration::from_millis(200),
         ..GroupConsumerConfig::default()
     };
     let consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
@@ -5356,9 +5367,9 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
     // still present, not just not-yet-swept.
     let mut observer = TestClient::connect(env.addr).await.unwrap();
 
-    // Wait comfortably past the fixed 10s session timeout, checking throughout — not just
-    // at the end — that the member never drops out along the way.
-    let deadline = std::time::Instant::now() + Duration::from_secs(11);
+    // Wait comfortably past the 1s session timeout, checking throughout — not just at the
+    // end — that the member never drops out along the way.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1_600);
     let mut checks = 0u32;
     while std::time::Instant::now() < deadline {
         let (_, members) = observer.describe_group(group_id).await.unwrap();
@@ -5369,10 +5380,10 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
             checks
         );
         checks += 1;
-        sleep(Duration::from_millis(400)).await;
+        sleep(Duration::from_millis(80)).await;
     }
     assert!(
-        checks >= 20,
+        checks >= 15,
         "the wait must actually span the session timeout with many checks along the way, \
          only ran {}",
         checks
@@ -5402,14 +5413,25 @@ async fn test_scenario_64_a_background_stale_generation_surfaces_as_rejoin() {
         .unwrap();
 
     // A fast heartbeat interval so the background task's rejected heartbeat is observed in
-    // well under a second, rather than needing to wait out the (fixed, coordinator-side)
-    // session timeout the way scenario 63 does. `session_timeout` here is purely the
-    // client-side value `validate()` checks the interval against — the coordinator's own
-    // 10s timeout is unaffected and irrelevant to this test.
+    // well under a second, rather than needing to wait out a session timeout the way
+    // scenario 63 does.
+    //
+    // `session_timeout` is deliberately generous (not tight against the interval like
+    // scenario 63's) now that the coordinator actually honors it (issue #53 follow-up,
+    // formerly a fixed, unaffected 10s): once c2's join bumps the generation, c1's eager
+    // (non-cooperative) heartbeats are rejected and, by design, do NOT refresh
+    // `last_heartbeat` — see `GroupCoordinator::heartbeat` — so c1 gets no heartbeat
+    // credit for the ~800ms this test deliberately waits before calling `c1.poll()` to
+    // observe the already-set `needs_rejoin` flag. A short session timeout here would
+    // have the coordinator evict c1 for real before the test ever gets to that
+    // assertion, which is a different scenario (session-timeout eviction) than the one
+    // this test is actually about (a stale-generation rejoin). What this test exercises
+    // is the generation-mismatch rejoin path, so the timeout just needs to comfortably
+    // outlast that wait.
     let config = GroupConsumerConfig {
         group_id: group_id.to_string(),
         topic: topic.to_string(),
-        session_timeout: Duration::from_millis(300),
+        session_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_millis(100),
         ..GroupConsumerConfig::default()
     };
@@ -5484,5 +5506,85 @@ async fn test_scenario_64_a_background_stale_generation_surfaces_as_rejoin() {
         combined,
         vec![0u32, 1, 2, 3],
         "together the two members must still cover every partition exactly once"
+    );
+}
+
+/// The session-timeout follow-up to issue #53: the coordinator must actually use the
+/// session timeout a client requests via `JoinGroup`'s `SESSION_TIMEOUT_MS` tagged field,
+/// not the historical hardcoded 10s it used to ignore the client's own value for entirely
+/// (`GroupCoordinator::resolve_session_timeout`).
+///
+/// Proven here by an outright-dead member — background heartbeat task stopped, no
+/// `leave()` — getting evicted within its own short configured timeout, nowhere near the
+/// old fixed 10s. `test_scenario_63` already proves the flip side (a short timeout doesn't
+/// cause a live member to be evicted early); this proves the timeout is real rather than
+/// decorative.
+#[tokio::test]
+async fn test_scenario_65_the_coordinator_honors_a_short_requested_session_timeout() {
+    let env = start_test_server().await;
+    let topic = "honored_session_timeout_topic";
+    let group_id = "honored_session_timeout_group";
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client.create_topic(topic, 1).await.unwrap();
+
+    let consumer_client = TestClient::connect(env.addr).await.unwrap();
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        session_timeout: Duration::from_millis(700),
+        heartbeat_interval: Duration::from_millis(150),
+        ..GroupConsumerConfig::default()
+    };
+    // Captured *before* the join round trip, not after: the coordinator stamps
+    // `last_heartbeat` early in `JoinGroup` handling, well before `GroupConsumer::join`
+    // returns (which additionally waits out the rebalance barrier and, as leader, runs
+    // `SyncGroup`). Starting the clock only once all of that has finished would make the
+    // measured gap to eviction look shorter than it really is relative to the
+    // coordinator's own clock, and could spuriously trip the lower-bound check below.
+    let started = std::time::Instant::now();
+    let consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
+    let member_id = consumer.member_id().to_string();
+
+    let mut observer = TestClient::connect(env.addr).await.unwrap();
+    let (_, members) = observer.describe_group(group_id).await.unwrap();
+    assert!(
+        members.iter().any(|m| m.member_id == member_id),
+        "the member must be present immediately after joining"
+    );
+
+    // Dropped without `leave()` — this stops the background heartbeat task
+    // (`GroupConsumer::drop`) without telling the coordinator, simulating a process that
+    // died outright rather than one that shut down cleanly.
+    drop(consumer);
+
+    // Bounded poll for the eviction rather than a single fixed sleep, so the assertion is
+    // both prompt (fails fast if it never happens at all) and tolerant of scheduling
+    // jitter around exactly when it happens.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut evicted_after = None;
+    while std::time::Instant::now() < deadline {
+        let (_, members) = observer.describe_group(group_id).await.unwrap();
+        if !members.iter().any(|m| m.member_id == member_id) {
+            evicted_after = Some(started.elapsed());
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let evicted_after = evicted_after.expect(
+        "a dead member must eventually be evicted — the coordinator must not still be \
+         waiting out the old hardcoded 10s",
+    );
+    assert!(
+        evicted_after >= Duration::from_millis(700),
+        "must not be evicted before its own configured session timeout elapsed, got {:?}",
+        evicted_after
+    );
+    assert!(
+        evicted_after < Duration::from_secs(5),
+        "must be evicted comfortably under the legacy hardcoded 10s, not just eventually \
+         — took {:?}",
+        evicted_after
     );
 }

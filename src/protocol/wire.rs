@@ -159,6 +159,17 @@ pub mod tags {
     /// metadata log, sees an unknown topic, concludes it is not the leader, and forwards
     /// straight back.
     pub const FORWARDED: u8 = 0x02;
+
+    /// Requested `session.timeout.ms` for the member joining via `JoinGroup`. Payload is a
+    /// big-endian `u32` of milliseconds.
+    ///
+    /// The coordinator does not trust this outright — it clamps it into a sane range (see
+    /// `server::coordinator::{MIN_SESSION_TIMEOUT, MAX_SESSION_TIMEOUT}`) before using it
+    /// as the member's eviction threshold, so a client cannot ask for a timeout so short it
+    /// gets evicted on ordinary jitter, or so long it defeats failure detection. An absent
+    /// tag — a legacy client, or any request built without it — keeps the coordinator's
+    /// historical fixed default.
+    pub const SESSION_TIMEOUT_MS: u8 = 0x03;
 }
 
 /// Read isolation requested by a fetch.
@@ -209,6 +220,11 @@ pub struct RequestTags {
     /// True when a broker relayed this request on a client's behalf — see
     /// [`tags::FORWARDED`]. Such a request is served where it lands, never forwarded on.
     pub forwarded: bool,
+    /// `session.timeout.ms` the joining member asked for — see
+    /// [`tags::SESSION_TIMEOUT_MS`]. `None` means no tag was sent at all, which the
+    /// coordinator treats differently from an in-range value: it keeps its historical
+    /// default rather than clamping "nothing" into something.
+    pub session_timeout_ms: Option<u32>,
 }
 
 /// How a request arrived, which determines how its response must be framed.
@@ -258,6 +274,15 @@ impl RequestFraming {
     pub fn is_forwarded(&self) -> bool {
         self.tags().forwarded
     }
+
+    /// `session.timeout.ms` requested via [`tags::SESSION_TIMEOUT_MS`], or `None` if the
+    /// request carried no such tag (a legacy request always reads `None`). Unlike
+    /// `isolation_level`/`is_forwarded`, this deliberately does not default the value here
+    /// — clamping an absent request into a default is the coordinator's job, not the wire
+    /// layer's, since only the coordinator knows what that default and clamp range are.
+    pub fn session_timeout_ms(&self) -> Option<u32> {
+        self.tags().session_timeout_ms
+    }
 }
 
 /// Rewraps a request for relay to another broker, marking it as forwarded.
@@ -265,8 +290,9 @@ impl RequestFraming {
 /// Any envelope already on `raw_request` is replaced rather than nested: a second envelope
 /// would leave the receiver parsing the outer one and then finding `0xF1` where a command
 /// code belongs, which decodes as an unknown command. The inner request is preserved
-/// byte-for-byte, and recognised tags from the original envelope are carried across so a
-/// forwarded fetch keeps the isolation level the client asked for.
+/// byte-for-byte, and recognised tags from the original envelope are carried across — so a
+/// forwarded fetch keeps the isolation level the client asked for, and a forwarded join
+/// keeps the session timeout it requested.
 pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> {
     let (inner, tags) = strip_envelope(raw_request)?;
 
@@ -286,6 +312,12 @@ pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> 
         tag_section.put_u8(tags::ISOLATION_LEVEL);
         tag_section.put_u16(1);
         tag_section.put_u8(isolation.to_byte());
+        tag_count += 1;
+    }
+    if let Some(session_timeout_ms) = tags.session_timeout_ms {
+        tag_section.put_u8(tags::SESSION_TIMEOUT_MS);
+        tag_section.put_u16(4);
+        tag_section.put_u32(session_timeout_ms);
         tag_count += 1;
     }
     out.put_u8(tag_count);
@@ -360,6 +392,10 @@ pub fn strip_envelope(src: &[u8]) -> Result<(&[u8], RequestTags), WireError> {
                 tags_out.isolation_level = Some(IsolationLevel::from_byte(cursor[0]));
             }
             tags::FORWARDED => tags_out.forwarded = true,
+            tags::SESSION_TIMEOUT_MS if len >= 4 => {
+                tags_out.session_timeout_ms =
+                    Some(u32::from_be_bytes(cursor[0..4].try_into().unwrap()));
+            }
             _ => {}
         }
         cursor = &cursor[len..];
@@ -745,6 +781,10 @@ impl WireRequest {
                         tags.isolation_level = Some(IsolationLevel::from_byte(value[0]));
                     }
                     tags::FORWARDED => tags.forwarded = true,
+                    tags::SESSION_TIMEOUT_MS if len >= 4 => {
+                        tags.session_timeout_ms =
+                            Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
+                    }
                     // Unknown tags are skipped, not rejected — that is the whole point of
                     // the section, and why a future field can be added without breaking
                     // this build. A known tag with an unusable length is skipped for the
@@ -1970,6 +2010,70 @@ mod envelope_tests {
         bytes.extend_from_slice(&legacy_ping());
         let (_req, versioned, _) = WireRequest::decode_framed(&bytes).unwrap();
         assert_eq!(versioned.isolation_level(), IsolationLevel::ReadUncommitted);
+    }
+
+    /// A recognised `SESSION_TIMEOUT_MS` tag is surfaced alongside unknown tags around it —
+    /// same shape as `isolation_tag_is_parsed_alongside_unknown_tags`.
+    #[test]
+    fn session_timeout_tag_is_parsed_alongside_unknown_tags() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(11);
+        bytes.put_u8(3);
+        bytes.put_u8(0x7E); // unknown, before
+        bytes.put_u16(2);
+        bytes.extend_from_slice(&[1, 2]);
+        bytes.put_u8(tags::SESSION_TIMEOUT_MS);
+        bytes.put_u16(4);
+        bytes.put_u32(45_000);
+        bytes.put_u8(0x7F); // unknown, after
+        bytes.put_u16(1);
+        bytes.put_u8(9);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let (_req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(framing.session_timeout_ms(), Some(45_000));
+        assert_eq!(used, bytes.len());
+    }
+
+    /// No tag means the wire layer reports nothing — it is the coordinator's job to turn
+    /// an absent request into its own default, not the wire layer's (see
+    /// `RequestFraming::session_timeout_ms`).
+    #[test]
+    fn absent_session_timeout_tag_reads_as_none() {
+        let (_req, legacy, _) = WireRequest::decode_framed(&legacy_ping()).unwrap();
+        assert_eq!(legacy.session_timeout_ms(), None);
+
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(1);
+        bytes.put_u8(0);
+        bytes.extend_from_slice(&legacy_ping());
+        let (_req, versioned, _) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(versioned.session_timeout_ms(), None);
+    }
+
+    /// `wrap_forwarded_request` must carry the `SESSION_TIMEOUT_MS` tag across too, not
+    /// just `ISOLATION_LEVEL` — otherwise a forwarded join would silently lose the session
+    /// timeout it asked for.
+    #[test]
+    fn wrap_forwarded_request_carries_session_timeout_tag() {
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(1);
+        bytes.put_u8(1);
+        bytes.put_u8(tags::SESSION_TIMEOUT_MS);
+        bytes.put_u16(4);
+        bytes.put_u32(6_000);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let wrapped = wrap_forwarded_request(&bytes).unwrap();
+        let (_req, framing, _used) = WireRequest::decode_framed(&wrapped).unwrap();
+        assert!(framing.is_forwarded());
+        assert_eq!(framing.session_timeout_ms(), Some(6_000));
     }
 
     /// The magic byte must not collide with any command code, or a legacy request would be

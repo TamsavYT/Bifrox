@@ -2,6 +2,26 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Lower bound the coordinator will honor for a member's requested `session.timeout.ms`
+/// (see `crate::protocol::wire::tags::SESSION_TIMEOUT_MS`), no matter how low the client
+/// asks. A shorter value would evict a perfectly live member on nothing more than ordinary
+/// heartbeat jitter — scheduling delay on the client, a slow network round trip — rather
+/// than an actual failure.
+pub const MIN_SESSION_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Upper bound the coordinator will honor for a requested session timeout. Past this, the
+/// timeout stops doing the job it exists for: a member that has genuinely died keeps its
+/// partitions — and blocks the group from redistributing them — for however long this is
+/// set to. Kept well under an hour for the same reason; five minutes is already a long time
+/// for a dead member to sit on live partitions.
+pub const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Session timeout used when a `JoinGroup` carries no `SESSION_TIMEOUT_MS` tag at all — a
+/// legacy client, or any request built without it. Matches the coordinator's historical
+/// hardcoded value exactly, so a caller that doesn't ask for anything sees no behavior
+/// change from before this was configurable.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupState {
     Empty,
@@ -168,9 +188,40 @@ impl GroupCoordinator {
     /// list, so the coordinator has nothing to compare. A static member that returns
     /// subscribed to different topics keeps its previous assignment until something else
     /// rebalances the group.
+    /// Clamps a client-requested `session.timeout.ms` into
+    /// `[MIN_SESSION_TIMEOUT, MAX_SESSION_TIMEOUT]`, logging when the requested value gets
+    /// adjusted. `None` — no `SESSION_TIMEOUT_MS` tag at all — yields
+    /// `DEFAULT_SESSION_TIMEOUT` unchanged rather than being clamped: a legacy client
+    /// asking for nothing is not "asking for something out of range", and clamping it
+    /// would just be a confusing way of writing the same default.
+    fn resolve_session_timeout(
+        requested_ms: Option<u32>,
+        group_id: &str,
+        member_id: &str,
+    ) -> Duration {
+        let Some(ms) = requested_ms else {
+            return DEFAULT_SESSION_TIMEOUT;
+        };
+        let requested = Duration::from_millis(ms as u64);
+        let clamped = requested.clamp(MIN_SESSION_TIMEOUT, MAX_SESSION_TIMEOUT);
+        if clamped != requested {
+            tracing::warn!(
+                group_id,
+                member_id,
+                requested_ms = ms,
+                clamped_ms = clamped.as_millis() as u64,
+                min_ms = MIN_SESSION_TIMEOUT.as_millis() as u64,
+                max_ms = MAX_SESSION_TIMEOUT.as_millis() as u64,
+                "session.timeout.ms clamped to the coordinator's allowed range"
+            );
+        }
+        clamped
+    }
+
     fn rejoin_static(
         group: &mut ConsumerGroup,
         instance_id: &str,
+        session_timeout: Duration,
     ) -> Option<(String, u32, bool, String)> {
         let previous_member_id = group.static_members.get(instance_id)?.clone();
         let mut member = group.members.remove(&previous_member_id)?;
@@ -181,6 +232,9 @@ impl GroupCoordinator {
         member.member_id = new_member_id.clone();
         member.client_id = new_member_id.clone();
         member.last_heartbeat = Instant::now();
+        // This JoinGroup's requested timeout applies from here on, in case it changed
+        // since the instance last joined (e.g. a config change shipped with the restart).
+        member.session_timeout = session_timeout;
         group.members.insert(new_member_id.clone(), member);
         group
             .static_members
@@ -267,12 +321,17 @@ impl GroupCoordinator {
     /// which meant this protocol only actually worked for a group's very first join.
     ///
     /// `group_instance_id` opts the caller into static membership: see `rejoin_static`.
+    /// `session_timeout_ms` is the client's requested `session.timeout.ms` — the
+    /// `SESSION_TIMEOUT_MS` tagged field off the request envelope, or `None` if the
+    /// request carried no such tag. Resolved (and clamped) via `resolve_session_timeout`
+    /// before it's used as this member's eviction threshold.
     pub fn join_group(
         &self,
         group_id: &str,
         member_id: &str,
         group_instance_id: Option<&str>,
         protocols: Vec<String>,
+        session_timeout_ms: Option<u32>,
     ) -> Result<(String, u32, bool, String), String> {
         let mut groups = self.groups.lock().unwrap();
         let group = groups
@@ -280,10 +339,13 @@ impl GroupCoordinator {
             .or_insert_with(|| ConsumerGroup::new(group_id.to_string()));
         Self::prune_expired_members(group);
 
+        let session_timeout =
+            Self::resolve_session_timeout(session_timeout_ms, group_id, member_id);
+
         // A known instance id short-circuits everything below: the caller is a member the
         // group already has, so it takes its slot back without the group rebalancing.
         if let Some(instance_id) = group_instance_id {
-            if let Some(result) = Self::rejoin_static(group, instance_id) {
+            if let Some(result) = Self::rejoin_static(group, instance_id, session_timeout) {
                 return Ok(result);
             }
         }
@@ -312,7 +374,7 @@ impl GroupCoordinator {
                 MemberState {
                     member_id: m_id.clone(),
                     client_id: m_id.clone(), // Simplify for now
-                    session_timeout: Duration::from_secs(10),
+                    session_timeout,
                     assigned_partitions: HashMap::new(),
                     last_heartbeat: Instant::now(),
                     group_instance_id: group_instance_id.map(str::to_string),
@@ -326,6 +388,9 @@ impl GroupCoordinator {
             rebalance_needed = true;
         } else if let Some(member) = group.members.get_mut(&m_id) {
             member.last_heartbeat = Instant::now();
+            // Refreshed on every rejoin, in case the client's requested timeout changed —
+            // same reasoning as `rejoin_static`.
+            member.session_timeout = session_timeout;
         }
 
         // Negotiate the protocol when the group is (re)forming from Empty — the first
@@ -565,5 +630,150 @@ impl GroupCoordinator {
             state_str,
             members,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- resolve_session_timeout ---
+
+    #[test]
+    fn resolve_session_timeout_defaults_when_absent() {
+        assert_eq!(
+            GroupCoordinator::resolve_session_timeout(None, "g", "m"),
+            DEFAULT_SESSION_TIMEOUT,
+            "no SESSION_TIMEOUT_MS tag must keep the coordinator's historical default"
+        );
+    }
+
+    #[test]
+    fn resolve_session_timeout_clamps_below_minimum() {
+        let requested_ms = (MIN_SESSION_TIMEOUT.as_millis() as u32).saturating_sub(50);
+        assert_eq!(
+            GroupCoordinator::resolve_session_timeout(Some(requested_ms), "g", "m"),
+            MIN_SESSION_TIMEOUT,
+            "a timeout below the floor must be clamped up to it, not honored as-is"
+        );
+    }
+
+    #[test]
+    fn resolve_session_timeout_clamps_above_maximum() {
+        let requested_ms = (MAX_SESSION_TIMEOUT.as_millis() as u32) + 60_000;
+        assert_eq!(
+            GroupCoordinator::resolve_session_timeout(Some(requested_ms), "g", "m"),
+            MAX_SESSION_TIMEOUT,
+            "a timeout above the ceiling must be clamped down to it, not honored as-is"
+        );
+    }
+
+    #[test]
+    fn resolve_session_timeout_passes_through_in_range_value() {
+        assert_eq!(
+            GroupCoordinator::resolve_session_timeout(Some(5_000), "g", "m"),
+            Duration::from_millis(5_000),
+            "an in-range request must be honored exactly, not silently adjusted"
+        );
+    }
+
+    // --- `join_group` actually applies the resolved timeout to the member ---
+
+    fn member_session_timeout(
+        coordinator: &GroupCoordinator,
+        group_id: &str,
+        member_id: &str,
+    ) -> Duration {
+        coordinator
+            .groups
+            .lock()
+            .unwrap()
+            .get(group_id)
+            .and_then(|g| g.members.get(member_id))
+            .expect("member must exist")
+            .session_timeout
+    }
+
+    #[test]
+    fn join_group_honors_an_in_range_requested_session_timeout() {
+        let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
+        let (member_id, ..) = coordinator
+            .join_group("g", "m1", None, vec!["range".to_string()], Some(2_000))
+            .unwrap();
+        assert_eq!(
+            member_session_timeout(&coordinator, "g", &member_id),
+            Duration::from_millis(2_000)
+        );
+    }
+
+    #[test]
+    fn join_group_clamps_a_too_low_requested_session_timeout() {
+        let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
+        let (member_id, ..) = coordinator
+            .join_group("g", "m1", None, vec!["range".to_string()], Some(1))
+            .unwrap();
+        assert_eq!(
+            member_session_timeout(&coordinator, "g", &member_id),
+            MIN_SESSION_TIMEOUT,
+            "a 1ms request must not be honored as-is — it would evict the member on \
+             ordinary jitter"
+        );
+    }
+
+    #[test]
+    fn join_group_clamps_a_too_high_requested_session_timeout() {
+        let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
+        let (member_id, ..) = coordinator
+            .join_group("g", "m1", None, vec!["range".to_string()], Some(3_600_000))
+            .unwrap();
+        assert_eq!(
+            member_session_timeout(&coordinator, "g", &member_id),
+            MAX_SESSION_TIMEOUT,
+            "an hour-long request must not be honored as-is — it would defeat failure \
+             detection almost entirely"
+        );
+    }
+
+    #[test]
+    fn join_group_without_the_tag_keeps_the_default_session_timeout() {
+        let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
+        let (member_id, ..) = coordinator
+            .join_group("g", "m1", None, vec!["range".to_string()], None)
+            .unwrap();
+        assert_eq!(
+            member_session_timeout(&coordinator, "g", &member_id),
+            DEFAULT_SESSION_TIMEOUT,
+            "a legacy caller sending no tag must see exactly the old hardcoded behavior"
+        );
+    }
+
+    #[test]
+    fn rejoin_static_refreshes_the_session_timeout_too() {
+        let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
+        coordinator
+            .join_group(
+                "g",
+                "",
+                Some("instance-a"),
+                vec!["range".to_string()],
+                Some(1_000),
+            )
+            .unwrap();
+        // Same instance rejoins with a different requested timeout — simulating a
+        // restarted process shipped with a new config.
+        let (member_id, ..) = coordinator
+            .join_group(
+                "g",
+                "",
+                Some("instance-a"),
+                vec!["range".to_string()],
+                Some(9_000),
+            )
+            .unwrap();
+        assert_eq!(
+            member_session_timeout(&coordinator, "g", &member_id),
+            Duration::from_millis(9_000),
+            "a static member's rejoin must pick up its newly requested timeout"
+        );
     }
 }

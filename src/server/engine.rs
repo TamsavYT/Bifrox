@@ -1674,9 +1674,39 @@ impl StorageEngine {
         group_instance_id: Option<&str>,
         protocols: Vec<String>,
     ) -> Result<(String, u32, bool, String), String> {
+        self.join_group_awaited_with_session_timeout(
+            group_id,
+            member_id,
+            group_instance_id,
+            protocols,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::join_group_awaited`], but also carries the client's requested
+    /// `session.timeout.ms` — the `SESSION_TIMEOUT_MS` tagged field off the request
+    /// envelope, or `None` if the request carried no such tag — through to
+    /// `GroupCoordinator::join_group`, which resolves (and clamps) it into the member's
+    /// actual eviction threshold. Split out from `join_group_awaited` rather than adding a
+    /// parameter there so the many existing callers that don't care about this are
+    /// unaffected.
+    pub async fn join_group_awaited_with_session_timeout(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocols: Vec<String>,
+        session_timeout_ms: Option<u32>,
+    ) -> Result<(String, u32, bool, String), String> {
         let coordinator = self.group_coordinator();
-        let (m_id, generation_id, is_leader, protocol_name) =
-            coordinator.join_group(group_id, member_id, group_instance_id, protocols)?;
+        let (m_id, generation_id, is_leader, protocol_name) = coordinator.join_group(
+            group_id,
+            member_id,
+            group_instance_id,
+            protocols,
+            session_timeout_ms,
+        )?;
 
         // Bound the total wait so a pathological extension chain can't pin a connection.
         let max_wait = coordinator.initial_rebalance_delay() * 3;
