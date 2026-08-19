@@ -132,6 +132,16 @@ pub const PROTOCOL_VERSION_MAX: u16 = 1;
 pub mod tags {
     /// Read isolation for a fetch. Payload is one byte — see [`super::IsolationLevel`].
     pub const ISOLATION_LEVEL: u8 = 0x01;
+
+    /// Marks a request that a broker is relaying on a client's behalf. The payload is
+    /// empty; the tag's presence is the signal.
+    ///
+    /// The receiving broker serves such a request locally instead of forwarding it onward.
+    /// Without it, forwarding can ping-pong: the controller creates a topic and forwards to
+    /// the newly assigned leader, which has not yet received that assignment through the
+    /// metadata log, sees an unknown topic, concludes it is not the leader, and forwards
+    /// straight back.
+    pub const FORWARDED: u8 = 0x02;
 }
 
 /// Read isolation requested by a fetch.
@@ -179,6 +189,9 @@ impl IsolationLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RequestTags {
     pub isolation_level: Option<IsolationLevel>,
+    /// True when a broker relayed this request on a client's behalf — see
+    /// [`tags::FORWARDED`]. Such a request is served where it lands, never forwarded on.
+    pub forwarded: bool,
 }
 
 /// How a request arrived, which determines how its response must be framed.
@@ -223,6 +236,119 @@ impl RequestFraming {
     pub fn isolation_level(&self) -> IsolationLevel {
         self.tags().isolation_level.unwrap_or_default()
     }
+
+    /// True when a broker relayed this request rather than a client sending it directly.
+    pub fn is_forwarded(&self) -> bool {
+        self.tags().forwarded
+    }
+}
+
+/// Rewraps a request for relay to another broker, marking it as forwarded.
+///
+/// Any envelope already on `raw_request` is replaced rather than nested: a second envelope
+/// would leave the receiver parsing the outer one and then finding `0xF1` where a command
+/// code belongs, which decodes as an unknown command. The inner request is preserved
+/// byte-for-byte, and recognised tags from the original envelope are carried across so a
+/// forwarded fetch keeps the isolation level the client asked for.
+pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> {
+    let (inner, tags) = strip_envelope(raw_request)?;
+
+    let mut out = Vec::with_capacity(inner.len() + 16);
+    out.put_u8(VERSIONED_ENVELOPE_MAGIC);
+    out.put_u16(PROTOCOL_VERSION_MAX);
+    // The relaying broker owns the correlation id on this hop; the client's own id belongs
+    // to its connection with us, and we relay the response body back to it unchanged.
+    out.put_u32(0);
+
+    let mut tag_section = Vec::new();
+    let mut tag_count = 0u8;
+    tag_section.put_u8(tags::FORWARDED);
+    tag_section.put_u16(0);
+    tag_count += 1;
+    if let Some(isolation) = tags.isolation_level {
+        tag_section.put_u8(tags::ISOLATION_LEVEL);
+        tag_section.put_u16(1);
+        tag_section.put_u8(isolation.to_byte());
+        tag_count += 1;
+    }
+    out.put_u8(tag_count);
+    out.extend_from_slice(&tag_section);
+    out.extend_from_slice(inner);
+    Ok(out)
+}
+
+/// Re-frames a response received from another broker for the client that asked for it.
+///
+/// The two hops can be framed differently: a broker always relays using the versioned
+/// envelope (to carry the forwarded marker), so the leader answers framed — but the client
+/// may have sent a bare legacy request and would read the envelope prefix as the response
+/// status. This strips whatever framing the leader used and applies the client's.
+pub fn relay_response(leader_response: &[u8], client_framing: RequestFraming) -> Vec<u8> {
+    let inner = if leader_response.first() == Some(&VERSIONED_ENVELOPE_MAGIC)
+        && leader_response.len() >= 5
+    {
+        &leader_response[5..] // magic + echoed correlation id
+    } else {
+        leader_response
+    };
+
+    match client_framing {
+        RequestFraming::Legacy => inner.to_vec(),
+        RequestFraming::Versioned { correlation_id, .. } => {
+            let mut out = Vec::with_capacity(inner.len() + 5);
+            out.put_u8(VERSIONED_ENVELOPE_MAGIC);
+            out.put_u32(correlation_id);
+            out.extend_from_slice(inner);
+            out
+        }
+    }
+}
+
+/// Splits a request into its inner `[cmd][len][payload]` and the recognised tags of any
+/// envelope wrapping it. A legacy request is returned unchanged with default tags.
+pub fn strip_envelope(src: &[u8]) -> Result<(&[u8], RequestTags), WireError> {
+    if src.first() != Some(&VERSIONED_ENVELOPE_MAGIC) {
+        return Ok((src, RequestTags::default()));
+    }
+    let mut cursor = src;
+    if cursor.len() < 8 {
+        return Err(WireError::Incomplete {
+            needed: 8,
+            available: cursor.len(),
+        });
+    }
+    cursor.get_u8(); // magic
+    cursor.get_u16(); // api_version
+    cursor.get_u32(); // correlation_id
+    let tagged_count = cursor.get_u8() as usize;
+
+    let mut tags_out = RequestTags::default();
+    for _ in 0..tagged_count {
+        if cursor.len() < 3 {
+            return Err(WireError::Incomplete {
+                needed: 3,
+                available: cursor.len(),
+            });
+        }
+        let tag = cursor.get_u8();
+        let len = cursor.get_u16() as usize;
+        if cursor.len() < len {
+            return Err(WireError::Incomplete {
+                needed: len,
+                available: cursor.len(),
+            });
+        }
+        match tag {
+            tags::ISOLATION_LEVEL if len >= 1 => {
+                tags_out.isolation_level = Some(IsolationLevel::from_byte(cursor[0]));
+            }
+            tags::FORWARDED => tags_out.forwarded = true,
+            _ => {}
+        }
+        cursor = &cursor[len..];
+    }
+    let consumed = src.len() - cursor.len();
+    Ok((&src[consumed..], tags_out))
 }
 
 #[derive(Debug, Error)]
@@ -590,6 +716,7 @@ impl WireRequest {
                     tags::ISOLATION_LEVEL if len >= 1 => {
                         tags.isolation_level = Some(IsolationLevel::from_byte(value[0]));
                     }
+                    tags::FORWARDED => tags.forwarded = true,
                     // Unknown tags are skipped, not rejected — that is the whole point of
                     // the section, and why a future field can be added without breaking
                     // this build. A known tag with an unusable length is skipped for the

@@ -353,9 +353,25 @@ where
                                 }
                             }
 
+                            // A request another broker relayed to us is served here, never
+                            // relayed again. The sender already decided we are the right
+                            // destination; bouncing it back is how the two brokers end up
+                            // ping-ponging a request that neither will serve — which is
+                            // exactly what happens when the assigned leader has not yet
+                            // received its assignment through the metadata log.
                             if let Some((topic, partition)) = target_partition {
-                                if !engine.is_partition_leader(&topic, partition) {
-                                    let raw_request = slice[..bytes_used].to_vec();
+                                if !framing.is_forwarded()
+                                    && !engine.is_partition_leader(&topic, partition)
+                                {
+                                    // Marked as forwarded so the receiving broker serves it rather than
+                                    // relaying it onward — see `tags::FORWARDED`. Falls back to
+                                    // the raw bytes if the request cannot be rewrapped, which
+                                    // preserves the previous behavior rather than dropping it.
+                                    let raw_request =
+                                        crate::protocol::wire::wrap_forwarded_request(
+                                            &slice[..bytes_used],
+                                        )
+                                        .unwrap_or_else(|_| slice[..bytes_used].to_vec());
                                     consumed += bytes_used;
 
                                     // Prefer the actual assigned leader for this partition; fall
@@ -380,7 +396,14 @@ where
                                             )
                                             .await
                                             {
-                                                Ok(bytes) => bytes,
+                                                Ok(bytes) => {
+                                                    // The relay hop is always framed (it
+                                                    // carries the forwarded marker); the
+                                                    // client may not be.
+                                                    crate::protocol::wire::relay_response(
+                                                        &bytes, framing,
+                                                    )
+                                                }
                                                 Err(e) => {
                                                     tracing::error!(
                                                         "Produce Forwarding: Failed to forward to leader {}: {}",
@@ -439,8 +462,18 @@ where
                                         return;
                                     }
                                 }
-                            } else if is_controller_mutation && !engine.is_leader() {
-                                let raw_request = slice[..bytes_used].to_vec();
+                            } else if is_controller_mutation
+                                && !engine.is_leader()
+                                && !framing.is_forwarded()
+                            {
+                                // Marked as forwarded so the receiving broker serves it rather than
+                                // relaying it onward — see `tags::FORWARDED`. Falls back to
+                                // the raw bytes if the request cannot be rewrapped, which
+                                // preserves the previous behavior rather than dropping it.
+                                let raw_request = crate::protocol::wire::wrap_forwarded_request(
+                                    &slice[..bytes_used],
+                                )
+                                .unwrap_or_else(|_| slice[..bytes_used].to_vec());
                                 consumed += bytes_used;
 
                                 let response_bytes = match engine.leader_addr() {
@@ -457,7 +490,9 @@ where
                                         )
                                         .await
                                         {
-                                            Ok(bytes) => bytes,
+                                            Ok(bytes) => crate::protocol::wire::relay_response(
+                                                &bytes, framing,
+                                            ),
                                             Err(e) => {
                                                 tracing::error!(
                                                     "Controller Forwarding: Failed to forward to leader {}: {}",
@@ -633,18 +668,66 @@ async fn forward_to_leader(
 
     stream.write_all(raw_request).await?;
 
-    let mut header = [0u8; 5];
-    match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut header)).await {
+    // The relay hop always uses the versioned envelope (it carries the forwarded marker),
+    // so the leader answers framed: `[0xF1][correlation: 4b]` precedes the usual
+    // `[status][len: 4b][payload]`. That prefix has to be consumed here, or its bytes get
+    // read as the response's status and length — turning the correlation id into a
+    // multi-gigabyte payload length and hanging the relay until it times out.
+    //
+    // Still tolerates an unframed reply, so a peer that answers without the envelope is
+    // handled rather than misread.
+    let mut first = [0u8; 1];
+    match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut first)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!(
-                    "Timed out reading response header from leader {}",
-                    leader_addr
-                ),
+                format!("Timed out reading response from leader {}", leader_addr),
             ))
+        }
+    }
+
+    let mut header = [0u8; 5];
+    if first[0] == crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC {
+        let mut correlation = [0u8; 4];
+        match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut correlation)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Timed out reading correlation id from {}", leader_addr),
+                ))
+            }
+        }
+        match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut header)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Timed out reading response header from leader {}",
+                        leader_addr
+                    ),
+                ))
+            }
+        }
+    } else {
+        header[0] = first[0];
+        match timeout(FORWARD_TIMEOUT, stream.read_exact(&mut header[1..5])).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Timed out reading response header from leader {}",
+                        leader_addr
+                    ),
+                ))
+            }
         }
     }
     let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -1866,7 +1949,11 @@ async fn process_request(
             } else {
                 0
             };
-            if !engine.is_partition_leader(&topic, target_partition) {
+            // A forwarded request was already routed here by the sending broker, which
+            // resolved the leader from cluster metadata. Re-checking locally would reject
+            // it whenever this node has not yet received that assignment through the
+            // metadata log — the exact window in which the request was forwarded.
+            if !framing.is_forwarded() && !engine.is_partition_leader(&topic, target_partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
             // Quota: the request's byte cost is known up front, so charge it and serve
@@ -1923,7 +2010,7 @@ async fn process_request(
             ) {
                 return WireResponse::error("TopicAuthorizationFailed");
             }
-            if !engine.is_partition_replica(&topic, partition) {
+            if !framing.is_forwarded() && !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
             let fetch_start = std::time::Instant::now();

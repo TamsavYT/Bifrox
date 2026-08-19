@@ -4330,3 +4330,89 @@ async fn test_scenario_50_sole_controller_commits_immediately() {
         started.elapsed()
     );
 }
+
+/// A forwarded request must be served where it lands, never relayed onward.
+///
+/// Without this, forwarding ping-pongs: the controller creates a topic and forwards to the
+/// newly assigned leader, which has not yet received that assignment through the metadata
+/// log, sees an unknown topic, concludes it is not the leader, and forwards straight back.
+/// That deadlock is what previously prevented routing new-topic produces to the controller
+/// at all.
+#[tokio::test]
+async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
+    use hermes::protocol::wire::{
+        strip_envelope, wrap_forwarded_request, RequestFraming, WireRequest,
+    };
+
+    // A plain client request carries no marker, so a broker is free to route it.
+    let mut original = Vec::new();
+    original.push(hermes::protocol::wire::CommandCode::Ping as u8);
+    original.extend_from_slice(&0u32.to_be_bytes());
+    let (_req, framing, _) = WireRequest::decode_framed(&original).unwrap();
+    assert!(
+        !framing.is_forwarded(),
+        "a client request must not look forwarded"
+    );
+
+    // Relaying it marks it, and the inner request survives byte-for-byte.
+    let relayed = wrap_forwarded_request(&original).unwrap();
+    let (req, relayed_framing, used) = WireRequest::decode_framed(&relayed).unwrap();
+    assert!(
+        relayed_framing.is_forwarded(),
+        "a relayed request must be marked so the receiver serves it"
+    );
+    assert_eq!(req.cmd, hermes::protocol::wire::CommandCode::Ping);
+    assert_eq!(used, relayed.len());
+    let (inner, _) = strip_envelope(&relayed).unwrap();
+    assert_eq!(inner, &original[..], "the inner request must be preserved");
+
+    // Relaying an already-enveloped request must REPLACE the envelope, not nest it —
+    // a nested envelope would leave the receiver reading 0xF1 where a command code belongs.
+    let twice = wrap_forwarded_request(&relayed).unwrap();
+    let (req2, framing2, used2) = WireRequest::decode_framed(&twice).unwrap();
+    assert_eq!(req2.cmd, hermes::protocol::wire::CommandCode::Ping);
+    assert!(framing2.is_forwarded());
+    assert_eq!(
+        used2,
+        twice.len(),
+        "a re-relayed request must still parse whole"
+    );
+
+    // Recognised tags survive the relay, so a forwarded fetch keeps the isolation the
+    // client asked for rather than silently reverting to the default.
+    let mut enveloped = Vec::new();
+    enveloped.push(hermes::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
+    enveloped.extend_from_slice(&hermes::protocol::wire::PROTOCOL_VERSION_MAX.to_be_bytes());
+    enveloped.extend_from_slice(&99u32.to_be_bytes());
+    enveloped.push(1);
+    enveloped.push(hermes::protocol::wire::tags::ISOLATION_LEVEL);
+    enveloped.extend_from_slice(&1u16.to_be_bytes());
+    enveloped.push(hermes::protocol::wire::IsolationLevel::ReadCommitted.to_byte());
+    enveloped.extend_from_slice(&original);
+
+    let relayed_iso = wrap_forwarded_request(&enveloped).unwrap();
+    let (_r, iso_framing, _) = WireRequest::decode_framed(&relayed_iso).unwrap();
+    assert!(iso_framing.is_forwarded());
+    assert_eq!(
+        iso_framing.isolation_level(),
+        hermes::protocol::wire::IsolationLevel::ReadCommitted,
+        "relaying must carry the client's isolation level across the hop"
+    );
+
+    // A response from the relay hop is framed; re-framing it for a legacy client must strip
+    // that envelope, or the client reads the magic byte as the response status.
+    let leader_reply = hermes::protocol::wire::WireResponse::ok(vec![7, 7]).encode_framed(
+        RequestFraming::Versioned {
+            api_version: hermes::protocol::wire::PROTOCOL_VERSION_MAX,
+            correlation_id: 5,
+            tags: Default::default(),
+        },
+    );
+    let for_legacy_client =
+        hermes::protocol::wire::relay_response(&leader_reply, RequestFraming::Legacy);
+    assert_eq!(
+        for_legacy_client,
+        hermes::protocol::wire::WireResponse::ok(vec![7, 7]).encode(),
+        "a legacy client must receive an unwrapped response"
+    );
+}

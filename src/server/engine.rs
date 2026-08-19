@@ -3455,25 +3455,28 @@ impl StorageEngine {
 
     /// Returns true if this broker node is the active leader for the specified partition.
     ///
-    /// A topic cluster metadata has never heard of resolves to this node.
+    /// A topic cluster metadata has never heard of resolves to the **controller**, so that
+    /// creation and replica assignment happen once, in one place, before any data exists.
     ///
-    /// It is tempting to answer "yes" only on the controller, so that produces for new
-    /// topics route there and creation happens once in one place. That does not work while
-    /// a forwarded request is indistinguishable from an original one: the controller
-    /// creates the topic, forwards to the newly assigned leader, and that leader — which
-    /// has not yet received the assignment through the metadata log — sees an unknown topic,
-    /// concludes it is not the leader, and forwards straight back. The request ping-pongs.
+    /// Every node used to answer "yes" here, which meant a produce for a new topic was
+    /// served wherever it happened to land: two clients producing the same new topic
+    /// through different brokers each created their own local copy of the "same" partition,
+    /// with nothing reconciling them, and neither copy had a replica assignment.
     ///
-    /// So an unknown topic is served locally, and controller-mediated creation is applied
-    /// where it is safe: on the controller, before the leadership check (see the auto-create
-    /// hook in `handler.rs`). A produce that lands directly on a non-controller still
-    /// creates an unassigned partition, which `reconcile_unassigned_partitions` repairs.
-    /// Closing that last gap needs forwarded requests to be marked as such, so the assigned
-    /// leader serves them instead of bouncing them.
+    /// This routing is only safe because forwarded requests are marked (see
+    /// `wire::tags::FORWARDED`). Without that mark it deadlocks: the controller creates the
+    /// topic, forwards to the newly assigned leader, and that leader — which has not yet
+    /// received the assignment through the metadata log — sees an unknown topic, concludes
+    /// it is not the leader, and forwards straight back. The marker stops the second hop,
+    /// so the assigned leader serves the request even while its metadata is still catching
+    /// up.
+    ///
+    /// Answering "yes" on the controller is what stops it forwarding to itself, and a
+    /// single-node deployment is its own controller, so it still serves new topics directly.
     pub fn is_partition_leader(&self, topic: &str, partition: u32) -> bool {
         match self.resolve_partition_leader(topic, partition) {
             Some(leader_id) => leader_id == self.config.node_id,
-            None => true,
+            None => Self::is_system_topic(topic) || self.is_leader(),
         }
     }
 
