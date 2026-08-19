@@ -1467,13 +1467,60 @@ impl StorageEngine {
 
     /// Core append+apply+replicate+quorum mechanics shared by every proposal path above.
     /// Callers are responsible for authorization — this function performs none.
+    /// Waits until a majority of the controller quorum has durably acknowledged
+    /// `__cluster_metadata` up to `offset`.
+    ///
+    /// Only controller-eligible peers count. A broker-only peer replicates the metadata log
+    /// so it can learn topics and ACLs, but it never votes, so counting it would make the
+    /// majority threshold wrong — too low, which is the dangerous direction.
+    ///
+    /// The leader counts itself: the record is already durable in its own log by the time
+    /// this is called.
+    async fn await_metadata_commit(&self, offset: u64, timeout: std::time::Duration) -> bool {
+        let controller_peers = self.config.effective_controller_peer_addrs();
+        let quorum_size = controller_peers.len() + 1;
+        let majority = quorum_size / 2 + 1;
+        if majority <= 1 {
+            // Sole controller: its own durable append already is a majority.
+            return true;
+        }
+
+        let start = std::time::Instant::now();
+        loop {
+            let mut acked = 1usize; // this leader
+            for peer in &controller_peers {
+                if self
+                    .replication
+                    .replica_watermark("__cluster_metadata", 0, peer)
+                    .is_some_and(|w| w >= offset)
+                {
+                    acked += 1;
+                }
+            }
+            if acked >= majority {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Metadata commit: only {} of the required {} controller(s) acknowledged \
+                     offset {} within {:?} — not applying",
+                    acked,
+                    majority,
+                    offset,
+                    timeout
+                );
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     async fn propose_metadata_unchecked(
         &self,
         record: crate::replication::MetadataRecord,
     ) -> IoResult<u64> {
         let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
         let frame = meta_pm.produce_frame(&record.encode())?;
-        self.apply_metadata_record(frame.offset, record);
 
         if !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
@@ -1497,6 +1544,30 @@ impl StorageEngine {
                     tracing::error!("propose_metadata: replicate_batch failed: {}", e);
                 }
             });
+
+            // Majority commit gate.
+            //
+            // A metadata record used to be applied the instant it was appended locally,
+            // before any peer had seen it. A record that only ever reached a minority was
+            // still acted upon, so if leadership then moved to a node that never received
+            // it the cluster ended up with two divergent views — different topic configs,
+            // different partition assignments, different ACLs — with nothing to detect or
+            // reconcile the split. Because metadata drives authorization and placement, the
+            // divergence was not confined to the metadata layer: it changed who was allowed
+            // to write and where data landed.
+            if !self
+                .await_metadata_commit(frame.offset, std::time::Duration::from_secs(5))
+                .await
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "NOT_ENOUGH_CONTROLLERS: metadata record at offset {} was not \
+                         acknowledged by a majority of the controller quorum",
+                        frame.offset
+                    ),
+                ));
+            }
 
             if self.config.min_insync_replicas > 1 {
                 self.await_full_isr_ack(
@@ -1529,6 +1600,15 @@ impl StorageEngine {
                 .await;
             });
         }
+
+        // Applied only now — once the record is durable on this leader AND acknowledged by
+        // a majority of the controller quorum (or immediately, for a sole controller, whose
+        // own durable append already is a majority).
+        //
+        // On a failed commit the record stays in the local log but is deliberately NOT
+        // applied and the caller gets an error, so the leader never serves state the
+        // cluster has not agreed on.
+        self.apply_metadata_record(frame.offset, record);
 
         Ok(frame.offset)
     }
@@ -2738,6 +2818,28 @@ impl StorageEngine {
                 "NOT_CONTROLLER: only the cluster leader may create a topic",
             ));
         }
+        // Don't bake in a roster before the cluster is known.
+        //
+        // Replication factor is fixed at creation and never raised automatically, so a
+        // topic auto-created while peers are configured but not yet discovered would be
+        // stuck at a single replica for its entire life — and worse, publishing that roster
+        // tells a peer already receiving the partition's data that it is *not* a replica,
+        // which stops it serving reads it can correctly serve.
+        //
+        // Deferring costs nothing: the produce still succeeds through the local path below,
+        // and `reconcile_unassigned_partitions` assigns the partition properly on a later
+        // sweep once the peers have been discovered.
+        let discovered = self.available_broker_ids().len();
+        if discovered <= 1 && !self.config.peer_addrs.is_empty() {
+            tracing::debug!(
+                "Auto-create: deferring creation of '{}' — {} peer(s) configured but none \
+                 discovered yet, so any roster written now would be single-replica",
+                topic,
+                self.config.peer_addrs.len()
+            );
+            return Ok(());
+        }
+
         self.create_topic(topic, num_partitions.max(1)).await
     }
 
@@ -2878,6 +2980,24 @@ impl StorageEngine {
         }
         let brokers = self.available_broker_ids();
         if brokers.is_empty() {
+            return;
+        }
+
+        // Don't publish an assignment while broker discovery is still incomplete.
+        //
+        // If peers are configured but none has been discovered yet, the only broker this
+        // controller can see is itself, so the computed roster would be `[self]` — and
+        // publishing that is actively destructive rather than merely premature: a peer
+        // that is already receiving this partition's data would be told it is *not* a
+        // replica, which stops it serving reads it can correctly serve and drops it from
+        // ISR accounting. Waiting costs nothing; the next sweep reassesses once the peer
+        // has been discovered through a heartbeat ACK or a BrokerRegister record.
+        if brokers.len() == 1 && !self.config.peer_addrs.is_empty() {
+            tracing::debug!(
+                "Assignment sweep: {} peer(s) configured but none discovered yet — deferring \
+                 assignment rather than publishing a single-replica roster",
+                self.config.peer_addrs.len()
+            );
             return;
         }
 

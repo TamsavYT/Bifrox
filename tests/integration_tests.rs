@@ -585,7 +585,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
         ..EngineConfig::default()
     };
     let engine_node2 = StorageEngine::new(config_node2).unwrap();
-    let server_node2 = Server::new(engine_node2);
+    let server_node2 = Server::new(engine_node2.clone());
     let (listener_node2, addr_node2) = server_node2.bind().unwrap();
 
     let server_node2_task = tokio::spawn(async move {
@@ -602,7 +602,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
         ..EngineConfig::default()
     };
     let engine_node1 = StorageEngine::new(config_node1).unwrap();
-    let server_node1 = Server::new(engine_node1);
+    let server_node1 = Server::new(engine_node1.clone());
     let (listener_node1, addr_node1) = server_node1.bind().unwrap();
 
     let server_node1_task = tokio::spawn(async move {
@@ -4159,5 +4159,92 @@ async fn test_scenario_48_controller_assigns_new_topics_before_first_write() {
         pm.leader_epoch(),
         epoch_before,
         "an existing topic must not be re-created on every produce"
+    );
+}
+
+/// Metadata must not take effect until a majority of the controller quorum has it.
+///
+/// A record used to be applied the instant it was appended locally, before any peer had
+/// seen it. A record that only ever reached a minority was still acted upon, so if
+/// leadership then moved to a node that never received it, the cluster ended up with two
+/// divergent views — different topic configs, partition assignments and ACLs — with nothing
+/// to detect or reconcile the split. Because metadata drives authorization and placement,
+/// that divergence changed who was allowed to write and where data landed.
+#[tokio::test]
+async fn test_scenario_49_metadata_requires_majority_before_taking_effect() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let base_dir =
+        std::env::temp_dir().join(format!("meta_quorum_{}_{}", std::process::id(), count));
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // A controller whose quorum peer does not exist: nothing can ever acknowledge, so no
+    // metadata record can reach a majority.
+    let engine = StorageEngine::new(EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: base_dir.join("lonely"),
+        bind_addr: "127.0.0.1:0".to_string(),
+        // Port 1 is not listening; the peer is unreachable by construction.
+        peer_addrs: vec!["127.0.0.1:1".to_string()],
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    assert!(
+        engine.is_leader(),
+        "it is still the controller, just without a quorum"
+    );
+
+    let started = std::time::Instant::now();
+    let result = engine.create_topic("needs_quorum", 1).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a metadata write that cannot reach a majority must fail, not silently apply"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("NOT_ENOUGH_CONTROLLERS"),
+        "expected a quorum error naming the cause, got: {}",
+        err
+    );
+
+    // And critically: it must not have taken effect locally.
+    assert!(
+        !engine.topic_is_registered("needs_quorum"),
+        "an uncommitted metadata record must not be applied on the leader"
+    );
+
+    // It failed by timing out on the quorum, not by refusing instantly for some other
+    // reason — the wait is what gives a reachable peer the chance to acknowledge.
+    assert!(
+        elapsed >= std::time::Duration::from_secs(1),
+        "expected the commit gate to wait for acknowledgement, returned in {:?}",
+        elapsed
+    );
+
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// A sole controller is its own majority, so it must not be blocked by the commit gate —
+/// otherwise every single-node deployment would be unable to write metadata at all.
+#[tokio::test]
+async fn test_scenario_50_sole_controller_commits_immediately() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+
+    let started = std::time::Instant::now();
+    engine
+        .create_topic("solo_quorum", 1)
+        .await
+        .expect("a sole controller is a majority of one");
+    assert!(
+        engine.topic_is_registered("solo_quorum"),
+        "the record must take effect immediately"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a sole controller must not wait on anyone, took {:?}",
+        started.elapsed()
     );
 }
