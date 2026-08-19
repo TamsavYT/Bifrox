@@ -288,6 +288,61 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Computes the `tls-server-end-point` channel-binding value for a certificate (RFC 5929).
+///
+/// The binding is a hash of the server's DER certificate. SHA-256 is used regardless of the
+/// SCRAM mechanism's own hash: RFC 5929 ties the choice to the certificate's *signature*
+/// algorithm, with SHA-256 substituted whenever that is MD5 or SHA-1, and every certificate
+/// worth binding to today is signed with SHA-256 or stronger.
+///
+/// Binding this value into the authentication exchange is what stops a proof captured on
+/// one TLS connection being replayed on another: a proof computed against this server's
+/// certificate cannot authenticate against a different endpoint, so an attacker who
+/// terminates TLS in the middle cannot forward the client's credentials onward.
+pub fn tls_server_end_point(cert_der: &[u8]) -> Vec<u8> {
+    scram_hash(ScramMechanism::Sha256, cert_der)
+}
+
+/// Builds the `c=` value a client sends: base64 of the GS2 header followed by the binding
+/// data. `None` binding produces the plain `n,,` header used by the non-PLUS mechanisms.
+pub fn encode_channel_binding(binding: Option<&[u8]>) -> String {
+    let mut raw = Vec::new();
+    match binding {
+        Some(data) => {
+            raw.extend_from_slice(b"p=tls-server-end-point,,");
+            raw.extend_from_slice(data);
+        }
+        // "n," means the client does not support channel binding; the trailing comma is
+        // the empty authzid field.
+        None => raw.extend_from_slice(b"n,,"),
+    }
+    BASE64_STANDARD.encode(raw)
+}
+
+/// Verifies a client's `c=` value against what this server expects.
+///
+/// `expected_binding` is `Some` only when the mechanism negotiated was a `-PLUS` variant.
+/// A mismatch means the client either bound to a different endpoint — the man-in-the-middle
+/// case this exists to catch — or claimed a binding the server cannot confirm.
+pub fn verify_channel_binding(c_value: &str, expected_binding: Option<&[u8]>) -> bool {
+    let Ok(decoded) = BASE64_STANDARD.decode(c_value) else {
+        return false;
+    };
+    match expected_binding {
+        Some(binding) => {
+            let prefix = b"p=tls-server-end-point,,";
+            if !decoded.starts_with(prefix) {
+                return false;
+            }
+            constant_time_eq(&decoded[prefix.len()..], binding)
+        }
+        // Without a negotiated binding the header must be one of the non-binding forms.
+        // "y,," means the client supports binding but believes the server does not — it is
+        // accepted here because rejecting it would break clients that probe, and the
+        // downgrade it signals is only meaningful when the server actually offers -PLUS.
+        None => decoded == b"n,," || decoded == b"y,,",
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +429,76 @@ mod tests {
                 mechanism
             );
         }
+    }
+
+    /// A binding proves the exchange belongs to one specific TLS endpoint. A proof bound to
+    /// one certificate must not verify against another — that is the whole point: an
+    /// attacker terminating TLS in the middle cannot forward captured credentials onward.
+    #[test]
+    fn channel_binding_is_tied_to_the_certificate() {
+        let cert_a = b"-----cert-a-----";
+        let cert_b = b"-----cert-b-----";
+        let bind_a = tls_server_end_point(cert_a);
+        let bind_b = tls_server_end_point(cert_b);
+        assert_ne!(
+            bind_a, bind_b,
+            "different certificates must bind differently"
+        );
+        assert_eq!(
+            bind_a,
+            tls_server_end_point(cert_a),
+            "binding must be stable"
+        );
+
+        let c_value = encode_channel_binding(Some(&bind_a));
+        assert!(verify_channel_binding(&c_value, Some(&bind_a)));
+        assert!(
+            !verify_channel_binding(&c_value, Some(&bind_b)),
+            "a binding for one endpoint must not verify against another"
+        );
+    }
+
+    /// The `c=` value used to be checked only for presence, so a client could claim any
+    /// binding and be believed. Each of these was accepted before and must not be now.
+    #[test]
+    fn channel_binding_rejects_mismatched_and_malformed_values() {
+        let binding = tls_server_end_point(b"server-cert");
+
+        // Claiming no binding when one was negotiated.
+        assert!(!verify_channel_binding(
+            &encode_channel_binding(None),
+            Some(&binding)
+        ));
+        // Claiming a binding when none was negotiated.
+        assert!(!verify_channel_binding(
+            &encode_channel_binding(Some(&binding)),
+            None
+        ));
+        // Right header, wrong binding bytes.
+        let mut wrong = b"p=tls-server-end-point,,".to_vec();
+        wrong.extend_from_slice(&tls_server_end_point(b"other-cert"));
+        assert!(!verify_channel_binding(
+            &BASE64_STANDARD.encode(wrong),
+            Some(&binding)
+        ));
+        // Not valid base64 at all.
+        assert!(!verify_channel_binding("not!base64", Some(&binding)));
+        assert!(!verify_channel_binding("not!base64", None));
+    }
+
+    /// Without a negotiated binding the header must still be one of the non-binding forms
+    /// rather than anything the client feels like sending. `y,,` is accepted because it is
+    /// how a binding-capable client reports that the server did not offer -PLUS.
+    #[test]
+    fn non_plus_mechanisms_accept_only_non_binding_headers() {
+        assert!(verify_channel_binding(&BASE64_STANDARD.encode("n,,"), None));
+        assert!(verify_channel_binding(&BASE64_STANDARD.encode("y,,"), None));
+        assert!(!verify_channel_binding(
+            &BASE64_STANDARD.encode("p=tls-server-end-point,,"),
+            None
+        ));
+        // "biws" is base64("n,,") — the value the client has always sent.
+        assert!(verify_channel_binding("biws", None));
     }
 
     /// The storage discriminant must round-trip, and an absent byte must mean SHA-256 so

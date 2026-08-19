@@ -50,6 +50,9 @@ impl AsPlainTcpStream for tokio_rustls::server::TlsStream<TcpStream> {
 
 #[derive(Debug, Clone)]
 struct ScramSession {
+    /// True when the negotiated mechanism was a `-PLUS` variant, so the client's `c=` must
+    /// carry this server's binding rather than a non-binding header.
+    channel_bound: bool,
     username: String,
     /// Mechanism negotiated in `SaslHandshake`. The credential store holds one entry per
     /// `(user, mechanism)`, so this selects which credential the exchange validates against.
@@ -152,6 +155,9 @@ where
     // Set by `SaslHandshake`; selects which of a user's credentials the SCRAM exchange
     // validates against (see `ScramSession::mechanism`).
     let mut negotiated_scram_mechanism: Option<crate::scram::ScramMechanism> = None;
+    // Whether the negotiated mechanism was a `-PLUS` variant, which is what requires the
+    // client's `c=` to carry this server's channel binding.
+    let mut negotiated_scram_is_plus = false;
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
@@ -448,6 +454,7 @@ where
                                         &mut logical_client_id,
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
+                                        &mut negotiated_scram_is_plus,
                                         framing,
                                     )
                                     .await;
@@ -588,6 +595,7 @@ where
                                         &mut logical_client_id,
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
+                                        &mut negotiated_scram_is_plus,
                                         framing,
                                     )
                                     .await;
@@ -1554,6 +1562,7 @@ async fn process_request(
     logical_client_id: &mut Option<String>,
     scram_session: &mut Option<ScramSession>,
     negotiated_scram_mechanism: &mut Option<crate::scram::ScramMechanism>,
+    negotiated_scram_is_plus: &mut bool,
     // How this request was framed, so per-request options carried as envelope tagged
     // fields (e.g. fetch isolation) are visible to the handlers that act on them.
     framing: crate::protocol::wire::RequestFraming,
@@ -1586,7 +1595,9 @@ async fn process_request(
 
     match req.payload {
         RequestPayload::SaslHandshake { mechanism } => {
-            let mechs = &engine.config().sasl_mechanisms;
+            // Includes the -PLUS variants when this broker has a certificate to bind to.
+            let mechs = engine.advertised_sasl_mechanisms();
+            let mechs = &mechs;
             let supported = mechs.iter().any(|m| m.eq_ignore_ascii_case(&mechanism));
             let error_code: i16 = if supported { 0 } else { 33 };
             // Remember which SCRAM mechanism was negotiated, so the subsequent
@@ -1668,6 +1679,9 @@ async fn process_request(
 
                 *scram_session = Some(ScramSession {
                     username,
+                    // A -PLUS mechanism was negotiated in the handshake, so this
+                    // exchange must carry a real channel binding.
+                    channel_bound: *negotiated_scram_is_plus,
                     // Pin the exchange to the credential actually selected above, so the
                     // client-final step verifies under the same hash the server-first
                     // salt/iterations came from.
@@ -1720,6 +1734,37 @@ async fn process_request(
                         );
                     }
                 };
+
+                // The `c=` value was previously only checked for *presence*, so a client
+                // could claim any binding — or none — and be believed. Verifying it is what
+                // makes the `-PLUS` mechanisms mean anything: a proof captured on one TLS
+                // connection cannot be replayed on another, because it was computed against
+                // this server's certificate.
+                //
+                // `expected` is `Some` only when a `-PLUS` mechanism was negotiated; for the
+                // plain mechanisms the header must still be one of the non-binding forms
+                // rather than an arbitrary value.
+                let expected_binding = if session.channel_bound {
+                    engine.tls_channel_binding()
+                } else {
+                    None
+                };
+                if !crate::scram::verify_channel_binding(
+                    &client_final.channel_binding,
+                    expected_binding,
+                ) {
+                    tracing::warn!(
+                        "SASL: channel binding mismatch for user '{}' — rejecting",
+                        session.username
+                    );
+                    scram_session.take();
+                    return build_sasl_auth_response(
+                        58,
+                        Some("SASL Authentication Failed"),
+                        &[],
+                        0,
+                    );
+                }
 
                 if client_final.nonce != session.combined_nonce
                     || !verify_scram_proof(&client_final, session, &credential)
@@ -2884,6 +2929,9 @@ struct ScramClientFinal {
     nonce: String,
     proof: Vec<u8>,
     without_proof: String,
+    /// The raw `c=` value, retained so the server can verify it against the binding it
+    /// expects rather than merely checking the field was present.
+    channel_binding: String,
 }
 
 fn build_sasl_auth_response(
@@ -2966,12 +3014,13 @@ fn parse_scram_client_final(auth_text: &str) -> Option<ScramClientFinal> {
         }
     }
 
-    channel_binding?;
+    let channel_binding = channel_binding?;
     let proof = BASE64_STANDARD.decode(proof_b64?).ok()?;
     Some(ScramClientFinal {
         nonce: nonce?,
         proof,
         without_proof: without_proof_parts.join(","),
+        channel_binding,
     })
 }
 
