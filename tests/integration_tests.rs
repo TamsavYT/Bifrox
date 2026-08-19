@@ -5319,3 +5319,170 @@ async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_reg
         stray
     );
 }
+
+/// Issue #53: liveness must no longer be a side effect of the application calling
+/// `poll()`. This is the core claim of the fix — a consumer that never polls at all must
+/// still be a live group member once the background heartbeat task takes over, for at
+/// least as long as the coordinator's session timeout (a fixed 10s,
+/// `GroupCoordinator::join_group`). Before this change, `poll()` was the only thing that
+/// ever sent a heartbeat, so this exact scenario would have gotten the consumer evicted.
+#[tokio::test]
+async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_polling() {
+    let env = start_test_server().await;
+    let topic = "background_heartbeat_topic";
+    let group_id = "background_heartbeat_group";
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client.create_topic(topic, 2).await.unwrap();
+
+    let consumer_client = TestClient::connect(env.addr).await.unwrap();
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        ..GroupConsumerConfig::default()
+    };
+    let consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
+    let member_id = consumer.member_id().to_string();
+    assert_eq!(
+        consumer.assignment().to_vec(),
+        vec![0u32, 1],
+        "the sole member must start out owning every partition"
+    );
+
+    // `consumer.poll()` is never called again anywhere in this test — that omission is the
+    // entire point. Membership is checked out-of-band, over a separate connection, via
+    // DescribeGroup, which prunes expired members before answering
+    // (`GroupCoordinator::describe_group`) — so a member it reports present really is
+    // still present, not just not-yet-swept.
+    let mut observer = TestClient::connect(env.addr).await.unwrap();
+
+    // Wait comfortably past the fixed 10s session timeout, checking throughout — not just
+    // at the end — that the member never drops out along the way.
+    let deadline = std::time::Instant::now() + Duration::from_secs(11);
+    let mut checks = 0u32;
+    while std::time::Instant::now() < deadline {
+        let (_, members) = observer.describe_group(group_id).await.unwrap();
+        assert!(
+            members.iter().any(|m| m.member_id == member_id),
+            "the consumer must still be a group member after {} check(s), having never \
+             called poll()",
+            checks
+        );
+        checks += 1;
+        sleep(Duration::from_millis(400)).await;
+    }
+    assert!(
+        checks >= 20,
+        "the wait must actually span the session timeout with many checks along the way, \
+         only ran {}",
+        checks
+    );
+
+    drop(consumer);
+}
+
+/// Issue #53, part two: a heartbeat rejected for a stale generation must surface to the
+/// consume loop as a rejoin, never be silently dropped by the background task. This
+/// exercises the same underlying event as
+/// `test_scenario_60_a_stale_generation_makes_a_consumer_rejoin`, but from the new angle
+/// that change introduces: the rejection is now observed by the background heartbeat task
+/// on its own connection, with the application never calling `poll()` in between, and only
+/// a shared `needs_rejoin` flag carries that observation over to the next `poll()` call.
+#[tokio::test]
+async fn test_scenario_64_a_background_stale_generation_surfaces_as_rejoin() {
+    let env = start_test_server().await;
+    let topic = "background_stale_generation_topic";
+    let group_id = "background_stale_generation_group";
+    let num_partitions = 4u32;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client
+        .create_topic(topic, num_partitions)
+        .await
+        .unwrap();
+
+    // A fast heartbeat interval so the background task's rejected heartbeat is observed in
+    // well under a second, rather than needing to wait out the (fixed, coordinator-side)
+    // session timeout the way scenario 63 does. `session_timeout` here is purely the
+    // client-side value `validate()` checks the interval against — the coordinator's own
+    // 10s timeout is unaffected and irrelevant to this test.
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        session_timeout: Duration::from_millis(300),
+        heartbeat_interval: Duration::from_millis(100),
+        ..GroupConsumerConfig::default()
+    };
+
+    let client1 = TestClient::connect(env.addr).await.unwrap();
+    let mut c1 = GroupConsumer::join(client1, config.clone()).await.unwrap();
+    assert_eq!(
+        c1.assignment().to_vec(),
+        vec![0u32, 1, 2, 3],
+        "the sole member must start out owning every partition"
+    );
+    let generation_before = c1.generation_id();
+
+    // Let c1's generation fully settle before c2 arrives, so the two don't land in the same
+    // rebalance window (matching scenario 60's setup for the same reason).
+    sleep(Duration::from_millis(150)).await;
+
+    // The second member's join bumps the group's generation immediately
+    // (`GroupCoordinator::join_group`), out from under c1, which hasn't rejoined. c1 is
+    // still the group's leader, so c2's own `SyncGroup` cannot complete until c1 rejoins
+    // and submits the new assignment — hence running the two concurrently.
+    let client2 = TestClient::connect(env.addr).await.unwrap();
+    let join_config = config.clone();
+    let c2_handle = tokio::spawn(async move { GroupConsumer::join(client2, join_config).await });
+
+    // Give the background heartbeat task several ticks — at 100ms apart — to hit the
+    // rejection and set `needs_rejoin`, entirely without `c1.poll()` being called. This is
+    // the crux of the test: detection must not depend on the application driving the poll
+    // loop at all.
+    sleep(Duration::from_millis(800)).await;
+
+    // A single `poll()` call must observe the already-set flag and rejoin immediately,
+    // rather than fetching under the stale generation or silently doing nothing.
+    let records = c1.poll().await.unwrap();
+    assert!(
+        records.is_empty(),
+        "the round that performs the rejoin must not also return fetched records"
+    );
+    assert_ne!(
+        c1.generation_id(),
+        generation_before,
+        "the stale generation the background task observed must have surfaced as a \
+         rejoin — c1 must not still be sitting on the old generation"
+    );
+
+    let c2 = c2_handle
+        .await
+        .unwrap()
+        .expect("the second member must be able to join and sync once c1 rejoins as leader");
+
+    let mut a1 = c1.assignment().to_vec();
+    let mut a2 = c2.assignment().to_vec();
+    a1.sort_unstable();
+    a2.sort_unstable();
+    assert!(
+        a1.len() < num_partitions as usize,
+        "c1's assignment must shrink once the stale generation surfaces and it rejoins, \
+         got {:?}",
+        a1
+    );
+    let a1_set: std::collections::HashSet<u32> = a1.iter().copied().collect();
+    let a2_set: std::collections::HashSet<u32> = a2.iter().copied().collect();
+    assert!(
+        a1_set.is_disjoint(&a2_set),
+        "after the rejoin the two consumers' assignments must not overlap: {:?} vs {:?}",
+        a1,
+        a2
+    );
+    let mut combined: Vec<u32> = a1.iter().chain(a2.iter()).copied().collect();
+    combined.sort_unstable();
+    assert_eq!(
+        combined,
+        vec![0u32, 1, 2, 3],
+        "together the two members must still cover every partition exactly once"
+    );
+}

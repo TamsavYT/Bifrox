@@ -210,6 +210,14 @@ impl TestClient {
         })
     }
 
+    /// The broker address this client talks to. Exists so a caller that needs a *second*,
+    /// independent connection to the same broker (e.g. `GroupConsumer`'s background
+    /// heartbeat task — a fetch in flight on this connection must not delay a heartbeat on
+    /// another) doesn't have to carry the address around separately.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     pub async fn connect_tls(addr: SocketAddr) -> IoResult<Self> {
         Self::connect_tls_full(addr, None, None, false).await
     }
