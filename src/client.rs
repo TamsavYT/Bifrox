@@ -1065,13 +1065,77 @@ impl TestClient {
         Ok(self.sasl_authenticate_full(auth_bytes).await?.error_code)
     }
 
+    /// This connection's `tls-server-end-point` channel binding, derived from the
+    /// certificate the server actually presented.
+    ///
+    /// `None` on a plaintext connection, or if the peer sent no certificate — in either
+    /// case there is nothing to bind to, and the `-PLUS` mechanisms are not usable.
+    pub fn tls_channel_binding(&self) -> Option<Vec<u8>> {
+        match self.stream.as_ref()? {
+            ClientStream::Plain(_) => None,
+            ClientStream::Tls(tls) => {
+                let (_, conn) = tls.get_ref();
+                let leaf = conn.peer_certificates()?.first()?;
+                Some(scram::tls_server_end_point(leaf))
+            }
+        }
+    }
+
+    /// SCRAM authentication over a `-PLUS` mechanism, binding the exchange to this TLS
+    /// connection.
+    ///
+    /// Without binding, a proof captured on one connection can be replayed on another — an
+    /// attacker terminating TLS in the middle can forward the client's credentials onward.
+    /// Binding ties the proof to the certificate this client actually saw, so it is
+    /// worthless anywhere else.
+    pub async fn sasl_authenticate_scram_plus(
+        &mut self,
+        username: &str,
+        password: &str,
+        mechanism: crate::scram::ScramMechanism,
+    ) -> IoResult<i16> {
+        let binding = self.tls_channel_binding().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "channel binding requires a TLS connection with a server certificate",
+            )
+        })?;
+        self.sasl_authenticate_scram_inner(username, password, mechanism, Some(binding))
+            .await
+    }
+
     pub async fn sasl_authenticate_scram_sha256(
         &mut self,
         username: &str,
         password: &str,
     ) -> IoResult<i16> {
+        self.sasl_authenticate_scram_inner(
+            username,
+            password,
+            crate::scram::ScramMechanism::Sha256,
+            None,
+        )
+        .await
+    }
+
+    /// Shared SCRAM exchange. `channel_binding` is `Some` only for the `-PLUS` mechanisms;
+    /// the GS2 header sent in client-first must match, or the server rejects the binding.
+    async fn sasl_authenticate_scram_inner(
+        &mut self,
+        username: &str,
+        password: &str,
+        _mechanism: crate::scram::ScramMechanism,
+        channel_binding: Option<Vec<u8>>,
+    ) -> IoResult<i16> {
         let client_nonce = generate_scram_client_nonce()?;
-        let client_first = format!("n,,n={},r={}", username, client_nonce);
+        // The GS2 header must state the same intent the `c=` value later encodes:
+        // `p=tls-server-end-point,,` when binding, plain `n,,` when not.
+        let gs2_header = if channel_binding.is_some() {
+            "p=tls-server-end-point,,"
+        } else {
+            "n,,"
+        };
+        let client_first = format!("{}n={},r={}", gs2_header, username, client_nonce);
         let first_response = self.sasl_authenticate_full(client_first.as_bytes()).await?;
         if first_response.error_code != 0 {
             return Ok(first_response.error_code);
@@ -1082,11 +1146,14 @@ impl TestClient {
         let (combined_nonce, salt, iterations) = parse_scram_server_first(&server_first)?;
         let client_final = build_scram_client_final(
             password,
-            &client_first[3..],
+            // client-first-bare is everything after the GS2 header, whose length varies
+            // with whether channel binding was requested.
+            &client_first[gs2_header.len()..],
             &server_first,
             &combined_nonce,
             &salt,
             iterations,
+            channel_binding.as_deref(),
         )?;
         let final_response = self.sasl_authenticate_full(client_final.as_bytes()).await?;
         Ok(final_response.error_code)
@@ -2087,6 +2154,7 @@ fn parse_scram_server_first(server_first: &str) -> IoResult<(String, Vec<u8>, u3
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scram_client_final(
     password: &str,
     client_first_bare: &str,
@@ -2094,8 +2162,16 @@ fn build_scram_client_final(
     combined_nonce: &str,
     salt: &[u8],
     iterations: u32,
+    // Channel binding proving this exchange belongs to this TLS connection, present only
+    // for the `-PLUS` mechanisms. `None` produces the plain `n,,` header (`c=biws`), which
+    // is exactly what was hardcoded before.
+    channel_binding: Option<&[u8]>,
 ) -> IoResult<String> {
-    let client_final_without_proof = format!("c=biws,r={}", combined_nonce);
+    let client_final_without_proof = format!(
+        "c={},r={}",
+        scram::encode_channel_binding(channel_binding),
+        combined_nonce
+    );
     let auth_message = format!(
         "{},{},{}",
         client_first_bare, server_first, client_final_without_proof

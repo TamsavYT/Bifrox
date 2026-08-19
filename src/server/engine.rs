@@ -149,6 +149,18 @@ fn topic_placement_seed(topic: &str) -> u64 {
     hash
 }
 
+/// Reads this broker's own certificate and derives its `tls-server-end-point` channel
+/// binding. `None` when TLS is not configured or the certificate cannot be read — either
+/// way there is nothing to bind to, which is what keeps the `-PLUS` mechanisms unadvertised
+/// rather than advertised and unusable.
+fn compute_tls_channel_binding(config: &EngineConfig) -> Option<Vec<u8>> {
+    let path = config.ssl_cert_path.as_ref()?;
+    let pem = std::fs::read(path).ok()?;
+    // Take the first certificate in the file: the leaf, which is the one the peer binds to.
+    let der = rustls_pemfile::certs(&mut pem.as_slice()).next()?.ok()?;
+    Some(crate::scram::tls_server_end_point(&der))
+}
+
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -242,6 +254,10 @@ pub struct StorageEngine {
     scram_credentials:
         Arc<DashMap<(String, crate::scram::ScramMechanism), crate::scram::ScramCredential>>,
     metrics: Arc<crate::server::metrics::MetricsCollector>,
+    /// This broker's `tls-server-end-point` channel-binding value, computed once from its
+    /// own certificate. `None` when TLS is not configured, which is also what disables the
+    /// `-PLUS` mechanisms: a binding cannot be offered without a certificate to bind to.
+    tls_channel_binding: Option<Vec<u8>>,
 }
 
 impl StorageEngine {
@@ -278,6 +294,7 @@ impl StorageEngine {
         let scram_credentials = Arc::new(DashMap::new());
         let metrics = Arc::new(crate::server::metrics::MetricsCollector::new());
 
+        let tls_channel_binding = compute_tls_channel_binding(&config);
         let engine = Self {
             config,
             partitions: Arc::new(DashMap::new()),
@@ -295,6 +312,7 @@ impl StorageEngine {
             acl,
             scram_credentials,
             metrics,
+            tls_channel_binding,
         };
 
         engine
@@ -599,6 +617,30 @@ impl StorageEngine {
         self.partitions
             .get(&(topic.to_string(), partition))
             .map(|e| e.clone())
+    }
+
+    /// This broker's `tls-server-end-point` channel-binding value, or `None` when TLS is
+    /// not configured. Also decides whether the `-PLUS` mechanisms are offered at all.
+    pub fn tls_channel_binding(&self) -> Option<&[u8]> {
+        self.tls_channel_binding.as_deref()
+    }
+
+    /// SASL mechanisms this broker offers, including the `-PLUS` variants when a channel
+    /// binding is available. Advertising `-PLUS` without a certificate to bind to would
+    /// promise a protection the server cannot actually verify.
+    pub fn advertised_sasl_mechanisms(&self) -> Vec<String> {
+        let mut mechs = self.config.sasl_mechanisms.clone();
+        if self.tls_channel_binding.is_some() {
+            for base in ["SCRAM-SHA-256", "SCRAM-SHA-512"] {
+                if mechs.iter().any(|m| m.eq_ignore_ascii_case(base)) {
+                    let plus = format!("{}-PLUS", base);
+                    if !mechs.iter().any(|m| m.eq_ignore_ascii_case(&plus)) {
+                        mechs.push(plus);
+                    }
+                }
+            }
+        }
+        mechs
     }
 
     /// Whether `topic` is an internal system topic (`__cluster_metadata`,
