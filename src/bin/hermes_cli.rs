@@ -1,4 +1,4 @@
-use hermes::TestClient;
+use hermes::{GroupConsumer, GroupConsumerConfig, TestClient};
 use std::net::ToSocketAddrs;
 use tokio::time::{sleep, Duration};
 
@@ -64,6 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--throughput",
         "--messages",
         "--tx-id",
+        "--instance-id",
+        "--protocol",
     ];
 
     let mut command_opt = None;
@@ -506,26 +508,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 get_arg_val(&args, "--group").unwrap_or_else(|| "my_consumer_group".to_string());
             let topic =
                 get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
-            let partition: u32 = get_arg_val(&args, "--partition")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let instance_id = get_arg_val(&args, "--instance-id");
+            let protocol = get_arg_val(&args, "--protocol").unwrap_or_else(|| "range".to_string());
             let poll_interval_ms: u64 = get_arg_val(&args, "--interval")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(500);
 
-            let committed = client.fetch_offset(&group_id, &topic, partition).await?;
-            let mut next_offset = if committed == u64::MAX {
-                0
-            } else {
-                committed + 1
+            if get_arg_val(&args, "--partition").is_some() {
+                println!(
+                    "⚠️  --partition is ignored by group-consume: partitions now come from \
+                     the group assignment, not from a flag."
+                );
+            }
+
+            let config = GroupConsumerConfig {
+                group_id: group_id.clone(),
+                topic: topic.clone(),
+                instance_id: instance_id.clone(),
+                protocols: vec![protocol],
+                ..GroupConsumerConfig::default()
             };
+            let mut consumer = GroupConsumer::join(client, config).await?;
 
             println!("============================================================");
             println!("   HERMES CONSUMER GROUP POLLING LOOP: '{}'", group_id);
             println!("============================================================");
             println!("  Topic:               {}", topic);
-            println!("  Partition:           {}", partition);
-            println!("  Starting Offset:     {}", next_offset);
+            println!("  Member ID:           {}", consumer.member_id());
+            println!("  Generation:          {}", consumer.generation_id());
+            println!("  Leader:              {}", consumer.is_leader());
+            println!("  Assigned Partitions: {:?}", consumer.assignment());
             println!("  Poll Interval:       {} ms", poll_interval_ms);
             println!("Polling for messages. Press Ctrl+C to stop.\n");
 
@@ -533,36 +545,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         println!("\n🛑 Graceful shutdown signal received. Exiting consumer group loop.");
+                        // A static member deliberately keeps its slot across a restart, so
+                        // only a dynamic member gives it up on the way out.
+                        if instance_id.is_none() {
+                            let _ = consumer.leave().await;
+                        }
                         break;
                     }
                     _ = sleep(Duration::from_millis(poll_interval_ms)) => {
-                        match client.fetch(&topic, partition, next_offset, 64 * 1024).await {
-                            Ok(frames) if !frames.is_empty() => {
-                                for frame in &frames {
-                                    // Advance past every frame (control markers occupy
-                                    // real offsets too), but only print real records —
-                                    // see the one-shot fetch command above for why.
-                                    if !frame.is_control_marker() {
-                                        let payload_str = String::from_utf8_lossy(&frame.payload);
-                                        println!(
-                                            "📥 Group '{}' consumed Offset {:<6} | Timestamp: {} | Payload: '{}'",
-                                            group_id, frame.offset, frame.timestamp, payload_str
-                                        );
-                                    }
-                                    next_offset = frame.offset + 1;
+                        let assignment_before = consumer.assignment().to_vec();
+                        match consumer.poll().await {
+                            Ok(records) => {
+                                for (partition, frame) in &records {
+                                    let payload_str = String::from_utf8_lossy(&frame.payload);
+                                    println!(
+                                        "📥 Group '{}' consumed Partition {} Offset {:<6} | Timestamp: {} | Payload: '{}'",
+                                        group_id, partition, frame.offset, frame.timestamp, payload_str
+                                    );
                                 }
-
-                                let last_offset = frames.last().unwrap().offset;
-                                if let Err(e) = client.commit_offset(&group_id, &topic, partition, last_offset).await {
-                                    eprintln!("Failed to commit offset {}: {}", last_offset, e);
-                                } else {
-                                    println!("  📌 Auto-committed offset {} to __consumer_offsets.log", last_offset);
+                                if !records.is_empty() {
+                                    if let Err(e) = consumer.commit().await {
+                                        eprintln!("Failed to commit offsets: {}", e);
+                                    } else {
+                                        println!("  📌 Auto-committed offsets to __consumer_offsets.log");
+                                    }
+                                }
+                                if consumer.assignment() != assignment_before.as_slice() {
+                                    println!(
+                                        "  🔁 Assignment changed: {:?} -> {:?}",
+                                        assignment_before,
+                                        consumer.assignment()
+                                    );
                                 }
                             }
-                            Ok(_) => {}
                             Err(e) => {
-                                eprintln!("Error polling server: {}. Reconnecting...", e);
-                                let _ = client.reconnect().await;
+                                eprintln!("Error polling server: {}", e);
+                                // poll() already retries per-partition fetch failures
+                                // internally, so an error reaching here means the
+                                // join/heartbeat path itself failed — usually a dropped
+                                // connection. Reconnect the socket; the next poll()'s
+                                // heartbeat will fail against the reconnected socket and
+                                // drive a rejoin, which is the actual recovery path.
+                                let _ = consumer.client_mut().reconnect().await;
                             }
                         }
                     }
@@ -936,10 +960,11 @@ fn print_usage() {
     );
     println!("                  --topic <NAME> [--group <GROUP>] [--partition <ID>] [--offset <N>] [--from-beginning]");
     println!(
-        "  group-consume   Kafka-style Consumer Group continuous loop (auto-fetches & commits)"
+        "  group-consume   Kafka-style Consumer Group continuous loop (joins the group, \
+consumes its assigned partitions, auto-commits)"
     );
     println!(
-        "                  --group <GROUP> --topic <NAME> [--partition <ID>] [--interval <MS>]"
+        "                  --group <GROUP> --topic <NAME> [--instance-id <ID>] [--protocol <NAME>] [--interval <MS>]"
     );
     println!("  latest-offset   Get partition high watermark offset");
     println!("                  --topic <NAME> [--partition <ID>]");

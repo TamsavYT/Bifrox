@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod consumer;
 pub mod consumer_group;
 pub mod protocol;
 pub mod replication;
@@ -9,6 +10,7 @@ pub mod server;
 
 pub use client::{ProduceResult, RoutedClient, SeekResult, TestClient};
 pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
+pub use consumer::{assign_range, GroupConsumer, GroupConsumerConfig};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{
     AckBatch, AcknowledgeType, AcquiredRecordBatch, CommandCode, FrameError, RecordFrame,
