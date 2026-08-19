@@ -574,13 +574,18 @@ impl GroupConsumer {
         let partitions = self.assignment.clone();
         for partition in partitions {
             let next_offset = *self.next_offsets.get(&partition).unwrap_or(&0);
+            // Tagged with this member's identity (issue #54) so the coordinator can tell
+            // a member that's genuinely still consuming from one that's merely still
+            // heartbeating — see `GroupCoordinator::record_progress`.
             match self
                 .client
-                .fetch(
+                .fetch_as_member(
                     &self.config.topic,
                     partition,
                     next_offset,
                     self.config.fetch_max_bytes,
+                    &self.config.group_id,
+                    &self.member_id,
                 )
                 .await
             {

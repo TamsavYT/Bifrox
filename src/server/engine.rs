@@ -283,8 +283,9 @@ impl StorageEngine {
             broker_addrs.clone(),
             broker_roles.clone(),
         );
-        let group_coordinator = Arc::new(GroupCoordinator::with_rebalance_delay(
+        let group_coordinator = Arc::new(GroupCoordinator::with_config(
             std::time::Duration::from_millis(config.group_initial_rebalance_delay_ms),
+            std::time::Duration::from_millis(config.max_poll_interval_ms),
         ));
         let quota = Arc::new(QuotaManager::new(
             config.produce_quota_bytes_per_sec,

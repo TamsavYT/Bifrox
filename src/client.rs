@@ -696,6 +696,52 @@ impl TestClient {
         Ok(frames)
     }
 
+    /// Fetch attributed to a specific consumer group member, via the `GROUP_MEMBER`
+    /// tagged field on the request envelope (issue #54).
+    ///
+    /// The coordinator otherwise has no visibility into consumption at all: `Fetch`
+    /// carries only `topic`/`partition`/`offset`/`max_bytes`, and membership is only ever
+    /// asserted through `Heartbeat` — so a member that keeps heartbeating but has stopped
+    /// actually consuming looks identical to a healthy one. Tagging the fetch with the
+    /// member's identity is what lets the coordinator tell those apart (see
+    /// `GroupCoordinator::record_progress`).
+    ///
+    /// `fetch` is deliberately left on the legacy framing so existing callers are
+    /// unaffected — same convention as `fetch_with_isolation`.
+    pub async fn fetch_as_member(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        group_id: &str,
+        member_id: &str,
+    ) -> IoResult<Vec<RecordFrame>> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u64(offset);
+        inner.put_u32(max_bytes);
+
+        let mut member_payload = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut member_payload, group_id);
+        crate::protocol::wire::write_pascal_string(&mut member_payload, member_id);
+
+        let resp = self
+            .send_versioned(
+                CommandCode::Fetch,
+                &[(crate::protocol::wire::tags::GROUP_MEMBER, member_payload)],
+                inner,
+            )
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_fetch_frames(&resp.payload)
+    }
+
     /// Asks the broker which protocol versions and commands it supports.
     ///
     /// Returns `(min_version, max_version, supported_command_codes)`. Sent under the legacy

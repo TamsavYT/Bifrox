@@ -170,6 +170,13 @@ pub mod tags {
     /// tag — a legacy client, or any request built without it — keeps the coordinator's
     /// historical fixed default.
     pub const SESSION_TIMEOUT_MS: u8 = 0x03;
+
+    /// Identifies the consumer group member a request on the consuming path (currently
+    /// `Fetch`) is made on behalf of, so the coordinator can record when that member last
+    /// made progress (issue #54: a member that keeps heartbeating but has stopped
+    /// consuming is otherwise indistinguishable from a healthy one). Payload is two
+    /// pascal strings back to back: `[group_id][member_id]`.
+    pub const GROUP_MEMBER: u8 = 0x04;
 }
 
 /// Read isolation requested by a fetch.
@@ -211,10 +218,12 @@ impl IsolationLevel {
 
 /// Recognised tagged fields from a request envelope.
 ///
-/// Deliberately a small `Copy` struct of *known* tags rather than a list of raw ones:
-/// unknown tags are still skipped during decode, so this stays cheap to pass around and
-/// gains a field only when a tag is actually implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Deliberately a small struct of *known* tags rather than a list of raw ones: unknown
+/// tags are still skipped during decode, so this gains a field only when a tag is actually
+/// implemented. Was `Copy` until [`tags::GROUP_MEMBER`] added a `String`-bearing field;
+/// every other field is still cheap, and the common case — no group-member tag on the
+/// request — clones for free since `Option::None` allocates nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestTags {
     pub isolation_level: Option<IsolationLevel>,
     /// True when a broker relayed this request on a client's behalf — see
@@ -225,6 +234,9 @@ pub struct RequestTags {
     /// coordinator treats differently from an in-range value: it keeps its historical
     /// default rather than clamping "nothing" into something.
     pub session_timeout_ms: Option<u32>,
+    /// `(group_id, member_id)` a consuming-path request is made on behalf of — see
+    /// [`tags::GROUP_MEMBER`].
+    pub group_member: Option<(String, String)>,
 }
 
 /// How a request arrived, which determines how its response must be framed.
@@ -233,7 +245,11 @@ pub struct RequestTags {
 /// revisions could not detect a mismatch and would silently misinterpret each other's
 /// bytes, and every layout change was a hard break requiring every broker and client to be
 /// upgraded together. This is the mechanism that ends that — see `VERSIONED_ENVELOPE_MAGIC`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy` now that `RequestTags` can carry a `String`-bearing tag — callers that
+/// need to use a `framing` value more than once now hold it by reference (`&RequestFraming`)
+/// rather than relying on an implicit copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestFraming {
     /// Bare `[cmd][len][payload]`, from a client that predates the envelope. Responses go
     /// back unwrapped, exactly as before.
@@ -261,7 +277,7 @@ impl RequestFraming {
     pub fn tags(&self) -> RequestTags {
         match self {
             RequestFraming::Legacy => RequestTags::default(),
-            RequestFraming::Versioned { tags, .. } => *tags,
+            RequestFraming::Versioned { tags, .. } => tags.clone(),
         }
     }
 
@@ -283,6 +299,12 @@ impl RequestFraming {
     pub fn session_timeout_ms(&self) -> Option<u32> {
         self.tags().session_timeout_ms
     }
+
+    /// `(group_id, member_id)` this request is attributed to via
+    /// [`tags::GROUP_MEMBER`], or `None` if untagged.
+    pub fn group_member(&self) -> Option<(String, String)> {
+        self.tags().group_member
+    }
 }
 
 /// Rewraps a request for relay to another broker, marking it as forwarded.
@@ -291,8 +313,9 @@ impl RequestFraming {
 /// would leave the receiver parsing the outer one and then finding `0xF1` where a command
 /// code belongs, which decodes as an unknown command. The inner request is preserved
 /// byte-for-byte, and recognised tags from the original envelope are carried across — so a
-/// forwarded fetch keeps the isolation level the client asked for, and a forwarded join
-/// keeps the session timeout it requested.
+/// forwarded fetch keeps the isolation level the client asked for, a forwarded join keeps
+/// the session timeout it requested, and a forwarded consuming-path request keeps the
+/// member it was attributed to.
 pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> {
     let (inner, tags) = strip_envelope(raw_request)?;
 
@@ -320,6 +343,15 @@ pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> 
         tag_section.put_u32(session_timeout_ms);
         tag_count += 1;
     }
+    if let Some((group_id, member_id)) = &tags.group_member {
+        let mut payload = Vec::new();
+        write_pascal_string(&mut payload, group_id);
+        write_pascal_string(&mut payload, member_id);
+        tag_section.put_u8(tags::GROUP_MEMBER);
+        tag_section.put_u16(payload.len() as u16);
+        tag_section.extend_from_slice(&payload);
+        tag_count += 1;
+    }
     out.put_u8(tag_count);
     out.extend_from_slice(&tag_section);
     out.extend_from_slice(inner);
@@ -332,7 +364,7 @@ pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> 
 /// envelope (to carry the forwarded marker), so the leader answers framed — but the client
 /// may have sent a bare legacy request and would read the envelope prefix as the response
 /// status. This strips whatever framing the leader used and applies the client's.
-pub fn relay_response(leader_response: &[u8], client_framing: RequestFraming) -> Vec<u8> {
+pub fn relay_response(leader_response: &[u8], client_framing: &RequestFraming) -> Vec<u8> {
     let inner = if leader_response.first() == Some(&VERSIONED_ENVELOPE_MAGIC)
         && leader_response.len() >= 5
     {
@@ -346,7 +378,7 @@ pub fn relay_response(leader_response: &[u8], client_framing: RequestFraming) ->
         RequestFraming::Versioned { correlation_id, .. } => {
             let mut out = Vec::with_capacity(inner.len() + 5);
             out.put_u8(VERSIONED_ENVELOPE_MAGIC);
-            out.put_u32(correlation_id);
+            out.put_u32(*correlation_id);
             out.extend_from_slice(inner);
             out
         }
@@ -395,6 +427,14 @@ pub fn strip_envelope(src: &[u8]) -> Result<(&[u8], RequestTags), WireError> {
             tags::SESSION_TIMEOUT_MS if len >= 4 => {
                 tags_out.session_timeout_ms =
                     Some(u32::from_be_bytes(cursor[0..4].try_into().unwrap()));
+            }
+            tags::GROUP_MEMBER => {
+                let mut value = &cursor[..len];
+                if let Ok(group_id) = read_pascal_string(&mut value) {
+                    if let Ok(member_id) = read_pascal_string(&mut value) {
+                        tags_out.group_member = Some((group_id, member_id));
+                    }
+                }
             }
             _ => {}
         }
@@ -784,6 +824,14 @@ impl WireRequest {
                     tags::SESSION_TIMEOUT_MS if len >= 4 => {
                         tags.session_timeout_ms =
                             Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
+                    }
+                    tags::GROUP_MEMBER => {
+                        let mut v = value;
+                        if let Ok(group_id) = read_pascal_string(&mut v) {
+                            if let Ok(member_id) = read_pascal_string(&mut v) {
+                                tags.group_member = Some((group_id, member_id));
+                            }
+                        }
                     }
                     // Unknown tags are skipped, not rejected — that is the whole point of
                     // the section, and why a future field can be added without breaking
@@ -1816,16 +1864,16 @@ impl WireResponse {
     /// connection instead of forcing a strict request/response lockstep.
     /// Allocating form of `encode_framed_into`, for the paths that build a response
     /// buffer rather than writing into the connection's scratch buffer.
-    pub fn encode_framed(&self, framing: RequestFraming) -> Vec<u8> {
+    pub fn encode_framed(&self, framing: &RequestFraming) -> Vec<u8> {
         let mut buf = Vec::with_capacity(10 + self.payload.len());
         self.encode_framed_into(framing, &mut buf);
         buf
     }
 
-    pub fn encode_framed_into(&self, framing: RequestFraming, buf: &mut impl BufMut) {
+    pub fn encode_framed_into(&self, framing: &RequestFraming, buf: &mut impl BufMut) {
         if let RequestFraming::Versioned { correlation_id, .. } = framing {
             buf.put_u8(VERSIONED_ENVELOPE_MAGIC);
-            buf.put_u32(correlation_id);
+            buf.put_u32(*correlation_id);
         }
         self.encode_into(buf);
     }
@@ -1861,7 +1909,7 @@ mod envelope_tests {
     fn legacy_response_is_not_wrapped() {
         let resp = WireResponse::ok(vec![1, 2, 3]);
         assert_eq!(
-            resp.encode_framed(RequestFraming::Legacy),
+            resp.encode_framed(&RequestFraming::Legacy),
             resp.encode(),
             "legacy responses must be byte-identical to the pre-envelope encoding"
         );
@@ -1895,7 +1943,7 @@ mod envelope_tests {
         );
 
         // The response echoes the correlation id so a client can match it to this request.
-        let encoded = WireResponse::ok(vec![]).encode_framed(framing);
+        let encoded = WireResponse::ok(vec![]).encode_framed(&framing);
         assert_eq!(encoded[0], VERSIONED_ENVELOPE_MAGIC);
         assert_eq!(
             u32::from_be_bytes(encoded[1..5].try_into().unwrap()),
@@ -2074,6 +2122,66 @@ mod envelope_tests {
         let (_req, framing, _used) = WireRequest::decode_framed(&wrapped).unwrap();
         assert!(framing.is_forwarded());
         assert_eq!(framing.session_timeout_ms(), Some(6_000));
+    }
+
+    /// The `GROUP_MEMBER` tag's payload is two pascal strings back to back, and both must
+    /// round-trip through decode.
+    #[test]
+    fn group_member_tag_is_parsed() {
+        let mut member_payload = Vec::new();
+        write_pascal_string(&mut member_payload, "my-group");
+        write_pascal_string(&mut member_payload, "member-7");
+
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(1);
+        bytes.put_u8(1);
+        bytes.put_u8(tags::GROUP_MEMBER);
+        bytes.put_u16(member_payload.len() as u16);
+        bytes.extend_from_slice(&member_payload);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let (_req, framing, used) = WireRequest::decode_framed(&bytes).unwrap();
+        assert_eq!(
+            framing.group_member(),
+            Some(("my-group".to_string(), "member-7".to_string()))
+        );
+        assert_eq!(used, bytes.len());
+    }
+
+    #[test]
+    fn absent_group_member_tag_reads_as_none() {
+        let (_req, legacy, _) = WireRequest::decode_framed(&legacy_ping()).unwrap();
+        assert_eq!(legacy.group_member(), None);
+    }
+
+    /// `wrap_forwarded_request` must carry the `GROUP_MEMBER` tag across too — otherwise a
+    /// forwarded consuming-path request would silently lose the member it was attributed
+    /// to.
+    #[test]
+    fn wrap_forwarded_request_carries_group_member_tag() {
+        let mut member_payload = Vec::new();
+        write_pascal_string(&mut member_payload, "g");
+        write_pascal_string(&mut member_payload, "m");
+
+        let mut bytes = Vec::new();
+        bytes.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        bytes.put_u16(PROTOCOL_VERSION_MAX);
+        bytes.put_u32(1);
+        bytes.put_u8(1);
+        bytes.put_u8(tags::GROUP_MEMBER);
+        bytes.put_u16(member_payload.len() as u16);
+        bytes.extend_from_slice(&member_payload);
+        bytes.extend_from_slice(&legacy_ping());
+
+        let wrapped = wrap_forwarded_request(&bytes).unwrap();
+        let (_req, framing, _used) = WireRequest::decode_framed(&wrapped).unwrap();
+        assert!(framing.is_forwarded());
+        assert_eq!(
+            framing.group_member(),
+            Some(("g".to_string(), "m".to_string()))
+        );
     }
 
     /// The magic byte must not collide with any command code, or a legacy request would be

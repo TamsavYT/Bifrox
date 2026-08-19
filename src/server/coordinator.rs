@@ -22,6 +22,39 @@ pub const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// change from before this was configurable.
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default `max.poll.interval.ms` — how long a member may go without making fetch progress
+/// before it is evicted for stalling even though it keeps heartbeating (issue #54). Matches
+/// Kafka's own default of five minutes.
+pub const DEFAULT_MAX_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Why a member was pruned from its group. Kept distinct from a plain string so a caller
+/// (currently: the eviction log line, and `GroupCoordinator::recent_evictions` for tests)
+/// can tell the two failure modes apart without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    /// No heartbeat arrived within `session.timeout.ms` — the member is presumed dead.
+    SessionTimeout,
+    /// Heartbeats kept arriving on schedule, but no fetch was attributed to this member
+    /// within `max.poll.interval.ms` (issue #54) — the member is alive but has stopped
+    /// making progress: deadlocked, stuck on a poisoned record, blocked on a downstream
+    /// call, or otherwise wedged in a way that heartbeating alone can't detect.
+    StalledConsumption,
+}
+
+/// One pruning event, kept around briefly so an operator (or a test) can see *why* a
+/// member disappeared rather than just that it did.
+#[derive(Debug, Clone)]
+pub struct EvictionRecord {
+    pub member_id: String,
+    pub reason: EvictionReason,
+    pub at: Instant,
+}
+
+/// How many `EvictionRecord`s a group keeps before dropping the oldest. Bounded so a group
+/// under churn can't grow this without limit; generous enough that an operator (or a test)
+/// polling occasionally still finds what it's looking for.
+const MAX_RECENT_EVICTIONS: usize = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupState {
     Empty,
@@ -38,6 +71,12 @@ pub struct MemberState {
     pub session_timeout: Duration,
     pub assigned_partitions: HashMap<String, Vec<u32>>,
     pub last_heartbeat: Instant,
+    /// When this member last made fetch progress (issue #54) — i.e. a `Fetch` tagged with
+    /// this member's identity (`crate::protocol::wire::tags::GROUP_MEMBER`) was served.
+    /// Seeded to the join/rejoin time rather than left at some zero value, so a member
+    /// that simply hasn't fetched *yet* gets a full `max.poll.interval` grace period
+    /// before it can be judged stalled, matching how `last_heartbeat` is seeded.
+    pub last_progress: Instant,
     /// Set when this member declared a `group.instance.id` — i.e. it is a *static* member
     /// whose slot survives its own process. Kept here so pruning can retire the
     /// instance-to-member mapping along with the member itself.
@@ -78,6 +117,9 @@ pub struct ConsumerGroup {
     /// `GroupCoordinator::join_group` for why a returning static member is issued a *new*
     /// member id rather than handed back its previous one.
     pub member_id_seq: u64,
+    /// Recent prunings, most recent last, capped at `MAX_RECENT_EVICTIONS` — see
+    /// `GroupCoordinator::recent_evictions`.
+    pub recent_evictions: Vec<EvictionRecord>,
 }
 
 impl ConsumerGroup {
@@ -92,6 +134,23 @@ impl ConsumerGroup {
             rebalance_deadline: None,
             static_members: HashMap::new(),
             member_id_seq: 0,
+            recent_evictions: Vec::new(),
+        }
+    }
+
+    /// Records a pruning event, dropping the oldest once `MAX_RECENT_EVICTIONS` is
+    /// exceeded — a bookkeeping detail kept on `ConsumerGroup` itself rather than inline
+    /// in `GroupCoordinator::prune_expired_members`, so the cap is enforced in exactly one
+    /// place no matter which caller records an eviction.
+    fn record_eviction(&mut self, member_id: String, reason: EvictionReason, at: Instant) {
+        self.recent_evictions.push(EvictionRecord {
+            member_id,
+            reason,
+            at,
+        });
+        if self.recent_evictions.len() > MAX_RECENT_EVICTIONS {
+            let overflow = self.recent_evictions.len() - MAX_RECENT_EVICTIONS;
+            self.recent_evictions.drain(0..overflow);
         }
     }
 
@@ -119,6 +178,10 @@ pub struct GroupCoordinator {
     /// How long a join window stays open for additional members to arrive
     /// (`group.initial.rebalance.delay.ms`).
     initial_rebalance_delay: Duration,
+    /// `max.poll.interval.ms` — how long a member may go without fetch progress before
+    /// it's evicted for stalling even while it keeps heartbeating (issue #54). See
+    /// `EvictionReason::StalledConsumption`.
+    max_poll_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -135,23 +198,38 @@ impl Default for GroupCoordinator {
 }
 
 impl GroupCoordinator {
-    fn prune_expired_members(group: &mut ConsumerGroup) {
+    /// Removes members that have failed one of two independent liveness checks, tagging
+    /// each removal with *which* check it failed (`EvictionReason`) so the two failure
+    /// modes stay distinguishable downstream (logging, `recent_evictions`) rather than
+    /// collapsing into one generic "member gone".
+    ///
+    /// A member is checked for `SessionTimeout` first — if it hasn't heartbeated in time
+    /// it's presumed dead outright, and whether it also happened to stop fetching is
+    /// moot. Only a member that's still heartbeating on schedule is then checked for
+    /// `StalledConsumption` (issue #54): heartbeating alone no longer proves a member is
+    /// doing useful work once heartbeats run on their own background schedule (#53),
+    /// decoupled from whatever the application is actually doing with `poll()`.
+    fn prune_expired_members(&self, group: &mut ConsumerGroup) {
         let now = Instant::now();
-        let expired: Vec<String> = group
+        let expired: Vec<(String, EvictionReason)> = group
             .members
             .iter()
-            .filter(|(_, member)| {
-                now.duration_since(member.last_heartbeat) > member.session_timeout
+            .filter_map(|(member_id, member)| {
+                if now.duration_since(member.last_heartbeat) > member.session_timeout {
+                    Some((member_id.clone(), EvictionReason::SessionTimeout))
+                } else if now.duration_since(member.last_progress) > self.max_poll_interval {
+                    Some((member_id.clone(), EvictionReason::StalledConsumption))
+                } else {
+                    None
+                }
             })
-            .map(|(member_id, _)| member_id.clone())
             .collect();
 
-        for member_id in expired {
-            // A static member is not exempt from the session timeout — it just gets its
-            // slot back for free if it returns inside one. Past that the instance is
-            // genuinely gone, so drop its reservation too; keeping it would let a member
-            // that has been down for hours reclaim an assignment the group has since
-            // redistributed.
+        for (member_id, reason) in expired {
+            // A static member is not exempt from either check — it just gets its slot
+            // back for free if it returns inside one. Past that the instance is genuinely
+            // gone, so drop its reservation too; keeping it would let a member that has
+            // been down for hours reclaim an assignment the group has since redistributed.
             if let Some(member) = group.members.remove(&member_id) {
                 if let Some(instance_id) = member.group_instance_id {
                     group.static_members.remove(&instance_id);
@@ -160,6 +238,24 @@ impl GroupCoordinator {
             if group.leader.as_deref() == Some(&member_id) {
                 group.leader = group.members.keys().next().cloned();
             }
+
+            match reason {
+                EvictionReason::SessionTimeout => tracing::warn!(
+                    group_id = group.group_id,
+                    member_id,
+                    reason = "session_timeout",
+                    "consumer group member evicted: no heartbeat within its session timeout"
+                ),
+                EvictionReason::StalledConsumption => tracing::warn!(
+                    group_id = group.group_id,
+                    member_id,
+                    reason = "stalled_consumption",
+                    max_poll_interval_ms = self.max_poll_interval.as_millis() as u64,
+                    "consumer group member evicted: heartbeating but no fetch progress \
+                     within max.poll.interval"
+                ),
+            }
+            group.record_eviction(member_id, reason, now);
         }
 
         if group.members.is_empty() {
@@ -231,7 +327,12 @@ impl GroupCoordinator {
 
         member.member_id = new_member_id.clone();
         member.client_id = new_member_id.clone();
-        member.last_heartbeat = Instant::now();
+        let now = Instant::now();
+        member.last_heartbeat = now;
+        // A restarting process hasn't fetched anything yet either, so this rejoin gets the
+        // same fresh `max.poll.interval` grace period a brand-new member would — not the
+        // stale progress timestamp its predecessor left behind.
+        member.last_progress = now;
         // This JoinGroup's requested timeout applies from here on, in case it changed
         // since the instance last joined (e.g. a config change shipped with the restart).
         member.session_timeout = session_timeout;
@@ -258,14 +359,23 @@ impl GroupCoordinator {
     }
 
     pub fn with_rebalance_delay(initial_rebalance_delay: Duration) -> Self {
+        Self::with_config(initial_rebalance_delay, DEFAULT_MAX_POLL_INTERVAL)
+    }
+
+    pub fn with_config(initial_rebalance_delay: Duration, max_poll_interval: Duration) -> Self {
         Self {
             groups: Mutex::new(HashMap::new()),
             initial_rebalance_delay,
+            max_poll_interval,
         }
     }
 
     pub fn initial_rebalance_delay(&self) -> Duration {
         self.initial_rebalance_delay
+    }
+
+    pub fn max_poll_interval(&self) -> Duration {
+        self.max_poll_interval
     }
 
     /// How long until this group's open join window closes, or `None` if it is already
@@ -337,7 +447,7 @@ impl GroupCoordinator {
         let group = groups
             .entry(group_id.to_string())
             .or_insert_with(|| ConsumerGroup::new(group_id.to_string()));
-        Self::prune_expired_members(group);
+        self.prune_expired_members(group);
 
         let session_timeout =
             Self::resolve_session_timeout(session_timeout_ms, group_id, member_id);
@@ -369,6 +479,7 @@ impl GroupCoordinator {
         let was_empty = group.state == GroupState::Empty;
         let mut rebalance_needed = false;
         if !group.members.contains_key(&m_id) {
+            let now = Instant::now();
             group.members.insert(
                 m_id.clone(),
                 MemberState {
@@ -376,7 +487,11 @@ impl GroupCoordinator {
                     client_id: m_id.clone(), // Simplify for now
                     session_timeout,
                     assigned_partitions: HashMap::new(),
-                    last_heartbeat: Instant::now(),
+                    last_heartbeat: now,
+                    // Seeded to the join time, not left at some zero value — a member
+                    // that simply hasn't fetched yet gets a full `max.poll.interval`
+                    // grace period before it can be judged stalled (issue #54).
+                    last_progress: now,
                     group_instance_id: group_instance_id.map(str::to_string),
                 },
             );
@@ -388,8 +503,11 @@ impl GroupCoordinator {
             rebalance_needed = true;
         } else if let Some(member) = group.members.get_mut(&m_id) {
             member.last_heartbeat = Instant::now();
-            // Refreshed on every rejoin, in case the client's requested timeout changed —
-            // same reasoning as `rejoin_static`.
+            // Refreshed on every rejoin, in case the client's requested timeout changed
+            // — same reasoning as `rejoin_static`. `last_progress` is deliberately left
+            // alone here: this is an existing member rejoining under its own id (e.g.
+            // recovering from a stale generation), not a fresh process, so it must not
+            // get a free pass on the stalled-consumption check it hasn't earned.
             member.session_timeout = session_timeout;
         }
 
@@ -465,7 +583,7 @@ impl GroupCoordinator {
     ) -> Result<HashMap<String, Vec<u32>>, String> {
         let mut groups = self.groups.lock().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
-            Self::prune_expired_members(group);
+            self.prune_expired_members(group);
             if generation_id != group.generation_id {
                 return Err(format!(
                     "Generation mismatch: expected {}, got {}",
@@ -514,7 +632,7 @@ impl GroupCoordinator {
     ) -> Result<(), String> {
         let mut groups = self.groups.lock().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
-            Self::prune_expired_members(group);
+            self.prune_expired_members(group);
             if generation_id != group.generation_id {
                 // Both branches below signal the same underlying event — this member's
                 // generation is stale and it needs to call JoinGroup — via the same
@@ -552,6 +670,35 @@ impl GroupCoordinator {
             }
         }
         Err("Group or member not found".to_string())
+    }
+
+    /// Records that `member_id` in `group_id` made fetch progress just now — the signal
+    /// used to detect a member that is heartbeating but has stopped consuming (issue #54).
+    /// See [`MemberState::last_progress`].
+    ///
+    /// A `group_id`/`member_id` that doesn't currently resolve to a live member (unknown
+    /// group, wrong or already-evicted member id) is silently ignored: the fetch itself is
+    /// still served normally by the caller regardless of whether the attribution lands,
+    /// same as an unrecognised tag anywhere else in the envelope.
+    pub fn record_progress(&self, group_id: &str, member_id: &str) {
+        let mut groups = self.groups.lock().unwrap();
+        if let Some(group) = groups.get_mut(group_id) {
+            if let Some(member) = group.members.get_mut(member_id) {
+                member.last_progress = Instant::now();
+            }
+        }
+    }
+
+    /// The group's most recent prunings, oldest first, capped at `MAX_RECENT_EVICTIONS`.
+    /// Exists so an eviction's cause (`EvictionReason`) is checkable in-process — by a
+    /// test, or eventually an operator-facing surface — rather than only ever visible in
+    /// the `tracing::warn!` line `prune_expired_members` emits.
+    pub fn recent_evictions(&self, group_id: &str) -> Vec<EvictionRecord> {
+        let groups = self.groups.lock().unwrap();
+        groups
+            .get(group_id)
+            .map(|g| g.recent_evictions.clone())
+            .unwrap_or_default()
     }
 
     /// Removes a member from the group.
@@ -602,7 +749,7 @@ impl GroupCoordinator {
     pub fn list_groups(&self) -> Vec<String> {
         let mut groups = self.groups.lock().unwrap();
         for group in groups.values_mut() {
-            Self::prune_expired_members(group);
+            self.prune_expired_members(group);
         }
         groups.keys().cloned().collect()
     }
@@ -610,7 +757,7 @@ impl GroupCoordinator {
     pub fn describe_group(&self, group_id: &str) -> Option<GroupDescription> {
         let mut groups = self.groups.lock().unwrap();
         let group = groups.get_mut(group_id)?;
-        Self::prune_expired_members(group);
+        self.prune_expired_members(group);
         let state_str = format!("{:?}", group.state);
         let mut members = Vec::new();
         for (m_id, member) in &group.members {
@@ -774,6 +921,179 @@ mod tests {
             member_session_timeout(&coordinator, "g", &member_id),
             Duration::from_millis(9_000),
             "a static member's rejoin must pick up its newly requested timeout"
+        );
+    }
+
+    // --- eviction-cause distinguishability (issue #54) ---
+
+    /// Back-dates a member's liveness timestamps directly, rather than sleeping in the
+    /// test — deterministic and instant instead of racing real wall-clock thresholds.
+    fn backdate(
+        coordinator: &GroupCoordinator,
+        group_id: &str,
+        member_id: &str,
+        heartbeat_age: Duration,
+        progress_age: Duration,
+    ) {
+        let mut groups = coordinator.groups.lock().unwrap();
+        let member = groups
+            .get_mut(group_id)
+            .unwrap()
+            .members
+            .get_mut(member_id)
+            .unwrap();
+        member.last_heartbeat = Instant::now().checked_sub(heartbeat_age).unwrap();
+        member.last_progress = Instant::now().checked_sub(progress_age).unwrap();
+    }
+
+    #[test]
+    fn a_dead_member_is_evicted_for_session_timeout_not_stalled_consumption() {
+        let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_secs(600));
+        let (member_id, ..) = coordinator
+            .join_group("g", "dead", None, vec!["range".to_string()], Some(1_000))
+            .unwrap();
+        // Neither heartbeat nor fetch for well past the 1s session timeout, but nowhere
+        // near the group's very generous 600s max_poll_interval — only the session-timeout
+        // check can be what fires here.
+        backdate(
+            &coordinator,
+            "g",
+            &member_id,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+
+        assert!(coordinator.describe_group("g").unwrap().members.is_empty());
+
+        let evictions = coordinator.recent_evictions("g");
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].member_id, member_id);
+        assert_eq!(evictions[0].reason, EvictionReason::SessionTimeout);
+    }
+
+    #[test]
+    fn a_heartbeating_member_that_stops_fetching_is_evicted_for_stalled_consumption() {
+        let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_millis(500));
+        let (member_id, ..) = coordinator
+            .join_group(
+                "g",
+                "stalled",
+                None,
+                vec!["range".to_string()],
+                Some(60_000),
+            )
+            .unwrap();
+        // Heartbeat is fresh — session timeout cannot be why this gets pruned — but fetch
+        // progress is stale well past max_poll_interval.
+        backdate(
+            &coordinator,
+            "g",
+            &member_id,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+
+        assert!(coordinator.describe_group("g").unwrap().members.is_empty());
+
+        let evictions = coordinator.recent_evictions("g");
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].member_id, member_id);
+        assert_eq!(evictions[0].reason, EvictionReason::StalledConsumption);
+    }
+
+    #[test]
+    fn record_progress_prevents_a_heartbeating_members_stalled_eviction() {
+        let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_millis(500));
+        let (member_id, ..) = coordinator
+            .join_group("g", "active", None, vec!["range".to_string()], Some(60_000))
+            .unwrap();
+        backdate(
+            &coordinator,
+            "g",
+            &member_id,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+
+        // Refresh progress right before the next prune-triggering call, exactly as a real
+        // tagged `Fetch` would via `GroupCoordinator::record_progress`.
+        coordinator.record_progress("g", &member_id);
+
+        assert!(
+            !coordinator.describe_group("g").unwrap().members.is_empty(),
+            "a member whose progress was just refreshed must not be evicted for stalling"
+        );
+        assert!(coordinator.recent_evictions("g").is_empty());
+    }
+
+    #[test]
+    fn both_eviction_causes_are_recorded_distinctly_in_the_same_group() {
+        let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_millis(500));
+        let (dead, ..) = coordinator
+            .join_group("g", "dead", None, vec!["range".to_string()], Some(200))
+            .unwrap();
+        let (stalled, ..) = coordinator
+            .join_group(
+                "g",
+                "stalled",
+                None,
+                vec!["range".to_string()],
+                Some(60_000),
+            )
+            .unwrap();
+        let (healthy, ..) = coordinator
+            .join_group(
+                "g",
+                "healthy",
+                None,
+                vec!["range".to_string()],
+                Some(60_000),
+            )
+            .unwrap();
+
+        backdate(
+            &coordinator,
+            "g",
+            &dead,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        backdate(
+            &coordinator,
+            "g",
+            &stalled,
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        );
+        backdate(
+            &coordinator,
+            "g",
+            &healthy,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+
+        let described = coordinator.describe_group("g").unwrap();
+        let remaining: Vec<String> = described
+            .members
+            .iter()
+            .map(|m| m.member_id.clone())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![healthy],
+            "only the actively healthy member should remain"
+        );
+
+        let evictions = coordinator.recent_evictions("g");
+        assert_eq!(evictions.len(), 2);
+        let dead_record = evictions.iter().find(|e| e.member_id == dead).unwrap();
+        let stalled_record = evictions.iter().find(|e| e.member_id == stalled).unwrap();
+        assert_eq!(dead_record.reason, EvictionReason::SessionTimeout);
+        assert_eq!(stalled_record.reason, EvictionReason::StalledConsumption);
+        assert_ne!(
+            dead_record.reason, stalled_record.reason,
+            "the two eviction causes must be distinguishable from one another"
         );
     }
 }
