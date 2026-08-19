@@ -1887,10 +1887,42 @@ impl TestClient {
         }
     }
 
+    /// Joins as a *dynamic* member: this process is a new arrival every time it starts,
+    /// and the group rebalances around it. Use [`Self::join_group_static`] to keep a slot
+    /// across restarts.
     pub async fn join_group(
         &mut self,
         group_id: &str,
         member_id: &str,
+        protocols: &[&str],
+    ) -> IoResult<JoinGroupResult> {
+        self.join_group_static(group_id, member_id, None, protocols)
+            .await
+    }
+
+    /// Joins with a `group.instance.id` — a name for *this consumer's slot in the group*
+    /// that outlives the process holding it.
+    ///
+    /// A restart that completes within the session timeout is not seen as a member leaving
+    /// and a member arriving: the returning process is recognised as the member already
+    /// there, keeps its assignment, and the group does not rebalance. That is what makes a
+    /// rolling restart of a consumer deployment free rather than costing two rebalances
+    /// per instance, each of which stops the whole group.
+    ///
+    /// `instance_id` must be stable across restarts and unique within the group — derive
+    /// it from something durable about the deployment slot (an ordinal, a hostname), never
+    /// from anything regenerated per process. Two live processes sharing one instance id
+    /// do not both consume: the later one takes the slot and the earlier is fenced out of
+    /// the group on its next call.
+    ///
+    /// The returned `member_id` is issued fresh on every join and must be used for the
+    /// `SyncGroup`/`Heartbeat` calls that follow — a static member is identified by its
+    /// instance id, not by a member id it can remember.
+    pub async fn join_group_static(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        instance_id: Option<&str>,
         protocols: &[&str],
     ) -> IoResult<JoinGroupResult> {
         let mut req_buf = Vec::new();
@@ -1901,6 +1933,11 @@ impl TestClient {
         inner.put_u32(protocols.len() as u32);
         for p in protocols {
             crate::protocol::wire::write_pascal_string(&mut inner, p);
+        }
+        // Trails the historical fields, and only when set — a dynamic join puts the exact
+        // bytes on the wire that it always did, so an older broker still understands it.
+        if let Some(instance_id) = instance_id {
+            crate::protocol::wire::write_pascal_string(&mut inner, instance_id);
         }
         req_buf.put_u32(inner.len() as u32);
         req_buf.extend_from_slice(&inner);
@@ -2039,11 +2076,29 @@ impl TestClient {
     }
 
     pub async fn leave_group(&mut self, group_id: &str, member_id: &str) -> IoResult<()> {
+        self.leave_group_static(group_id, member_id, None).await
+    }
+
+    /// Retires a static member for good, naming it by `group.instance.id`.
+    ///
+    /// A static member should *not* call this on an ordinary shutdown — keeping the slot
+    /// through a restart is the entire reason it declared an instance id. Call it when the
+    /// instance is being decommissioned rather than bounced, so the group redistributes
+    /// its partitions now instead of waiting out the session timeout.
+    pub async fn leave_group_static(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        instance_id: Option<&str>,
+    ) -> IoResult<()> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::LeaveGroup as u8);
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, group_id);
         crate::protocol::wire::write_pascal_string(&mut inner, member_id);
+        if let Some(instance_id) = instance_id {
+            crate::protocol::wire::write_pascal_string(&mut inner, instance_id);
+        }
         req_buf.put_u32(inner.len() as u32);
         req_buf.extend_from_slice(&inner);
         let resp = self.send_raw_bytes(&req_buf).await?;

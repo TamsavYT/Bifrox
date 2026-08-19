@@ -3522,6 +3522,7 @@ async fn test_scenario_40_join_group_barrier_forms_one_generation() {
                 .join_group_awaited(
                     "barrier_group",
                     &format!("member-{}", i),
+                    None,
                     vec!["range".to_string()],
                 )
                 .await
@@ -4467,5 +4468,283 @@ async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
         for_legacy_client,
         hermes::protocol::wire::WireResponse::ok(vec![7, 7]).encode(),
         "a legacy client must receive an unwrapped response"
+    );
+}
+
+/// A static member's restart must cost the group nothing.
+///
+/// A consumer that declares a `group.instance.id` names a *slot* in the group rather than
+/// a process. Restarting the process holding that slot is not a member leaving and a
+/// member arriving, so the group must not form a new generation, must not move the
+/// member's partitions, and must not stop the other members while it happens — otherwise a
+/// rolling restart of an N-member deployment costs 2N rebalances, each one halting
+/// consumption group-wide.
+#[tokio::test]
+async fn test_scenario_54_static_member_restart_does_not_rebalance() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    let group_id = "static_group";
+
+    // Two static members start up together and land in one generation.
+    let mut first_join = Vec::new();
+    for instance in ["worker-0", "worker-1"] {
+        let engine = engine.clone();
+        first_join.push(tokio::spawn(async move {
+            engine
+                .join_group_awaited(group_id, "", Some(instance), vec!["range".to_string()])
+                .await
+        }));
+    }
+    let mut members = Vec::new();
+    for join in first_join {
+        members.push(join.await.unwrap().unwrap());
+    }
+    let generation = members[0].1;
+    assert!(
+        members.iter().all(|m| m.1 == generation),
+        "both members must share one generation, got {:?}",
+        members.iter().map(|m| m.1).collect::<Vec<_>>()
+    );
+
+    // The leader assigns a partition to each member.
+    let (leader_id, _, _, _) = members
+        .iter()
+        .find(|m| m.2)
+        .expect("one member must lead")
+        .clone();
+    let assignments: Vec<hermes::protocol::wire::MemberAssignment> = members
+        .iter()
+        .enumerate()
+        .map(
+            |(i, (member_id, _, _, _))| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: "static_topic".to_string(),
+                partitions: vec![i as u32],
+            },
+        )
+        .collect();
+    engine
+        .group_coordinator()
+        .sync_group(group_id, generation, &leader_id, assignments)
+        .expect("leader must be able to submit the assignment");
+
+    // Find the member holding worker-0's slot and what it owns, then restart that process:
+    // it comes back knowing its instance id but NOT the member id it previously held.
+    let (worker0_member_id, ..) = members
+        .iter()
+        .find(|(member_id, ..)| member_id.starts_with("worker-0"))
+        .expect("worker-0 must hold a slot")
+        .clone();
+    let owned_before = engine
+        .group_coordinator()
+        .sync_group(group_id, generation, &worker0_member_id, Vec::new())
+        .expect("worker-0 must be able to read its assignment");
+
+    let (restarted_member_id, restarted_generation, _, _) = engine
+        .join_group_awaited(group_id, "", Some("worker-0"), vec!["range".to_string()])
+        .await
+        .expect("a restarting static member must be able to rejoin");
+
+    assert_eq!(
+        restarted_generation, generation,
+        "a static member's restart must not form a new generation"
+    );
+    assert_ne!(
+        restarted_member_id, worker0_member_id,
+        "the returning process must be issued a fresh member id, so a predecessor that is \
+         somehow still running cannot keep acting as this member"
+    );
+
+    let owned_after = engine
+        .group_coordinator()
+        .sync_group(group_id, generation, &restarted_member_id, Vec::new())
+        .expect("the restarted member must be able to read its assignment");
+    assert_eq!(
+        owned_after, owned_before,
+        "a static member must get its own partitions back, not a redistributed set"
+    );
+
+    // The predecessor's id is gone, so a process that outlived its replacement cannot
+    // keep heartbeating — and therefore cannot keep consuming — under the same identity.
+    assert!(
+        engine
+            .group_coordinator()
+            .heartbeat(group_id, generation, &worker0_member_id)
+            .is_err(),
+        "the fenced member id must no longer be accepted"
+    );
+
+    // And the group still has exactly two members: the restart replaced a slot rather
+    // than adding one.
+    let described = engine
+        .group_coordinator()
+        .describe_group(group_id)
+        .expect("group should exist");
+    assert_eq!(
+        described.members.len(),
+        2,
+        "a restart must not leave the group holding a stale extra member"
+    );
+}
+
+/// The contrast that gives the scenario above its meaning: without an instance id, a
+/// restart *is* a new arrival, and the group rebalances around it.
+#[tokio::test]
+async fn test_scenario_55_dynamic_member_restart_does_rebalance() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    let group_id = "dynamic_group";
+
+    let (_, first_generation, _, _) = engine
+        .join_group_awaited(group_id, "member-a", None, vec!["range".to_string()])
+        .await
+        .unwrap();
+
+    // Same consumer, restarted: with no stable identity to present, it is indistinguishable
+    // from a member that has never been seen.
+    let (_, second_generation, _, _) = engine
+        .join_group_awaited(
+            group_id,
+            "member-a-restarted",
+            None,
+            vec!["range".to_string()],
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        second_generation > first_generation,
+        "a dynamic member's arrival must rebalance the group ({} -> {})",
+        first_generation,
+        second_generation
+    );
+}
+
+/// A static member that is being decommissioned rather than bounced must be able to give
+/// its slot up, naming itself by instance id — it has no other way to say which member it
+/// is, since that id is reissued on every join.
+#[tokio::test]
+async fn test_scenario_56_static_member_can_retire_its_instance() {
+    let env = start_test_server().await;
+    let engine = env.engine.clone();
+    let group_id = "retire_group";
+
+    engine
+        .join_group_awaited(group_id, "", Some("worker-0"), vec!["range".to_string()])
+        .await
+        .unwrap();
+    engine
+        .join_group_awaited(group_id, "", Some("worker-1"), vec!["range".to_string()])
+        .await
+        .unwrap();
+
+    engine
+        .group_coordinator()
+        .leave_group(group_id, "", Some("worker-0"))
+        .expect("an instance id must be enough to leave the group");
+
+    let described = engine
+        .group_coordinator()
+        .describe_group(group_id)
+        .expect("group should exist");
+    assert_eq!(
+        described.members.len(),
+        1,
+        "the retired instance must be gone, not waiting out a session timeout"
+    );
+
+    // The slot is released, so the instance coming back is a genuinely new member and the
+    // group rebalances for it — the reservation did not outlive the departure.
+    let generation_before_return = engine
+        .group_coordinator()
+        .join_result(group_id, "")
+        .expect("group should exist")
+        .0;
+    let (_, generation_after_return, _, _) = engine
+        .join_group_awaited(group_id, "", Some("worker-0"), vec!["range".to_string()])
+        .await
+        .unwrap();
+
+    assert!(
+        generation_after_return > generation_before_return,
+        "a retired instance returning must be treated as a new member ({} -> {})",
+        generation_before_return,
+        generation_after_return
+    );
+    assert_eq!(
+        engine
+            .group_coordinator()
+            .describe_group(group_id)
+            .expect("group should exist")
+            .members
+            .len(),
+        2
+    );
+}
+
+/// The same guarantee, driven the way a real consumer drives it: over the wire, through a
+/// reconnect. Proves the instance id survives encoding and reaches the coordinator, which
+/// the coordinator-level scenarios above cannot show.
+#[tokio::test]
+async fn test_scenario_57_static_membership_survives_a_reconnect() {
+    let env = start_test_server().await;
+    let group_id = "wire_static_group";
+    let instance_id = "worker-7";
+
+    let mut client = TestClient::connect(env.addr).await.unwrap();
+    let first = client
+        .join_group_static(group_id, "", Some(instance_id), &["range"])
+        .await
+        .expect("static join must be accepted");
+
+    client
+        .sync_group(
+            group_id,
+            first.generation_id,
+            &first.member_id,
+            &[hermes::protocol::wire::MemberAssignment {
+                member_id: first.member_id.clone(),
+                topic: "wire_static_topic".to_string(),
+                partitions: vec![0, 1],
+            }],
+        )
+        .await
+        .expect("leader must be able to submit the assignment");
+
+    // The process goes away entirely — connection and all — and comes back with nothing
+    // but its instance id.
+    drop(client);
+    let mut restarted = TestClient::connect(env.addr).await.unwrap();
+    let second = restarted
+        .join_group_static(group_id, "", Some(instance_id), &["range"])
+        .await
+        .expect("the returning process must be recognised as the member already there");
+
+    assert_eq!(
+        second.generation_id, first.generation_id,
+        "reconnecting under a known instance id must not rebalance the group"
+    );
+
+    let assignment = restarted
+        .sync_group(group_id, second.generation_id, &second.member_id, &[])
+        .await
+        .expect("the returned member must be able to read its assignment");
+    assert_eq!(
+        assignment,
+        vec![("wire_static_topic".to_string(), vec![0, 1])],
+        "the reconnected member must resume the partitions it already owned"
+    );
+
+    // Heartbeating under the new id works; the id it held before the restart does not.
+    restarted
+        .heartbeat(group_id, second.generation_id, &second.member_id)
+        .await
+        .expect("the current member id must be accepted");
+    assert!(
+        restarted
+            .heartbeat(group_id, second.generation_id, &first.member_id)
+            .await
+            .is_err(),
+        "the pre-restart member id must be fenced"
     );
 }
