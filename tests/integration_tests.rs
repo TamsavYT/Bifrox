@@ -6749,7 +6749,8 @@ fn test_scenario_78_correlation_id_mismatch_is_reported_as_error() {
 /// rejoin ever happens, leaving nothing left to distinguish "resumed correctly" from
 /// "resumed from scratch".
 #[tokio::test]
-async fn test_scenario_79_cooperative_rebalance_preserves_position_on_non_moving_partitions() {
+async fn test_scenario_79_cooperative_rebalance_revokes_before_reassigning_and_preserves_position()
+{
     let env = start_test_server().await;
     let topic = "coop_key_topic";
     let group_id = "coop_key_group";
@@ -6822,6 +6823,59 @@ async fn test_scenario_79_cooperative_rebalance_preserves_position_on_non_moving
         .expect("B must be able to register with the group");
     assert!(!join_b.is_leader, "A must remain the leader when B joins");
 
+    // Watch the coordinator's own bookkeeping, from a separate connection, for a moment
+    // where the partition about to move is owned by neither A nor B — the handover-safety
+    // property that is actually specific to cooperative rebalancing (see the rename
+    // comment below). A's leader-side `rejoin()` submits round one and round two as two
+    // separate, atomic `SyncGroup` calls with a real round-trip (and, for round two, a
+    // full `group_initial_rebalance_delay_ms` join window) between them, so this window
+    // is not a hair's-breadth race: it is open for tens of milliseconds, plenty for this
+    // background poll loop to land inside it before A's own poll loop (below) observes
+    // the settled, final state. If the intersection narrowing in `cooperative_round_one`
+    // were disabled, A's single `SyncGroup` call would move every partition in one atomic
+    // step and this sum would never dip below `num_partitions` at all.
+    let a_member_id = a.member_id().to_string();
+    let b_member_id = join_b.member_id.clone();
+    let watch_group_id = group_id.to_string();
+    let watch_topic = topic.to_string();
+    let watch_addr = env.addr;
+    let handover_witness: tokio::task::JoinHandle<Option<(Vec<u32>, Vec<u32>)>> =
+        tokio::spawn(async move {
+            let mut spectator = TestClient::connect(watch_addr).await.ok()?;
+            // Bounded well under B's session timeout (10s by default, since B is a raw
+            // `TestClient` here and never heartbeats): the genuine window this is
+            // watching for is tens of milliseconds wide (see the comment above), so 3s is
+            // generous headroom for it, while still failing fast — rather than stalling
+            // long enough for B's own session to expire and produce a confusing,
+            // unrelated failure further down — if the property genuinely never appears.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((_, members)) = spectator.describe_group(&watch_group_id).await {
+                    let mut a_partitions: Vec<u32> = Vec::new();
+                    let mut b_partitions: Vec<u32> = Vec::new();
+                    for m in members {
+                        let mut partitions: Vec<u32> = m
+                            .assigned_partitions
+                            .into_iter()
+                            .filter(|(t, _)| t == &watch_topic)
+                            .map(|(_, p)| p)
+                            .collect();
+                        partitions.sort_unstable();
+                        if m.member_id == a_member_id {
+                            a_partitions = partitions;
+                        } else if m.member_id == b_member_id {
+                            b_partitions = partitions;
+                        }
+                    }
+                    if a_partitions.len() + b_partitions.len() < num_partitions as usize {
+                        return Some((a_partitions, b_partitions));
+                    }
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+            None
+        });
+
     // Drive A's own poll loop until it notices B (via its background heartbeat
     // failing on the now-stale generation) and rebalances. A is the leader, and its
     // `rejoin()` performs both cooperative rounds synchronously once it fires, so
@@ -6843,6 +6897,33 @@ async fn test_scenario_79_cooperative_rebalance_preserves_position_on_non_moving
         );
         sleep(Duration::from_millis(20)).await;
     }
+
+    // --- The key assertion: cooperative rebalancing must have actually passed through
+    // an intermediate state where the moving partition belonged to neither A nor B,
+    // rather than jumping directly from A to B in one atomic step. This is what an
+    // eager-equivalent bug — e.g. `cooperative_round_one` hand out the full target
+    // instead of the intersection with what a member already owned — would remove: it
+    // would collapse the two-round handover into a single round, so the watcher above
+    // would never see the partition count dip below `num_partitions` at all. ---
+    let handover_witness = handover_witness
+        .await
+        .expect("the handover-watcher task must not panic");
+    let (witnessed_a, witnessed_b) = handover_witness.expect(
+        "must observe a moment where the moving partition is owned by neither A nor B — \
+         cooperative rebalancing must revoke it from A (round one) before it is ever \
+         handed to B (round two), never both in the same atomic SyncGroup submission",
+    );
+    assert!(
+        witnessed_b.is_empty(),
+        "B is a brand-new member with nothing to intersect against, so round one's \
+         keep-set for it must be empty — B must own nothing at this intermediate point, \
+         got {witnessed_b:?}"
+    );
+    assert!(
+        witnessed_a.len() < num_partitions as usize,
+        "A must have already released at least one partition by this intermediate point, \
+         got {witnessed_a:?}"
+    );
 
     // Only now produce r1/r2 — after the rebalance has fully settled and A's own
     // position for whatever it kept is confirmed untouched since r0.
@@ -6898,9 +6979,15 @@ async fn test_scenario_79_cooperative_rebalance_preserves_position_on_non_moving
         "together the two members must cover every partition exactly once"
     );
 
-    // --- The key assertion: non-moving partitions resume exactly where A left off,
-    // picking up r1/r2 (produced after the rebalance settled but never yet fetched)
-    // without re-reading r0. ---
+    // --- A regression guard, not proof of this feature: non-moving partitions resume
+    // exactly where A left off, picking up r1/r2 (produced after the rebalance settled
+    // but never yet fetched) without re-reading r0. This behavior — `next_offsets`
+    // surviving a rebalance for whatever a member still owns — predates cooperative
+    // rebalancing entirely (it came from #51's original `GroupConsumer`, untouched by
+    // this feature) and holds just as well for an eager rebalance, so it passes even
+    // with the intersection narrowing above disabled. Worth keeping as a guard against a
+    // different regression, but the property that actually distinguishes cooperative
+    // from eager is the handover-safety assertion above. ---
     let mut seen_on_kept: std::collections::HashMap<u32, Vec<String>> =
         std::collections::HashMap::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
