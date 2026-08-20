@@ -2,12 +2,110 @@ use crate::protocol::{CommandCode, RecordFrame, WireResponse};
 use crate::scram;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::{Buf, BufMut};
+use std::collections::VecDeque;
 use std::io::Result as IoResult;
 use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const MAX_CLIENT_RESPONSE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Kafka's `max.in.flight.requests.per.connection` default: how many requests
+/// [`TestClient::send_pipelined`] keeps outstanding on one connection before it must wait
+/// for a response to free a slot, rather than growing the pipeline unboundedly.
+pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 5;
+
+/// One request in a [`TestClient::send_pipelined`] batch: `(command, tagged_fields,
+/// inner_payload)` — exactly what [`TestClient::send_versioned`] takes for a single
+/// request, built the same way every other versioned command in this file builds one.
+pub type PipelinedRequest = (CommandCode, Vec<(u8, Vec<u8>)>, Vec<u8>);
+
+/// Checks a versioned response's echoed correlation id against the one the client is
+/// expecting next, returning a descriptive error on mismatch instead of pairing the
+/// response with the wrong request.
+///
+/// The broker guarantees responses return in the same order requests were sent on a
+/// connection (Kafka protocol guide: "requests will be processed in the order they are
+/// sent and responses will return in that order as well"), so pipelined responses are
+/// matched to requests with a plain FIFO queue of expected ids ([`InFlightWindow`]) rather
+/// than a map keyed by id. This check still runs on every response: a mismatch means a
+/// protocol bug or wire corruption, which must surface loudly rather than pass silently.
+pub fn verify_correlation_id(expected: u32, echoed: u32) -> IoResult<()> {
+    if expected != echoed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "correlation id mismatch: expected {}, received {}",
+                expected, echoed
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// FIFO window of correlation ids for requests that have been sent but not yet
+/// acknowledged, bounding how many can be outstanding on one connection at once.
+///
+/// A queue rather than a map keyed by correlation id: the broker guarantees in-order
+/// responses on a connection, so the next response to arrive is always for the oldest
+/// still-outstanding request — there is never a need to look one up by id.
+#[derive(Debug)]
+pub struct InFlightWindow {
+    max_in_flight: usize,
+    pending: VecDeque<u32>,
+}
+
+impl InFlightWindow {
+    /// `max_in_flight` of `0` is treated as `1` — a window that could send nothing would
+    /// never drain.
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Number of requests currently outstanding (sent, awaiting a response).
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// True once `max_in_flight` requests are outstanding — a caller must read a response
+    /// (via [`Self::pop_front`]) before sending another.
+    pub fn is_full(&self) -> bool {
+        self.pending.len() >= self.max_in_flight
+    }
+
+    /// Records that a request with this correlation id was just sent. Returns `false`
+    /// without recording anything if the window is already full: callers must check
+    /// [`Self::is_full`] (or this return value) rather than exceeding the bound.
+    pub fn try_push(&mut self, correlation_id: u32) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        self.pending.push_back(correlation_id);
+        true
+    }
+
+    /// Removes and returns the oldest outstanding correlation id — the one the next
+    /// response on the wire is expected to echo.
+    pub fn pop_front(&mut self) -> Option<u32> {
+        self.pending.pop_front()
+    }
+}
+
+/// Shared by every versioned-envelope send path (`send_versioned`, `send_pipelined`) so
+/// correlation ids stay unique across a connection's whole in-flight window, not just
+/// within a single call.
+static NEXT_CORRELATION_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_correlation_id() -> u32 {
+    NEXT_CORRELATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProduceResult {
@@ -202,27 +300,18 @@ impl TestClient {
         })
     }
 
-    /// Sends `cmd`/`inner` wrapped in the versioned envelope with the given tagged fields
-    /// attached, and returns the response with any envelope framing stripped — the same
-    /// `WireResponse` shape [`Self::send_raw_bytes`] returns for a legacy request.
-    ///
-    /// A hand-rolled envelope like this already existed once per tagged field
-    /// (`fetch_with_isolation`); this factors the send/receive plumbing out so a second tag
-    /// (`SESSION_TIMEOUT_MS`) doesn't need its own copy of it.
-    async fn send_versioned(
-        &mut self,
+    /// Builds the versioned envelope for `cmd`/`inner` with the given tagged fields
+    /// attached, assigning it a fresh, process-wide-unique correlation id. Pure/no I/O, so
+    /// [`Self::send_versioned`] and [`Self::send_pipelined`] can share it without either
+    /// one needing a live connection to build a request.
+    fn encode_versioned_request(
         cmd: CommandCode,
         tagged_fields: &[(u8, Vec<u8>)],
-        inner: Vec<u8>,
-    ) -> IoResult<WireResponse> {
+        inner: &[u8],
+    ) -> (u32, Vec<u8>) {
         use crate::protocol::wire::{PROTOCOL_VERSION_MAX, VERSIONED_ENVELOPE_MAGIC};
 
-        // A process-wide counter rather than per-connection state: the id only has to be
-        // distinguishable within a connection's in-flight window, and this keeps the
-        // client struct and its constructors untouched.
-        static NEXT_CORRELATION_ID: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(1);
-        let correlation_id = NEXT_CORRELATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let correlation_id = next_correlation_id();
 
         let mut req_buf = Vec::new();
         req_buf.put_u8(VERSIONED_ENVELOPE_MAGIC);
@@ -237,12 +326,20 @@ impl TestClient {
 
         req_buf.put_u8(cmd as u8);
         req_buf.put_u32(inner.len() as u32);
-        req_buf.extend_from_slice(&inner);
+        req_buf.extend_from_slice(inner);
 
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
-        })?;
-        stream.write_all(&req_buf).await?;
+        (correlation_id, req_buf)
+    }
+
+    /// Reads one versioned response off `stream` and checks its echoed correlation id
+    /// against `expected_correlation_id` before returning it with envelope framing
+    /// stripped — the same `WireResponse` shape [`Self::send_raw_bytes`] returns for a
+    /// legacy request.
+    async fn read_versioned_response(
+        stream: &mut ClientStream,
+        expected_correlation_id: u32,
+    ) -> IoResult<WireResponse> {
+        use crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC;
 
         // A versioned request is answered with a versioned response: the magic byte and
         // the echoed correlation id precede the usual status/length/payload.
@@ -255,17 +352,85 @@ impl TestClient {
             ));
         }
         let echoed = u32::from_be_bytes(prefix[1..5].try_into().unwrap());
-        if echoed != correlation_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "correlation id mismatch: sent {}, received {}",
-                    correlation_id, echoed
-                ),
-            ));
-        }
+        verify_correlation_id(expected_correlation_id, echoed)?;
 
         Self::read_wire_response(stream).await
+    }
+
+    /// Sends `cmd`/`inner` wrapped in the versioned envelope with the given tagged fields
+    /// attached, and returns the response with any envelope framing stripped — the same
+    /// `WireResponse` shape [`Self::send_raw_bytes`] returns for a legacy request.
+    ///
+    /// A hand-rolled envelope like this already existed once per tagged field
+    /// (`fetch_with_isolation`); this factors the send/receive plumbing out so a second tag
+    /// (`SESSION_TIMEOUT_MS`) doesn't need its own copy of it.
+    async fn send_versioned(
+        &mut self,
+        cmd: CommandCode,
+        tagged_fields: &[(u8, Vec<u8>)],
+        inner: Vec<u8>,
+    ) -> IoResult<WireResponse> {
+        let (correlation_id, req_buf) = Self::encode_versioned_request(cmd, tagged_fields, &inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+
+        Self::read_versioned_response(stream, correlation_id).await
+    }
+
+    /// Pipelines `requests` over this connection instead of awaiting each response before
+    /// sending the next one: every request is built and written with the same
+    /// versioned-envelope + correlation-id machinery [`Self::send_versioned`] uses for a
+    /// single request ([`Self::encode_versioned_request`] / [`Self::read_versioned_response`]),
+    /// keeping at most `max_in_flight` outstanding at a time via [`InFlightWindow`] rather
+    /// than growing the pipeline unboundedly. Responses are returned in the same order
+    /// `requests` were given — guaranteed by the broker replying in order on a connection.
+    ///
+    /// This is the client half of request pipelining (issue #20). The wire format and the
+    /// broker's in-order response guarantee are unchanged; this only stops the client from
+    /// blocking on a full round trip per request, per the Kafka protocol guide: "clients
+    /// can (and ideally should) use non-blocking IO to implement request pipelining ...
+    /// since the outstanding requests will be buffered in the underlying OS socket buffer."
+    ///
+    /// Each element of `requests` is a [`PipelinedRequest`] — `(command, tagged_fields,
+    /// inner_payload)`, exactly what [`Self::send_versioned`] takes for one request.
+    pub async fn send_pipelined(
+        &mut self,
+        requests: Vec<PipelinedRequest>,
+        max_in_flight: usize,
+    ) -> IoResult<Vec<WireResponse>> {
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+
+        let mut window = InFlightWindow::new(max_in_flight);
+        let mut requests = requests.into_iter();
+        let mut responses = Vec::new();
+
+        loop {
+            // Top the pipeline up to the bound (or until requests run out) before waiting
+            // on anything back — this is what lets writes for later requests go out while
+            // an earlier response is still in flight.
+            while !window.is_full() {
+                let Some((cmd, tagged_fields, inner)) = requests.next() else {
+                    break;
+                };
+                let (correlation_id, req_buf) =
+                    Self::encode_versioned_request(cmd, &tagged_fields, &inner);
+                stream.write_all(&req_buf).await?;
+                window.try_push(correlation_id);
+            }
+
+            let Some(expected) = window.pop_front() else {
+                break; // Nothing outstanding and nothing left to send.
+            };
+            let resp = Self::read_versioned_response(stream, expected).await?;
+            responses.push(resp);
+        }
+
+        Ok(responses)
     }
 
     pub async fn connect(addr: SocketAddr) -> IoResult<Self> {
