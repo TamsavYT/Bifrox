@@ -262,6 +262,14 @@ pub enum AssignmentStrategy {
     RoundRobin,
     /// Keeps each member's previous partitions where possible — see [`assign_sticky`].
     Sticky,
+    /// Same underlying computation as [`Sticky`](Self::Sticky) — see [`assign_sticky`] —
+    /// but applied incrementally (Kafka's KIP-429): the leader hands out only the
+    /// intersection of a member's current and target partitions in a first round, and
+    /// only the partitions that actually have to move go through a revoke-then-reassign
+    /// second round. See `GroupConsumer::rejoin`'s leader branch and
+    /// [`cooperative_round_one`] for the two-round mechanics this drives; the assignment
+    /// *algorithm* itself is untouched, only how its output is rolled out.
+    CooperativeSticky,
 }
 
 impl AssignmentStrategy {
@@ -277,6 +285,11 @@ impl AssignmentStrategy {
             "roundrobin" => AssignmentStrategy::RoundRobin,
             "range" => AssignmentStrategy::Range,
             "sticky" => AssignmentStrategy::Sticky,
+            // Kafka's own convention for its cooperative sticky assignor name — matching
+            // it exactly is what lets `ConsumerGroup::is_cooperative`'s "contains
+            // cooperative" check recognise a group that negotiated this without any
+            // wire-visible change.
+            "cooperative-sticky" => AssignmentStrategy::CooperativeSticky,
             other => {
                 if !other.is_empty() {
                     tracing::warn!(
@@ -305,11 +318,73 @@ impl AssignmentStrategy {
         match self {
             AssignmentStrategy::Range => assign_range(partition_count, member_ids),
             AssignmentStrategy::RoundRobin => assign_roundrobin(partition_count, member_ids),
-            AssignmentStrategy::Sticky => {
+            AssignmentStrategy::Sticky | AssignmentStrategy::CooperativeSticky => {
                 assign_sticky(partition_count, member_ids, previous_assignment)
             }
         }
     }
+
+    /// Whether this strategy is applied incrementally (KIP-429) rather than
+    /// stop-the-world. Only [`CooperativeSticky`](Self::CooperativeSticky) is — `Sticky`
+    /// computes the same *target*, per [`assign_sticky`], but still hands it out in one
+    /// shot, same as `Range`/`RoundRobin` always have.
+    ///
+    /// Named to match [`crate::server::coordinator::ConsumerGroup::is_cooperative`] (same
+    /// question, asked from the coordinator's side of the protocol name instead of a
+    /// parsed strategy), which this must stay consistent with: both ultimately key off
+    /// the same negotiated `protocol_name` containing "cooperative".
+    pub fn is_cooperative(self) -> bool {
+        matches!(self, AssignmentStrategy::CooperativeSticky)
+    }
+}
+
+/// Round one of a cooperative (KIP-429) rebalance: for each member, narrows its freshly
+/// computed `target` down to the intersection with what it already owned per
+/// `previous_assignment` — literally `target(m) ∩ previous(m)`, nothing cleverer. A
+/// partition in a member's target that it did not already own itself — whether it's
+/// moving over from a different member, or was never owned by anyone in
+/// `previous_assignment` at all (a brand-new group, or brand-new partitions) — is left out
+/// of the member's keep-set entirely, not handed to it early.
+///
+/// That last case is a deliberate simplification, not an oversight: a genuinely unowned
+/// partition would actually be *safe* to hand out immediately (nobody needs to revoke it
+/// first), but distinguishing "unowned by anyone" from "owned by someone else" here would
+/// mean computing a second, cleverer notion of "safe to hand out now" beyond the plain
+/// per-member intersection. Plain intersection is what round one submits; the cost is that
+/// a brand-new group's very first assignment — or any addition of new partitions — costs
+/// one extra (harmless, self-contained) round to hand out, same as an actual conflict
+/// would.
+///
+/// Returns `(keep_sets, needs_second_round)`. `keep_sets` is submitted via `SyncGroup`
+/// instead of `target` — see `GroupConsumer::rejoin`'s leader branch.
+/// `needs_second_round` is true the moment any member's keep-set came out smaller than its
+/// target, i.e. something had to be held back (given up by its old owner, or newly
+/// available to a new one) — exactly the condition under which a second round is required
+/// to actually deliver it.
+pub fn cooperative_round_one(
+    target: &[(String, Vec<u32>)],
+    previous_assignment: &HashMap<String, Vec<u32>>,
+) -> (Vec<(String, Vec<u32>)>, bool) {
+    let mut needs_second_round = false;
+    let keep_sets = target
+        .iter()
+        .map(|(member_id, target_partitions)| {
+            let previously_owned = previous_assignment
+                .get(member_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let kept: Vec<u32> = target_partitions
+                .iter()
+                .copied()
+                .filter(|p| previously_owned.contains(p))
+                .collect();
+            if kept.len() != target_partitions.len() {
+                needs_second_round = true;
+            }
+            (member_id.clone(), kept)
+        })
+        .collect();
+    (keep_sets, needs_second_round)
 }
 
 /// Configuration for a [`GroupConsumer`].
@@ -673,29 +748,84 @@ impl GroupConsumer {
             // `GroupCoordinator::join_group`), not necessarily the first entry in this
             // member's own `protocols` list. Using it here, rather than always calling
             // `assign_range`, is the point of this method: a group that negotiated
-            // `roundrobin` must actually get round-robin, and one that negotiated `sticky`
-            // must actually get sticky assignment fed with `previous_assignment` above.
+            // `roundrobin` must actually get round-robin, one that negotiated `sticky`
+            // must actually get sticky assignment fed with `previous_assignment` above,
+            // and one that negotiated `cooperative-sticky` must roll that same target out
+            // incrementally rather than handing it out in one shot — see below.
             let strategy = AssignmentStrategy::from_protocol_name(&join.protocol_name);
-            let assignments = strategy.assign(partition_count, &member_ids, &previous_assignment);
-            let member_assignments: Vec<MemberAssignment> = assignments
-                .into_iter()
-                .map(|(member_id, partitions)| MemberAssignment {
-                    member_id,
-                    topic: self.config.topic.clone(),
-                    partitions,
-                })
-                .collect();
+            let target = strategy.assign(partition_count, &member_ids, &previous_assignment);
 
-            self.client
-                .sync_group(
-                    &self.config.group_id,
-                    self.generation_id,
-                    &self.member_id,
-                    &member_assignments,
-                )
-                .await?
-                .into_iter()
-                .collect()
+            // Eager strategies (`Range`, `RoundRobin`, plain `Sticky`) submit `target`
+            // directly, in one round, exactly as this always has — `is_cooperative()` is
+            // false for every one of them, so `round_one` is just `target` and
+            // `needs_second_round` is always false; nothing below changes their
+            // behavior. Only `CooperativeSticky` narrows round one down to each member's
+            // keep-set (`target ∩ previous`) instead.
+            let (round_one, needs_second_round) = if strategy.is_cooperative() {
+                cooperative_round_one(&target, &previous_assignment)
+            } else {
+                (target.clone(), false)
+            };
+
+            let round_one_map = self.submit_assignment(&round_one).await?;
+
+            if needs_second_round {
+                // Round one's SyncGroup above just made every withheld partition
+                // ownerless — no member's `assigned_partitions` includes them any more
+                // (each kept only its share of `round_one`). Getting them to their new
+                // owners needs a second generation, and the only lever this member has
+                // to request one — without a wire change — is calling JoinGroup again
+                // itself: for a cooperative group, the coordinator treats an already-known
+                // member calling JoinGroup while the group is Stable as a request for a
+                // fresh rebalance round (see `GroupCoordinator::join_group`), bumping the
+                // generation and reopening the join barrier so every other member gets a
+                // chance to notice — via its own heartbeat rejection — and rejoin before
+                // this round closes. Eager groups never reach this branch at all
+                // (`needs_second_round` is always false for them), so this never runs for
+                // them regardless.
+                // Recomputed rather than reusing the outer `protocol_refs` — that borrow
+                // of `self.config.protocols` would otherwise have to stay alive across
+                // the mutable `self.submit_assignment` call above, which the borrow
+                // checker rejects.
+                let protocol_refs_round_two: Vec<&str> =
+                    self.config.protocols.iter().map(String::as_str).collect();
+                let round_two_join = self
+                    .client
+                    .join_group_with_session_timeout(
+                        &self.config.group_id,
+                        &self.member_id,
+                        self.config.instance_id.as_deref(),
+                        &protocol_refs_round_two,
+                        Some(self.config.session_timeout),
+                    )
+                    .await?;
+                self.generation_id = round_two_join.generation_id;
+                self.is_leader = round_two_join.is_leader;
+                // Same reasoning as the round-one publish above: the background
+                // heartbeat task must heartbeat under round two's generation for the
+                // rest of this call, not round one's.
+                let _ = self.identity_tx.send(HeartbeatIdentity {
+                    member_id: self.member_id.clone(),
+                    generation_id: self.generation_id,
+                });
+                self.needs_rejoin.store(false, Ordering::Release);
+
+                // Round two submits `target` as-is, not recomputed. Round one already
+                // reduced every member's holdings to a subset of `target` and nothing
+                // outside it, so `target` is now fully achievable without taking
+                // anything away from anyone: every partition a member doesn't yet own
+                // is either freshly freed by round one or was never anyone's to begin
+                // with. Recomputing instead — running the assignor's leveling step
+                // again against round one's partial state — could, depending on
+                // tie-breaks, reassign a partition a member is still actively holding
+                // straight to someone else, defeating the revoke-before-reassign
+                // ordering this whole scheme exists to guarantee. Reusing `target` is
+                // also what bounds this to exactly two rounds: there is nothing left to
+                // disagree with, so a third round is never triggered.
+                self.submit_assignment(&target).await?
+            } else {
+                round_one_map
+            }
         } else {
             let deadline = Instant::now() + self.config.sync_retry_timeout;
             loop {
@@ -759,6 +889,36 @@ impl GroupConsumer {
 
         self.assignment = new_assignment;
         Ok(())
+    }
+
+    /// Submits `assignments` via `SyncGroup` under the current generation and member id,
+    /// returning this member's own resulting `topic -> partitions` map. Leader-only —
+    /// only the leader's `SyncGroup` call carries a payload — and shared between a
+    /// cooperative rebalance's two rounds and an eager rebalance's single one, so every
+    /// round goes over the wire the exact same way.
+    async fn submit_assignment(
+        &mut self,
+        assignments: &[(String, Vec<u32>)],
+    ) -> IoResult<HashMap<String, Vec<u32>>> {
+        let member_assignments: Vec<MemberAssignment> = assignments
+            .iter()
+            .map(|(member_id, partitions)| MemberAssignment {
+                member_id: member_id.clone(),
+                topic: self.config.topic.clone(),
+                partitions: partitions.clone(),
+            })
+            .collect();
+        Ok(self
+            .client
+            .sync_group(
+                &self.config.group_id,
+                self.generation_id,
+                &self.member_id,
+                &member_assignments,
+            )
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// One poll round: fetches every owned partition in order. Liveness itself no longer
@@ -1360,6 +1520,170 @@ mod tests {
             assign_range(7, &members),
             "an unrecognised protocol name must default rather than error"
         );
+    }
+
+    #[test]
+    fn strategy_from_protocol_name_recognises_cooperative_sticky() {
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name("cooperative-sticky"),
+            AssignmentStrategy::CooperativeSticky
+        );
+    }
+
+    #[test]
+    fn is_cooperative_is_true_only_for_cooperative_sticky() {
+        assert!(!AssignmentStrategy::Range.is_cooperative());
+        assert!(!AssignmentStrategy::RoundRobin.is_cooperative());
+        assert!(
+            !AssignmentStrategy::Sticky.is_cooperative(),
+            "plain sticky computes the same target as cooperative-sticky but still rolls \
+             it out eagerly — it must not be treated as cooperative"
+        );
+        assert!(AssignmentStrategy::CooperativeSticky.is_cooperative());
+    }
+
+    #[test]
+    fn negotiated_cooperative_sticky_protocol_name_computes_the_same_target_as_sticky() {
+        // Constraint: cooperative-sticky must not change what the assignor computes,
+        // only how the leader rolls the result out (see `cooperative_round_one`).
+        let negotiated_protocol_name = "cooperative-sticky".to_string();
+        let members = ids(&["a", "b", "c"]);
+        let mut previous = HashMap::new();
+        previous.insert("a".to_string(), vec![0, 1, 2]);
+        previous.insert("b".to_string(), vec![3, 4]);
+        previous.insert("c".to_string(), vec![5, 6]);
+
+        let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
+        assert_eq!(strategy, AssignmentStrategy::CooperativeSticky);
+        let result = strategy.assign(7, &members, &previous);
+
+        assert_eq!(result, assign_sticky(7, &members, &previous));
+    }
+
+    // --- cooperative_round_one ---
+
+    #[test]
+    fn cooperative_round_one_keeps_only_the_intersection_with_target() {
+        // "a" is losing partition 1 (to "b") and keeping 0; "b" is gaining 1 but already
+        // had 2 and keeps it too.
+        let target = vec![("a".to_string(), vec![0]), ("b".to_string(), vec![1, 2])];
+        let previous = prev(&[("a", &[0, 1]), ("b", &[2])]);
+
+        let (keep_sets, needs_second_round) = cooperative_round_one(&target, &previous);
+
+        let owned: HashMap<&str, &Vec<u32>> =
+            keep_sets.iter().map(|(id, p)| (id.as_str(), p)).collect();
+        assert_eq!(
+            owned["a"],
+            &vec![0],
+            "\"a\" must keep exactly what it already owned and is still targeted for"
+        );
+        assert_eq!(
+            owned["b"],
+            &vec![2],
+            "\"b\" must not receive partition 1 in round one — it never owned it, so it \
+             hasn't been revoked by anyone yet"
+        );
+        assert!(
+            needs_second_round,
+            "partition 1 had to be withheld from everyone, so a second round is required"
+        );
+    }
+
+    #[test]
+    fn cooperative_round_one_needs_no_second_round_when_nothing_moves() {
+        let target = vec![("a".to_string(), vec![0, 1]), ("b".to_string(), vec![2, 3])];
+        let previous = prev(&[("a", &[0, 1]), ("b", &[2, 3])]);
+
+        let (keep_sets, needs_second_round) = cooperative_round_one(&target, &previous);
+
+        assert_eq!(
+            keep_sets, target,
+            "an unchanged target must be handed out in full"
+        );
+        assert!(
+            !needs_second_round,
+            "nothing had to be withheld, so no second round should be requested"
+        );
+    }
+
+    #[test]
+    fn cooperative_round_one_gives_a_new_member_nothing_until_round_two() {
+        // "c" just joined and has no previous assignment at all.
+        let target = vec![
+            ("a".to_string(), vec![0]),
+            ("b".to_string(), vec![1]),
+            ("c".to_string(), vec![2]),
+        ];
+        let previous = prev(&[("a", &[0, 2]), ("b", &[1])]);
+
+        let (keep_sets, needs_second_round) = cooperative_round_one(&target, &previous);
+
+        let owned: HashMap<&str, &Vec<u32>> =
+            keep_sets.iter().map(|(id, p)| (id.as_str(), p)).collect();
+        assert_eq!(
+            owned["a"],
+            &vec![0],
+            "\"a\" keeps only what's still its own"
+        );
+        assert_eq!(
+            owned["b"],
+            &vec![1],
+            "\"b\" is unaffected, keeps its only partition"
+        );
+        assert_eq!(
+            owned["c"],
+            &Vec::<u32>::new(),
+            "a brand-new member must receive nothing in round one"
+        );
+        assert!(needs_second_round);
+    }
+
+    #[test]
+    fn cooperative_round_one_revoked_set_is_exactly_the_difference_not_everything() {
+        // Only partition 1 is actually moving (from "a" to "b"); "a"'s partition 0 and
+        // "b"'s partition 2 are untouched. The key claim under test: round one's keep-set
+        // for "a" must equal target(a) minus the moved partition, not an empty set — an
+        // eager (stop-the-world) implementation would produce an empty keep-set for every
+        // member instead.
+        let target = vec![("a".to_string(), vec![0]), ("b".to_string(), vec![1, 2])];
+        let previous = prev(&[("a", &[0, 1]), ("b", &[2])]);
+
+        let (keep_sets, _) = cooperative_round_one(&target, &previous);
+        let owned: HashMap<&str, &Vec<u32>> =
+            keep_sets.iter().map(|(id, p)| (id.as_str(), p)).collect();
+
+        let a_current = previous["a"].clone();
+        let a_revoked: Vec<u32> = a_current
+            .iter()
+            .copied()
+            .filter(|p| !owned["a"].contains(p))
+            .collect();
+        assert_eq!(
+            a_revoked,
+            vec![1],
+            "\"a\" must revoke exactly partition 1, the one actually moving — not \
+             partition 0 too"
+        );
+        assert!(
+            owned["a"].contains(&0),
+            "\"a\"'s non-moving partition must stay in its round-one keep-set"
+        );
+    }
+
+    #[test]
+    fn cooperative_round_one_bootstrap_with_no_previous_assignment_withholds_everything() {
+        // A deliberate consequence of the plain `target ∩ previous` definition: a
+        // brand-new group's very first assignment has no previous owners at all, so
+        // nothing can be kept and a second round is always needed to actually hand
+        // anything out — same treatment as a genuine conflict, not a special case.
+        let target = vec![("a".to_string(), vec![0, 1])];
+        let previous = HashMap::new();
+
+        let (keep_sets, needs_second_round) = cooperative_round_one(&target, &previous);
+
+        assert_eq!(keep_sets, vec![("a".to_string(), Vec::new())]);
+        assert!(needs_second_round);
     }
 
     // --- GroupConsumerConfig::validate ---
