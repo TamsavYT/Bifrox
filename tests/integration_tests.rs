@@ -6571,3 +6571,152 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
          with an empty allowlist"
     );
 }
+
+// ─────────────────────────────────────────────────────────
+// Issue #20: client-side request pipelining
+// ─────────────────────────────────────────────────────────
+//
+// The Kafka protocol guide is explicit that the broker does *not* answer out of order:
+// "The server guarantees that on a single TCP connection, requests will be processed in
+// the order they are sent and responses will return in that order as well." Hermes's
+// broker already relies on exactly that guarantee (`WireResponse::encode_framed_into`
+// echoes each request's correlation id, and the connection loop in `server/handler.rs`
+// drains and answers back-to-back requests off one read in order) — so pipelining is
+// purely a client-side change: send several requests without waiting for each response,
+// bounded by `TestClient::send_pipelined`'s `max_in_flight`, and let the broker's existing
+// in-order guarantee do the matching.
+
+/// The key end-to-end proof: pipeline more requests than the default max-in-flight bound
+/// (5) over one connection and confirm every response comes back correctly correlated, in
+/// the same order the requests were sent, carrying the right payload for its request. This
+/// is what exercises the broker's in-order-response contract under an actual bounded
+/// sliding window rather than one request at a time.
+#[tokio::test]
+async fn test_scenario_76_pipelined_requests_return_correlated_in_order_responses() {
+    use bytes::BufMut;
+
+    let env = start_test_server().await;
+    let mut client = TestClient::connect(env.addr)
+        .await
+        .expect("Failed to connect");
+
+    // N > hermes::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS (5), so the pipeline must refill
+    // its window at least once mid-flight rather than emptying it in a single pass.
+    const N: usize = 8;
+    let mut expected_watermarks = Vec::with_capacity(N);
+    for i in 0..N {
+        let topic = format!("pipeline_topic_{}", i);
+        client.create_topic(&topic, 1).await.expect("create topic");
+        // A distinct record count per topic so a response landing at the wrong index would
+        // be caught by a wrong watermark, not just a coincidentally-matching one.
+        let record_count = (i as u64) + 1;
+        for r in 0..record_count {
+            client
+                .produce_single(
+                    &topic,
+                    "k",
+                    None,
+                    1,
+                    format!("pipeline-payload-{}-{}", i, r),
+                )
+                .await
+                .expect("produce");
+        }
+        expected_watermarks.push(record_count);
+    }
+
+    let requests: Vec<_> = (0..N)
+        .map(|i| {
+            let topic = format!("pipeline_topic_{}", i);
+            let mut inner = Vec::new();
+            hermes::protocol::wire::write_pascal_string(&mut inner, &topic);
+            inner.put_u32(0); // partition
+            (hermes::CommandCode::LatestOffset, Vec::new(), inner)
+        })
+        .collect();
+
+    let responses = client
+        .send_pipelined(requests, hermes::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS)
+        .await
+        .expect("pipelined send failed");
+
+    assert_eq!(
+        responses.len(),
+        N,
+        "must get back exactly one response per pipelined request"
+    );
+    for (i, resp) in responses.iter().enumerate() {
+        assert_eq!(
+            resp.status, 0,
+            "request {} came back with an error status",
+            i
+        );
+        assert!(
+            resp.payload.len() >= 8,
+            "LatestOffset response {} payload too short",
+            i
+        );
+        let watermark = u64::from_be_bytes(resp.payload[0..8].try_into().unwrap());
+        assert_eq!(
+            watermark, expected_watermarks[i],
+            "response {} does not match its request — pipelined responses came back \
+             mis-correlated or out of order",
+            i
+        );
+    }
+}
+
+/// `InFlightWindow` is the structure [`TestClient::send_pipelined`] uses to decide when it
+/// must stop writing and wait for a response: this proves that structure actually refuses
+/// to exceed its bound, in FIFO order, rather than growing unboundedly.
+#[test]
+fn test_scenario_77_in_flight_window_enforces_max_bound() {
+    let mut window = hermes::client::InFlightWindow::new(3);
+
+    assert!(window.try_push(1));
+    assert!(window.try_push(2));
+    assert!(window.try_push(3));
+    assert!(window.is_full());
+    assert_eq!(window.len(), 3);
+    assert!(
+        !window.try_push(4),
+        "a 4th outstanding request must be refused once the bound of 3 is reached"
+    );
+    assert_eq!(
+        window.len(),
+        3,
+        "a refused push must not have been recorded"
+    );
+
+    // Draining the oldest frees exactly one slot, in the order requests were sent.
+    assert_eq!(window.pop_front(), Some(1));
+    assert!(!window.is_full());
+    assert!(window.try_push(4));
+    assert!(window.is_full());
+
+    assert_eq!(window.pop_front(), Some(2));
+    assert_eq!(window.pop_front(), Some(3));
+    assert_eq!(window.pop_front(), Some(4));
+    assert_eq!(window.pop_front(), None);
+    assert!(window.is_empty());
+}
+
+/// A correlation id mismatch means a protocol bug or wire corruption and must be a loud
+/// error, never a silently mismatched result. Hermes's broker always echoes the correct id
+/// (this is the guarantee issue #20 depends on), so a real mismatch cannot be provoked by
+/// talking to a well-behaved broker — this instead tests the matching logic itself, the
+/// same `verify_correlation_id` both `send_versioned` and `send_pipelined` check every
+/// response against.
+#[test]
+fn test_scenario_78_correlation_id_mismatch_is_reported_as_error() {
+    hermes::client::verify_correlation_id(42, 42).expect("matching ids must be accepted");
+
+    let err = hermes::client::verify_correlation_id(42, 43)
+        .expect_err("a mismatched correlation id must be reported as an error, not accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("correlation id mismatch"),
+        "error should name the actual problem; got: {}",
+        err
+    );
+}
