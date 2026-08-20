@@ -133,7 +133,7 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
     let engine = StorageEngine::new(config)?;
     let server = Server::new(engine);
 
-    tracing::info!("Starting TCP Listener Loop. Press Ctrl+C to stop.");
+    tracing::info!("Starting TCP Listener Loop. Send SIGINT (Ctrl+C) or SIGTERM to stop.");
     server.run().await?;
 
     Ok(())

@@ -7,6 +7,7 @@ pub mod replication;
 pub mod scram;
 pub mod segment;
 pub mod server;
+pub mod shutdown;
 
 pub use client::{ProduceResult, RoutedClient, SeekResult, TestClient};
 pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
@@ -30,3 +31,4 @@ pub use server::{
     PartitionManager, QuotaManager, ResourceType, Server, ShareGroupManager, SharePartition,
     ShareRecordState, StorageEngine, TransactionManager, TransactionState, TxStatus,
 };
+pub use shutdown::wait_for_shutdown_signal;

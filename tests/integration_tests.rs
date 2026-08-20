@@ -5892,3 +5892,276 @@ async fn test_scenario_67_session_timeout_and_stalled_consumption_evictions_are_
 
     drop(stalled);
 }
+
+/// Waits for a child process to exit, with a hard deadline, draining stdout/stderr
+/// concurrently so a full pipe buffer can never block the child.
+///
+/// If the child hasn't exited by `deadline`, it is SIGKILLed and this panics with a clear
+/// message plus whatever output was captured so far -- turning a hang into a readable test
+/// failure instead of blocking the whole suite (and CI) for however long the runner allows.
+///
+/// Synchronous by design: run it inside `tokio::task::spawn_blocking` rather than awaiting
+/// it directly, so the polling loop below doesn't starve the (single-threaded, by default)
+/// test runtime that the in-process test server also runs on.
+#[cfg(unix)]
+fn wait_for_child_with_deadline(
+    mut child: std::process::Child,
+    deadline: Duration,
+) -> std::process::Output {
+    use std::io::Read;
+
+    let pid = child.id();
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll child status") {
+            break status;
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stdout =
+                String::from_utf8_lossy(&stdout_handle.join().unwrap_or_default()).into_owned();
+            let stderr =
+                String::from_utf8_lossy(&stderr_handle.join().unwrap_or_default()).into_owned();
+            panic!(
+                "child process (pid {}) did not exit within {:?} and was SIGKILLed -- it \
+                 hung instead of shutting down gracefully.\nstdout so far: {}\nstderr so \
+                 far: {}",
+                pid, deadline, stdout, stderr
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let stdout = stdout_handle.join().expect("stdout reader thread panicked");
+    let stderr = stderr_handle.join().expect("stderr reader thread panicked");
+
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// Issue #60: SIGTERM must reach the same graceful-shutdown path as SIGINT (Ctrl+C).
+/// Docker, Kubernetes and systemd stop a managed process with SIGTERM, not SIGINT, so a
+/// shutdown handler that only ever waited on `ctrl_c()` never ran under those supervisors
+/// -- silently skipping the consumer's final offset commit on every container restart, and
+/// reprocessing everything since the last periodic commit.
+///
+/// This drives the real `hermes_cli` binary as a child process and sends it an actual
+/// SIGTERM, rather than exercising the `select!` arm in-process, because the bug was
+/// specifically about which OS signal reaches that arm -- an in-process test would not have
+/// caught it. Unix-only: Windows has no SIGTERM to send.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_scenario_68_sigterm_triggers_the_same_graceful_shutdown_as_sigint() {
+    let env = start_test_server().await;
+    let topic = "sigterm_shutdown_topic";
+    let group_id = "sigterm_shutdown_group";
+    let num_records = 5u64;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client.create_topic(topic, 1).await.unwrap();
+    for i in 0..num_records {
+        setup_client
+            .produce_single(topic, "k", None, 1, format!("msg-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    let cli_path = env!("CARGO_BIN_EXE_hermes_cli");
+    let child = std::process::Command::new(cli_path)
+        .args([
+            "group-consume",
+            "--server",
+            &env.addr.to_string(),
+            "--group",
+            group_id,
+            "--topic",
+            topic,
+            "--interval",
+            "50",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hermes_cli group-consume");
+    let pid = child.id();
+
+    // Wait for the consumer to actually join, consume every produced record, and
+    // auto-commit at least once -- so SIGTERM lands on a process that has something to
+    // lose if the graceful-shutdown path is skipped. Frame offsets are 0-indexed, so the
+    // last of `num_records` frames commits offset `num_records - 1`.
+    let expected_committed = num_records - 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(committed) = setup_client.fetch_offset(group_id, topic, 0).await {
+            if committed == expected_committed {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CLI consumer must consume and auto-commit every produced record before \
+             we send it SIGTERM"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // Send SIGTERM the same way Docker/Kubernetes/systemd would -- not SIGKILL, not
+    // SIGINT -- via the system `kill` binary rather than a new crate dependency.
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("failed to invoke `kill`");
+    assert!(
+        kill_status.success(),
+        "`kill -TERM {}` itself must succeed",
+        pid
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        wait_for_child_with_deadline(child, Duration::from_secs(5))
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "hermes_cli must exit successfully after SIGTERM, proving it went through the \
+         graceful-shutdown path instead of being killed outright by the OS default action; \
+         status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Graceful shutdown signal received"),
+        "SIGTERM must drive the same graceful-shutdown log line SIGINT already used; \
+         stdout was: {}",
+        stdout
+    );
+}
+
+/// Regression test for the swallowed-signal bug itself (as opposed to scenario 68, which
+/// exercises SIGTERM in general but -- being timing-dependent -- passed even with the bug
+/// present, which is exactly why CI caught this and local runs didn't).
+///
+/// `wait_for_shutdown_signal()` used to be constructed fresh on every loop iteration of the
+/// `tokio::select!` in `group-consume`. Whichever branch didn't win had its future dropped,
+/// so a signal delivered while the *other* branch's body was still running (i.e. while
+/// `consumer.poll().await` was in flight, with no live signal listener registered) was lost
+/// for good -- not merely delayed, since tokio's `signal()` had already replaced the OS
+/// default disposition, so the process didn't die from that either. It just hung forever.
+///
+/// To land SIGTERM deterministically inside that window rather than racing a sub-millisecond
+/// gap, this configures a very low fetch byte-rate quota and produces enough data that the
+/// consumer's first `poll()` is server-side throttled for several seconds -- turning the
+/// race into a wide, reliable window instead of a coin flip. The signal is sent well inside
+/// that window, so a fix that keeps the shutdown listener alive across iterations must still
+/// observe it (and exit once the in-flight poll finishes), while the old per-iteration
+/// reconstruction would drop it and hang, which `wait_for_child_with_deadline`'s bounded
+/// wait turns into a clean panic instead of stalling the suite.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
+    // 100 bytes/sec, 100-byte burst capacity. Five records well over that in one fetch
+    // response throttle the first `poll()` for (500 - 100) / 100 = 4 seconds -- long
+    // enough to comfortably send SIGTERM into the middle of it without racing.
+    let fetch_quota_bytes_per_sec = 100u64;
+    let env = start_test_server_with_quota(None, Some(fetch_quota_bytes_per_sec)).await;
+    let topic = "sigterm_mid_poll_topic";
+    let group_id = "sigterm_mid_poll_group";
+    let num_records = 5u64;
+    let payload = vec![b'x'; 100];
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client.create_topic(topic, 1).await.unwrap();
+    for _ in 0..num_records {
+        setup_client
+            .produce_single(topic, "k", None, 1, payload.as_slice())
+            .await
+            .unwrap();
+    }
+
+    let cli_path = env!("CARGO_BIN_EXE_hermes_cli");
+    let child = std::process::Command::new(cli_path)
+        .args([
+            "group-consume",
+            "--server",
+            &env.addr.to_string(),
+            "--group",
+            group_id,
+            "--topic",
+            topic,
+            "--interval",
+            "50",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hermes_cli group-consume");
+    let pid = child.id();
+
+    // The first `sleep(50ms)` branch wins (no signal has been sent yet), which starts the
+    // one and only `poll()` this test needs -- fetching all 5 records in a single request
+    // that the quota throttles for ~4s before the server responds. Waiting 1s here lands
+    // well past the 50ms sleep (so the CLI is certainly inside that throttled `poll().await`
+    // by then) and well before the ~4s throttle expires (so it's certainly still there).
+    sleep(Duration::from_millis(1_000)).await;
+
+    // Send SIGTERM the same way Docker/Kubernetes/systemd would.
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("failed to invoke `kill`");
+    assert!(
+        kill_status.success(),
+        "`kill -TERM {}` itself must succeed",
+        pid
+    );
+
+    // The signal can only be acted on once the in-flight throttled poll (~4s from its
+    // start, ~3s remaining from here) returns control to the `select!` loop, so give it
+    // generous headroom before declaring a hang.
+    let output = tokio::task::spawn_blocking(move || {
+        wait_for_child_with_deadline(child, Duration::from_secs(10))
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "hermes_cli must exit successfully after SIGTERM sent mid-poll, proving the \
+         shutdown listener survives across select! iterations instead of being dropped and \
+         losing the signal; status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Graceful shutdown signal received"),
+        "SIGTERM sent mid-poll must still drive the graceful-shutdown log line; stdout was: {}",
+        stdout
+    );
+}

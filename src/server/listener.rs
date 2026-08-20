@@ -278,6 +278,13 @@ impl Server {
             }
         });
 
+        // Construct the shutdown future once, before the loop, and poll the same instance
+        // every iteration. Constructing it fresh inside the loop would drop the underlying
+        // signal listener whenever the other `select!` branch won, silently swallowing a
+        // signal that arrives mid-iteration (e.g. while `listener.accept()` is pending).
+        let shutdown = crate::shutdown::wait_for_shutdown_signal();
+        tokio::pin!(shutdown);
+
         loop {
             tokio::select! {
                 res = listener.accept() => {
@@ -316,7 +323,7 @@ impl Server {
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received. Flushing storage engine partitions...");
                     if let Err(e) = self.engine.flush_all() {
                         tracing::error!("Failed to flush partitions during shutdown: {}", e);
