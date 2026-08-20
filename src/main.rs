@@ -82,6 +82,13 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("  Node ID:            {}", config.node_id);
     tracing::info!("  HA Cluster Role:    {:?}", config.role);
     tracing::info!("  TCP Bind Address:   {}", config.bind_addr);
+    tracing::info!(
+        "  Advertised Address: {}",
+        config
+            .advertised_addr
+            .clone()
+            .unwrap_or_else(|| "(derived from real bound address)".to_string())
+    );
     tracing::info!("  Storage Directory:  {}", config.data_dir.display());
     tracing::info!("  Log File Directory: {}", config.log_file_dir.display());
     tracing::info!("  Segment Size Limit: {} bytes", config.max_segment_bytes);

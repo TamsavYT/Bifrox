@@ -1424,17 +1424,21 @@ fn decode_heartbeat_packet(
         );
     }
 
-    // Reply with this node's own identity (node_id + bind_addr + roles) so the Leader can
-    // learn this follower's broker address AND process role(s) purely from the heartbeat
-    // round-trip. Followers otherwise have no way to publish this, since only the
-    // controller may durably write `BrokerRegister` records — and a follower's own
+    // Reply with this node's own identity (node_id + advertised address + roles) so the
+    // Leader can learn this follower's broker address AND process role(s) purely from the
+    // heartbeat round-trip. Followers otherwise have no way to publish this, since only
+    // the controller may durably write `BrokerRegister` records — and a follower's own
     // bootstrap-time self-registration attempt would just fail with NOT_CONTROLLER.
-    let self_bind_addr = &engine.config().bind_addr;
+    //
+    // Uses the *advertised* address (issue #62), not `config().bind_addr` verbatim: the
+    // latter is whatever was configured before the listener bound (often a wildcard host
+    // or an ephemeral `:0` port), neither of which the Leader could ever dial back.
+    let self_advertised_addr = engine.replication().advertised_addr();
     let role_bytes = crate::config::roles_to_bytes(&engine.config().roles);
-    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_bind_addr.len() + 1 + role_bytes.len());
+    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_advertised_addr.len() + 1 + role_bytes.len());
     ack.put_u8(0u8);
     ack.put_u32(engine.config().node_id);
-    crate::protocol::wire::write_pascal_string(&mut ack, self_bind_addr);
+    crate::protocol::wire::write_pascal_string(&mut ack, &self_advertised_addr);
     ack.put_u8(role_bytes.len() as u8);
     ack.extend_from_slice(&role_bytes);
     Ok((bytes_consumed, ack))

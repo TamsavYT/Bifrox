@@ -6165,3 +6165,101 @@ async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
         stdout
     );
 }
+
+// ─────────────────────────────────────────────────────────
+// Issue #62: broker discovery deadlock — advertised address (Commit 1)
+// ─────────────────────────────────────────────────────────
+
+/// Issue #62 / Commit 1: a node configured with an ephemeral `bind_addr` (`:0`) must
+/// advertise the real port the OS assigned it, not the literal `:0` it was configured
+/// with. Before this fix, `ReplicationManager` captured `EngineConfig::bind_addr` at
+/// construction time — before the TCP listener ever bound — so every identity this node
+/// published (heartbeats, heartbeat ACKs, its own `BrokerRegister`) carried an unusable
+/// placeholder no peer could ever dial back.
+#[tokio::test]
+async fn test_scenario_70_advertised_addr_resolves_to_real_bound_address() {
+    let dir = TestDataDirGuard::new("advertised_addr_real");
+    let config = EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (_listener, addr) = server.bind().unwrap();
+
+    let advertised = engine.replication().advertised_addr();
+    assert_ne!(
+        advertised, "127.0.0.1:0",
+        "must not still be advertising the configured ephemeral placeholder"
+    );
+    assert_eq!(
+        advertised,
+        addr.to_string(),
+        "advertised address must be exactly the real address the OS bound"
+    );
+    let port: u16 = advertised.rsplit(':').next().unwrap().parse().unwrap();
+    assert_ne!(
+        port, 0,
+        "advertised port must be the real, non-zero OS-assigned port"
+    );
+}
+
+/// Issue #62 / Commit 1: an explicit `advertised_addr` override (Kafka's
+/// `advertised.listeners`) takes precedence over the real bound address — needed behind
+/// NAT / a load balancer, where the locally bound address isn't what a peer should dial.
+#[tokio::test]
+async fn test_scenario_71_advertised_addr_override_takes_precedence() {
+    let dir = TestDataDirGuard::new("advertised_addr_override");
+    let config = EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        advertised_addr: Some("203.0.113.5:9092".to_string()),
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (_listener, addr) = server.bind().unwrap();
+
+    assert_ne!(
+        addr.to_string(),
+        "203.0.113.5:9092",
+        "sanity check: the real bound loopback address must differ from the override"
+    );
+    assert_eq!(
+        engine.replication().advertised_addr(),
+        "203.0.113.5:9092",
+        "the configured override must win over the real bound address"
+    );
+}
+
+/// Issue #62 / Commit 1: refusing to advertise a wildcard identity. A node bound to
+/// `0.0.0.0` (with no `advertised_addr` override) has no real address to fall back on —
+/// `local_addr()` after such a bind still reports the wildcard IP, since the OS never
+/// picks a concrete interface for it. Kafka refuses to start in the equivalent case;
+/// here that surfaces as `Server::bind` returning `Err` (a hard failure — `main.rs`
+/// propagates it straight out of `run()` and the process exits without ever starting the
+/// listener loop).
+#[tokio::test]
+async fn test_scenario_72_wildcard_advertised_addr_refuses_to_bind() {
+    let dir = TestDataDirGuard::new("advertised_addr_wildcard");
+    let config = EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "0.0.0.0:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine);
+
+    let result = server.bind();
+    assert!(
+        result.is_err(),
+        "binding to a wildcard host with no advertised_addr override must be refused"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("advertised.listeners") || err_msg.contains("advertised"),
+        "the error must name the config key to fix; got: {}",
+        err_msg
+    );
+}

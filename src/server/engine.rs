@@ -161,6 +161,22 @@ fn compute_tls_channel_binding(config: &EngineConfig) -> Option<Vec<u8>> {
     Some(crate::scram::tls_server_end_point(&der))
 }
 
+/// Rejects an address that cannot function as this node's advertised identity: anything
+/// that doesn't parse as `host:port`, an unspecified IP (`0.0.0.0` / `::`, matched by
+/// `SocketAddr::ip().is_unspecified()`), or port `0`. None of these can be dialed back by
+/// a peer, so advertising one is strictly worse than refusing — see
+/// `StorageEngine::finalize_advertised_addr` and issue #62.
+fn validate_advertised_addr(addr: &str) -> Result<(), &'static str> {
+    let parsed: std::net::SocketAddr = addr.parse().map_err(|_| "not a valid host:port address")?;
+    if parsed.ip().is_unspecified() {
+        return Err("its IP is unspecified (a wildcard bind address, not a dialable identity)");
+    }
+    if parsed.port() == 0 {
+        return Err("its port is 0 (an unbound ephemeral placeholder, not a real port)");
+    }
+    Ok(())
+}
+
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -455,6 +471,69 @@ impl StorageEngine {
     /// Called by heartbeat handler to store the leader's bind address on follower nodes.
     pub fn set_leader_addr(&self, addr: String) {
         self.replication.set_leader_addr(addr);
+    }
+
+    /// Corrects this node's advertised identity once the real bound TCP address is
+    /// known. Called by `Server::bind` immediately after the listener binds.
+    ///
+    /// `ReplicationManager::new` (called from `StorageEngine::new`, well before the
+    /// listener binds) has no way to know the real address yet — for the real server
+    /// entry point, `bind_addr` is read from config before any socket exists, so it may
+    /// be a wildcard host (`0.0.0.0`) or carry an ephemeral `:0` port. Every identity this
+    /// node publishes up to this point (heartbeats, heartbeat ACKs, its own
+    /// `BrokerRegister`) would otherwise carry that placeholder — unusable by a peer
+    /// trying to dial back — for as long as it takes the periodic heartbeat loop to
+    /// self-correct (issue #62). This closes that gap immediately instead.
+    ///
+    /// An explicit `advertised_addr` config override (Kafka's `advertised.listeners`)
+    /// takes precedence over `bound_addr` when set — e.g. behind NAT or a load balancer,
+    /// where the locally bound address isn't what a peer should dial.
+    ///
+    /// Returns `Err` (naming the config key to set) without changing anything, rather
+    /// than advertising it, if the resolved address is unusable as an identity — an
+    /// unspecified IP (`0.0.0.0`/`::`), port `0`, or simply not parseable as a
+    /// `host:port`. Matches Kafka, which refuses to start in the equivalent case; here
+    /// the caller (`Server::bind`) turns this into a startup-time `Err`, which is a hard
+    /// failure in the real server entry point (`main.rs` propagates it and exits) without
+    /// this function itself needing to reach for `std::process::exit`.
+    pub fn finalize_advertised_addr(&self, bound_addr: String) -> Result<(), String> {
+        let resolved = self.config.advertised_addr.clone().unwrap_or(bound_addr);
+        if let Err(reason) = validate_advertised_addr(&resolved) {
+            return Err(format!(
+                "refusing to advertise '{}' as this node's identity: {}. Set \
+                 `advertised.listeners` (EngineConfig::advertised_addr) to this node's \
+                 real, externally-reachable address, or bind `listeners` (bind_addr) to a \
+                 concrete host so the real bound address can be used instead.",
+                resolved, reason
+            ));
+        }
+
+        self.replication.set_advertised_addr(resolved.clone());
+        self.broker_addrs
+            .insert(self.config.node_id, resolved.clone());
+
+        // (Re-)publish this node's own BrokerRegister with the corrected address. The
+        // constructor already wrote one (if leader) using the placeholder address — this
+        // supersedes it in every node's metadata log the same way any later record
+        // supersedes an earlier one for the same key, and `build_metadata_snapshot_records`
+        // always reads the live `broker_addrs` entry just updated above, so a
+        // snapshot taken after this point never re-introduces the placeholder.
+        if self.is_leader() {
+            let reg_rec = crate::replication::MetadataRecord::BrokerRegister {
+                node_id: self.config.node_id,
+                bind_addr: resolved,
+                roles: crate::config::roles_to_bytes(&self.config.roles),
+            };
+            if let Ok(meta_pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+                let _ = meta_pm.produce(&reg_rec.encode());
+            }
+        }
+
+        // Now that this node's identity is real, it's safe to start announcing it — see
+        // the deferral comment in `ReplicationManager::new`.
+        self.replication.start_heartbeat_broadcasting_if_leader();
+
+        Ok(())
     }
 
     /// Retrieve existing partition or dynamically initialize directory `data/{topic}-{partition}` on demand (RACE-02, SEC-03)

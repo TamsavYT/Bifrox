@@ -107,8 +107,19 @@ pub struct ReplicationManager {
     config: ClusterConfig,
     /// Current epoch (term) for consensus (RACE-03 atomic)
     epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Bind address of this node's TCP listener (used in heartbeat announcements)
-    bind_addr: String,
+    /// This node's advertised identity — the address announced in heartbeats, heartbeat
+    /// ACKs, and self `BrokerRegister` writes. Wrapped in a shared cell rather than a
+    /// plain `String` because it starts life as whatever `bind_addr` the caller passed to
+    /// `new` (often a wildcard host or an ephemeral `:0` port — neither dialable by a
+    /// peer) and is only known for certain once the TCP listener actually binds, which
+    /// happens *after* this manager is constructed (and, for a statically-configured
+    /// Leader, after the heartbeat broadcaster would otherwise have already started
+    /// using it). `set_advertised_addr` corrects it in place once the real address (or an
+    /// operator override) is known — see `StorageEngine::finalize_advertised_addr` and
+    /// issue #62. Every heartbeat send re-reads this cell fresh rather than closing over
+    /// a snapshot taken at loop-spawn time, so the correction reaches an already-running
+    /// broadcaster too.
+    advertised_addr: Arc<RwLock<String>>,
     /// Tracking partition high watermarks for replicas: (topic, partition, peer_addr) -> watermark_offset
     replica_watermarks: Arc<DashMap<(String, u32, String), u64>>,
     /// Wall-clock time of the most recent successful replication ACK per
@@ -189,10 +200,27 @@ impl ReplicationManager {
             Arc::new(RwLock::new(None))
         };
 
+        if config.peer_addrs.is_empty() {
+            // Issue #62: an empty `peer_addrs` now means "no static peer allowlist
+            // configured" rather than "reject every peer" — see the heartbeat
+            // acceptance check in `handler.rs`. Log this once at startup so the weaker
+            // posture (membership gated by cluster_id + authentication, not by a static
+            // address list) is visible to an operator rather than silently in effect.
+            tracing::warn!(
+                "HA Cluster [{}]: Node {} starting with no `peer_addrs` configured — \
+                 inter-node heartbeats will be accepted from any sender presenting the \
+                 correct cluster_id (subject to the CRIT-03 same-address check), rather \
+                 than only from a statically whitelisted address. Configure `peer_addrs` \
+                 to restore the static allowlist.",
+                config.cluster_id,
+                config.node_id
+            );
+        }
+
         let mgr = Self {
             config,
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bind_addr,
+            advertised_addr: Arc::new(RwLock::new(bind_addr)),
             replica_watermarks: Arc::new(DashMap::new()),
             replica_ack_time: Arc::new(DashMap::new()),
             stale_partitions: Arc::new(DashMap::new()),
@@ -216,16 +244,56 @@ impl ReplicationManager {
         // could never recontest an election. The loop itself only lets a *controller*
         // node actually contest — see `start_election_timeout_loop`.
         mgr.start_election_timeout_loop();
-        // Leader: additionally start the heartbeat broadcaster to all followers.
-        if initial_consensus_state == ConsensusState::Leader && !mgr.config.peer_addrs.is_empty() {
-            mgr.start_leader_heartbeat_loop();
-        }
 
+        // Leader: additionally start the heartbeat broadcaster to all followers.
+        //
+        // Deliberately NOT started here for a statically-configured Leader (issue #62).
+        // At this point in construction the address above is still whatever `bind_addr`
+        // the caller passed in — for the real server that's `EngineConfig::bind_addr`
+        // read before the TCP listener has bound, which may be a wildcard host or an
+        // ephemeral `:0` port. A heartbeat broadcast right now would announce that
+        // unusable address to every peer on its very first (and, at a 10s interval,
+        // possibly its only-for-a-while) beat. `StorageEngine::finalize_advertised_addr`
+        // (called from `Server::bind` once the real address is known) starts this
+        // broadcaster instead, via `start_heartbeat_broadcasting_if_leader` below. A node
+        // that boots as Follower and is later elected takes the equivalent path in
+        // `start_election_timeout_loop`, which by then always runs well after bind.
         mgr
     }
 
     pub fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    /// Returns this node's currently advertised address — the identity announced in
+    /// heartbeats, heartbeat ACKs, and self `BrokerRegister` writes. Read fresh (not
+    /// cached) since it can be corrected after construction — see `set_advertised_addr`.
+    pub fn advertised_addr(&self) -> String {
+        self.advertised_addr.read().clone()
+    }
+
+    /// Corrects this node's advertised address once the real bound address (or an
+    /// operator-configured override) is known. See `advertised_addr`'s docs and issue
+    /// #62. If this node currently believes itself the cluster leader, also updates the
+    /// locally-known leader address to match — a leader's own address is always itself.
+    pub fn set_advertised_addr(&self, addr: String) {
+        *self.advertised_addr.write() = addr.clone();
+        if self.is_leader() {
+            *self.leader_addr.write() = Some(addr);
+        }
+    }
+
+    /// Starts the leader heartbeat broadcaster if (and only if) this node is currently
+    /// the cluster leader with peers configured to hear it. Idempotent to call
+    /// speculatively — see the constructor-time comment on why this is deferred rather
+    /// than run unconditionally from `new`. Safe to call more than once in principle
+    /// (each call spawns its own loop, which self-terminates the moment this node is no
+    /// longer Leader), but callers should only need to call it the one time the real
+    /// advertised address becomes known.
+    pub fn start_heartbeat_broadcasting_if_leader(&self) {
+        if self.is_leader() && !self.config.peer_addrs.is_empty() {
+            self.start_leader_heartbeat_loop();
+        }
     }
 
     pub fn get_or_connect_peer(
@@ -357,7 +425,11 @@ impl ReplicationManager {
         let peer_addrs = self.config.peer_addrs.clone();
         let cluster_id = self.config.cluster_id.clone();
         let node_id = self.config.node_id;
-        let bind_addr = self.bind_addr.clone();
+        // Shared cell, not a snapshot — read fresh on every tick (see its docs) so a
+        // correction applied after this loop already started (or even mid-loop, on a
+        // wildcard->real address fixup) reaches the very next heartbeat rather than
+        // waiting a full `HEARTBEAT_INTERVAL`.
+        let advertised_addr = self.advertised_addr.clone();
         let epoch = self.epoch.clone(); // share epoch for heartbeat term
         let broker_addrs = self.broker_addrs.clone();
         let broker_roles = self.broker_roles.clone();
@@ -388,6 +460,7 @@ impl ReplicationManager {
                     break;
                 }
                 let current_term = epoch.load(std::sync::atomic::Ordering::Acquire);
+                let current_addr = advertised_addr.read().clone();
                 for peer in &peer_addrs {
                     let peer_conn = manager.get_or_connect_peer(peer);
                     match send_leader_heartbeat_pooled(
@@ -396,7 +469,7 @@ impl ReplicationManager {
                         &cluster_id,
                         node_id,
                         current_term,
-                        &bind_addr,
+                        &current_addr,
                     )
                     .await
                     {
@@ -658,7 +731,10 @@ impl ReplicationManager {
         let node_id = self.config.node_id;
         let epoch = self.epoch.clone();
         let leader_addr = self.leader_addr.clone();
-        let bind_addr = self.bind_addr.clone();
+        // Shared cell — see `advertised_addr`'s docs. Read fresh at use, not snapshotted
+        // here, so a correction applied between construction and a (possibly much later)
+        // election win is picked up rather than advertising a stale address forever.
+        let advertised_addr = self.advertised_addr.clone();
         let broker_addrs = self.broker_addrs.clone();
         let broker_roles = self.broker_roles.clone();
         let local_metadata_log_index = self.local_metadata_log_index.clone();
@@ -773,7 +849,7 @@ impl ReplicationManager {
                     epoch.store(new_term, std::sync::atomic::Ordering::Release);
                     {
                         let mut la = leader_addr.write();
-                        *la = Some(bind_addr.clone());
+                        *la = Some(advertised_addr.read().clone());
                     }
                     tracing::info!(
                         "Hermes Election: Node {} is now LEADER for term {} with {}/{} votes.",
@@ -797,7 +873,7 @@ impl ReplicationManager {
                     if !all_peer_addrs.is_empty() {
                         let peer_addrs_c = all_peer_addrs.clone();
                         let cluster_id_c = cluster_id.clone();
-                        let bind_addr_c = bind_addr.clone();
+                        let advertised_addr_c = advertised_addr.clone();
                         let epoch_c = epoch.clone();
                         let consensus_c = consensus.clone();
                         let broker_addrs_c = broker_addrs.clone();
@@ -814,6 +890,7 @@ impl ReplicationManager {
                                 }
                                 let current_term =
                                     epoch_c.load(std::sync::atomic::Ordering::Acquire);
+                                let current_addr = advertised_addr_c.read().clone();
                                 for peer in &peer_addrs_c {
                                     if let Ok((follower_id, follower_addr, follower_roles)) =
                                         send_leader_heartbeat(
@@ -821,7 +898,7 @@ impl ReplicationManager {
                                             &cluster_id_c,
                                             node_id,
                                             current_term,
-                                            &bind_addr_c,
+                                            &current_addr,
                                         )
                                         .await
                                     {
