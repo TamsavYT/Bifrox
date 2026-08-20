@@ -541,9 +541,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Poll Interval:       {} ms", poll_interval_ms);
             println!("Polling for messages. Press Ctrl+C (or send SIGTERM) to stop.\n");
 
+            // Construct the shutdown future once, before the loop, and poll the same
+            // instance every iteration. Constructing it fresh inside the loop would drop
+            // the underlying signal listener whenever the other `select!` branch won,
+            // silently swallowing a signal that arrives mid-iteration (e.g. during
+            // `consumer.poll().await`).
+            let shutdown = wait_for_shutdown_signal();
+            tokio::pin!(shutdown);
+
             loop {
                 tokio::select! {
-                    _ = wait_for_shutdown_signal() => {
+                    _ = &mut shutdown => {
                         println!("\n🛑 Graceful shutdown signal received. Exiting consumer group loop.");
                         // A static member deliberately keeps its slot across a restart, so
                         // only a dynamic member gives it up on the way out.
