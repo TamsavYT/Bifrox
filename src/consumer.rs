@@ -84,8 +84,170 @@ pub fn assign_roundrobin(partition_count: u32, member_ids: &[String]) -> Vec<(St
     result
 }
 
-/// Which partition assignment strategy the group negotiated, per [`assign_range`] vs.
-/// [`assign_roundrobin`].
+/// Sticky assignor (KIP-54-style, minus the cooperative-protocol half of it): unlike
+/// [`assign_range`] and [`assign_roundrobin`], which derive every member's share purely
+/// from its *position* in a sorted member list, this one takes the group's *previous*
+/// assignment into account so that a membership change moves as few partitions as possible.
+///
+/// Position-based assignors reshuffle nearly everything on any membership change: adding or
+/// removing one member shifts almost every other member's index in the sorted list, and with
+/// it almost every partition it owns. Every partition that moves discards whatever local
+/// state a consumer built for it (in-memory aggregates, warmed caches, ...) even though most
+/// members had no reason to lose anything. This assignor instead keeps a still-present
+/// member's previously-owned partitions in place and only reshuffles what it must to stay
+/// balanced.
+///
+/// Algorithm:
+/// 1. **Keep**: for each member still in the group, keep whichever of its previously-owned
+///    partitions still exist in the topic (a partition owned by a member who has since left,
+///    or that no longer exists, is not kept by anyone).
+/// 2. **Collect the remainder**: every partition not kept by its previous owner — new
+///    partitions, and partitions orphaned by a departed member — goes into an unassigned
+///    pool.
+/// 3. **Fill**: hand the pool out to members with the fewest partitions first, so members
+///    who kept little get topped up before members who kept a lot get more.
+/// 4. **Level**: while any member holds more than `ceil(partition_count / member_count)`,
+///    move one partition from it to a member below `floor(partition_count / member_count)`.
+///    A partition the receiving member did not previously own is preferred, so a partition
+///    is not thrashed back to an owner it was just taken from purely to hit the target count.
+///
+/// Every step sorts its inputs, so — like [`assign_range`] and [`assign_roundrobin`] — the
+/// result is deterministic: the same `(partition_count, member_ids, previous_assignment)`
+/// always produces the same output, which matters here more than for the position-based
+/// assignors since the leader is folding in state (the previous assignment) rather than
+/// just recomputing from scratch.
+///
+/// Same empty-input contract as [`assign_range`]: an empty `member_ids` or zero
+/// `partition_count` produces an empty result, and a member past the partition count still
+/// appears in the output with an empty `Vec` rather than being omitted.
+pub fn assign_sticky(
+    partition_count: u32,
+    member_ids: &[String],
+    previous_assignment: &HashMap<String, Vec<u32>>,
+) -> Vec<(String, Vec<u32>)> {
+    if member_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted_ids: Vec<String> = member_ids.to_vec();
+    sorted_ids.sort();
+    let member_set: std::collections::HashSet<&str> =
+        sorted_ids.iter().map(String::as_str).collect();
+
+    // Step 1: keep whichever previously-owned partitions are still valid — still exist, and
+    // still owned by a member still in the group.
+    let mut owned: HashMap<String, Vec<u32>> = HashMap::with_capacity(sorted_ids.len());
+    for member_id in &sorted_ids {
+        owned.insert(member_id.clone(), Vec::new());
+    }
+    let mut claimed = vec![false; partition_count as usize];
+    // Iterate previous owners in sorted order so which duplicate claim (if the input were
+    // ever inconsistent) wins is deterministic rather than HashMap-iteration-order dependent.
+    let mut previous_owners: Vec<&String> = previous_assignment.keys().collect();
+    previous_owners.sort();
+    for member_id in previous_owners {
+        if !member_set.contains(member_id.as_str()) {
+            continue;
+        }
+        let mut kept: Vec<u32> = previous_assignment[member_id]
+            .iter()
+            .copied()
+            .filter(|&p| p < partition_count && !claimed[p as usize])
+            .collect();
+        kept.sort_unstable();
+        for &p in &kept {
+            claimed[p as usize] = true;
+        }
+        owned.insert(member_id.clone(), kept);
+    }
+
+    // Step 2: collect the unassigned remainder, in order.
+    let mut remainder: Vec<u32> = (0..partition_count)
+        .filter(|&p| !claimed[p as usize])
+        .collect();
+
+    // Step 3: fill — hand the remainder to whichever member currently has the fewest
+    // partitions, breaking ties by member id so the outcome is deterministic.
+    remainder.sort_unstable();
+    for partition in remainder {
+        let target = sorted_ids
+            .iter()
+            .min_by_key(|id| (owned[id.as_str()].len(), id.as_str()))
+            .expect("sorted_ids is non-empty")
+            .clone();
+        owned.get_mut(&target).unwrap().push(partition);
+    }
+
+    // Step 4: level — while the most- and least-loaded members are more than one
+    // partition apart, move one from the former to the latter. Ties are broken by member
+    // id (both the max and the min searches below run over `sorted_ids`, already sorted),
+    // so this converges to a deterministic balanced state: no member ends up holding more
+    // than `ceil(partition_count / member_count)`, and none holds fewer than
+    // `floor(partition_count / member_count)`.
+    //
+    // Comparing counts directly (rather than each against a precomputed ceiling/floor) is
+    // what makes this correct for e.g. a brand-new member with zero partitions joining a
+    // group where everyone else already sits exactly at the ceiling: such a member is
+    // never "over" the ceiling, but the gap between it and everyone else is still > 1 and
+    // must be closed.
+    if !sorted_ids.is_empty() {
+        loop {
+            // `sorted_ids` is sorted ascending, so `find`ing the first id at the max (or
+            // min) count — rather than `max_by_key`/`min_by_key`, which break ties toward
+            // the *last* matching element — ties both searches to the smallest id, the
+            // same tie-break `fill` above uses.
+            let max_count = sorted_ids
+                .iter()
+                .map(|id| owned[id.as_str()].len())
+                .max()
+                .unwrap();
+            let min_count = sorted_ids
+                .iter()
+                .map(|id| owned[id.as_str()].len())
+                .min()
+                .unwrap();
+            if max_count <= min_count + 1 {
+                break;
+            }
+            let over = sorted_ids
+                .iter()
+                .find(|id| owned[id.as_str()].len() == max_count)
+                .cloned()
+                .unwrap();
+            let under = sorted_ids
+                .iter()
+                .find(|id| owned[id.as_str()].len() == min_count)
+                .cloned()
+                .unwrap();
+
+            let over_partitions = owned.get_mut(&over).unwrap();
+            // Prefer moving a partition `under` did not previously own, so a partition is
+            // not moved only to be moved straight back to where it started.
+            let previously_under = previous_assignment
+                .get(&under)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let idx = over_partitions
+                .iter()
+                .position(|p| !previously_under.contains(p))
+                .unwrap_or(0);
+            let moved = over_partitions.remove(idx);
+            owned.get_mut(&under).unwrap().push(moved);
+        }
+    }
+
+    sorted_ids
+        .into_iter()
+        .map(|id| {
+            let mut partitions = owned.remove(&id).unwrap_or_default();
+            partitions.sort_unstable();
+            (id, partitions)
+        })
+        .collect()
+}
+
+/// Which partition assignment strategy the group negotiated, per [`assign_range`],
+/// [`assign_roundrobin`], and [`assign_sticky`].
 ///
 /// This mirrors [`crate::protocol::IsolationLevel`]'s house style: a small `Copy` enum, a
 /// permissive `from_*` constructor that never fails on an unrecognised input, and a default
@@ -98,6 +260,8 @@ pub enum AssignmentStrategy {
     Range,
     /// Partitions dealt out one at a time across members — see [`assign_roundrobin`].
     RoundRobin,
+    /// Keeps each member's previous partitions where possible — see [`assign_sticky`].
+    Sticky,
 }
 
 impl AssignmentStrategy {
@@ -112,6 +276,7 @@ impl AssignmentStrategy {
         match name {
             "roundrobin" => AssignmentStrategy::RoundRobin,
             "range" => AssignmentStrategy::Range,
+            "sticky" => AssignmentStrategy::Sticky,
             other => {
                 if !other.is_empty() {
                     tracing::warn!(
@@ -125,10 +290,24 @@ impl AssignmentStrategy {
     }
 
     /// Runs this strategy's assignment function.
-    pub fn assign(self, partition_count: u32, member_ids: &[String]) -> Vec<(String, Vec<u32>)> {
+    ///
+    /// `previous_assignment` carries the group's prior `member_id -> Vec<partition>` mapping
+    /// for the subscribed topic (empty for a brand-new group, or when the negotiated
+    /// strategy has no use for it). `Range` and `RoundRobin` ignore it entirely — they are
+    /// purely position-based and must keep producing exactly the assignment they always
+    /// have; only `Sticky` consults it.
+    pub fn assign(
+        self,
+        partition_count: u32,
+        member_ids: &[String],
+        previous_assignment: &HashMap<String, Vec<u32>>,
+    ) -> Vec<(String, Vec<u32>)> {
         match self {
             AssignmentStrategy::Range => assign_range(partition_count, member_ids),
             AssignmentStrategy::RoundRobin => assign_roundrobin(partition_count, member_ids),
+            AssignmentStrategy::Sticky => {
+                assign_sticky(partition_count, member_ids, previous_assignment)
+            }
         }
     }
 }
@@ -143,9 +322,10 @@ pub struct GroupConsumerConfig {
     /// it. See `TestClient::join_group_static` for what setting this buys.
     pub instance_id: Option<String>,
     /// Assignment protocols this member offers, most preferred first. The group as a whole
-    /// negotiates one name (see `GroupCoordinator::join_group`) — offering both `"range"`
-    /// and `"roundrobin"` here, rather than only the default, lets a group actually pick
-    /// either instead of `"range"` being the sole option a member could ever propose.
+    /// negotiates one name (see `GroupCoordinator::join_group`) — offering `"range"`,
+    /// `"roundrobin"`, and `"sticky"` here, rather than only the default, lets a group
+    /// actually pick any of them instead of `"range"` being the sole option a member could
+    /// ever propose.
     pub protocols: Vec<String>,
     pub fetch_max_bytes: u32,
     /// How long a follower keeps retrying a `REBALANCE_IN_PROGRESS` `SyncGroup` response
@@ -183,7 +363,11 @@ impl Default for GroupConsumerConfig {
             group_id: String::new(),
             topic: String::new(),
             instance_id: None,
-            protocols: vec!["range".to_string(), "roundrobin".to_string()],
+            protocols: vec![
+                "range".to_string(),
+                "roundrobin".to_string(),
+                "sticky".to_string(),
+            ],
             fetch_max_bytes: 64 * 1024,
             sync_retry_timeout: Duration::from_secs(5),
             sync_retry_interval: Duration::from_millis(50),
@@ -460,7 +644,27 @@ impl GroupConsumer {
             // deliberate — propagating subscriptions through JoinGroup is a wire change
             // and belongs to a later issue.
             let (_, members) = self.client.describe_group(&self.config.group_id).await?;
-            let member_ids: Vec<String> = members.into_iter().map(|m| m.member_id).collect();
+            // `DescribeGroup` already carries each member's current assignment
+            // (`assigned_partitions`, populated server-side from its last `SyncGroup`) —
+            // across every topic that member is subscribed to. Sticky assignment needs
+            // that as its starting point, so pull out this subscription's slice before the
+            // member list collapses down to bare ids below.
+            let mut previous_assignment: HashMap<String, Vec<u32>> =
+                HashMap::with_capacity(members.len());
+            let member_ids: Vec<String> = members
+                .into_iter()
+                .map(|m| {
+                    let mut partitions: Vec<u32> = m
+                        .assigned_partitions
+                        .into_iter()
+                        .filter(|(topic, _)| topic == &self.config.topic)
+                        .map(|(_, partition)| partition)
+                        .collect();
+                    partitions.sort_unstable();
+                    previous_assignment.insert(m.member_id.clone(), partitions);
+                    m.member_id
+                })
+                .collect();
             let (_, partitions) = self.client.describe_topic(&self.config.topic).await?;
             let partition_count = partitions.len() as u32;
 
@@ -469,9 +673,10 @@ impl GroupConsumer {
             // `GroupCoordinator::join_group`), not necessarily the first entry in this
             // member's own `protocols` list. Using it here, rather than always calling
             // `assign_range`, is the point of this method: a group that negotiated
-            // `roundrobin` must actually get round-robin.
+            // `roundrobin` must actually get round-robin, and one that negotiated `sticky`
+            // must actually get sticky assignment fed with `previous_assignment` above.
             let strategy = AssignmentStrategy::from_protocol_name(&join.protocol_name);
-            let assignments = strategy.assign(partition_count, &member_ids);
+            let assignments = strategy.assign(partition_count, &member_ids, &previous_assignment);
             let member_assignments: Vec<MemberAssignment> = assignments
                 .into_iter()
                 .map(|(member_id, partitions)| MemberAssignment {
@@ -845,6 +1050,222 @@ mod tests {
         );
     }
 
+    // --- assign_sticky ---
+
+    /// Builds a `member_id -> partitions` previous-assignment map from `(id, partitions)`
+    /// pairs, the shape [`assign_sticky`] takes.
+    fn prev(pairs: &[(&str, &[u32])]) -> HashMap<String, Vec<u32>> {
+        pairs
+            .iter()
+            .map(|(id, partitions)| (id.to_string(), partitions.to_vec()))
+            .collect()
+    }
+
+    /// Counts partitions whose owner differs between two assignment results covering the
+    /// same partition range — a direct measure of how much a rebalance churned.
+    fn moved_partitions(before: &[(String, Vec<u32>)], after: &[(String, Vec<u32>)]) -> usize {
+        let mut before_owner: HashMap<u32, &str> = HashMap::new();
+        for (id, partitions) in before {
+            for &p in partitions {
+                before_owner.insert(p, id.as_str());
+            }
+        }
+        let mut after_owner: HashMap<u32, &str> = HashMap::new();
+        for (id, partitions) in after {
+            for &p in partitions {
+                after_owner.insert(p, id.as_str());
+            }
+        }
+        after_owner
+            .iter()
+            .filter(|(p, owner)| before_owner.get(*p) != Some(*owner))
+            .count()
+    }
+
+    #[test]
+    fn sticky_stable_membership_reshuffles_nothing() {
+        let previous = prev(&[("a", &[0, 1, 2]), ("b", &[3, 4, 5]), ("c", &[6, 7, 8])]);
+        let members = ids(&["a", "b", "c"]);
+        let result = assign_sticky(9, &members, &previous);
+        assert_eq!(
+            result,
+            vec![
+                ("a".to_string(), vec![0, 1, 2]),
+                ("b".to_string(), vec![3, 4, 5]),
+                ("c".to_string(), vec![6, 7, 8]),
+            ],
+            "an unchanged membership must not reshuffle anything"
+        );
+    }
+
+    #[test]
+    fn sticky_member_joining_moves_far_fewer_partitions_than_range() {
+        // Steady state: "b", "c", "d" hold three partitions each.
+        let previous = prev(&[("b", &[0, 1, 2]), ("c", &[3, 4, 5]), ("d", &[6, 7, 8])]);
+        let before: Vec<(String, Vec<u32>)> = vec![
+            ("b".to_string(), vec![0, 1, 2]),
+            ("c".to_string(), vec![3, 4, 5]),
+            ("d".to_string(), vec![6, 7, 8]),
+        ];
+
+        // "a" joins, sorting before every existing member — the worst case for a
+        // position-based assignor, since it shifts every existing member's index by one.
+        let members = ids(&["a", "b", "c", "d"]);
+
+        let sticky_after = assign_sticky(9, &members, &previous);
+        let range_after = assign_range(9, &members);
+
+        let sticky_moved = moved_partitions(&before, &sticky_after);
+        let range_moved = moved_partitions(&before, &range_after);
+
+        assert!(
+            sticky_moved <= 3,
+            "sticky should move only a handful of partitions when one member joins, moved {sticky_moved}"
+        );
+        assert!(
+            range_moved >= 6,
+            "range reshuffles nearly everything on this transition, moved {range_moved}"
+        );
+        assert!(
+            sticky_moved < range_moved,
+            "sticky ({sticky_moved} moved) must move strictly fewer partitions than range \
+             ({range_moved} moved) for the same membership change"
+        );
+
+        let mut all: Vec<u32> = sticky_after.iter().flat_map(|(_, p)| p.clone()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..9).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn sticky_member_leaving_redistributes_without_moving_stayers() {
+        let previous = prev(&[
+            ("a", &[0, 1]),
+            ("b", &[2, 3]),
+            ("c", &[4, 5]),
+            ("d", &[6, 7, 8]),
+        ]);
+        let members = ids(&["a", "c", "d"]); // "b" has left
+
+        let result = assign_sticky(9, &members, &previous);
+        let owned: HashMap<&str, &Vec<u32>> =
+            result.iter().map(|(id, p)| (id.as_str(), p)).collect();
+
+        // Every partition "a", "c", and "d" already owned is still theirs — nothing moves
+        // off a member who did not leave.
+        assert!(owned["a"].contains(&0) && owned["a"].contains(&1));
+        assert!(owned["c"].contains(&4) && owned["c"].contains(&5));
+        assert!(
+            owned["d"].contains(&6) && owned["d"].contains(&7) && owned["d"].contains(&8),
+            "\"d\"'s partitions must be untouched by a departure that has nothing to do with it"
+        );
+
+        // "b"'s orphaned partitions (2, 3) are redistributed, not dropped.
+        let mut all: Vec<u32> = result.iter().flat_map(|(_, p)| p.clone()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..9).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn sticky_is_deterministic() {
+        let previous = prev(&[("a", &[0, 2, 4]), ("b", &[1, 3]), ("d", &[5, 6, 7, 8])]);
+        let members = ids(&["a", "b", "c", "d"]);
+
+        let first = assign_sticky(9, &members, &previous);
+        for _ in 0..20 {
+            assert_eq!(
+                assign_sticky(9, &members, &previous),
+                first,
+                "same inputs must always produce the same assignment"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_cold_start_with_no_previous_assignment_is_balanced() {
+        // A brand-new group has nothing to stay sticky to, but the result still must not be
+        // degenerate — e.g. everything piled onto one member.
+        let members = ids(&["a", "b", "c"]);
+        let result = assign_sticky(6, &members, &HashMap::new());
+        assert_eq!(
+            result,
+            assign_roundrobin(6, &members),
+            "with no prior assignment, sticky should fall back to an evenly spread split"
+        );
+    }
+
+    #[test]
+    fn sticky_every_partition_is_assigned_exactly_once() {
+        let members = ids(&["m1", "m2", "m3", "m4", "m5", "m6", "m7"]);
+        let partition_count = 23;
+        // "m9" is not a current member — its old partitions must be reclaimed, not dropped.
+        let previous = prev(&[("m1", &[0, 1, 2, 3]), ("m9", &[4, 5])]);
+        let result = assign_sticky(partition_count, &members, &previous);
+
+        let mut all_partitions: Vec<u32> = result
+            .iter()
+            .flat_map(|(_, partitions)| partitions.clone())
+            .collect();
+        all_partitions.sort_unstable();
+
+        let expected: Vec<u32> = (0..partition_count).collect();
+        assert_eq!(
+            all_partitions, expected,
+            "every partition must be assigned to exactly one member"
+        );
+    }
+
+    #[test]
+    fn sticky_more_members_than_partitions_leaves_some_empty() {
+        let members = ids(&["a", "b", "c", "d", "e"]);
+        let result = assign_sticky(2, &members, &HashMap::new());
+        assert_eq!(
+            result,
+            vec![
+                ("a".to_string(), vec![0]),
+                ("b".to_string(), vec![1]),
+                ("c".to_string(), vec![]),
+                ("d".to_string(), vec![]),
+                ("e".to_string(), vec![]),
+            ]
+        );
+        assert_eq!(result.len(), 5, "every member must still be present");
+    }
+
+    #[test]
+    fn sticky_empty_member_ids_produces_empty_result() {
+        let previous = prev(&[("a", &[0, 1])]);
+        assert_eq!(assign_sticky(10, &[], &previous), Vec::new());
+    }
+
+    #[test]
+    fn sticky_zero_partitions_and_empty_group_do_not_panic() {
+        assert_eq!(assign_sticky(0, &[], &HashMap::new()), Vec::new());
+        let members = ids(&["a", "b"]);
+        assert_eq!(
+            assign_sticky(0, &members, &HashMap::new()),
+            vec![("a".to_string(), vec![]), ("b".to_string(), vec![])]
+        );
+    }
+
+    #[test]
+    fn sticky_result_is_balanced() {
+        let members = ids(&["m1", "m2", "m3", "m4", "m5", "m6", "m7"]);
+        let partition_count = 23;
+        // A deliberately lopsided prior state — one member holding far more than its share
+        // — to prove leveling actually kicks in rather than only ever preserving state.
+        let previous = prev(&[("m1", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])]);
+        let result = assign_sticky(partition_count, &members, &previous);
+
+        let counts: Vec<usize> = result.iter().map(|(_, p)| p.len()).collect();
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        assert!(
+            max - min <= 1,
+            "no member should hold more than one partition above the minimum, got counts {counts:?}"
+        );
+    }
+
     // --- AssignmentStrategy ---
 
     #[test]
@@ -869,9 +1290,19 @@ mod tests {
     }
 
     #[test]
-    fn strategy_from_protocol_name_falls_back_to_range_for_unknown_or_empty() {
+    fn strategy_from_protocol_name_recognises_sticky() {
         assert_eq!(
             AssignmentStrategy::from_protocol_name("sticky"),
+            AssignmentStrategy::Sticky
+        );
+    }
+
+    #[test]
+    fn strategy_from_protocol_name_falls_back_to_range_for_unknown_or_empty() {
+        // "sticky" used to stand in here as an example of an unrecognised name, but it is
+        // now a real, recognised strategy — use a name that actually is unrecognised.
+        assert_eq!(
+            AssignmentStrategy::from_protocol_name("fancy-new-protocol"),
             AssignmentStrategy::Range
         );
         assert_eq!(
@@ -887,9 +1318,10 @@ mod tests {
         // strategy, rather than always calling `assign_range`.
         let negotiated_protocol_name = "roundrobin".to_string();
         let members = ids(&["a", "b", "c"]);
+        let no_previous = HashMap::new();
 
         let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
-        let result = strategy.assign(7, &members);
+        let result = strategy.assign(7, &members, &no_previous);
 
         assert_eq!(result, assign_roundrobin(7, &members));
         assert_ne!(
@@ -900,12 +1332,28 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_negotiated_protocol_name_falls_back_to_range_assignment() {
+    fn negotiated_sticky_protocol_name_selects_sticky_assignment() {
         let negotiated_protocol_name = "sticky".to_string();
         let members = ids(&["a", "b", "c"]);
+        let mut previous = HashMap::new();
+        previous.insert("a".to_string(), vec![0, 1, 2]);
+        previous.insert("b".to_string(), vec![3, 4]);
+        previous.insert("c".to_string(), vec![5, 6]);
 
         let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
-        let result = strategy.assign(7, &members);
+        let result = strategy.assign(7, &members, &previous);
+
+        assert_eq!(result, assign_sticky(7, &members, &previous));
+    }
+
+    #[test]
+    fn unrecognised_negotiated_protocol_name_falls_back_to_range_assignment() {
+        let negotiated_protocol_name = "fancy-new-protocol".to_string();
+        let members = ids(&["a", "b", "c"]);
+        let no_previous = HashMap::new();
+
+        let strategy = AssignmentStrategy::from_protocol_name(&negotiated_protocol_name);
+        let result = strategy.assign(7, &members, &no_previous);
 
         assert_eq!(
             result,
