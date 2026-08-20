@@ -202,12 +202,86 @@ impl TestClient {
         })
     }
 
+    /// Sends `cmd`/`inner` wrapped in the versioned envelope with the given tagged fields
+    /// attached, and returns the response with any envelope framing stripped — the same
+    /// `WireResponse` shape [`Self::send_raw_bytes`] returns for a legacy request.
+    ///
+    /// A hand-rolled envelope like this already existed once per tagged field
+    /// (`fetch_with_isolation`); this factors the send/receive plumbing out so a second tag
+    /// (`SESSION_TIMEOUT_MS`) doesn't need its own copy of it.
+    async fn send_versioned(
+        &mut self,
+        cmd: CommandCode,
+        tagged_fields: &[(u8, Vec<u8>)],
+        inner: Vec<u8>,
+    ) -> IoResult<WireResponse> {
+        use crate::protocol::wire::{PROTOCOL_VERSION_MAX, VERSIONED_ENVELOPE_MAGIC};
+
+        // A process-wide counter rather than per-connection state: the id only has to be
+        // distinguishable within a connection's in-flight window, and this keeps the
+        // client struct and its constructors untouched.
+        static NEXT_CORRELATION_ID: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(1);
+        let correlation_id = NEXT_CORRELATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(VERSIONED_ENVELOPE_MAGIC);
+        req_buf.put_u16(PROTOCOL_VERSION_MAX);
+        req_buf.put_u32(correlation_id);
+        req_buf.put_u8(tagged_fields.len() as u8);
+        for (tag, value) in tagged_fields {
+            req_buf.put_u8(*tag);
+            req_buf.put_u16(value.len() as u16);
+            req_buf.extend_from_slice(value);
+        }
+
+        req_buf.put_u8(cmd as u8);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+
+        // A versioned request is answered with a versioned response: the magic byte and
+        // the echoed correlation id precede the usual status/length/payload.
+        let mut prefix = [0u8; 5];
+        stream.read_exact(&mut prefix).await?;
+        if prefix[0] != VERSIONED_ENVELOPE_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "broker answered a versioned request with an unframed response",
+            ));
+        }
+        let echoed = u32::from_be_bytes(prefix[1..5].try_into().unwrap());
+        if echoed != correlation_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "correlation id mismatch: sent {}, received {}",
+                    correlation_id, echoed
+                ),
+            ));
+        }
+
+        Self::read_wire_response(stream).await
+    }
+
     pub async fn connect(addr: SocketAddr) -> IoResult<Self> {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self {
             addr,
             stream: Some(ClientStream::Plain(stream)),
         })
+    }
+
+    /// The broker address this client talks to. Exists so a caller that needs a *second*,
+    /// independent connection to the same broker (e.g. `GroupConsumer`'s background
+    /// heartbeat task — a fetch in flight on this connection must not delay a heartbeat on
+    /// another) doesn't have to carry the address around separately.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     pub async fn connect_tls(addr: SocketAddr) -> IoResult<Self> {
@@ -620,6 +694,52 @@ impl TestClient {
             }
         }
         Ok(frames)
+    }
+
+    /// Fetch attributed to a specific consumer group member, via the `GROUP_MEMBER`
+    /// tagged field on the request envelope (issue #54).
+    ///
+    /// The coordinator otherwise has no visibility into consumption at all: `Fetch`
+    /// carries only `topic`/`partition`/`offset`/`max_bytes`, and membership is only ever
+    /// asserted through `Heartbeat` — so a member that keeps heartbeating but has stopped
+    /// actually consuming looks identical to a healthy one. Tagging the fetch with the
+    /// member's identity is what lets the coordinator tell those apart (see
+    /// `GroupCoordinator::record_progress`).
+    ///
+    /// `fetch` is deliberately left on the legacy framing so existing callers are
+    /// unaffected — same convention as `fetch_with_isolation`.
+    pub async fn fetch_as_member(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        group_id: &str,
+        member_id: &str,
+    ) -> IoResult<Vec<RecordFrame>> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u64(offset);
+        inner.put_u32(max_bytes);
+
+        let mut member_payload = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut member_payload, group_id);
+        crate::protocol::wire::write_pascal_string(&mut member_payload, member_id);
+
+        let resp = self
+            .send_versioned(
+                CommandCode::Fetch,
+                &[(crate::protocol::wire::tags::GROUP_MEMBER, member_payload)],
+                inner,
+            )
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_fetch_frames(&resp.payload)
     }
 
     /// Asks the broker which protocol versions and commands it supports.
@@ -1925,8 +2045,25 @@ impl TestClient {
         instance_id: Option<&str>,
         protocols: &[&str],
     ) -> IoResult<JoinGroupResult> {
-        let mut req_buf = Vec::new();
-        req_buf.put_u8(CommandCode::JoinGroup as u8);
+        self.join_group_with_session_timeout(group_id, member_id, instance_id, protocols, None)
+            .await
+    }
+
+    /// Same as [`Self::join_group_static`], but additionally carries a requested
+    /// `session.timeout.ms` on the request envelope when given (`tags::SESSION_TIMEOUT_MS`)
+    /// — the coordinator honors it, clamped to its own sane range, instead of a hardcoded
+    /// default (see `GroupCoordinator::resolve_session_timeout`).
+    ///
+    /// `None` sends exactly the bytes `join_group_static` always has — legacy framing, no
+    /// envelope — so a caller that doesn't care about this is completely unaffected.
+    pub async fn join_group_with_session_timeout(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        instance_id: Option<&str>,
+        protocols: &[&str],
+        session_timeout: Option<std::time::Duration>,
+    ) -> IoResult<JoinGroupResult> {
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, group_id);
         crate::protocol::wire::write_pascal_string(&mut inner, member_id);
@@ -1939,9 +2076,29 @@ impl TestClient {
         if let Some(instance_id) = instance_id {
             crate::protocol::wire::write_pascal_string(&mut inner, instance_id);
         }
-        req_buf.put_u32(inner.len() as u32);
-        req_buf.extend_from_slice(&inner);
-        let resp = self.send_raw_bytes(&req_buf).await?;
+
+        let resp = match session_timeout {
+            None => {
+                let mut req_buf = Vec::new();
+                req_buf.put_u8(CommandCode::JoinGroup as u8);
+                req_buf.put_u32(inner.len() as u32);
+                req_buf.extend_from_slice(&inner);
+                self.send_raw_bytes(&req_buf).await?
+            }
+            Some(timeout) => {
+                let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+                self.send_versioned(
+                    CommandCode::JoinGroup,
+                    &[(
+                        crate::protocol::wire::tags::SESSION_TIMEOUT_MS,
+                        ms.to_be_bytes().to_vec(),
+                    )],
+                    inner,
+                )
+                .await?
+            }
+        };
+
         if resp.status == 0 {
             let mut payload = &resp.payload[..];
             if payload.len() < 2 {

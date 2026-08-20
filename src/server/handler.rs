@@ -407,7 +407,7 @@ where
                                                     // carries the forwarded marker); the
                                                     // client may not be.
                                                     crate::protocol::wire::relay_response(
-                                                        &bytes, framing,
+                                                        &bytes, &framing,
                                                     )
                                                 }
                                                 Err(e) => {
@@ -420,7 +420,7 @@ where
                                                         "Failed to forward produce to leader: {}",
                                                         e
                                                     ))
-                                                    .encode_framed(framing)
+                                                    .encode_framed(&framing)
                                                 }
                                             }
                                         }
@@ -431,7 +431,7 @@ where
                                             );
                                             WireResponse::error(
                                                 "NOT_LEADER: No leader elected for this partition. Retry later."
-                                            ).encode_framed(framing)
+                                            ).encode_framed(&framing)
                                         }
                                     };
 
@@ -455,11 +455,11 @@ where
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
                                         &mut negotiated_scram_is_plus,
-                                        framing,
+                                        &framing,
                                     )
                                     .await;
                                     response_scratch.clear();
-                                    response.encode_framed_into(framing, &mut response_scratch);
+                                    response.encode_framed_into(&framing, &mut response_scratch);
                                     if let Err(e) = socket.write_all(&response_scratch).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",
@@ -498,7 +498,7 @@ where
                                         .await
                                         {
                                             Ok(bytes) => crate::protocol::wire::relay_response(
-                                                &bytes, framing,
+                                                &bytes, &framing,
                                             ),
                                             Err(e) => {
                                                 tracing::error!(
@@ -510,7 +510,7 @@ where
                                                     "Failed to forward request to cluster leader: {}",
                                                     e
                                                 ))
-                                                .encode_framed(framing)
+                                                .encode_framed(&framing)
                                             }
                                         }
                                     }
@@ -522,7 +522,7 @@ where
                                         WireResponse::error(
                                             "NOT_CONTROLLER: No cluster leader elected. Retry later.",
                                         )
-                                        .encode_framed(framing)
+                                        .encode_framed(&framing)
                                     }
                                 };
 
@@ -567,7 +567,7 @@ where
                                             &client_principal,
                                             &client_key,
                                             &logical_client_id,
-                                            framing,
+                                            &framing,
                                         )
                                         .await
                                         {
@@ -596,11 +596,11 @@ where
                                         &mut scram_session,
                                         &mut negotiated_scram_mechanism,
                                         &mut negotiated_scram_is_plus,
-                                        framing,
+                                        &framing,
                                     )
                                     .await;
                                     response_scratch.clear();
-                                    response.encode_framed_into(framing, &mut response_scratch);
+                                    response.encode_framed_into(&framing, &mut response_scratch);
                                     if let Err(e) = socket.write_all(&response_scratch).await {
                                         tracing::error!(
                                             "Failed to send response to {}: {}",
@@ -1467,7 +1467,7 @@ async fn try_zero_copy_fetch(
     principal: &str,
     client_key: &str,
     logical_client_id: &Option<String>,
-    framing: crate::protocol::wire::RequestFraming,
+    framing: &crate::protocol::wire::RequestFraming,
 ) -> std::io::Result<bool> {
     if !engine.authorize(
         principal,
@@ -1480,6 +1480,17 @@ async fn try_zero_copy_fetch(
     }
     if !engine.is_partition_replica(topic, partition) {
         return Ok(false);
+    }
+
+    // Attribute this fetch to the group member it was tagged for, if any (issue #54).
+    // This is the zero-copy fast path — most plain-TCP fetches on a partition with no
+    // transactional data are served here rather than by `process_request`'s `Fetch` arm,
+    // so progress attribution has to be duplicated here too or it would silently never
+    // fire for the common case.
+    if let Some((group_id, member_id)) = framing.group_member() {
+        engine
+            .group_coordinator()
+            .record_progress(&group_id, &member_id);
     }
 
     // Never serve a partition with transactional data from the zero-copy path.
@@ -1538,7 +1549,7 @@ async fn try_zero_copy_fetch(
     let mut header = Vec::with_capacity(14);
     if let crate::protocol::wire::RequestFraming::Versioned { correlation_id, .. } = framing {
         header.put_u8(crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
-        header.put_u32(correlation_id);
+        header.put_u32(*correlation_id);
     }
     header.put_u8(0u8); // WireResponse status = OK
     header.put_u32(payload_len as u32);
@@ -1565,7 +1576,7 @@ async fn process_request(
     negotiated_scram_is_plus: &mut bool,
     // How this request was framed, so per-request options carried as envelope tagged
     // fields (e.g. fetch isolation) are visible to the handlers that act on them.
-    framing: crate::protocol::wire::RequestFraming,
+    framing: &crate::protocol::wire::RequestFraming,
 ) -> WireResponse {
     let quota_key = resolve_quota_key(principal.as_str(), logical_client_id.as_deref(), client_key);
 
@@ -2070,6 +2081,21 @@ async fn process_request(
             if !framing.is_forwarded() && !engine.is_partition_replica(&topic, partition) {
                 return WireResponse::error("NotLeaderForPartition");
             }
+            // Attribute this fetch to the group member it was tagged for, if any (issue
+            // #54): the coordinator otherwise has no visibility into consumption at all —
+            // membership is only ever asserted through `Heartbeat` — so a member that
+            // keeps heartbeating but has stopped actually consuming is indistinguishable
+            // from a healthy one. An absent tag (a legacy client, or a fetch not made on
+            // behalf of a group member) records nothing, same as today.
+            //
+            // Also duplicated on the zero-copy fast path (`try_zero_copy_fetch`), which
+            // most plain-TCP fetches on a non-transactional partition are served by
+            // instead of reaching this arm at all.
+            if let Some((group_id, member_id)) = framing.group_member() {
+                engine
+                    .group_coordinator()
+                    .record_progress(&group_id, &member_id);
+            }
             let fetch_start = std::time::Instant::now();
             // Isolation is a per-request property, expressed as a tagged field on the
             // request envelope. Committed-only reads previously required calling a
@@ -2489,12 +2515,18 @@ async fn process_request(
             // `join_group_awaited` holds the response until the group's join window
             // closes, so every member that joined the same window is handed the same
             // generation (see `GroupCoordinator::join_group`).
+            //
+            // `session_timeout_ms` — when the client sent the tag — lets the coordinator
+            // use the timeout the client actually asked for instead of its historical
+            // hardcoded default, clamped to a sane range (see
+            // `GroupCoordinator::resolve_session_timeout`).
             match engine
-                .join_group_awaited(
+                .join_group_awaited_with_session_timeout(
                     &group_id,
                     &member_id,
                     group_instance_id.as_deref(),
                     protocols,
+                    framing.session_timeout_ms(),
                 )
                 .await
             {

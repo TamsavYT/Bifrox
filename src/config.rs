@@ -365,6 +365,15 @@ pub struct EngineConfig {
     /// slower first assignment; 0 disables the barrier entirely and restores the old
     /// join-immediately behavior.
     pub group_initial_rebalance_delay_ms: u64,
+    /// How long a consumer group member may go without making fetch progress — a `Fetch`
+    /// attributed to it via the request envelope's `GROUP_MEMBER` tag — before the
+    /// coordinator evicts it for stalling even though it keeps heartbeating on schedule
+    /// (Kafka `max.poll.interval.ms`; issue #54: a member deadlocked, stuck on a poisoned
+    /// record, or blocked on a downstream call still reports itself healthy through
+    /// heartbeats alone).
+    ///
+    /// Defaults to five minutes, matching Kafka's own default.
+    pub max_poll_interval_ms: u64,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
     /// exist yet (Kafka `auto.create.topics.enable`). Defaults to **true**, matching both
     /// Kafka's own default and Hermes's long-standing behavior.
@@ -422,6 +431,7 @@ impl Default for EngineConfig {
             num_network_threads: None,
             auto_assign_partitions_enable: true,
             group_initial_rebalance_delay_ms: 3_000,
+            max_poll_interval_ms: 300_000, // 5 minutes, matching Kafka's max.poll.interval.ms
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
@@ -627,6 +637,11 @@ impl EngineConfig {
                     "group.initial.rebalance.delay.ms" => {
                         if let Ok(v) = value.parse::<u64>() {
                             config.group_initial_rebalance_delay_ms = v;
+                        }
+                    }
+                    "max.poll.interval.ms" => {
+                        if let Ok(v) = value.parse::<u64>() {
+                            config.max_poll_interval_ms = v;
                         }
                     }
                     "auto.assign.partitions.enable" => {
