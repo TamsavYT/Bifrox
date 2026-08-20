@@ -932,26 +932,27 @@ impl ReplicationManager {
     ///
     /// `__cluster_metadata` still replicates to every peer — brokers need to learn
     /// topics/ACLs/broker registrations too, even though they never vote on it. Real
-    /// data-topic partitions, though, should never be pushed to a controller-only peer,
-    /// since it was never eligible to be assigned as a replica for one in the first place
-    /// (see `StorageEngine::available_broker_ids`) and has no business storing that data.
-    /// `pull_covered` lists peers that run a pull fetcher for this partition, i.e. that are
-    /// assigned replicas of it. They are excluded from push, so **no peer ever receives the
-    /// same records over both mechanisms**.
+    /// data-topic partitions no longer reach this function at all: as of the fix for
+    /// issue #22, `StorageEngine::produce_batch` replicates data topics exclusively via
+    /// the pull fetcher and never calls `replicate_batch`/`broadcast_high_watermark` for
+    /// them.
     ///
-    /// Push and pull used to run unconditionally side by side, which meant every record
-    /// crossed the wire and hit the follower's append path twice, a pushed and a pulled
-    /// batch covering the same offsets could race on append, and follower progress was
-    /// written by two independent paths so ISR decisions read a value neither owned.
+    /// Push and pull used to run unconditionally side by side for data topics, which meant
+    /// every record crossed the wire and hit the follower's append path twice, a pushed
+    /// and a pulled batch covering the same offsets could race on append, and follower
+    /// progress was written by two independent paths so ISR decisions read a value neither
+    /// owned. A first fix excluded pull-covered peers from push (`pull_covered` below); once
+    /// partition assignment became universal (issue #40, `default_replication_factor` is
+    /// now 3) that exclusion emptied the push target list for every data partition on its
+    /// own, so push was removed from the produce path outright rather than left calling
+    /// this function to compute an always-empty target list.
     ///
-    /// Push is not deleted outright because it is currently the *only* mechanism covering
-    /// the common case: `get_or_create_partition` proposes no partition assignment, so an
-    /// auto-created topic has no replica set and therefore no pull fetcher, and
-    /// `default_replication_factor` is 1 so even an explicitly created topic usually has
-    /// none either. Deleting push before assignment is universal would silently stop
-    /// replicating those partitions altogether. Once every partition carries a real replica
-    /// set, `pull_covered` covers every peer, this filter empties the push target list on
-    /// its own, and the push path can be removed with no behavior change.
+    /// The data-topic filtering below (controller-only peers, `pull_covered` exclusion) is
+    /// therefore dead in practice — nothing currently calls this with a topic other than
+    /// `__cluster_metadata` — but it is left in place rather than deleted, since
+    /// `replicate_batch`/`broadcast_high_watermark` remain generic public API taking an
+    /// arbitrary `topic`, and stripping it would silently drop the controller-only safety
+    /// filter for any future data-topic caller.
     fn replication_targets(
         &self,
         topic: &str,
@@ -997,7 +998,8 @@ impl ReplicationManager {
     /// it delivers. Something has to deliver the updated committed point afterwards, or a
     /// follower would sit indefinitely holding replicated-but-not-readable records — with
     /// no pull fetcher to converge it, which is exactly the case for `__cluster_metadata`
-    /// and for any partition whose fetcher hasn't started.
+    /// (its only caller as of issue #22 — data topics converge their watermark via the
+    /// `leader_watermark` carried on every pull fetch response instead).
     ///
     /// This sends the same 0xAA packet carrying zero frames: the follower's decoder skips
     /// the (empty) record loop and applies the watermark clamp. Failures are logged, not
