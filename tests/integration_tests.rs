@@ -697,6 +697,39 @@ async fn test_scenario_10_multi_node_cluster_replication() {
         "Cluster Replication Event 101".as_bytes()
     );
 
+    // Issue #62: prove broker discovery genuinely completed rather than merely that data
+    // arrived — Node 2 (the follower) booted with the default *empty* peer_addrs, which
+    // deadlocked heartbeat acceptance before this fix and left the leader's view of the
+    // cluster permanently at `[self]`. Delivery above could previously happen anyway
+    // because the leader also pushes to `config.peer_addrs` regardless of discovery, so
+    // it alone doesn't prove the deadlock is fixed — a real replica assignment does: it
+    // can only exist once the leader has learned Node 2 exists (via Node 2's heartbeat
+    // ACK) and named it a replica through `ensure_topic_created`/the reconcile sweep.
+    let mut replicas = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Some(parts) = engine_node1.describe_topic("cluster_topic") {
+            if let Some(p0) = parts.iter().find(|p| p.partition_id == 0) {
+                if p0.replicas.len() >= 2 {
+                    replicas = p0.replicas.clone();
+                    break;
+                }
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        replicas.len() >= 2,
+        "cluster_topic-0 must have a multi-replica assignment once discovery completes; \
+         got replicas={:?}",
+        replicas
+    );
+    assert!(
+        replicas.contains(&1) && replicas.contains(&2),
+        "the assignment must name both nodes as replicas, got {:?}",
+        replicas
+    );
+
     server_node1_task.abort();
     server_node2_task.abort();
     let _ = std::fs::remove_dir_all(&base_dir);
@@ -738,7 +771,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
         ..EngineConfig::default()
     };
     let engine_node1 = StorageEngine::new(config_node1).unwrap();
-    let server_node1 = Server::new(engine_node1);
+    let server_node1 = Server::new(engine_node1.clone());
     let (listener_node1, addr_node1) = server_node1.bind().unwrap();
 
     let server_node1_task = tokio::spawn(async move {
@@ -775,6 +808,35 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
     assert_eq!(
         fetched[0].payload,
         "Dynamic Metadata Replicated Event".as_bytes()
+    );
+
+    // Issue #62: same proof as scenario 10 — the topic must carry a genuine multi-replica
+    // assignment, not merely have delivered a record via the leader's unconditional push
+    // to its static `peer_addrs`. Node 2 booted with an empty `peer_addrs`, the exact
+    // topology that deadlocked heartbeat acceptance before this fix.
+    let mut replicas = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Some(parts) = engine_node1.describe_topic("dynamic_topic") {
+            if let Some(p0) = parts.iter().find(|p| p.partition_id == 0) {
+                if p0.replicas.len() >= 2 {
+                    replicas = p0.replicas.clone();
+                    break;
+                }
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        replicas.len() >= 2,
+        "dynamic_topic-0 must have a multi-replica assignment once discovery completes; \
+         got replicas={:?}",
+        replicas
+    );
+    assert!(
+        replicas.contains(&1) && replicas.contains(&2),
+        "the assignment must name both nodes as replicas, got {:?}",
+        replicas
     );
 
     server_node1_task.abort();
@@ -6261,5 +6323,152 @@ async fn test_scenario_72_wildcard_advertised_addr_refuses_to_bind() {
         err_msg.contains("advertised.listeners") || err_msg.contains("advertised"),
         "the error must name the config key to fix; got: {}",
         err_msg
+    );
+}
+
+// ─────────────────────────────────────────────────────────
+// Issue #62: broker discovery deadlock — heartbeat allowlist (Commit 2)
+// ─────────────────────────────────────────────────────────
+
+/// Issue #62 / Commit 2: this is the actual deadlock topology — a node with the default
+/// *empty* `peer_addrs` must accept a heartbeat from a distinct sender address rather than
+/// rejecting every sender forever. Before this fix, an empty allowlist meant "nothing is
+/// ever whitelisted", so a follower configured this way (the common case for a node whose
+/// peers' addresses aren't known ahead of time — e.g. an ephemeral port) could never be
+/// discovered by its leader.
+#[tokio::test]
+async fn test_scenario_73_empty_peer_allowlist_accepts_heartbeat_from_any_distinct_leader() {
+    let dir = TestDataDirGuard::new("heartbeat_empty_allowlist");
+    let cluster_id = EngineConfig::default().cluster_id;
+    let config = EngineConfig {
+        node_id: 9,
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        // peer_addrs left at the default: empty.
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+    let _task = tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    let result = hermes::replication::send_leader_heartbeat(
+        &addr.to_string(),
+        &cluster_id,
+        42,                // a leader node_id distinct from this node's own (9)
+        1,                 // term
+        "127.0.0.1:19999", // a leader address never configured anywhere
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "a heartbeat from a distinct, unlisted address must be accepted when no allowlist \
+         is configured; got {:?}",
+        result.err()
+    );
+    let (follower_id, follower_addr, _roles) = result.unwrap();
+    assert_eq!(follower_id, 9);
+    assert_eq!(
+        follower_addr,
+        addr.to_string(),
+        "the ACK must carry this node's real advertised address"
+    );
+}
+
+/// Issue #62 / Commit 2: a *non-empty* `peer_addrs` must keep exactly its previous
+/// behavior — a heartbeat whose claimed leader address isn't one of the configured peers
+/// is still rejected, and one that is a configured peer is still accepted.
+#[tokio::test]
+async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader() {
+    let dir = TestDataDirGuard::new("heartbeat_nonempty_allowlist");
+    let cluster_id = EngineConfig::default().cluster_id;
+    let whitelisted_peer = "127.0.0.1:55001".to_string();
+    let config = EngineConfig {
+        node_id: 9,
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![whitelisted_peer.clone()],
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+    let _task = tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    let rejected = hermes::replication::send_leader_heartbeat(
+        &addr.to_string(),
+        &cluster_id,
+        42,
+        1,
+        "127.0.0.1:55002", // not the whitelisted peer
+    )
+    .await;
+    assert!(
+        rejected.is_err(),
+        "a heartbeat claiming a leader address outside the configured allowlist must still \
+         be rejected"
+    );
+
+    let accepted = hermes::replication::send_leader_heartbeat(
+        &addr.to_string(),
+        &cluster_id,
+        42,
+        1,
+        &whitelisted_peer,
+    )
+    .await;
+    assert!(
+        accepted.is_ok(),
+        "a heartbeat claiming a whitelisted leader address must still be accepted; got {:?}",
+        accepted.err()
+    );
+}
+
+/// Issue #62 / Commit 2 / CRIT-03: a peer claiming to be this node's own advertised
+/// address must be rejected even with no allowlist configured — this is what stops a peer
+/// from advertising our own address as "the leader" to make forwarded produces loop back
+/// to us. The allowlist becoming permissive when empty must not weaken this.
+#[tokio::test]
+async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist() {
+    let dir = TestDataDirGuard::new("heartbeat_crit03_empty_allowlist");
+    let cluster_id = EngineConfig::default().cluster_id;
+    let config = EngineConfig {
+        node_id: 9,
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        // peer_addrs left at the default: empty.
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+    let self_advertised_addr = engine.replication().advertised_addr();
+    assert_eq!(
+        self_advertised_addr,
+        addr.to_string(),
+        "sanity check: this node's advertised address should be its real bound address"
+    );
+    let _task = tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    let result = hermes::replication::send_leader_heartbeat(
+        &addr.to_string(),
+        &cluster_id,
+        42,
+        1,
+        &self_advertised_addr, // claims to *be* this node
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a peer claiming our own advertised address as the leader must be rejected even \
+         with an empty allowlist"
     );
 }
