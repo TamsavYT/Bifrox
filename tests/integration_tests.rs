@@ -5903,6 +5903,7 @@ async fn test_scenario_67_session_timeout_and_stalled_consumption_evictions_are_
 /// Synchronous by design: run it inside `tokio::task::spawn_blocking` rather than awaiting
 /// it directly, so the polling loop below doesn't starve the (single-threaded, by default)
 /// test runtime that the in-process test server also runs on.
+#[cfg(unix)]
 fn wait_for_child_with_deadline(
     mut child: std::process::Child,
     deadline: Duration,
