@@ -123,6 +123,19 @@ impl Server {
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
         let local_addr = listener.local_addr()?;
+
+        // Issue #62: correct this node's advertised identity to the real bound address
+        // (or an operator-configured override) now that it's known, and start
+        // broadcasting it if this node is the leader — see
+        // `StorageEngine::finalize_advertised_addr` for why this can't happen any
+        // earlier. A wildcard/unusable resolved address is a hard failure here (matching
+        // Kafka's refusal to start in the equivalent case) rather than a degrade: binding
+        // is a one-time startup step, so there is no "keep running with the old identity"
+        // to fall back to — the old identity was never valid in the first place.
+        self.engine
+            .finalize_advertised_addr(local_addr.to_string())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
         Ok((listener, local_addr))
     }
 

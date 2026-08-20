@@ -14,7 +14,8 @@ param(
     [ValidateSet("WinSW", "NSSM")]
     [string]$ServiceType = "WinSW",
     [int]$BrokerPort = 9092,
-    [int]$MetricsPort = 10092
+    [int]$MetricsPort = 10092,
+    [string]$AdvertisedHost = $env:COMPUTERNAME
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,7 +60,10 @@ if (Test-Path $PropertiesPath) {
     Write-Host "[3/5] Generating default server.properties..." -ForegroundColor Yellow
     @"
 node.id=1
+# Bind to all interfaces, but advertise a specific dialable address to peers
+# (the broker requires an explicit advertised address, not a wildcard)
 bind.address=0.0.0.0:$BrokerPort
+advertised.listeners=$AdvertisedHost:$BrokerPort
 metrics.bind.address=0.0.0.0:$MetricsPort
 data.dir=$InstallDir\data
 log.file.dir=$InstallDir\logs

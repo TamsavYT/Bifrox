@@ -242,6 +242,16 @@ pub struct EngineConfig {
     pub log_file_dir: PathBuf,
     /// Server bind socket address (Kafka listeners)
     pub bind_addr: String,
+    /// Explicit override for the address this node advertises to peers and clients as
+    /// its own identity (Kafka `advertised.listeners`) — in inter-node heartbeats,
+    /// heartbeat ACKs, and `BrokerRegister` metadata records. Takes precedence over the
+    /// TCP listener's actual bound address when set, which is what makes an address
+    /// expressible at all when `bind_addr` is a wildcard host (`0.0.0.0`) or sits behind
+    /// NAT/a load balancer, where the bound address itself is not what a peer should
+    /// dial. `None` (the default) derives the advertised address from the listener's
+    /// real bound address once it's known — see `StorageEngine::finalize_advertised_addr`
+    /// and issue #62.
+    pub advertised_addr: Option<String>,
     /// Peer node addresses for HA cluster replication
     pub peer_addrs: Vec<String>,
     /// Minimum In-Sync Replicas required for write commits
@@ -421,6 +431,7 @@ impl Default for EngineConfig {
             preallocate_segments: false,
             log_file_dir: PathBuf::from("./logs"),
             bind_addr: "127.0.0.1:9092".to_string(),
+            advertised_addr: None,
             peer_addrs: Vec::new(),
             min_insync_replicas: 1,
             // Clamped to the number of available brokers at assignment time, so a
@@ -553,6 +564,15 @@ impl EngineConfig {
                             .or_else(|| value.strip_prefix("SASL_SSL://"))
                             .unwrap_or(value);
                         config.bind_addr = clean_addr.to_string();
+                    }
+                    "advertised.listeners" | "advertised.bind.addr" => {
+                        let clean_addr = value
+                            .strip_prefix("PLAINTEXT://")
+                            .or_else(|| value.strip_prefix("SASL_PLAINTEXT://"))
+                            .or_else(|| value.strip_prefix("SSL://"))
+                            .or_else(|| value.strip_prefix("SASL_SSL://"))
+                            .unwrap_or(value);
+                        config.advertised_addr = Some(clean_addr.to_string());
                     }
                     "security.protocol" => {
                         if let Ok(sp) = value.parse() {

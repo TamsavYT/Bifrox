@@ -1304,7 +1304,12 @@ fn decode_replication_packet(
 /// P4 Wire format: `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [leader_bind_addr: pascal]`
 ///
 /// Followers only reset the election timer if the heartbeat's term >= our current epoch.
-/// CRIT-03: leader_bind_addr is validated against the configured peer_addrs whitelist before use.
+///
+/// CRIT-03: leader_bind_addr must never equal this node's own advertised address,
+/// unconditionally. Beyond that, issue #62: a non-empty configured peer_addrs whitelist
+/// still requires leader_bind_addr to be one of those peers; an *empty* peer_addrs means
+/// no static allowlist was configured, so it's accepted (subject to the cluster_id and
+/// CRIT-03 checks) rather than rejecting every sender — see the inline comments below.
 fn decode_heartbeat_packet(
     engine: &StorageEngine,
     mut src: &[u8],
@@ -1379,15 +1384,38 @@ fn decode_heartbeat_packet(
         return Ok((bytes_consumed, vec![1u8]));
     }
 
-    // CRIT-03 / H6: Validate leader_bind_addr against peer_addrs only.
-    // Previously also matched against this node's own bind_addr, which allowed two
-    // exploits when all nodes share "0.0.0.0:port": (1) any peer could advertise our
-    // own address as the leader, causing forwarded produces to loop back; (2) the
-    // wildcard match made the whitelist entirely ineffective.  The leader's address
-    // must be a known peer, never this node's own address.
+    // CRIT-03 / H6: leader_bind_addr must never equal this node's own advertised
+    // address, full stop — independent of whitelist state (checked below) and enforced
+    // before it. This is the actual exploit: a peer advertising our own address as "the
+    // leader" would make any produce we forward loop straight back to us. Previously
+    // this was only ever enforced implicitly, by peer_addrs never containing our own
+    // address by construction; issue #62 makes an empty peer_addrs valid (see below),
+    // which removes that implicit protection, so it's now checked explicitly and
+    // unconditionally.
+    let self_advertised_addr = engine.replication().advertised_addr();
+    if leader_bind_addr == self_advertised_addr {
+        tracing::warn!(
+            "HA Heartbeat: REJECTED — leader_bind_addr '{}' equals this node's own advertised \
+             address (Node {}); a peer must never claim to be us",
+            leader_bind_addr,
+            peer_node_id
+        );
+        return Ok((bytes_consumed, vec![1u8]));
+    }
+
+    // Issue #62: an empty `peer_addrs` means "no static peer allowlist configured", not
+    // "reject every peer". Static configuration cannot always name a peer's address up
+    // front — its port may be ephemeral, or simply not yet known — which is exactly what
+    // made broker discovery deadlock: a follower with no way to list its leader's address
+    // rejected every heartbeat forever, so the leader never learned it existed and no
+    // replica assignment was ever published. Kafka's answer here is that cluster
+    // membership is gated by authentication (Hermes has SCRAM/ACLs for that), not by a
+    // static address allowlist — so once the CRIT-03 self-address check above and the
+    // cluster_id check further above both pass, an empty allowlist accepts. A non-empty
+    // allowlist keeps exactly its previous behavior: the leader's address must be one of
+    // the configured peers.
     let peer_addrs = &engine.config().peer_addrs;
-    let is_whitelisted = peer_addrs.contains(&leader_bind_addr);
-    if !is_whitelisted {
+    if !peer_addrs.is_empty() && !peer_addrs.contains(&leader_bind_addr) {
         tracing::warn!(
             "HA Heartbeat: REJECTED — leader_bind_addr '{}' not in configured peer whitelist (Node {})",
             leader_bind_addr, peer_node_id
@@ -1424,17 +1452,21 @@ fn decode_heartbeat_packet(
         );
     }
 
-    // Reply with this node's own identity (node_id + bind_addr + roles) so the Leader can
-    // learn this follower's broker address AND process role(s) purely from the heartbeat
-    // round-trip. Followers otherwise have no way to publish this, since only the
-    // controller may durably write `BrokerRegister` records — and a follower's own
+    // Reply with this node's own identity (node_id + advertised address + roles) so the
+    // Leader can learn this follower's broker address AND process role(s) purely from the
+    // heartbeat round-trip. Followers otherwise have no way to publish this, since only
+    // the controller may durably write `BrokerRegister` records — and a follower's own
     // bootstrap-time self-registration attempt would just fail with NOT_CONTROLLER.
-    let self_bind_addr = &engine.config().bind_addr;
+    //
+    // Uses the *advertised* address (issue #62), not `config().bind_addr` verbatim: the
+    // latter is whatever was configured before the listener bound (often a wildcard host
+    // or an ephemeral `:0` port), neither of which the Leader could ever dial back.
+    let self_advertised_addr = engine.replication().advertised_addr();
     let role_bytes = crate::config::roles_to_bytes(&engine.config().roles);
-    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_bind_addr.len() + 1 + role_bytes.len());
+    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_advertised_addr.len() + 1 + role_bytes.len());
     ack.put_u8(0u8);
     ack.put_u32(engine.config().node_id);
-    crate::protocol::wire::write_pascal_string(&mut ack, self_bind_addr);
+    crate::protocol::wire::write_pascal_string(&mut ack, &self_advertised_addr);
     ack.put_u8(role_bytes.len() as u8);
     ack.extend_from_slice(&role_bytes);
     Ok((bytes_consumed, ack))
