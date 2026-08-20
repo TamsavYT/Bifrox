@@ -62,6 +62,7 @@ Add or customize Prometheus metrics listener & security settings:
 # Server Listener & Storage
 node.id=1
 bind.addr=0.0.0.0:9092
+advertised.listeners=myhost.example.com:9092
 data.dir=C:\Program Files\Hermes\data
 log.file.dir=C:\Program Files\Hermes\logs
 
@@ -70,6 +71,8 @@ metrics.bind.address=0.0.0.0:10092
 metrics.auth.token=SecretScrapeToken123
 metrics.allowed.ips=127.0.0.1,10.0.0.0/8
 ```
+
+**Important:** When using a wildcard bind address like `0.0.0.0`, you must provide an explicit `advertised.listeners` value that peers can use to dial back to this broker. The broker will refuse to start if the advertised address is a wildcard or unspecified. Use the machine's hostname, FQDN, or a specific LAN IP address.
 
 ---
 
