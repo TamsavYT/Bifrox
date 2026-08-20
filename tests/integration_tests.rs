@@ -3744,52 +3744,156 @@ async fn test_scenario_41_alter_configs_rejects_invalid_values() {
 
 /// Push and pull replication must never both deliver the same records to the same peer.
 ///
-/// The two ran unconditionally side by side: every record crossed the wire and hit the
-/// follower's append path twice, a pushed and a pulled batch covering the same offsets
+/// The two used to run unconditionally side by side: every record crossed the wire and hit
+/// the follower's append path twice, a pushed and a pulled batch covering the same offsets
 /// could race on append, and follower progress was written by two independent paths so ISR
-/// decisions read a value neither owned. A peer that pull-fetches a partition is now
-/// excluded from the push for it.
+/// decisions read a value neither owned. A first fix excluded pull-covered peers from push;
+/// once partition assignment became universal (issue #40) that exclusion emptied the push
+/// target list for every data partition on its own, so push was removed from the produce
+/// path outright (issue #22) rather than left calling a filter that always returned empty.
+///
+/// There is no push target list left to inspect for a data topic now, so this proves the
+/// same "no peer is ever delivered the same records twice" invariant at the wire level
+/// instead: a raw peer standing in for an assigned replica must never see a single byte
+/// from a data-topic produce (push simply never fires), while it must see an actual 0xAA
+/// push packet the moment a metadata mutation happens, since `__cluster_metadata` has no
+/// pull fetcher and is push-only by design.
 #[tokio::test]
-async fn test_scenario_42_push_excludes_pull_covered_peers() {
-    let env = start_test_server().await;
-    let engine = env.engine.clone();
-    engine.create_topic("dual_path", 1).await.unwrap();
-    let pm = engine.get_or_create_partition("dual_path", 0).unwrap();
+async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes() {
+    use hermes::config::ProcessRole;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::AsyncReadExt;
 
+    let test_dir = std::env::temp_dir().join(format!(
+        "hermes_test_no_dup_push_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&test_dir);
+
+    // A raw, non-Hermes TCP peer standing in for a replica: nothing but a leader-side
+    // wire call (replication push *or* the leader heartbeat, which shares the same
+    // per-peer pooled connection) could ever make a connection land here. Only the
+    // replication-push magic byte (0xAA) counts as proof of a push; the leader heartbeat
+    // (0xAC) also legitimately connects here (`start_leader_heartbeat_loop`, started for
+    // any Leader with a non-empty `peer_addrs`) and must be ignored.
+    //
+    // The harness doesn't implement either wire protocol's full reply — it just reads the
+    // magic byte and drops the connection. Both `send_replication_push_pooled` and
+    // `send_leader_heartbeat_pooled` treat a dropped/EOF reply as a failed call, clear
+    // their pooled connection, and reconnect fresh next time, so a new accept() here
+    // observes every subsequent call as its own connection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap().to_string();
+
+    let magic_seen = std::sync::Arc::new(AtomicBool::new(false));
+    let magic_seen_task = magic_seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut magic = [0u8; 1];
+            if stream.read_exact(&mut magic).await.is_ok() && magic[0] == 0xAA {
+                magic_seen_task.store(true, Ordering::SeqCst);
+            }
+            // Deliberately no reply: dropping here is what makes the client treat this as
+            // a failed call and reconnect fresh for its next one (see comment above).
+        }
+    });
+
+    // Controller-only role (no Broker) with an explicitly empty controller peer set
+    // decouples the metadata-commit quorum (majority of 1, satisfied by this sole
+    // controller alone) from `peer_addrs` below, which drives push targeting. Without this
+    // split, giving the node a non-empty `peer_addrs` — needed so push has somewhere to go
+    // at all, mirroring a real multi-node deployment — would also force the metadata write
+    // to wait on a majority ack from the fake peer.
+    //
+    // The periodic ISR/failover sweep independently calls `catch_up_follower_metadata`,
+    // which would also push to this peer once the metadata log is non-empty (it is, from
+    // the leader's own startup bootstrap record) — set the interval far beyond this test's
+    // runtime so that sweep can't fire and manufacture a false-positive push.
+    let config = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: test_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![peer_addr.clone()],
+        roles: vec![ProcessRole::Controller],
+        controller_peer_addrs: Vec::new(),
+        isr_check_interval_ms: 60_000,
+        ..EngineConfig::default()
+    };
+    let engine = StorageEngine::new(config).unwrap();
+
+    // An assigned data partition: manually set leadership/replicas so this looks exactly
+    // like the common case push used to special-case (an assigned replica), rather than
+    // the auto-created/unassigned case push was originally kept around for.
+    let topic = "no_dup_push_topic";
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
     let self_id = engine.config().node_id;
-    let follower = self_id + 7;
-    let follower_addr = "127.0.0.1:19501".to_string();
-    engine.register_broker_address(follower, follower_addr.clone());
+    let follower_id = self_id + 1;
+    engine.register_broker_address(follower_id, peer_addr.clone());
+    pm.update_leadership(
+        self_id,
+        1,
+        vec![self_id, follower_id],
+        vec![self_id, follower_id],
+    );
+    assert!(engine.is_partition_leader(topic, 0));
 
-    // No replica assignment yet: nothing pull-fetches this partition, so push must still
-    // cover it — this is the auto-created-topic case, where push is the ONLY mechanism.
+    // Produce to the assigned data partition. If push still fired here, the fake peer
+    // would see a connection carrying 0xAA.
+    let records = vec![bytes::Bytes::from("no-push-payload")];
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records,
+    };
+    engine.produce_batch(params).await.unwrap();
+
+    // Give any (wrongly) spawned push task time to connect before checking.
+    sleep(Duration::from_millis(300)).await;
     assert!(
-        engine.pull_covered_peers("dual_path", 0).is_empty(),
-        "an unassigned partition has no pull fetcher, so push must not be suppressed"
+        !magic_seen.load(Ordering::SeqCst),
+        "a data-topic produce must never push to an assigned replica — pull is now the \
+         only replication mechanism for data topics"
     );
 
-    // Assign the follower as a replica. It now runs a fetcher for this partition, so push
-    // must stop targeting it.
-    pm.update_leadership(self_id, 1, vec![self_id, follower], vec![self_id, follower]);
-    let covered = engine.pull_covered_peers("dual_path", 0);
-    assert_eq!(
-        covered,
-        vec![follower_addr],
-        "an assigned replica must be excluded from push once it pull-fetches"
-    );
+    // Now a metadata mutation on the same node: `__cluster_metadata` has no pull fetcher
+    // by design, so it must still push.
+    engine
+        .upsert_scram_user_with_mechanism(
+            "no_dup_push_test_user",
+            "irrelevant-password",
+            hermes::scram::ScramMechanism::Sha256,
+        )
+        .await
+        .unwrap();
+
+    let mut pushed = false;
+    for _ in 0..40 {
+        if magic_seen.load(Ordering::SeqCst) {
+            pushed = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        !covered.iter().any(|a| a == &env.addr.to_string()),
-        "the leader never pushes to itself"
+        pushed,
+        "__cluster_metadata must still replicate via leader-push — it has no pull fetcher \
+         to fall back on"
     );
 
-    // The metadata log is deliberately push-only (no pull fetcher), so nothing is ever
-    // excluded for it — otherwise it would stop replicating entirely.
-    assert!(
-        engine
-            .pull_covered_peers("__cluster_metadata", 0)
-            .is_empty(),
-        "__cluster_metadata has no pull fetcher and must keep its push path"
-    );
+    let _ = std::fs::remove_dir_all(&test_dir);
 }
 
 /// A user may hold a SHA-256 and a SHA-512 credential at once, each verifying only under
@@ -3899,12 +4003,12 @@ async fn test_scenario_44_unassigned_partitions_get_a_replica_assignment() {
     );
 }
 
-/// End-to-end proof that pull replication takes over once a partition is assigned.
+/// End-to-end proof that pull replication delivers data-topic records on its own, now that
+/// push has been removed from the produce path entirely (issue #22).
 ///
-/// This is the behavior push deletion depends on: an implicitly-created partition gets a
-/// replica assignment from the controller sweep, the follower's fetcher starts as a result,
-/// and records produced *after* the assignment reach the follower even though push
-/// deliberately excludes pull-covered peers.
+/// An implicitly-created partition gets a replica assignment from the controller sweep, the
+/// follower's fetcher starts as a result, and records produced *after* the assignment reach
+/// the follower purely by being pulled — there is no push left to deliver them.
 #[tokio::test]
 async fn test_scenario_45_follower_pulls_after_assignment() {
     let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -4010,15 +4114,10 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
         assigned_on_follower,
         "the follower must receive the assignment via replicated __cluster_metadata"
     );
-    assert!(
-        engine_node1
-            .pull_covered_peers("pull_topic", 0)
-            .contains(&addr_node2.to_string()),
-        "with the follower assigned, push must exclude it in favour of pull"
-    );
 
-    // 4. Produce AFTER assignment. Push now skips node 2, so this record can only reach
-    //    the follower by being pulled.
+    // 4. Produce AFTER assignment. Data-topic replication no longer pushes at all (see
+    //    `test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes`), so this
+    //    record can only reach the follower by being pulled.
     client
         .produce_single("pull_topic", "k2", None, 1, "after-assignment")
         .await

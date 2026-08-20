@@ -658,28 +658,6 @@ impl StorageEngine {
         }
     }
 
-    /// Peer addresses that run a pull fetcher for this partition, i.e. that are assigned
-    /// replicas of it and will therefore fetch these records themselves.
-    ///
-    /// Push replication skips them, so no peer ever receives the same records over both
-    /// mechanisms — see `ReplicationManager::replication_targets` for why push still exists
-    /// at all rather than having been deleted outright.
-    pub fn pull_covered_peers(&self, topic: &str, partition: u32) -> Vec<String> {
-        // The metadata log has no pull fetcher by design (applying its records through two
-        // paths concurrently would race), so nothing is ever pull-covered for it.
-        if Self::is_system_topic(topic) {
-            return Vec::new();
-        }
-        let Some(pm) = self.get_partition(topic, partition) else {
-            return Vec::new();
-        };
-        pm.replicas()
-            .into_iter()
-            .filter(|&r| r != self.config.node_id)
-            .filter_map(|r| self.get_broker_address(r))
-            .collect()
-    }
-
     /// Whether this partition carries any transactional data whose visibility depends on
     /// transaction state — an in-flight transaction pinning its LSO, or a recorded aborted
     /// range.
@@ -2192,7 +2170,7 @@ impl StorageEngine {
         let pm_blocking = pm.clone();
         let records_owned: Vec<Bytes> = records.to_vec();
         let num_records = records_owned.len();
-        let (first_offset, last_offset, frames) =
+        let (first_offset, last_offset, _frames) =
             tokio::task::spawn_blocking(move || -> IoResult<(u64, u64, Vec<RecordFrame>)> {
                 let mut first_offset = 0u64;
                 let mut last_offset = 0u64;
@@ -2247,51 +2225,15 @@ impl StorageEngine {
         // stop replication for any partition led by a node that isn't currently the
         // cluster leader.
         //
-        // Data-topic replication is now Kafka-style follower-pull *in addition to*
-        // leader-push, not a full replacement of it. Every follower's background fetch
-        // loop (`ReplicationManager::start_per_partition_fetcher_manager`) independently
-        // pulls from this partition's log, and the leader's `handler.rs` 0xBB handler
-        // (`decode_grpc_replication_fetch_packet`) records each follower's confirmed
-        // progress into the exact same `replica_watermarks`/`replica_ack_time` maps this
-        // push ack updates below — `await_isr_quorum` doesn't care which mechanism
-        // populated them.
-        //
-        // Push stays as a backstop rather than being fully retired because pull discovery
-        // depends on `describe_topic`/`list_topics()`, which requires a real replica
-        // assignment recorded in `__cluster_metadata` (via `create_topic`). A topic that's
-        // only ever been implicitly auto-created by a bare produce (no explicit
-        // `CreateTopic`) never gets that assignment propagated, so a follower can never
-        // discover — and therefore never pull — a partition it doesn't already know it
-        // replicates. `append_replica_frame_verbatim` is idempotent/gap-safe by design
-        // (`AlreadyApplied`/`Gap` are both no-ops, never corruption), so having both
-        // mechanisms active for a partition pull *can* reach is redundant, not unsafe.
+        // Data-topic replication is Kafka-style follower-pull only. Every follower's
+        // background fetch loop (`ReplicationManager::start_per_partition_fetcher_manager`)
+        // independently pulls from this partition's log, and the leader's `handler.rs`
+        // 0xBB handler (`decode_grpc_replication_fetch_packet`) records each follower's
+        // confirmed progress into the `replica_watermarks`/`replica_ack_time` maps that
+        // `await_full_isr_ack` below reads — there is no leader-push counterpart on this
+        // path to race it. (`__cluster_metadata` is the exception: it has no pull fetcher
+        // by design and still replicates via leader-push — see `propose_metadata_unchecked`.)
         if self.is_partition_leader(topic, partition_id) && !self.config.peer_addrs.is_empty() {
-            let repl = self.replication.clone();
-            let topic_str = topic.to_string();
-            let topic_for_spawn = topic_str.clone();
-            let frames_clone = frames.clone();
-            let leader_hw = pm.high_watermark();
-            // A data partition is fenced by its own leader epoch, never the controller term.
-            let fencing_epoch = pm.leader_epoch() as u64;
-            // Peers that pull-fetch this partition are excluded from the push, so no peer
-            // ever receives the same records twice (see `pull_covered_peers`).
-            let pull_covered = self.pull_covered_peers(topic, partition_id);
-            tokio::spawn(async move {
-                if let Err(e) = repl
-                    .replicate_batch(
-                        &topic_for_spawn,
-                        partition_id,
-                        fencing_epoch,
-                        leader_hw,
-                        &pull_covered,
-                        &frames_clone,
-                    )
-                    .await
-                {
-                    tracing::error!("HA Replication: replicate_batch failed: {}", e);
-                }
-            });
-
             // Enforce min_insync_replicas requirement before returning success and before
             // advancing the committed high watermark (REP-05 & PARTIAL-03). Until quorum
             // is reached, `pm.latest_offset()` (LEO) has moved but `pm.high_watermark()`
@@ -2301,7 +2243,7 @@ impl StorageEngine {
             if self.effective_min_insync_replicas(topic) > 1 {
                 self.await_full_isr_ack(
                     &pm,
-                    &topic_str,
+                    topic,
                     partition_id,
                     last_offset,
                     std::time::Duration::from_secs(5),
@@ -2313,34 +2255,11 @@ impl StorageEngine {
         // Reached only once quorum (if required) has been confirmed above — or
         // immediately for single-node/no-peer deployments and non-partition-leader
         // system-partition writes, where there's nothing else to wait on.
-        pm.advance_committed_hw(last_offset + 1);
-
-        // Tell the push-served followers about the newly committed point. The push that
-        // delivered this batch necessarily carried the *previous* watermark (a batch isn't
-        // committed until the ISR has it), so without this the records would sit
-        // replicated-but-unreadable on those followers until some later write happened to
-        // carry the watermark along.
         //
-        // Pull-served followers need none of this — every fetch response already carries
-        // `leader_watermark` — so they are excluded here for the same reason they are
-        // excluded from the push itself.
-        if self.is_partition_leader(topic, partition_id) && !self.config.peer_addrs.is_empty() {
-            let repl = self.replication.clone();
-            let topic_for_hw = topic.to_string();
-            let committed_hw = pm.high_watermark();
-            let fencing_epoch = pm.leader_epoch() as u64;
-            let pull_covered = self.pull_covered_peers(topic, partition_id);
-            tokio::spawn(async move {
-                repl.broadcast_high_watermark(
-                    &topic_for_hw,
-                    partition_id,
-                    fencing_epoch,
-                    committed_hw,
-                    &pull_covered,
-                )
-                .await;
-            });
-        }
+        // Nothing needs to be told about this commit point separately: every pull fetch
+        // response already carries `leader_watermark`, so followers pick up the newly
+        // committed high watermark on their own next fetch.
+        pm.advance_committed_hw(last_offset + 1);
 
         Ok((partition_id, first_offset, last_offset))
     }
