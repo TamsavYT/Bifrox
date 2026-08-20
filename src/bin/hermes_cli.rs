@@ -1,4 +1,4 @@
-use hermes::{GroupConsumer, GroupConsumerConfig, TestClient};
+use hermes::{wait_for_shutdown_signal, GroupConsumer, GroupConsumerConfig, TestClient};
 use std::net::ToSocketAddrs;
 use tokio::time::{sleep, Duration};
 
@@ -539,11 +539,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Leader:              {}", consumer.is_leader());
             println!("  Assigned Partitions: {:?}", consumer.assignment());
             println!("  Poll Interval:       {} ms", poll_interval_ms);
-            println!("Polling for messages. Press Ctrl+C to stop.\n");
+            println!("Polling for messages. Press Ctrl+C (or send SIGTERM) to stop.\n");
 
             loop {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = wait_for_shutdown_signal() => {
                         println!("\n🛑 Graceful shutdown signal received. Exiting consumer group loop.");
                         // A static member deliberately keeps its slot across a restart, so
                         // only a dynamic member gives it up on the way out.

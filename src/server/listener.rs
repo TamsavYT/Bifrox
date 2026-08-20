@@ -316,7 +316,7 @@ impl Server {
                         }
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = crate::shutdown::wait_for_shutdown_signal() => {
                     tracing::info!("Shutdown signal received. Flushing storage engine partitions...");
                     if let Err(e) = self.engine.flush_all() {
                         tracing::error!("Failed to flush partitions during shutdown: {}", e);

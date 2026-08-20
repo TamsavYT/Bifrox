@@ -5892,3 +5892,104 @@ async fn test_scenario_67_session_timeout_and_stalled_consumption_evictions_are_
 
     drop(stalled);
 }
+
+/// Issue #60: SIGTERM must reach the same graceful-shutdown path as SIGINT (Ctrl+C).
+/// Docker, Kubernetes and systemd stop a managed process with SIGTERM, not SIGINT, so a
+/// shutdown handler that only ever waited on `ctrl_c()` never ran under those supervisors
+/// -- silently skipping the consumer's final offset commit on every container restart, and
+/// reprocessing everything since the last periodic commit.
+///
+/// This drives the real `hermes_cli` binary as a child process and sends it an actual
+/// SIGTERM, rather than exercising the `select!` arm in-process, because the bug was
+/// specifically about which OS signal reaches that arm -- an in-process test would not have
+/// caught it. Unix-only: Windows has no SIGTERM to send.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_scenario_68_sigterm_triggers_the_same_graceful_shutdown_as_sigint() {
+    let env = start_test_server().await;
+    let topic = "sigterm_shutdown_topic";
+    let group_id = "sigterm_shutdown_group";
+    let num_records = 5u64;
+
+    let mut setup_client = TestClient::connect(env.addr).await.unwrap();
+    setup_client.create_topic(topic, 1).await.unwrap();
+    for i in 0..num_records {
+        setup_client
+            .produce_single(topic, "k", None, 1, format!("msg-{}", i).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    let cli_path = env!("CARGO_BIN_EXE_hermes_cli");
+    let child = std::process::Command::new(cli_path)
+        .args([
+            "group-consume",
+            "--server",
+            &env.addr.to_string(),
+            "--group",
+            group_id,
+            "--topic",
+            topic,
+            "--interval",
+            "50",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hermes_cli group-consume");
+    let pid = child.id();
+
+    // Wait for the consumer to actually join, consume every produced record, and
+    // auto-commit at least once -- so SIGTERM lands on a process that has something to
+    // lose if the graceful-shutdown path is skipped. Frame offsets are 0-indexed, so the
+    // last of `num_records` frames commits offset `num_records - 1`.
+    let expected_committed = num_records - 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(committed) = setup_client.fetch_offset(group_id, topic, 0).await {
+            if committed == expected_committed {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the CLI consumer must consume and auto-commit every produced record before \
+             we send it SIGTERM"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // Send SIGTERM the same way Docker/Kubernetes/systemd would -- not SIGKILL, not
+    // SIGINT -- via the system `kill` binary rather than a new crate dependency.
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("failed to invoke `kill`");
+    assert!(
+        kill_status.success(),
+        "`kill -TERM {}` itself must succeed",
+        pid
+    );
+
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .expect("failed to wait on the hermes_cli child process");
+
+    assert!(
+        output.status.success(),
+        "hermes_cli must exit successfully after SIGTERM, proving it went through the \
+         graceful-shutdown path instead of being killed outright by the OS default action; \
+         status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Graceful shutdown signal received"),
+        "SIGTERM must drive the same graceful-shutdown log line SIGINT already used; \
+         stdout was: {}",
+        stdout
+    );
+}
