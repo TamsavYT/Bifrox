@@ -1,5 +1,6 @@
 use crate::config::EngineConfig;
-use crate::protocol::{RecordFrame, HEADER_SIZE};
+use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, HEADER_SIZE};
+use crate::segment::entry::{decode_entry, LogEntry};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
 use crate::segment::timeindex::TimeIndexSegment;
@@ -99,7 +100,10 @@ pub struct SegmentPair {
 }
 
 impl SegmentPair {
-    /// Reads all valid record frames sequentially from this log segment
+    /// Reads all valid record frames sequentially from this log segment. Callers of this
+    /// method (log compaction) only understand individual `RecordFrame`s, so a `RecordBatch`
+    /// found along the way is skipped by its own reported length rather than decoded into
+    /// the result — its presence must never truncate the scan and lose the frames after it.
     pub fn read_all_frames(&mut self) -> IoResult<Vec<RecordFrame>> {
         let size = self.log.physical_size as usize;
         if size == 0 {
@@ -114,10 +118,13 @@ impl SegmentPair {
                 break;
             }
             let slice = &raw_bytes[cursor..];
-            match RecordFrame::decode(slice) {
-                Ok((frame, consumed)) => {
+            match decode_entry(slice) {
+                Ok((LogEntry::Frame(frame), consumed)) => {
                     cursor += consumed;
                     frames.push(frame);
+                }
+                Ok((LogEntry::Batch(_), consumed)) => {
+                    cursor += consumed;
                 }
                 Err(_) => break,
             }
@@ -403,6 +410,16 @@ impl SegmentManager {
         self.active.log.append_bytes(&self.frame_encode_scratch)
     }
 
+    /// Same as `append_frame_to_active`, for a `RecordBatch` instead of a single frame —
+    /// shares the same reused scratch buffer (appends of every kind are already serialized
+    /// behind this `SegmentManager`'s owning `Mutex`, so there is never more than one
+    /// encode in flight to reuse it for).
+    fn append_batch_to_active(&mut self, batch: &RecordBatch) -> IoResult<u64> {
+        self.frame_encode_scratch.clear();
+        batch.encode_into(&mut self.frame_encode_scratch);
+        self.active.log.append_bytes(&self.frame_encode_scratch)
+    }
+
     /// Append record frames with optional payload compression. `payload` is taken by
     /// value as `Bytes` rather than `&[u8]` so the hot produce path (see
     /// `PartitionManager::produce_frame_eos`) can thread the already-decoded, already-owned
@@ -447,6 +464,74 @@ impl SegmentManager {
         self.active.log.next_offset = self.high_watermark;
 
         Ok(frame)
+    }
+
+    /// Appends a batch of records into the active segment as one `RecordBatch`, assigning
+    /// its base offset from the current high watermark exactly as `append_with_codec`
+    /// assigns a single frame's offset. Performs segment rotation if the size limit is
+    /// reached.
+    ///
+    /// Unlike a frame, a batch spans a *range* of offsets — `base_offset` through
+    /// `base_offset + last_offset_delta` — so it is only indexed (sparse offset index and
+    /// time index) by that base offset, the same way `open_at_path_with_trust`'s recovery
+    /// scan indexes a batch it finds on disk: the rest of the batch's offsets are reached
+    /// by decoding forward from there, never by their own index entry.
+    ///
+    /// Nothing on the produce path calls this yet (stage 1b-ii) — this only makes it
+    /// possible for a batch to be written and read back correctly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_batch(
+        &mut self,
+        base_timestamp: u64,
+        leader_epoch: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+        codec: BatchCompression,
+        records: &[(u64, Bytes)],
+    ) -> IoResult<RecordBatch> {
+        let assigned_base_offset = self.high_watermark;
+        let batch = RecordBatch::create(
+            assigned_base_offset,
+            base_timestamp,
+            leader_epoch,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            transactional,
+            codec,
+            records,
+        );
+        let batch_size = batch.encoded_size() as u64;
+
+        self.maybe_rotate_before_append(batch_size)?;
+
+        let physical_pos = self.append_batch_to_active(&batch)?;
+
+        // Sparse index entry placement, keyed by the batch's base offset (see doc comment).
+        if self.bytes_since_last_index >= self.config.index_interval_bytes
+            || self.active.index.entries_count() == 0
+        {
+            self.active
+                .index
+                .append(assigned_base_offset, physical_pos)?;
+            let _ = self
+                .active
+                .time_index
+                .append(base_timestamp, assigned_base_offset);
+            self.bytes_since_last_index = 0;
+        }
+
+        self.bytes_since_last_index += batch_size;
+        // The batch occupies `last_offset_delta + 1` offsets starting at
+        // `assigned_base_offset` (this also correctly reserves exactly one offset for a
+        // zero-record batch, matching `RecordBatch::create`'s own `last_offset_delta`
+        // convention, rather than duplicating its `record_count.saturating_sub(1)` logic).
+        self.high_watermark += batch.last_offset_delta as u64 + 1;
+        self.active.log.next_offset = self.high_watermark;
+
+        Ok(batch)
     }
 
     /// Appends a frame produced elsewhere (i.e. a leader's `RecordFrame`) byte-for-byte:
@@ -575,9 +660,21 @@ impl SegmentManager {
             if cursor + HEADER_SIZE > raw.len() {
                 break;
             }
-            match RecordFrame::decode(&raw[cursor..]) {
-                Ok((frame, consumed)) => {
+            match decode_entry(&raw[cursor..]) {
+                Ok((LogEntry::Frame(frame), consumed)) => {
                     if frame.offset == offset {
+                        return Ok(phys);
+                    }
+                    cursor += consumed;
+                    phys += consumed as u64;
+                }
+                Ok((LogEntry::Batch(batch), consumed)) => {
+                    // A batch is atomic — there is no physical position for an offset
+                    // partway through it, only for the batch as a whole. Any target
+                    // offset within its range (including its base) can only be reached
+                    // by truncating at the batch's own start, since discarding one of a
+                    // batch's records means discarding the whole batch.
+                    if offset <= batch.base_offset + batch.last_offset_delta as u64 {
                         return Ok(phys);
                     }
                     cursor += consumed;
@@ -2158,5 +2255,201 @@ mod tests {
             1,
             "active segment should have rolled purely due to age"
         );
+    }
+
+    fn sample_batch_records(n: usize) -> Vec<(u64, Bytes)> {
+        (0..n)
+            .map(|i| {
+                (
+                    1_700_000_000_000 + i as u64,
+                    Bytes::from(format!("rec-{i}")),
+                )
+            })
+            .collect()
+    }
+
+    /// A batch written via `append_batch` must read back byte-identical to what was
+    /// written, and be locatable through the sparse index by its base offset — the same
+    /// contract a frame append already provides.
+    #[test]
+    fn append_batch_round_trips_and_is_indexed_by_base_offset() {
+        let dir = TempDir::new("append_batch_round_trip");
+        let mut mgr = open_manager(&dir);
+
+        let records = sample_batch_records(4);
+        let written = mgr
+            .append_batch(
+                1_700_000_000_000,
+                7,
+                42,
+                3,
+                9,
+                false,
+                BatchCompression::None,
+                &records,
+            )
+            .unwrap();
+        assert_eq!(written.base_offset, 0);
+        assert_eq!(written.record_count, 4);
+
+        let size = mgr.active.log.physical_size as usize;
+        let raw = mgr.active.log.read_at(0, size).unwrap();
+        let (entry, consumed) = crate::segment::entry::decode_entry(&raw).unwrap();
+        assert_eq!(consumed, raw.len());
+        match entry {
+            LogEntry::Batch(decoded) => assert_eq!(decoded, written),
+            LogEntry::Frame(_) => panic!("expected a batch, decoded a frame"),
+        }
+
+        // Indexed by base offset: looking up any offset in [0, 3] must resolve to the
+        // batch's own physical start (0), the same as a fresh index with one entry would
+        // for a single frame at that position.
+        let seek = mgr.active.index.find_nearest_physical_pos(0).unwrap();
+        assert_eq!(seek.physical_position, 0);
+    }
+
+    /// A batch occupies as many offsets as it has records (`last_offset_delta + 1`) — the
+    /// next append must land right after the batch's whole range, not just after its base.
+    #[test]
+    fn append_batch_advances_high_watermark_by_record_count() {
+        let dir = TempDir::new("append_batch_hw");
+        let mut mgr = open_manager(&dir);
+
+        let records = sample_batch_records(5);
+        mgr.append_batch(0, 0, 0, 0, 0, false, BatchCompression::None, &records)
+            .unwrap();
+        assert_eq!(mgr.high_watermark(), 5);
+
+        let frame = mgr.append(b"after-the-batch", 123).unwrap();
+        assert_eq!(
+            frame.offset, 5,
+            "the frame after a 5-record batch must be assigned offset 5"
+        );
+    }
+
+    /// `SegmentPair::read_all_frames` is one of the four scan sites — its callers (log
+    /// compaction) only understand individual frames, so a batch in the middle must be
+    /// skipped by its own length, not decoded and not mistaken for corruption that would
+    /// truncate the scan and lose the frame written after it.
+    #[test]
+    fn read_all_frames_skips_a_batch_without_losing_frames_after_it() {
+        let dir = TempDir::new("read_all_frames_skip_batch");
+        let mut mgr = open_manager(&dir);
+
+        let f0 = mgr.append(b"frame0", 0).unwrap();
+        mgr.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap();
+        let f4 = mgr.append(b"frame4", 40).unwrap();
+
+        let frames = mgr.active.read_all_frames().unwrap();
+        assert_eq!(
+            frames,
+            vec![f0, f4],
+            "the batch must be skipped, and the frame after it must still be recovered"
+        );
+    }
+
+    /// `read_all_frames` on a segment with no batches at all must behave exactly as before
+    /// this stage — the regression check for the frame-only path.
+    #[test]
+    fn read_all_frames_frame_only_segment_is_unaffected() {
+        let dir = TempDir::new("read_all_frames_regression");
+        let mut mgr = open_manager(&dir);
+
+        let mut expected = Vec::new();
+        for i in 0..4u64 {
+            expected.push(mgr.append(format!("payload-{i}").as_bytes(), i).unwrap());
+        }
+
+        let frames = mgr.active.read_all_frames().unwrap();
+        assert_eq!(frames, expected);
+    }
+
+    /// `physical_pos_for_offset` is the other manager.rs scan site. A batch is atomic —
+    /// there is no on-disk position for an offset partway through one — so any offset
+    /// inside a batch's range (its base offset or a record after it) must resolve to the
+    /// batch's own start, the same physical point.
+    #[test]
+    fn physical_pos_for_offset_treats_any_offset_inside_a_batch_as_its_start() {
+        let dir = TempDir::new("physical_pos_batch");
+        let mut mgr = open_manager(&dir);
+
+        let f0 = mgr.append(b"frame0", 0).unwrap();
+        let f0_end = mgr.active.log.physical_size;
+        // base_offset=1, 3 records -> offsets 1,2,3
+        mgr.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap();
+        let batch_end = mgr.active.log.physical_size;
+        let f4 = mgr.append(b"frame4", 40).unwrap();
+
+        assert_eq!(f0.offset, 0);
+        assert_eq!(f4.offset, 4);
+
+        for target in [1u64, 2, 3] {
+            let phys = SegmentManager::physical_pos_for_offset(&mut mgr.active, target).unwrap();
+            assert_eq!(
+                phys, f0_end,
+                "offset {target} is inside the batch [1,3]; must resolve to the batch's start"
+            );
+        }
+
+        let phys = SegmentManager::physical_pos_for_offset(&mut mgr.active, 4).unwrap();
+        assert_eq!(
+            phys, batch_end,
+            "offset 4 is the frame right after the batch"
+        );
+    }
+
+    /// End-to-end: truncating exactly at a batch's base offset (the well-defined case,
+    /// analogous to truncating at a frame's own offset) removes the whole batch and
+    /// everything after it, keeping everything before intact.
+    #[test]
+    fn truncate_after_batch_base_offset_removes_whole_batch_and_later_frames() {
+        let dir = TempDir::new("truncate_after_batch_base");
+        let mut mgr = open_manager(&dir);
+
+        mgr.append(b"frame0", 0).unwrap();
+        mgr.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap(); // offsets 1-3
+        mgr.append(b"frame4", 40).unwrap();
+        assert_eq!(mgr.high_watermark(), 5);
+
+        mgr.truncate_after(1).unwrap();
+        assert_eq!(mgr.high_watermark(), 1);
+
+        let frames = mgr.active.read_all_frames().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset, 0);
+
+        // The freed offset range is reusable, exactly as it is after truncating a frame.
+        let refilled = mgr.append(b"replacement", 99).unwrap();
+        assert_eq!(refilled.offset, 1);
     }
 }
