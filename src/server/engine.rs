@@ -1589,8 +1589,10 @@ impl StorageEngine {
     /// so it can learn topics and ACLs, but it never votes, so counting it would make the
     /// majority threshold wrong — too low, which is the dangerous direction.
     ///
-    /// The leader counts itself: the record is already durable in its own log by the time
-    /// this is called.
+    /// The leader counts itself: `propose_metadata_unchecked` forces its own append durable
+    /// (via `PartitionManager::flush_durable`, unconditionally, not gated by the configured
+    /// flush policy) before calling this, so the record is already durable in its own log
+    /// by the time this is called.
     async fn await_metadata_commit(&self, offset: u64, timeout: std::time::Duration) -> bool {
         let controller_peers = self.config.effective_controller_peer_addrs();
         let quorum_size = controller_peers.len() + 1;
@@ -1636,6 +1638,12 @@ impl StorageEngine {
     ) -> IoResult<u64> {
         let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
         let frame = meta_pm.produce_frame(&record.encode())?;
+        // Force this leader's own append durable regardless of the configured flush
+        // policy — `produce_frame`'s internal `flush_if_sync_policy()` is a no-op under
+        // the default `AsyncPeriodic` policy. `await_metadata_commit` below counts the
+        // leader as an automatic ACK on the assumption that its own copy is already
+        // durable; without this, that assumption was false by default (issue #24).
+        meta_pm.flush_durable()?;
 
         if !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();

@@ -1253,7 +1253,19 @@ fn decode_replication_packet(
 
     // Group commit: one fsync for the whole replicated batch instead of one per frame
     // (see `PartitionManager::flush_if_sync_policy`).
-    if let Err(e) = pm.flush_if_sync_policy() {
+    //
+    // `__cluster_metadata` is the exception: it always syncs, regardless of the configured
+    // flush policy (see `PartitionManager::flush_durable`). Issue #24's remaining gap was
+    // that under the default `AsyncPeriodic` policy this ACK meant "in page cache", not "on
+    // disk" — so a majority acknowledgement did not actually guarantee durability of state
+    // that drives authorization and partition placement. Data topics keep the configurable
+    // policy; only the low-volume control-plane log pays the unconditional fsync.
+    let flush_result = if is_cluster_meta {
+        pm.flush_durable()
+    } else {
+        pm.flush_if_sync_policy()
+    };
+    if let Err(e) = flush_result {
         tracing::error!(
             "HA Replication: Failed to sync '{}' P{} after replicated batch: {}",
             topic,
@@ -3307,5 +3319,250 @@ mod grpc_replication_fetch_tests {
             Err(PacketError::NeedMoreData) => {}
             other => panic!("expected NeedMoreData, got {:?}", other),
         }
+    }
+}
+
+/// Issue #24's remaining item: a follower's ACK on the `__cluster_metadata` replication
+/// path (`decode_replication_packet`, the `0xAA` handler) must mean the record is actually
+/// durable, not merely written to the page cache. `FlushPolicy::AsyncPeriodic` (the
+/// default) makes `flush_if_sync_policy` a no-op until its interval/byte threshold trips,
+/// so before this fix the ACK was issued regardless. These tests exercise the fix directly
+/// against the `0xAA` decoder, the same way `grpc_replication_fetch_tests` above exercises
+/// the fetch-side decoder.
+#[cfg(test)]
+mod cluster_metadata_durability_tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::replication::MetadataRecord;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_handler_meta_durability_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_engine(dir: &TempDir) -> StorageEngine {
+        StorageEngine::new(EngineConfig {
+            data_dir: dir.0.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            // Explicit for documentation, though this is already `EngineConfig::default()`:
+            // AsyncPeriodic is the policy under which the durability gap existed.
+            flush_policy: crate::config::FlushPolicy::default(),
+            ..EngineConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Builds a `0xAA` replication-push packet exactly the way
+    /// `send_replication_push_pooled` (`src/replication/mod.rs`) frames it on the wire.
+    fn build_push_packet(
+        engine: &StorageEngine,
+        topic: &str,
+        partition: u32,
+        epoch: u64,
+        leader_hw: u64,
+        frames: &[RecordFrame],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put_u8(0xAA);
+        crate::protocol::wire::write_pascal_string(&mut buf, &engine.config().cluster_id);
+        crate::protocol::wire::write_pascal_string(&mut buf, topic);
+        buf.put_u32(partition);
+        buf.put_u64(epoch);
+        buf.put_u64(leader_hw);
+        buf.put_u32(frames.len() as u32);
+        for frame in frames {
+            frame.encode_into(&mut buf);
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn cluster_metadata_push_is_synced_even_under_the_default_async_periodic_policy() {
+        let dir = TempDir::new("sync_proof");
+        let engine = open_engine(&dir);
+
+        let record = MetadataRecord::TopicCreated {
+            topic: "sync_proof_topic".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+        };
+        let frame = RecordFrame::create(0, 0, record.encode());
+        let epoch = engine.replication().get_epoch();
+        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 1, &[frame]);
+
+        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
+        assert_eq!(ack, vec![0u8], "expected an ACK for a clean push");
+        assert!(
+            engine.topic_is_registered("sync_proof_topic"),
+            "the durable record must have been applied"
+        );
+
+        // The honest thing this proves: `unsynced_bytes` is reset to 0 only by a code path
+        // that called `SegmentManager::sync()` (a real `fsync`/`fdatasync` syscall) and
+        // succeeded — see `PartitionManager::flush_durable`/`flush_if_sync_policy`. It does
+        // not prove the bytes reached the physical platter (nothing running inside the
+        // process can prove that), but it does prove the sync syscall was actually issued
+        // here, under `FlushPolicy::AsyncPeriodic` with its default 5ms/64KB thresholds
+        // nowhere near tripped by this one small record — i.e. that the metadata push no
+        // longer depends on the configured flush policy to become durable.
+        let pm = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap();
+        assert_eq!(
+            pm.unsynced_bytes_for_test(),
+            0,
+            "the metadata partition must be fully synced immediately after the ACK"
+        );
+    }
+
+    /// Same push, but for an ordinary data topic — confirms the fix did not change data-topic
+    /// behavior under the default policy: the write lands, but nothing forces a sync, so
+    /// `unsynced_bytes` stays nonzero exactly as it always has.
+    #[tokio::test]
+    async fn data_topic_push_is_still_unsynced_under_the_default_async_periodic_policy() {
+        let dir = TempDir::new("data_topic_unaffected");
+        let engine = open_engine(&dir);
+
+        let frame = RecordFrame::create(0, 0, b"data record".to_vec());
+        let packet = build_push_packet(&engine, "orders", 0, 0, 1, &[frame]);
+
+        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
+        assert_eq!(ack, vec![0u8], "expected an ACK for a clean push");
+
+        let pm = engine.get_or_create_partition("orders", 0).unwrap();
+        assert!(
+            pm.unsynced_bytes_for_test() > 0,
+            "a data-topic push must NOT be forced durable under AsyncPeriodic — only \
+             __cluster_metadata gets the unconditional sync"
+        );
+    }
+
+    /// Sabotages the OS-level file descriptor backing `path` so the next `sync()` through
+    /// any `std::fs::File` still pointing at it fails, without ever fully closing the fd.
+    /// Used to force a real I/O failure in the sync step without depending on any
+    /// fault-injection seam in production code.
+    ///
+    /// This finds the fd via `/proc/self/fd` and `dup2`s a pipe's write end onto it after
+    /// closing the pipe's read end — a write end whose reader is gone still accepts
+    /// `close()` normally, but `fsync`/`fdatasync` on a pipe always fails with `EINVAL`
+    /// (verified: pipes aren't syncable objects). Redirecting instead of closing matters:
+    /// an outright `libc::close` on a fd the standard library still owns is exactly the
+    /// double-close pattern its IO-safety hardening watches for, and it aborts the whole
+    /// process the moment the owning `File`'s `Drop` tries to close the same fd again.
+    /// `dup2` keeps the fd number continuously open (just repointed), so that `Drop` closes
+    /// a live fd like any other and nothing aborts.
+    ///
+    /// Linux-only: relies on `/proc/self/fd` and `libc`, which is a
+    /// `cfg(target_os = "linux")`-only dependency (see `Cargo.toml`) and unavailable on the
+    /// Windows CI target.
+    #[cfg(target_os = "linux")]
+    fn sabotage_fd_for(path: &std::path::Path) {
+        let target = std::fs::canonicalize(path).expect("path must exist to steal its fd");
+        let fd_dir = std::fs::read_dir("/proc/self/fd").expect("/proc/self/fd must be readable");
+        let mut target_fd: Option<i32> = None;
+        for entry in fd_dir.flatten() {
+            let fd_path = entry.path();
+            if std::fs::read_link(&fd_path).ok().as_deref() != Some(target.as_path()) {
+                continue;
+            }
+            target_fd = fd_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse().ok());
+            break;
+        }
+        let target_fd = target_fd.unwrap_or_else(|| panic!("no open fd found for {:?}", target));
+
+        unsafe {
+            let mut pipe_fds = [0i32; 2];
+            assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0, "pipe() failed");
+            let [read_end, write_end] = pipe_fds;
+            assert_eq!(libc::close(read_end), 0, "closing pipe read end failed");
+            assert_eq!(
+                libc::dup2(write_end, target_fd),
+                target_fd,
+                "dup2 onto the target fd failed"
+            );
+            assert_eq!(
+                libc::close(write_end),
+                0,
+                "closing spare pipe write end failed"
+            );
+        }
+    }
+
+    /// Guards the NACK-on-failure logic (existing behavior) specifically against the sync
+    /// step, isolated from the write step: this closes only the *index* file's fd, after an
+    /// earlier append already forced its first (and only, for a while — see
+    /// `index_interval_bytes`) index write, so the record under test appends its log bytes
+    /// successfully — `append_replica_frame_verbatim` returns `Appended` — and only the
+    /// follow-up `flush_durable()` sync fails. This is deliberately a different failure
+    /// shape than the existing `Gap`-based write-failure path: it proves specifically that a
+    /// failed *sync*, with the write itself having succeeded, still produces a NACK and still
+    /// leaves the metadata record unapplied.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_sync_still_nacks_and_leaves_metadata_unapplied() {
+        let dir = TempDir::new("sync_failure_nacks");
+        let engine = open_engine(&dir);
+
+        let pm = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap();
+        // Prime the index: the very first append always writes an index entry (see
+        // `SegmentManager::append_verbatim`), so this is out of the way before the fd gets
+        // closed below.
+        pm.append_replica_frame_verbatim(&RecordFrame::create(0, 0, b"priming record".to_vec()))
+            .unwrap();
+        pm.flush_durable().unwrap();
+
+        let index_path = dir.0.join("__cluster_metadata-0").join(format!(
+            "{}.index",
+            crate::segment::log::format_segment_filename(0)
+        ));
+        sabotage_fd_for(&index_path);
+
+        let record = MetadataRecord::TopicCreated {
+            topic: "should_not_apply".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+        };
+        // Offset 1, tiny payload: well under `index_interval_bytes` (4096 by default), so
+        // this append writes only to the log — the index file (whose fd is now closed) is
+        // untouched by the write itself, only by the sync that follows.
+        let frame = RecordFrame::create(1, 0, record.encode());
+        let epoch = engine.replication().get_epoch();
+        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 2, &[frame]);
+
+        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
+        assert_eq!(
+            ack,
+            vec![1u8],
+            "a sync failure must still produce a NACK, not a silent ACK"
+        );
+        assert!(
+            !engine.topic_is_registered("should_not_apply"),
+            "metadata whose durability could not be confirmed must not be applied"
+        );
     }
 }
