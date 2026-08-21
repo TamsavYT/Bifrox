@@ -6720,3 +6720,871 @@ fn test_scenario_78_correlation_id_mismatch_is_reported_as_error() {
         err
     );
 }
+
+/// The key claim of incremental cooperative rebalancing (issue #66, Kafka's KIP-429):
+/// when a new member joins a `cooperative-sticky` group, partitions that are NOT moving
+/// keep their in-memory consumption position across the rebalance — the existing member
+/// (a real `GroupConsumer`, exercising the actual `rejoin()` implementation, not a
+/// hand-simulated stand-in) resumes exactly where it left off, with no re-delivery and no
+/// gap — while the partition that does move is picked up by its new owner from exactly
+/// where the old owner's automatic revoke-commit left it. This is deliberately stronger
+/// than asserting the final assignment is correct (an eager rebalance would produce that
+/// too): it checks actual record continuity, at the offset level, on both the kept and
+/// the moved partition.
+///
+/// The new member's own join is driven with a raw `TestClient` rather than a second
+/// `GroupConsumer`: the round-one-only intermediate state this feature produces exists
+/// for a network-round-trip-scale window (the leader chains straight from round one into
+/// requesting round two), far too narrow for a second, independently-scheduled
+/// `GroupConsumer`'s background heartbeat to reliably observe without an inherently flaky
+/// race — that specific protocol-level property (round one hands out nothing) is instead
+/// proven deterministically in scenario 80. This test's job is the data-level guarantee,
+/// which only needs the new member's *final* state.
+///
+/// The timing of production matters here: r1/r2 are held back until the coordinator has
+/// *already* fully settled the rebalance (checked via a spectator connection, not via
+/// A's own client) and A's background heartbeat has had a full interval to notice and
+/// flag `needs_rejoin` — otherwise A's own poll loop, driven by this test to detect the
+/// rebalance, would race ahead and fetch r1/r2 under the old assignment before the
+/// rejoin ever happens, leaving nothing left to distinguish "resumed correctly" from
+/// "resumed from scratch".
+#[tokio::test]
+async fn test_scenario_79_cooperative_rebalance_revokes_before_reassigning_and_preserves_position()
+{
+    let env = start_test_server().await;
+    let topic = "coop_key_topic";
+    let group_id = "coop_key_group";
+    let num_partitions = 4u32;
+
+    let mut setup = TestClient::connect(env.addr).await.unwrap();
+    setup.create_topic(topic, num_partitions).await.unwrap();
+
+    // Only r0 on every partition up front.
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        let payload = format!("p{partition}-r0");
+        setup
+            .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    let heartbeat_interval = Duration::from_millis(60);
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        protocols: vec!["cooperative-sticky".to_string()],
+        heartbeat_interval,
+        session_timeout: Duration::from_secs(3),
+        ..GroupConsumerConfig::default()
+    };
+
+    let client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut a = GroupConsumer::join(client_a, config.clone()).await.unwrap();
+    let mut a_assignment = a.assignment().to_vec();
+    a_assignment.sort_unstable();
+    assert_eq!(
+        a_assignment,
+        vec![0u32, 1, 2, 3],
+        "A must start out owning every partition"
+    );
+
+    // A consumes r0 from every partition, but never commits — its in-memory position
+    // moves ahead of the broker's committed offset, and stays that way for whichever
+    // partitions it ends up keeping.
+    let mut consumed_first: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while consumed_first.len() < num_partitions as usize && std::time::Instant::now() < deadline {
+        let records = a.poll().await.unwrap();
+        for (partition, frame) in records {
+            consumed_first
+                .entry(partition)
+                .or_insert_with(|| String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        if consumed_first.len() < num_partitions as usize {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    for partition in 0..num_partitions {
+        assert_eq!(
+            consumed_first.get(&partition),
+            Some(&format!("p{partition}-r0")),
+            "A must have consumed exactly r0 of partition {partition} before B joins"
+        );
+    }
+
+    // B joins. A brand-new member's JoinGroup bumps the group's generation — this is
+    // round one's trigger.
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+    let join_b = client_b
+        .join_group(group_id, "", &["cooperative-sticky"])
+        .await
+        .expect("B must be able to register with the group");
+    assert!(!join_b.is_leader, "A must remain the leader when B joins");
+
+    // Watch the coordinator's own bookkeeping, from a separate connection, for a moment
+    // where the partition about to move is owned by neither A nor B — the handover-safety
+    // property that is actually specific to cooperative rebalancing (see the rename
+    // comment below). A's leader-side `rejoin()` submits round one and round two as two
+    // separate, atomic `SyncGroup` calls with a real round-trip (and, for round two, a
+    // full `group_initial_rebalance_delay_ms` join window) between them, so this window
+    // is not a hair's-breadth race: it is open for tens of milliseconds, plenty for this
+    // background poll loop to land inside it before A's own poll loop (below) observes
+    // the settled, final state. If the intersection narrowing in `cooperative_round_one`
+    // were disabled, A's single `SyncGroup` call would move every partition in one atomic
+    // step and this sum would never dip below `num_partitions` at all.
+    let a_member_id = a.member_id().to_string();
+    let b_member_id = join_b.member_id.clone();
+    let watch_group_id = group_id.to_string();
+    let watch_topic = topic.to_string();
+    let watch_addr = env.addr;
+    let handover_witness: tokio::task::JoinHandle<Option<(Vec<u32>, Vec<u32>)>> =
+        tokio::spawn(async move {
+            let mut spectator = TestClient::connect(watch_addr).await.ok()?;
+            // Bounded well under B's session timeout (10s by default, since B is a raw
+            // `TestClient` here and never heartbeats): the genuine window this is
+            // watching for is tens of milliseconds wide (see the comment above), so 3s is
+            // generous headroom for it, while still failing fast — rather than stalling
+            // long enough for B's own session to expire and produce a confusing,
+            // unrelated failure further down — if the property genuinely never appears.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((_, members)) = spectator.describe_group(&watch_group_id).await {
+                    let mut a_partitions: Vec<u32> = Vec::new();
+                    let mut b_partitions: Vec<u32> = Vec::new();
+                    for m in members {
+                        let mut partitions: Vec<u32> = m
+                            .assigned_partitions
+                            .into_iter()
+                            .filter(|(t, _)| t == &watch_topic)
+                            .map(|(_, p)| p)
+                            .collect();
+                        partitions.sort_unstable();
+                        if m.member_id == a_member_id {
+                            a_partitions = partitions;
+                        } else if m.member_id == b_member_id {
+                            b_partitions = partitions;
+                        }
+                    }
+                    if a_partitions.len() + b_partitions.len() < num_partitions as usize {
+                        return Some((a_partitions, b_partitions));
+                    }
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+            None
+        });
+
+    // Drive A's own poll loop until it notices B (via its background heartbeat
+    // failing on the now-stale generation) and rebalances. A is the leader, and its
+    // `rejoin()` performs both cooperative rounds synchronously once it fires, so
+    // this loop only ever needs to observe the *final* state — there's no
+    // intermediate value to catch here. This is safe to do with plain `poll()` calls
+    // rather than racing an eager fetch: r1/r2 don't exist on the broker yet (they're
+    // produced further down, only once this settles), so there is nothing for an
+    // ordinary fetch to prematurely slurp up in the meantime.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = a.poll().await.unwrap();
+        if !a.assignment().is_empty() && a.assignment().len() < num_partitions as usize {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never rebalanced after B joined; still owns {:?}",
+            a.assignment()
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // --- The key assertion: cooperative rebalancing must have actually passed through
+    // an intermediate state where the moving partition belonged to neither A nor B,
+    // rather than jumping directly from A to B in one atomic step. This is what an
+    // eager-equivalent bug — e.g. `cooperative_round_one` hand out the full target
+    // instead of the intersection with what a member already owned — would remove: it
+    // would collapse the two-round handover into a single round, so the watcher above
+    // would never see the partition count dip below `num_partitions` at all. ---
+    let handover_witness = handover_witness
+        .await
+        .expect("the handover-watcher task must not panic");
+    let (witnessed_a, witnessed_b) = handover_witness.expect(
+        "must observe a moment where the moving partition is owned by neither A nor B — \
+         cooperative rebalancing must revoke it from A (round one) before it is ever \
+         handed to B (round two), never both in the same atomic SyncGroup submission",
+    );
+    assert!(
+        witnessed_b.is_empty(),
+        "B is a brand-new member with nothing to intersect against, so round one's \
+         keep-set for it must be empty — B must own nothing at this intermediate point, \
+         got {witnessed_b:?}"
+    );
+    assert!(
+        witnessed_a.len() < num_partitions as usize,
+        "A must have already released at least one partition by this intermediate point, \
+         got {witnessed_a:?}"
+    );
+
+    // Only now produce r1/r2 — after the rebalance has fully settled and A's own
+    // position for whatever it kept is confirmed untouched since r0.
+    for partition in 0..num_partitions {
+        let key = key_for_partition(partition, num_partitions);
+        for i in 1..3 {
+            let payload = format!("p{partition}-r{i}");
+            setup
+                .produce_single(topic, &key, None, num_partitions, payload.as_bytes())
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut a_final = a.assignment().to_vec();
+    a_final.sort_unstable();
+    assert!(
+        !a_final.is_empty(),
+        "A must still own at least one partition"
+    );
+    assert!(
+        a_final.len() < num_partitions as usize,
+        "A must have given up at least one partition to B"
+    );
+
+    // B's confirmed, final share — read via the *same* generation A (the real
+    // `GroupConsumer`) ended up on, with no further JoinGroup call from B: B is
+    // already a known member, so a redundant JoinGroup here — while the group is
+    // already Stable — would itself request an unwanted *third* round under this
+    // feature's own cooperative JoinGroup semantics. A plain SyncGroup has no such
+    // side effect and simply returns B's stored assignment.
+    let final_generation = a.generation_id();
+    let b_assignment = client_b
+        .sync_group(group_id, final_generation, &join_b.member_id, &[])
+        .await
+        .expect("B's sync at the group's final, current generation must succeed");
+    let mut b_final: Vec<u32> = b_assignment
+        .into_iter()
+        .find(|(t, _)| t == topic)
+        .map(|(_, p)| p)
+        .unwrap_or_default();
+    b_final.sort_unstable();
+    assert!(
+        !b_final.is_empty(),
+        "B must have gained at least one partition"
+    );
+
+    let mut combined: Vec<u32> = a_final.iter().chain(b_final.iter()).copied().collect();
+    combined.sort_unstable();
+    assert_eq!(
+        combined,
+        vec![0u32, 1, 2, 3],
+        "together the two members must cover every partition exactly once"
+    );
+
+    // --- A regression guard, not proof of this feature: non-moving partitions resume
+    // exactly where A left off, picking up r1/r2 (produced after the rebalance settled
+    // but never yet fetched) without re-reading r0. This behavior — `next_offsets`
+    // surviving a rebalance for whatever a member still owns — predates cooperative
+    // rebalancing entirely (it came from #51's original `GroupConsumer`, untouched by
+    // this feature) and holds just as well for an eager rebalance, so it passes even
+    // with the intersection narrowing above disabled. Worth keeping as a guard against a
+    // different regression, but the property that actually distinguishes cooperative
+    // from eager is the handover-safety assertion above. ---
+    let mut seen_on_kept: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen_on_kept.values().map(Vec::len).sum::<usize>() < a_final.len() * 2
+        && std::time::Instant::now() < deadline
+    {
+        let records = a.poll().await.unwrap();
+        for (partition, frame) in records {
+            seen_on_kept
+                .entry(partition)
+                .or_default()
+                .push(String::from_utf8_lossy(&frame.payload).to_string());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    for &partition in &a_final {
+        assert_eq!(
+            seen_on_kept.get(&partition).cloned().unwrap_or_default(),
+            vec![format!("p{partition}-r1"), format!("p{partition}-r2")],
+            "partition {partition} never moved and must resume exactly where A left off \
+             — no re-delivery of r0, no gap on r1/r2 either"
+        );
+    }
+
+    // --- Moved partitions resume from A's committed offset: r0 (committed via the
+    // automatic commit at the top of A's own rejoin) must not be re-delivered to B,
+    // but r1 and r2 (which A never touched) must both still arrive. Read directly via
+    // raw fetch/offset calls under B's own member identity — this is exactly what a
+    // real consuming `GroupConsumer` would do with this assignment, just without a
+    // second background-heartbeat actor racing the narrow round-one window. ---
+    for &partition in &b_final {
+        let committed = client_b
+            .fetch_offset(group_id, topic, partition)
+            .await
+            .expect("fetching the committed offset must succeed");
+        assert_eq!(
+            committed, 0,
+            "partition {partition} must be committed exactly through r0 — A's automatic \
+             revoke-commit, not 0 records and not r1/r2 (which A never fetched)"
+        );
+        let start = committed + 1;
+        let frames = client_b
+            .fetch_as_member(
+                topic,
+                partition,
+                start,
+                64 * 1024,
+                group_id,
+                &join_b.member_id,
+            )
+            .await
+            .expect("B's fetch of its newly-owned partition must succeed");
+        let payloads: Vec<String> = frames
+            .iter()
+            .filter(|f| !f.is_control_marker())
+            .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![format!("p{partition}-r1"), format!("p{partition}-r2")],
+            "partition {partition} moved to B and must resume from A's committed offset \
+             — neither re-delivering r0 nor skipping r1/r2"
+        );
+    }
+}
+
+/// Complements scenario 79 from the giver's side: when a member's target loses exactly
+/// one of its two partitions, round one's SyncGroup submission must revoke exactly that
+/// one partition — not both (an eager-equivalent bug would hand out an empty keep-set
+/// for everyone), and not neither (a no-op bug would never free anything up for round
+/// two). Driven with raw `TestClient` calls, computing the expected round-one payload
+/// with the real library functions (`assign_sticky` / `cooperative_round_one`) — exactly
+/// what `GroupConsumer::rejoin`'s leader branch does internally — so this test is
+/// checking the coordinator's actual protocol state, deterministically, rather than
+/// racing a background heartbeat.
+#[tokio::test]
+async fn test_scenario_80_cooperative_round_one_revokes_only_the_moving_partition() {
+    let env = start_test_server().await;
+    let group_id = "coop-revoke-group";
+    let topic = "coop-revoke-topic";
+
+    let mut setup = TestClient::connect(env.addr).await.unwrap();
+    setup.create_topic(topic, 2).await.unwrap();
+
+    let mut client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+
+    // A forms the group alone, holding both partitions.
+    let join_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .expect("A must be able to join");
+    assert_eq!(join_a.generation_id, 1);
+    assert!(join_a.is_leader);
+    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+        member_id: "member-a".to_string(),
+        topic: topic.to_string(),
+        partitions: vec![0, 1],
+    }];
+    let a_assignment = client_a
+        .sync_group(group_id, 1, "member-a", &a_full)
+        .await
+        .expect("A's initial sync must succeed");
+    assert_eq!(a_assignment, vec![(topic.to_string(), vec![0, 1])]);
+
+    // B joins — a brand-new member always bumps the generation.
+    let join_b = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .expect("B must be able to join");
+    assert_eq!(join_b.generation_id, 2);
+    assert!(!join_b.is_leader);
+
+    // A rejoins to learn generation 2 (an already-known member joining a window that's
+    // still open — existing, unchanged behavior), then computes round one exactly like
+    // `GroupConsumer::rejoin`'s leader branch does.
+    let rejoin_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .expect("A's rejoin must succeed");
+    assert_eq!(rejoin_a.generation_id, 2);
+    assert!(rejoin_a.is_leader);
+
+    let previous: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::from([
+        ("member-a".to_string(), vec![0, 1]),
+        ("member-b".to_string(), vec![]),
+    ]);
+    let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
+    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
+    let (round_one, needs_second_round) =
+        hermes::consumer::cooperative_round_one(&target, &previous);
+    assert!(
+        needs_second_round,
+        "one partition must be moving from A to B, so a second round is required"
+    );
+
+    let round_one_map: std::collections::HashMap<String, Vec<u32>> =
+        round_one.iter().cloned().collect();
+    let a_keep = round_one_map.get("member-a").cloned().unwrap_or_default();
+    let b_keep = round_one_map.get("member-b").cloned().unwrap_or_default();
+
+    // The distinguishing property under test: A's keep-set is exactly one partition
+    // (the one NOT moving) — not both (nothing withheld at all) and not empty
+    // (everything withheld, the eager-equivalent behavior).
+    assert_eq!(
+        a_keep.len(),
+        1,
+        "A must keep exactly one of its two partitions in round one, got {a_keep:?}"
+    );
+    assert!(
+        b_keep.is_empty(),
+        "B must receive nothing in round one — it never owned anything yet, got {b_keep:?}"
+    );
+    let a_revoked: Vec<u32> = vec![0u32, 1]
+        .into_iter()
+        .filter(|p| !a_keep.contains(p))
+        .collect();
+    assert_eq!(
+        a_revoked.len(),
+        1,
+        "exactly one partition must be revoked from A, not both"
+    );
+
+    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+        .iter()
+        .map(
+            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: topic.to_string(),
+                partitions: partitions.clone(),
+            },
+        )
+        .collect();
+    client_a
+        .sync_group(group_id, 2, "member-a", &round_one_assignments)
+        .await
+        .expect("A's round-one submission must succeed");
+
+    // Inspect what actually landed, from a separate connection, so the assertion is
+    // about the coordinator's real state rather than what the test computed locally.
+    let mut spectator = TestClient::connect(env.addr).await.unwrap();
+    let (_, members) = spectator.describe_group(group_id).await.unwrap();
+    let by_id: std::collections::HashMap<String, Vec<u32>> = members
+        .into_iter()
+        .map(|m| {
+            let mut partitions: Vec<u32> = m
+                .assigned_partitions
+                .into_iter()
+                .filter(|(t, _)| t == topic)
+                .map(|(_, p)| p)
+                .collect();
+            partitions.sort_unstable();
+            (m.member_id, partitions)
+        })
+        .collect();
+    let mut expected_a_keep = a_keep.clone();
+    expected_a_keep.sort_unstable();
+    assert_eq!(
+        by_id.get("member-a"),
+        Some(&expected_a_keep),
+        "the coordinator must reflect exactly A's computed keep-set, not everything and \
+         not nothing"
+    );
+    assert_eq!(
+        by_id.get("member-b"),
+        Some(&Vec::new()),
+        "B must own nothing in the coordinator's state after round one"
+    );
+
+    // B's own follower sync now succeeds (the group is Stable) and confirms it got
+    // nothing either.
+    let b_assignment = client_b
+        .sync_group(group_id, 2, "member-b", &[])
+        .await
+        .expect("B's follower sync must succeed once A has submitted round one");
+    assert_eq!(b_assignment, vec![(topic.to_string(), Vec::new())]);
+}
+
+/// Proves the two-round cooperative dance actually completes in exactly two rounds and
+/// converges to the sticky target — not one (which would mean cooperative silently
+/// degraded to eager) and not three-or-more (which would mean it oscillates instead of
+/// converging). Continues directly from where scenario 80 leaves off, driving round two
+/// through raw `TestClient` calls for the same determinism.
+#[tokio::test]
+async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds() {
+    let env = start_test_server().await;
+    let group_id = "coop-converge-group";
+    let topic = "coop-converge-topic";
+
+    let mut client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+    TestClient::connect(env.addr)
+        .await
+        .unwrap()
+        .create_topic(topic, 2)
+        .await
+        .unwrap();
+
+    let join_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(join_a.generation_id, 1);
+    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+        member_id: "member-a".to_string(),
+        topic: topic.to_string(),
+        partitions: vec![0, 1],
+    }];
+    client_a
+        .sync_group(group_id, 1, "member-a", &a_full)
+        .await
+        .unwrap();
+
+    let join_b = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(
+        join_b.generation_id, 2,
+        "round one: B's join bumps the generation once"
+    );
+
+    let rejoin_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(rejoin_a.generation_id, 2);
+
+    let previous: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::from([
+        ("member-a".to_string(), vec![0, 1]),
+        ("member-b".to_string(), vec![]),
+    ]);
+    let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
+    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
+    let (round_one, needs_second_round) =
+        hermes::consumer::cooperative_round_one(&target, &previous);
+    assert!(needs_second_round);
+
+    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+        .iter()
+        .map(
+            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: topic.to_string(),
+                partitions: partitions.clone(),
+            },
+        )
+        .collect();
+    client_a
+        .sync_group(group_id, 2, "member-a", &round_one_assignments)
+        .await
+        .unwrap();
+    // The group is Stable again at generation 2 — round one is done.
+
+    // Round two: A (the leader), already a known member, requests a fresh round by
+    // calling JoinGroup again while the group is Stable — the coordinator change this
+    // feature needed (`GroupCoordinator::join_group`'s cooperative branch) bumps the
+    // generation for exactly this call.
+    let round_two_join = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .expect("A must be able to request a second round");
+    assert_eq!(
+        round_two_join.generation_id, 3,
+        "round two: the generation must advance again, with no membership change at all"
+    );
+    assert!(round_two_join.is_leader);
+
+    // Round two reuses `target` as-is (see `GroupConsumer::rejoin`'s reasoning) rather
+    // than recomputing it.
+    let target_assignments: Vec<hermes::protocol::wire::MemberAssignment> = target
+        .iter()
+        .map(
+            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: topic.to_string(),
+                partitions: partitions.clone(),
+            },
+        )
+        .collect();
+    let a_final = client_a
+        .sync_group(group_id, 3, "member-a", &target_assignments)
+        .await
+        .expect("A's round-two submission must succeed");
+
+    let target_map: std::collections::HashMap<String, Vec<u32>> = target.iter().cloned().collect();
+    assert_eq!(
+        a_final,
+        vec![(topic.to_string(), target_map["member-a"].clone())]
+    );
+
+    // B notices the new generation and rejoins, then syncs to get its final share.
+    let b_rejoin = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .expect("B must be able to rejoin for round two");
+    assert_eq!(b_rejoin.generation_id, 3);
+    let b_final = client_b
+        .sync_group(group_id, 3, "member-b", &[])
+        .await
+        .expect("B's round-two sync must succeed");
+    assert_eq!(
+        b_final,
+        vec![(topic.to_string(), target_map["member-b"].clone())]
+    );
+
+    // Convergence: the group's final state exactly matches the sticky target, and
+    // re-running round one's own logic against that final state shows nothing further
+    // would need to be withheld — i.e. a third round is never triggered.
+    let mut spectator = TestClient::connect(env.addr).await.unwrap();
+    let (state_str, members) = spectator.describe_group(group_id).await.unwrap();
+    assert_eq!(state_str, "Stable");
+    let final_ownership: std::collections::HashMap<String, Vec<u32>> = members
+        .into_iter()
+        .map(|m| {
+            let mut partitions: Vec<u32> = m
+                .assigned_partitions
+                .into_iter()
+                .filter(|(t, _)| t == topic)
+                .map(|(_, p)| p)
+                .collect();
+            partitions.sort_unstable();
+            (m.member_id, partitions)
+        })
+        .collect();
+    assert_eq!(
+        final_ownership, target_map,
+        "the group must land exactly on the sticky target"
+    );
+
+    let (_, no_third_round) = hermes::consumer::cooperative_round_one(&target, &final_ownership);
+    assert!(
+        !no_third_round,
+        "the final state already matches the target, so nothing more should ever be \
+         withheld — a third round must never be triggered"
+    );
+}
+
+/// Eager groups (`range`, `roundrobin`, plain `sticky`) must rebalance exactly as they
+/// did before this feature existed: one generation bump, one `SyncGroup` submission,
+/// full target handed out immediately — no intersection narrowing, no withheld
+/// partitions, no second round. `GroupConsumer::rejoin`'s cooperative branch must be
+/// entered only for a negotiated `cooperative-sticky` protocol.
+#[tokio::test]
+async fn test_scenario_82_eager_group_still_rebalances_in_a_single_round() {
+    let env = start_test_server().await;
+    let topic = "eager_unaffected_topic";
+    let group_id = "eager_unaffected_group";
+    let num_partitions = 4u32;
+
+    let mut setup = TestClient::connect(env.addr).await.unwrap();
+    setup.create_topic(topic, num_partitions).await.unwrap();
+
+    let config = GroupConsumerConfig {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        protocols: vec!["sticky".to_string()],
+        heartbeat_interval: Duration::from_millis(60),
+        session_timeout: Duration::from_secs(3),
+        ..GroupConsumerConfig::default()
+    };
+
+    let client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut a = GroupConsumer::join(client_a, config.clone()).await.unwrap();
+    let mut a_assignment = a.assignment().to_vec();
+    a_assignment.sort_unstable();
+    assert_eq!(a_assignment, vec![0u32, 1, 2, 3]);
+    let generation_after_bootstrap = a.generation_id();
+
+    let client_b = TestClient::connect(env.addr).await.unwrap();
+    let join_config = config.clone();
+    let b_handle = tokio::spawn(async move { GroupConsumer::join(client_b, join_config).await });
+
+    // Drive A's poll loop until it notices B and rebalances.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = a.poll().await.unwrap();
+        if a.assignment().len() < num_partitions as usize {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never rebalanced after B joined"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // Exactly one generation bump for this membership change — no cooperative second
+    // round exists for an eager protocol.
+    assert_eq!(
+        a.generation_id(),
+        generation_after_bootstrap + 1,
+        "an eager group must advance the generation exactly once per membership change"
+    );
+
+    let b = b_handle
+        .await
+        .unwrap()
+        .expect("B must be able to join and sync in a single round");
+
+    // The distinguishing assertion: B's very first join+sync cycle already carries its
+    // full, final share — not an empty round-one placeholder. This is what would break
+    // if the cooperative narrowing logic leaked into the eager path.
+    assert!(
+        !b.assignment().is_empty(),
+        "an eager group must hand the new member its real assignment immediately, not \
+         an empty round-one placeholder"
+    );
+
+    let mut a_final = a.assignment().to_vec();
+    a_final.sort_unstable();
+    let mut b_final = b.assignment().to_vec();
+    b_final.sort_unstable();
+    let mut combined: Vec<u32> = a_final.iter().chain(b_final.iter()).copied().collect();
+    combined.sort_unstable();
+    assert_eq!(combined, vec![0u32, 1, 2, 3]);
+}
+
+/// Generation fencing: two cooperative rounds mean the group's generation advances
+/// twice for the same membership change. A member still holding round one's now-stale
+/// generation id must be rejected — not served round two's assignment, and not treated
+/// as still current — once round two has landed.
+#[tokio::test]
+async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two() {
+    let env = start_test_server().await;
+    let group_id = "coop-fencing-group";
+    let topic = "coop-fencing-topic";
+
+    let mut client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+    TestClient::connect(env.addr)
+        .await
+        .unwrap()
+        .create_topic(topic, 2)
+        .await
+        .unwrap();
+
+    let join_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+        member_id: "member-a".to_string(),
+        topic: topic.to_string(),
+        partitions: vec![0, 1],
+    }];
+    client_a
+        .sync_group(group_id, join_a.generation_id, "member-a", &a_full)
+        .await
+        .unwrap();
+
+    let join_b = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    let round_one_generation = join_b.generation_id;
+
+    let rejoin_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(rejoin_a.generation_id, round_one_generation);
+
+    let previous: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::from([
+        ("member-a".to_string(), vec![0, 1]),
+        ("member-b".to_string(), vec![]),
+    ]);
+    let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
+    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
+    let (round_one, _) = hermes::consumer::cooperative_round_one(&target, &previous);
+    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+        .iter()
+        .map(
+            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: topic.to_string(),
+                partitions: partitions.clone(),
+            },
+        )
+        .collect();
+    client_a
+        .sync_group(
+            group_id,
+            round_one_generation,
+            "member-a",
+            &round_one_assignments,
+        )
+        .await
+        .unwrap();
+
+    // Round two: A requests and drives a fresh round, advancing the generation again.
+    let round_two_join = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    let round_two_generation = round_two_join.generation_id;
+    assert_ne!(
+        round_two_generation, round_one_generation,
+        "round two must be a genuinely new generation"
+    );
+    let target_assignments: Vec<hermes::protocol::wire::MemberAssignment> = target
+        .iter()
+        .map(
+            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                member_id: member_id.clone(),
+                topic: topic.to_string(),
+                partitions: partitions.clone(),
+            },
+        )
+        .collect();
+    client_a
+        .sync_group(
+            group_id,
+            round_two_generation,
+            "member-a",
+            &target_assignments,
+        )
+        .await
+        .unwrap();
+
+    // The group has now fully stabilized at round two's generation. A follower still
+    // presenting round one's stale generation id must be fenced, not served.
+    let stale_sync = client_b
+        .sync_group(group_id, round_one_generation, "member-b", &[])
+        .await;
+    assert!(
+        stale_sync.is_err(),
+        "SyncGroup at round one's stale generation must not succeed once round two has \
+         landed"
+    );
+    assert!(
+        stale_sync
+            .unwrap_err()
+            .to_string()
+            .contains("Generation mismatch"),
+        "the failure must be a recognisable generation mismatch, not some other error"
+    );
+
+    let stale_heartbeat = client_b
+        .heartbeat(group_id, round_one_generation, "member-b")
+        .await;
+    assert!(
+        stale_heartbeat.is_err(),
+        "a heartbeat at round one's stale generation must not succeed once the group has \
+         fully stabilized past it — even for a cooperative group, once state is Stable \
+         there is no further grace period for a generation that old"
+    );
+
+    // Confirm the group's real state never regressed to round one's assignment: B's
+    // real (round two) generation still works and returns its final share.
+    let b_current = client_b
+        .sync_group(group_id, round_two_generation, "member-b", &[])
+        .await
+        .expect("B's real, current generation must still work");
+    let target_map: std::collections::HashMap<String, Vec<u32>> = target.into_iter().collect();
+    assert_eq!(
+        b_current,
+        vec![(topic.to_string(), target_map["member-b"].clone())]
+    );
+}

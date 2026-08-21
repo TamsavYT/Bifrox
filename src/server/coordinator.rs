@@ -509,6 +509,47 @@ impl GroupCoordinator {
             // recovering from a stale generation), not a fresh process, so it must not
             // get a free pass on the stalled-consumption check it hasn't earned.
             member.session_timeout = session_timeout;
+
+            // Incremental cooperative rebalancing (KIP-429, issue #66) needs a second
+            // rebalance round with no membership change at all: round one hands a
+            // cooperative group's leader only the intersection of each member's current
+            // and target partitions, and the partitions withheld from that intersection
+            // only reach their new owner once a second round hands out the (now
+            // ownerless) remainder. Nothing else in this protocol lets an established,
+            // still-healthy member request a fresh round — every other path to
+            // `rebalance_needed = true` is a membership change (a new member above, or
+            // the group re-forming from Empty below) — so the group's own leader calling
+            // JoinGroup again while the group is genuinely Stable is treated as exactly
+            // that request.
+            //
+            // Deliberately scoped to the *leader specifically*, not "any known member":
+            // an ordinary follower's routine catch-up call — heartbeat-triggered,
+            // `GroupConsumer`'s only path to `rejoin()` — always lands on a group that
+            // has *already* stabilized on a newer generation by the time it arrives
+            // (that's what made its own heartbeat fail in the first place), which means
+            // `state == Stable` is true for that call too. Treating that as a fresh
+            // request would misfire on every ordinary follower catch-up after any real
+            // rebalance, cooperative or not, and — worse — would never stop: each
+            // follower's catch-up would itself open a new round for the *next* follower
+            // to stumble into. Restricting this to the leader closes that: a leader only
+            // ever reaches this call site once, deliberately, right after submitting a
+            // round that needed a follow-up (`GroupConsumer::rejoin`'s cooperative
+            // branch) — never as a reaction to its own generation going stale, since the
+            // leader is the one *causing* the generation to advance, not discovering it
+            // secondhand.
+            //
+            // Also scoped to `is_cooperative()` groups only: an eager group has no
+            // second round to ask for, so this never fires for one regardless of who
+            // calls it. The `state == Stable` guard is what keeps a single legitimate
+            // request from cascading: the moment it fires, the group leaves Stable
+            // (below) atomically under this same lock, so it cannot re-fire for the
+            // very generation it just opened.
+            if group.is_cooperative()
+                && group.state == GroupState::Stable
+                && group.leader.as_deref() == Some(m_id.as_str())
+            {
+                rebalance_needed = true;
+            }
         }
 
         // Negotiate the protocol when the group is (re)forming from Empty — the first
