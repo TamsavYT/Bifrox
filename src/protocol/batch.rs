@@ -1,0 +1,952 @@
+use std::borrow::Cow;
+
+use bytes::{Buf, BufMut, Bytes};
+use crc32fast::Hasher;
+use thiserror::Error;
+
+/// Magic byte for [`RecordBatch`]. Distinct from every magic byte already in use in this
+/// codebase: the per-record `RecordFrame` magics (`0xAB` plain, `0xAC` LZ4, `0xAD` control,
+/// `0xAE` zstd — `src/protocol/frame.rs`), the inter-node magics (`0xAA` replication push,
+/// `0xAE`/`0xAF` vote request/response, `0xBB` gRPC replication — `src/replication/mod.rs`,
+/// `src/replication/grpc.rs`), the client wire protocol's `0xF1` versioned envelope
+/// (`src/protocol/wire.rs`), `0xCE`/`0xCF` (share-group/consumer-offset snapshot magics), the
+/// 4-byte `0xCAFEBABE` auth preamble, and `0xB0` (reserved by the parked
+/// `inter-node-versioning` branch for a future versioned inter-node frame — avoided so that
+/// branch can still land without a collision).
+pub const BATCH_MAGIC_BYTE: u8 = 0xC0;
+
+/// Bytes fixed for every batch, from the `magic` byte through `record_count` inclusive —
+/// everything before the variable-length `record_data` section.
+/// `1(magic) + 4(batch_length) + 4(crc) + 8(base_offset) + 4(last_offset_delta) +
+///  8(base_timestamp) + 8(producer_id) + 2(producer_epoch) + 4(base_sequence) +
+///  4(leader_epoch) + 2(attributes) + 4(record_count)`
+pub const BATCH_HEADER_SIZE: usize = 53;
+
+/// Bytes fixed between the `crc` field and `record_data`, i.e. everything `batch_length`
+/// counts (`batch_length` runs from just after itself to the end of the batch, so it covers
+/// `crc` too): `BATCH_HEADER_SIZE - 1 (magic) - 4 (batch_length)`.
+const BATCH_LENGTH_COVERED_FIXED: usize = BATCH_HEADER_SIZE - 1 - 4;
+
+/// Bytes fixed per record entry inside (decompressed) `record_data`:
+/// `4(offset_delta) + 8(timestamp_delta) + 4(payload_len)`.
+const RECORD_ENTRY_HEADER_SIZE: usize = 16;
+
+const ATTR_COMPRESSION_MASK: u16 = 0x0007;
+const ATTR_TRANSACTIONAL_FLAG: u16 = 0x0008;
+
+#[derive(Debug, Error)]
+pub enum BatchError {
+    #[error("Buffer too short: needed {required} bytes, available {found} bytes")]
+    BufferTooShort { required: usize, found: usize },
+    #[error("Invalid magic byte: expected 0x{expected:02X}, got 0x{found:02X}")]
+    InvalidMagic { expected: u8, found: u8 },
+    #[error("Batch length {batch_length} is smaller than the fixed header it must cover ({minimum} bytes)")]
+    InvalidBatchLength { batch_length: usize, minimum: usize },
+    #[error("Batch CRC32 checksum corruption: batch CRC 0x{expected:08X} != computed 0x{calculated:08X}")]
+    CrcMismatch { expected: u32, calculated: u32 },
+    #[error("Invalid compression codec in attributes: {value}")]
+    InvalidCompressionCodec { value: u16 },
+    #[error("Truncated record: buffer ended mid-record while decoding record data")]
+    TruncatedRecord,
+    #[error(
+        "Record count mismatch: {declared} records declared but {trailing} bytes of record data remained unconsumed"
+    )]
+    TrailingRecordData { declared: u32, trailing: usize },
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Compression codec applied to a batch's record data as a whole (never per-record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchCompression {
+    None,
+    Lz4,
+    Zstd,
+}
+
+impl BatchCompression {
+    fn to_bits(self) -> u16 {
+        match self {
+            BatchCompression::None => 0,
+            BatchCompression::Lz4 => 1,
+            BatchCompression::Zstd => 2,
+        }
+    }
+
+    fn from_bits(bits: u16) -> Result<Self, BatchError> {
+        match bits {
+            0 => Ok(BatchCompression::None),
+            1 => Ok(BatchCompression::Lz4),
+            2 => Ok(BatchCompression::Zstd),
+            other => Err(BatchError::InvalidCompressionCodec { value: other }),
+        }
+    }
+}
+
+/// One record decoded out of a batch: its absolute offset and timestamp (base + delta) and
+/// its opaque payload. Structured key/value decomposition is out of scope for this format —
+/// the payload stays an opaque length-prefixed blob (stage 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRecord {
+    pub offset: u64,
+    pub timestamp: u64,
+    pub payload: Bytes,
+}
+
+/// Disk/wire binary representation of a batch of records sharing one header, one CRC, and
+/// (optionally) one compressed payload — replacing per-record `RecordFrame` framing for the
+/// common case of producing/replicating many records together.
+///
+/// Layout (all integers big-endian):
+/// `[Magic: 1b (0xC0)] | [Batch Length: 4b] | [CRC32: 4b] | [Base Offset: 8b] |
+///  [Last Offset Delta: 4b] | [Base Timestamp: 8b] | [Producer Id: 8b] | [Producer Epoch: 2b] |
+///  [Base Sequence: 4b] | [Leader Epoch: 4b] | [Attributes: 2b] | [Record Count: 4b] |
+///  [Record Data: variable, see below]`
+///
+/// `Batch Length` counts every byte from `CRC32` to the end of `Record Data` — a reader can
+/// read the first 5 bytes, then skip exactly `Batch Length` more bytes to reach the next
+/// batch without decoding this one.
+///
+/// `Attributes` is a bitfield: bits 0-2 hold the compression codec (0 = none, 1 = LZ4,
+/// 2 = zstd; 3-7 reserved for future codecs), bit 3 is the transactional flag, bits 4-15 are
+/// reserved for future use.
+///
+/// `CRC32` covers everything from `Base Offset` through the end of `Record Data` (i.e. the
+/// stored, possibly-compressed bytes — corruption of the compressed form is caught even
+/// before decompression is attempted).
+///
+/// `Record Data` holds `Record Count` records back to back, optionally compressed as a
+/// single unit per `Attributes` (the surrounding header above is never compressed, so a
+/// reader can inspect offsets/length/attributes without decompressing anything). Each
+/// decompressed record entry is:
+/// `[Offset Delta: 4b] | [Timestamp Delta: 8b, signed] | [Payload Len: 4b] | [Payload Bytes]`
+/// — `Offset Delta` added to `Base Offset` and `Timestamp Delta` added to `Base Timestamp`
+/// (as signed arithmetic) give the record's absolute offset and timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordBatch {
+    pub magic: u8,
+    pub crc: u32,
+    pub base_offset: u64,
+    pub last_offset_delta: u32,
+    pub base_timestamp: u64,
+    pub producer_id: u64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+    pub leader_epoch: u32,
+    pub attributes: u16,
+    pub record_count: u32,
+    /// Record data as stored: possibly compressed per `attributes`. Use [`RecordBatch::records`]
+    /// to get decoded, decompressed records.
+    pub record_data: Bytes,
+}
+
+impl RecordBatch {
+    /// Builds a batch from a base offset, batch-level metadata, and the records to include.
+    /// Each record is `(timestamp, payload)`; offsets are assigned sequentially starting at
+    /// `base_offset` (record `i` gets offset `base_offset + i`), which is how batches are
+    /// always produced — there are no gaps to express within a single batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        base_offset: u64,
+        base_timestamp: u64,
+        leader_epoch: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+        codec: BatchCompression,
+        records: &[(u64, Bytes)],
+    ) -> Self {
+        let record_count = records.len() as u32;
+        let last_offset_delta = record_count.saturating_sub(1);
+
+        let mut raw = Vec::new();
+        for (i, (timestamp, payload)) in records.iter().enumerate() {
+            raw.put_u32(i as u32);
+            raw.put_i64(*timestamp as i64 - base_timestamp as i64);
+            raw.put_u32(payload.len() as u32);
+            raw.put_slice(payload);
+        }
+
+        let record_data: Bytes = match codec {
+            BatchCompression::None => raw.into(),
+            BatchCompression::Lz4 => lz4_flex::compress_prepend_size(&raw).into(),
+            BatchCompression::Zstd => zstd::stream::encode_all(raw.as_slice(), 3)
+                .expect("in-memory zstd compression is infallible")
+                .into(),
+        };
+
+        let mut attributes = codec.to_bits() & ATTR_COMPRESSION_MASK;
+        if transactional {
+            attributes |= ATTR_TRANSACTIONAL_FLAG;
+        }
+
+        let crc = Self::calculate_crc(
+            base_offset,
+            last_offset_delta,
+            base_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            leader_epoch,
+            attributes,
+            record_count,
+            &record_data,
+        );
+
+        Self {
+            magic: BATCH_MAGIC_BYTE,
+            crc,
+            base_offset,
+            last_offset_delta,
+            base_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            leader_epoch,
+            attributes,
+            record_count,
+            record_data,
+        }
+    }
+
+    /// The compression codec this batch's `record_data` is stored under, per `attributes`.
+    pub fn compression(&self) -> Result<BatchCompression, BatchError> {
+        BatchCompression::from_bits(self.attributes & ATTR_COMPRESSION_MASK)
+    }
+
+    /// Whether the transactional attribute bit is set.
+    pub fn is_transactional(&self) -> bool {
+        self.attributes & ATTR_TRANSACTIONAL_FLAG != 0
+    }
+
+    /// Recomputes the CRC32 over the batch's fields and compares it against `self.crc`.
+    pub fn verify_crc(&self) -> Result<(), BatchError> {
+        let calculated = Self::calculate_crc(
+            self.base_offset,
+            self.last_offset_delta,
+            self.base_timestamp,
+            self.producer_id,
+            self.producer_epoch,
+            self.base_sequence,
+            self.leader_epoch,
+            self.attributes,
+            self.record_count,
+            &self.record_data,
+        );
+        if calculated != self.crc {
+            return Err(BatchError::CrcMismatch {
+                expected: self.crc,
+                calculated,
+            });
+        }
+        Ok(())
+    }
+
+    /// Decompresses (if needed) and decodes this batch's records, yielding each record's
+    /// absolute offset, absolute timestamp, and opaque payload.
+    pub fn records(&self) -> Result<Vec<BatchRecord>, BatchError> {
+        let raw: Cow<'_, [u8]> = match self.compression()? {
+            BatchCompression::None => Cow::Borrowed(&self.record_data[..]),
+            BatchCompression::Lz4 => {
+                let decompressed =
+                    lz4_flex::decompress_size_prepended(&self.record_data).map_err(|e| {
+                        BatchError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        ))
+                    })?;
+                Cow::Owned(decompressed)
+            }
+            BatchCompression::Zstd => {
+                let decompressed =
+                    zstd::stream::decode_all(self.record_data.as_ref()).map_err(|e| {
+                        BatchError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        ))
+                    })?;
+                Cow::Owned(decompressed)
+            }
+        };
+
+        decode_records(
+            self.record_count,
+            self.base_offset,
+            self.base_timestamp,
+            &raw,
+        )
+    }
+
+    /// Computes CRC32 over: `[BaseOffset | LastOffsetDelta | BaseTimestamp | ProducerId |
+    /// ProducerEpoch | BaseSequence | LeaderEpoch | Attributes | RecordCount | RecordData]`.
+    #[allow(clippy::too_many_arguments)]
+    fn calculate_crc(
+        base_offset: u64,
+        last_offset_delta: u32,
+        base_timestamp: u64,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        leader_epoch: u32,
+        attributes: u16,
+        record_count: u32,
+        record_data: &[u8],
+    ) -> u32 {
+        let mut hasher = Hasher::new();
+        hasher.update(&base_offset.to_be_bytes());
+        hasher.update(&last_offset_delta.to_be_bytes());
+        hasher.update(&base_timestamp.to_be_bytes());
+        hasher.update(&producer_id.to_be_bytes());
+        hasher.update(&producer_epoch.to_be_bytes());
+        hasher.update(&base_sequence.to_be_bytes());
+        hasher.update(&leader_epoch.to_be_bytes());
+        hasher.update(&attributes.to_be_bytes());
+        hasher.update(&record_count.to_be_bytes());
+        hasher.update(record_data);
+        hasher.finalize()
+    }
+
+    /// Total serialized size on disk/wire in bytes.
+    pub fn encoded_size(&self) -> usize {
+        BATCH_HEADER_SIZE + self.record_data.len()
+    }
+
+    /// Serializes the batch into the provided output buffer. Generic over `BufMut` (rather
+    /// than concretely `&mut Vec<u8>`), matching `RecordFrame::encode_into`, so callers on a
+    /// hot path can reuse a scratch buffer instead of allocating a fresh `Vec` per call.
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        let batch_length = (BATCH_LENGTH_COVERED_FIXED + self.record_data.len()) as u32;
+        buf.put_u8(self.magic);
+        buf.put_u32(batch_length);
+        buf.put_u32(self.crc);
+        buf.put_u64(self.base_offset);
+        buf.put_u32(self.last_offset_delta);
+        buf.put_u64(self.base_timestamp);
+        buf.put_u64(self.producer_id);
+        buf.put_i16(self.producer_epoch);
+        buf.put_i32(self.base_sequence);
+        buf.put_u32(self.leader_epoch);
+        buf.put_u16(self.attributes);
+        buf.put_u32(self.record_count);
+        buf.put_slice(&self.record_data);
+    }
+
+    /// Decodes a batch from a raw byte buffer. Returns the decoded batch and total bytes
+    /// consumed. Defensive: every length is checked against the remaining buffer before it
+    /// is trusted, so a truncated, corrupt, or hostile buffer yields a clean `Err`, never a
+    /// panic or an unbounded allocation.
+    pub fn decode(mut src: &[u8]) -> Result<(Self, usize), BatchError> {
+        const PREFIX: usize = 5; // magic + batch_length
+        if src.len() < PREFIX {
+            return Err(BatchError::BufferTooShort {
+                required: PREFIX,
+                found: src.len(),
+            });
+        }
+
+        let magic = src.get_u8();
+        if magic != BATCH_MAGIC_BYTE {
+            return Err(BatchError::InvalidMagic {
+                expected: BATCH_MAGIC_BYTE,
+                found: magic,
+            });
+        }
+
+        let batch_length = src.get_u32() as usize;
+        if batch_length < BATCH_LENGTH_COVERED_FIXED {
+            return Err(BatchError::InvalidBatchLength {
+                batch_length,
+                minimum: BATCH_LENGTH_COVERED_FIXED,
+            });
+        }
+        if src.len() < batch_length {
+            return Err(BatchError::BufferTooShort {
+                required: batch_length,
+                found: src.len(),
+            });
+        }
+        let total_consumed = PREFIX + batch_length;
+
+        let crc = src.get_u32();
+        let base_offset = src.get_u64();
+        let last_offset_delta = src.get_u32();
+        let base_timestamp = src.get_u64();
+        let producer_id = src.get_u64();
+        let producer_epoch = src.get_i16();
+        let base_sequence = src.get_i32();
+        let leader_epoch = src.get_u32();
+        let attributes = src.get_u16();
+        let record_count = src.get_u32();
+
+        let record_data_len = batch_length - BATCH_LENGTH_COVERED_FIXED;
+        // Guaranteed by the `src.len() < batch_length` check above: src still held
+        // `batch_length` bytes before the fixed fields were consumed, and exactly
+        // `BATCH_LENGTH_COVERED_FIXED` of those bytes were just consumed above.
+        debug_assert!(src.len() >= record_data_len);
+        let record_data = Bytes::copy_from_slice(&src[..record_data_len]);
+
+        let batch = Self {
+            magic,
+            crc,
+            base_offset,
+            last_offset_delta,
+            base_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            leader_epoch,
+            attributes,
+            record_count,
+            record_data,
+        };
+        batch.verify_crc()?;
+
+        Ok((batch, total_consumed))
+    }
+}
+
+/// Parses `record_count` record entries out of already-decompressed `data`, resolving each
+/// record's offset/timestamp deltas against `base_offset`/`base_timestamp`. Defensive: never
+/// trusts a `payload_len` before checking it against the remaining slice, and never
+/// pre-allocates based on the untrusted `record_count` alone (capacity is clamped to what the
+/// buffer could actually hold).
+fn decode_records(
+    record_count: u32,
+    base_offset: u64,
+    base_timestamp: u64,
+    data: &[u8],
+) -> Result<Vec<BatchRecord>, BatchError> {
+    let max_possible_records = data.len() / RECORD_ENTRY_HEADER_SIZE;
+    let mut records = Vec::with_capacity((record_count as usize).min(max_possible_records));
+
+    let mut cursor = data;
+    for _ in 0..record_count {
+        if cursor.remaining() < RECORD_ENTRY_HEADER_SIZE {
+            return Err(BatchError::TruncatedRecord);
+        }
+        let offset_delta = cursor.get_u32();
+        let timestamp_delta = cursor.get_i64();
+        let payload_len = cursor.get_u32() as usize;
+
+        if cursor.remaining() < payload_len {
+            return Err(BatchError::TruncatedRecord);
+        }
+        let payload = Bytes::copy_from_slice(&cursor[..payload_len]);
+        cursor.advance(payload_len);
+
+        records.push(BatchRecord {
+            offset: base_offset + offset_delta as u64,
+            timestamp: (base_timestamp as i64 + timestamp_delta) as u64,
+            payload,
+        });
+    }
+
+    if !cursor.is_empty() {
+        return Err(BatchError::TrailingRecordData {
+            declared: record_count,
+            trailing: cursor.len(),
+        });
+    }
+
+    Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::frame::RecordFrame;
+
+    fn sample_records(n: usize) -> Vec<(u64, Bytes)> {
+        (0..n)
+            .map(|i| {
+                let ts = 1_700_000_000_000u64 + i as u64 * 10;
+                let payload = format!(
+                    "{{\"user_id\":{},\"event\":\"page_view\",\"path\":\"/home\",\"referrer\":\"https://example.com/search\"}}",
+                    i
+                );
+                (ts, Bytes::from(payload))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_trip_preserves_records_offsets_and_metadata_uncompressed() {
+        let records = sample_records(10);
+        let batch = RecordBatch::create(
+            1000,
+            1_700_000_000_000,
+            7,
+            42,
+            3,
+            9,
+            false,
+            BatchCompression::None,
+            &records,
+        );
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordBatch::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, batch);
+
+        assert_eq!(decoded.base_offset, 1000);
+        assert_eq!(decoded.last_offset_delta, 9);
+        assert_eq!(decoded.leader_epoch, 7);
+        assert_eq!(decoded.producer_id, 42);
+        assert_eq!(decoded.producer_epoch, 3);
+        assert_eq!(decoded.base_sequence, 9);
+        assert!(!decoded.is_transactional());
+
+        let decoded_records = decoded.records().unwrap();
+        assert_eq!(decoded_records.len(), records.len());
+        for (i, (ts, payload)) in records.iter().enumerate() {
+            assert_eq!(decoded_records[i].offset, 1000 + i as u64);
+            assert_eq!(decoded_records[i].timestamp, *ts);
+            assert_eq!(decoded_records[i].payload, *payload);
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_records_offsets_and_metadata_lz4() {
+        let records = sample_records(10);
+        let batch = RecordBatch::create(
+            500,
+            1_700_000_000_000,
+            2,
+            1,
+            0,
+            0,
+            false,
+            BatchCompression::Lz4,
+            &records,
+        );
+        assert_eq!(batch.compression().unwrap(), BatchCompression::Lz4);
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordBatch::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+
+        let decoded_records = decoded.records().unwrap();
+        assert_eq!(decoded_records.len(), records.len());
+        for (i, (ts, payload)) in records.iter().enumerate() {
+            assert_eq!(decoded_records[i].offset, 500 + i as u64);
+            assert_eq!(decoded_records[i].timestamp, *ts);
+            assert_eq!(decoded_records[i].payload, *payload);
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_records_offsets_and_metadata_zstd() {
+        let records = sample_records(10);
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            99,
+            5,
+            2,
+            true,
+            BatchCompression::Zstd,
+            &records,
+        );
+        assert_eq!(batch.compression().unwrap(), BatchCompression::Zstd);
+        assert!(batch.is_transactional());
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordBatch::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(decoded.is_transactional());
+
+        let decoded_records = decoded.records().unwrap();
+        assert_eq!(decoded_records.len(), records.len());
+        for (i, (ts, payload)) in records.iter().enumerate() {
+            assert_eq!(decoded_records[i].offset, i as u64);
+            assert_eq!(decoded_records[i].timestamp, *ts);
+            assert_eq!(decoded_records[i].payload, *payload);
+        }
+    }
+
+    #[test]
+    fn empty_batch_round_trips() {
+        let batch = RecordBatch::create(77, 0, 0, 0, 0, 0, false, BatchCompression::None, &[]);
+        assert_eq!(batch.record_count, 0);
+        assert_eq!(batch.last_offset_delta, 0);
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordBatch::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert!(decoded.records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_record_batch_round_trips() {
+        let records = vec![(123u64, Bytes::from_static(b"only record"))];
+        let batch =
+            RecordBatch::create(10, 100, 1, 1, 1, 1, false, BatchCompression::None, &records);
+        assert_eq!(batch.record_count, 1);
+        assert_eq!(batch.last_offset_delta, 0);
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+        let decoded_records = decoded.records().unwrap();
+        assert_eq!(decoded_records.len(), 1);
+        assert_eq!(decoded_records[0].offset, 10);
+        assert_eq!(decoded_records[0].timestamp, 123);
+        assert_eq!(decoded_records[0].payload.as_ref(), b"only record");
+    }
+
+    #[test]
+    fn last_offset_delta_matches_record_count_minus_one() {
+        for n in [0usize, 1, 2, 50] {
+            let records = sample_records(n);
+            let batch =
+                RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+            let expected_delta = if n == 0 { 0 } else { (n - 1) as u32 };
+            assert_eq!(batch.last_offset_delta, expected_delta, "n={n}");
+            assert_eq!(batch.record_count, n as u32);
+        }
+    }
+
+    #[test]
+    fn crc_detects_corruption_in_header_field() {
+        let records = sample_records(5);
+        let batch = RecordBatch::create(1, 2, 3, 4, 5, 6, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+
+        // Flip a bit inside base_offset (fixed header, after crc).
+        encoded[9] ^= 0xFF;
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(err, BatchError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn crc_detects_corruption_in_record_data() {
+        let records = sample_records(5);
+        let batch = RecordBatch::create(1, 2, 3, 4, 5, 6, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+
+        // Flip a bit inside record_data (after the fixed header).
+        let last = encoded.len() - 1;
+        encoded[last] ^= 0xFF;
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(err, BatchError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn crc_detects_corruption_anywhere_in_batch() {
+        let records = sample_records(3);
+        let batch = RecordBatch::create(1, 2, 3, 4, 5, 6, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+
+        for i in 0..encoded.len() {
+            let mut corrupted = encoded.clone();
+            corrupted[i] ^= 0x01;
+            // Corrupting the magic byte or batch_length is reported as a different error
+            // class (InvalidMagic / BufferTooShort / InvalidBatchLength), not CrcMismatch —
+            // every other byte must be caught by the CRC. Any `Err` is an acceptable
+            // detection of the corruption; only a silent `Ok` with changed content is a bug.
+            if let Ok((decoded, _)) = RecordBatch::decode(&corrupted) {
+                assert_eq!(decoded, batch, "byte {i} silently changed the batch");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_fields_survive_round_trip() {
+        let records = sample_records(3);
+        let batch = RecordBatch::create(
+            123_456,
+            1_700_000_000_000,
+            17,
+            999_999,
+            -5,
+            -12345,
+            true,
+            BatchCompression::Zstd,
+            &records,
+        );
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.base_offset, 123_456);
+        assert_eq!(decoded.base_timestamp, 1_700_000_000_000);
+        assert_eq!(decoded.leader_epoch, 17);
+        assert_eq!(decoded.producer_id, 999_999);
+        assert_eq!(decoded.producer_epoch, -5);
+        assert_eq!(decoded.base_sequence, -12345);
+        assert!(decoded.is_transactional());
+    }
+
+    #[test]
+    fn decode_rejects_truncated_prefix() {
+        let err = RecordBatch::decode(&[BATCH_MAGIC_BYTE, 0, 0]).unwrap_err();
+        assert!(matches!(err, BatchError::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_magic() {
+        let records = sample_records(2);
+        let batch = RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        encoded[0] = 0xEE;
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(err, BatchError::InvalidMagic { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_corrupt_batch_length_too_small() {
+        let records = sample_records(2);
+        let batch = RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        // batch_length is bytes [1..5]; set it below the fixed-header minimum.
+        encoded[1..5].copy_from_slice(&1u32.to_be_bytes());
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(err, BatchError::InvalidBatchLength { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_length_field_claiming_more_than_buffer_holds() {
+        let records = sample_records(2);
+        let batch = RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        // Claim a batch_length far larger than what actually follows.
+        encoded[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(err, BatchError::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_bogus_record_count_too_large() {
+        let records = sample_records(2);
+        let batch = RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        // record_count is the last 4 bytes of the fixed header, right before record_data.
+        let record_count_start = BATCH_HEADER_SIZE - 4;
+        encoded[record_count_start..BATCH_HEADER_SIZE].copy_from_slice(&u32::MAX.to_be_bytes());
+        // Recompute nothing: this now fails CRC first (attributes/record_count are covered
+        // by the CRC), which is itself a clean, non-panicking error — decode either way must
+        // not panic or over-allocate.
+        let err = RecordBatch::decode(&encoded).unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::CrcMismatch { .. } | BatchError::TruncatedRecord
+        ));
+    }
+
+    #[test]
+    fn records_rejects_bogus_record_count_too_large_past_crc() {
+        // Build a batch, then hand-craft a variant where record_count is inflated but the
+        // CRC is recomputed to match, isolating decode_records' own defense (not the CRC's).
+        let records = sample_records(2);
+        let mut batch =
+            RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        batch.record_count = u32::MAX;
+        batch.crc = RecordBatch::calculate_crc(
+            batch.base_offset,
+            batch.last_offset_delta,
+            batch.base_timestamp,
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.leader_epoch,
+            batch.attributes,
+            batch.record_count,
+            &batch.record_data,
+        );
+        let err = batch.records().unwrap_err();
+        assert!(matches!(err, BatchError::TruncatedRecord));
+    }
+
+    #[test]
+    fn records_rejects_bogus_record_count_too_small() {
+        // record_count under-declares how many records record_data actually holds; leftover
+        // bytes after the declared count must be reported, not silently dropped.
+        let records = sample_records(3);
+        let mut batch =
+            RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        batch.record_count = 1;
+        batch.crc = RecordBatch::calculate_crc(
+            batch.base_offset,
+            batch.last_offset_delta,
+            batch.base_timestamp,
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.leader_epoch,
+            batch.attributes,
+            batch.record_count,
+            &batch.record_data,
+        );
+        let err = batch.records().unwrap_err();
+        assert!(matches!(err, BatchError::TrailingRecordData { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_corrupt_payload_len_field() {
+        // Corrupt payload_len of the first record entry — layout is
+        // offset_delta[0..4] | timestamp_delta[4..12] | payload_len[12..16] — to a huge
+        // value; must be a clean decode error from `records()`, not a panic or an attempt to
+        // allocate gigabytes.
+        let records = sample_records(2);
+        let mut batch =
+            RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut raw = batch.record_data.to_vec();
+        raw[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        batch.record_data = Bytes::from(raw);
+        batch.crc = RecordBatch::calculate_crc(
+            batch.base_offset,
+            batch.last_offset_delta,
+            batch.base_timestamp,
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.leader_epoch,
+            batch.attributes,
+            batch.record_count,
+            &batch.record_data,
+        );
+        let err = batch.records().unwrap_err();
+        assert!(matches!(err, BatchError::TruncatedRecord));
+    }
+
+    #[test]
+    fn decode_rejects_invalid_compression_codec() {
+        let records = sample_records(2);
+        let mut batch =
+            RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        batch.attributes |= 0x0007; // reserved codec value (7)
+        batch.crc = RecordBatch::calculate_crc(
+            batch.base_offset,
+            batch.last_offset_delta,
+            batch.base_timestamp,
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.leader_epoch,
+            batch.attributes,
+            batch.record_count,
+            &batch.record_data,
+        );
+        let err = batch.records().unwrap_err();
+        assert!(matches!(err, BatchError::InvalidCompressionCodec { .. }));
+    }
+
+    #[test]
+    fn decode_never_panics_on_arbitrary_short_buffers() {
+        // Fuzz-lite: every truncation length of a valid encoding must decode cleanly or
+        // error cleanly, never panic.
+        let records = sample_records(4);
+        let batch = RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::Zstd, &records);
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+
+        for len in 0..encoded.len() {
+            let _ = RecordBatch::decode(&encoded[..len]);
+        }
+    }
+
+    /// The headline claim of #18: batching similar records and compressing the batch as one
+    /// unit beats compressing each record individually, both in ratio (shared structure
+    /// compresses away once instead of per record) and in overhead (one header/CRC instead
+    /// of one per record). Measure it, don't just assert it's possible.
+    #[test]
+    fn batch_compression_beats_individual_record_compression_zstd() {
+        let n = 200;
+        let records = sample_records(n);
+
+        let individual_total: usize = records
+            .iter()
+            .enumerate()
+            .map(|(i, (ts, payload))| {
+                RecordFrame::create_compressed_zstd(i as u64, *ts, payload).encoded_size()
+            })
+            .sum();
+
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::Zstd,
+            &records,
+        );
+        let batch_total = batch.encoded_size();
+
+        eprintln!(
+            "zstd: {n} individually-compressed RecordFrames = {individual_total} bytes, \
+             1 compressed RecordBatch = {batch_total} bytes ({:.1}% of individual)",
+            100.0 * batch_total as f64 / individual_total as f64
+        );
+
+        assert!(
+            batch_total < individual_total,
+            "batch ({batch_total}b) should beat individually-compressed records ({individual_total}b)"
+        );
+        // The win should be substantial, not marginal — this is the point of batching.
+        assert!(
+            batch_total * 2 < individual_total,
+            "expected the batch to be less than half the size of individually compressed records: \
+             batch={batch_total}b individual={individual_total}b"
+        );
+    }
+
+    #[test]
+    fn batch_compression_beats_individual_record_compression_lz4() {
+        let n = 200;
+        let records = sample_records(n);
+
+        let individual_total: usize = records
+            .iter()
+            .enumerate()
+            .map(|(i, (ts, payload))| {
+                RecordFrame::create_compressed_lz4(i as u64, *ts, payload).encoded_size()
+            })
+            .sum();
+
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::Lz4,
+            &records,
+        );
+        let batch_total = batch.encoded_size();
+
+        eprintln!(
+            "lz4: {n} individually-compressed RecordFrames = {individual_total} bytes, \
+             1 compressed RecordBatch = {batch_total} bytes ({:.1}% of individual)",
+            100.0 * batch_total as f64 / individual_total as f64
+        );
+
+        assert!(
+            batch_total < individual_total,
+            "batch ({batch_total}b) should beat individually-compressed records ({individual_total}b)"
+        );
+        assert!(
+            batch_total * 2 < individual_total,
+            "expected the batch to be less than half the size of individually compressed records: \
+             batch={batch_total}b individual={individual_total}b"
+        );
+    }
+}
