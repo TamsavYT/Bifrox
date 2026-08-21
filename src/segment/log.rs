@@ -1,4 +1,5 @@
-use crate::protocol::{FrameError, RecordFrame, HEADER_SIZE};
+use crate::protocol::HEADER_SIZE;
+use crate::segment::entry::{decode_entry, LogEntry};
 use crate::segment::index::{IndexEntry, IndexSegment};
 use std::fs::OpenOptions;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
@@ -261,9 +262,14 @@ impl LogSegment {
                             let mut pos = 0usize;
                             let mut last_offset = base_offset;
                             while pos < tail.len() {
-                                match RecordFrame::decode(&tail[pos..]) {
-                                    Ok((frame, consumed)) => {
+                                match decode_entry(&tail[pos..]) {
+                                    Ok((LogEntry::Frame(frame), consumed)) => {
                                         last_offset = frame.offset;
+                                        pos += consumed;
+                                    }
+                                    Ok((LogEntry::Batch(batch), consumed)) => {
+                                        last_offset =
+                                            batch.base_offset + batch.last_offset_delta as u64;
                                         pos += consumed;
                                     }
                                     Err(_) => return Ok(None), // fall back to full scan
@@ -327,7 +333,7 @@ impl LogSegment {
                             break; // need more data from file
                         } else {
                             tracing::warn!(
-                                "Incomplete frame header at byte position {} in segment {}. Truncating.",
+                                "Incomplete entry header at byte position {} in segment {}. Truncating.",
                                 file_offset + pos as u64,
                                 base_offset
                             );
@@ -345,25 +351,40 @@ impl LogSegment {
                         break;
                     }
 
-                    match RecordFrame::decode(slice) {
-                        Ok((frame, frame_len)) => {
+                    match decode_entry(slice) {
+                        Ok((entry, entry_len)) => {
                             let phys_pos = file_offset + pos as u64;
+                            // A batch spans a range of offsets (`base_offset` through
+                            // `base_offset + last_offset_delta`), so it's indexed by its
+                            // base offset and advances `next_offset` past its whole range —
+                            // a frame is just the range-of-one special case of the same
+                            // bookkeeping.
+                            let (relative_offset, last_offset_in_entry) = match &entry {
+                                LogEntry::Frame(frame) => (
+                                    frame.offset.saturating_sub(base_offset) as u32,
+                                    frame.offset,
+                                ),
+                                LogEntry::Batch(batch) => (
+                                    batch.base_offset.saturating_sub(base_offset) as u32,
+                                    batch.base_offset + batch.last_offset_delta as u64,
+                                ),
+                            };
+
                             if bytes_since_last_index >= index_interval
                                 || rebuilt_index_entries.is_empty()
                             {
                                 rebuilt_index_entries.push(IndexEntry {
-                                    relative_offset: (frame.offset.saturating_sub(base_offset))
-                                        as u32,
+                                    relative_offset,
                                     physical_position: phys_pos as u32,
                                 });
                                 bytes_since_last_index = 0;
                             }
 
-                            bytes_since_last_index += frame_len as u64;
-                            pos += frame_len;
-                            next_offset = frame.offset + 1;
+                            bytes_since_last_index += entry_len as u64;
+                            pos += entry_len;
+                            next_offset = last_offset_in_entry + 1;
                         }
-                        Err(FrameError::BufferTooShort { .. }) => {
+                        Err(err) if err.is_buffer_too_short() => {
                             if n > 0 {
                                 break; // need more data
                             } else {
@@ -372,7 +393,7 @@ impl LogSegment {
                                     break;
                                 }
                                 tracing::warn!(
-                                    "Partial payload at byte position {} in segment {}. Truncating.",
+                                    "Partial entry at byte position {} in segment {}. Truncating.",
                                     file_offset + pos as u64,
                                     base_offset
                                 );
@@ -386,7 +407,7 @@ impl LogSegment {
                                 break;
                             }
                             tracing::error!(
-                                "Corrupt frame detected at position {} in segment {}: {}. Truncating log.",
+                                "Corrupt entry detected at position {} in segment {}: {}. Truncating log.",
                                 file_offset + pos as u64,
                                 base_offset,
                                 err
@@ -622,4 +643,306 @@ pub async fn transmit_zero_copy(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{BatchCompression, RecordBatch, RecordFrame};
+    use bytes::Bytes;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_log_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn frame_bytes(offset: u64, timestamp: u64, payload: &[u8]) -> Vec<u8> {
+        let frame = RecordFrame::create(offset, timestamp, Bytes::copy_from_slice(payload));
+        let mut buf = Vec::new();
+        frame.encode_into(&mut buf);
+        buf
+    }
+
+    fn batch_bytes(base_offset: u64, records: &[(u64, Bytes)]) -> Vec<u8> {
+        let batch = RecordBatch::create(
+            base_offset,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            records,
+        );
+        let mut buf = Vec::new();
+        batch.encode_into(&mut buf);
+        buf
+    }
+
+    fn open_fresh_index(dir: &Path, base_offset: u64) -> IndexSegment {
+        let path = dir.join(format!("{}.index", format_segment_filename(base_offset)));
+        IndexSegment::open(path, base_offset).unwrap()
+    }
+
+    /// A batch as the very first entry in the segment, and a second batch sandwiched
+    /// between two frames — the full recovery scan (`open_at_path`, log.rs's site of the
+    /// four this stage updates) must decode both, index each by its base offset, and land
+    /// on the correct `next_offset` past the last frame, exactly as it would for an
+    /// all-frame segment.
+    #[test]
+    fn full_scan_recovers_batch_as_first_entry_and_between_frames() {
+        let dir = TempDir::new("batch_first_and_between");
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+
+        let mut raw = Vec::new();
+        raw.extend(batch_bytes(
+            0,
+            &[
+                (100, Bytes::from_static(b"a")),
+                (110, Bytes::from_static(b"b")),
+            ],
+        )); // offsets 0-1, FIRST entry
+        raw.extend(frame_bytes(2, 200, b"frame2"));
+        raw.extend(batch_bytes(3, &[(300, Bytes::from_static(b"c"))])); // offset 3, BETWEEN frames
+        raw.extend(frame_bytes(4, 400, b"frame4"));
+        std::fs::write(&log_path, &raw).unwrap();
+
+        let mut index_segment = open_fresh_index(&dir.0, 0);
+        // index_interval = 0 so every entry gets its own sparse index entry, letting this
+        // test check each one individually.
+        let seg =
+            LogSegment::open_at_path(log_path, 0, 1_000_000, 0, false, &mut index_segment).unwrap();
+
+        assert_eq!(
+            seg.next_offset, 5,
+            "next_offset must be past the last frame (4)"
+        );
+        assert_eq!(
+            seg.physical_size,
+            raw.len() as u64,
+            "nothing should be truncated"
+        );
+        assert_eq!(index_segment.entries_count(), 4);
+        assert_eq!(
+            index_segment
+                .find_nearest_physical_pos(0)
+                .unwrap()
+                .physical_position,
+            0
+        );
+        assert_eq!(
+            index_segment
+                .find_nearest_physical_pos(2)
+                .unwrap()
+                .physical_position as usize,
+            batch_bytes(
+                0,
+                &[
+                    (100, Bytes::from_static(b"a")),
+                    (110, Bytes::from_static(b"b"))
+                ]
+            )
+            .len()
+        );
+    }
+
+    /// A batch as the very last entry — nothing after it to lose, but `next_offset` must
+    /// still land past its whole offset range, not just past its base offset.
+    #[test]
+    fn full_scan_recovers_batch_as_last_entry() {
+        let dir = TempDir::new("batch_last");
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+
+        let mut raw = Vec::new();
+        raw.extend(frame_bytes(0, 0, b"frame0"));
+        raw.extend(frame_bytes(1, 10, b"frame1"));
+        raw.extend(batch_bytes(
+            2,
+            &[
+                (200, Bytes::from_static(b"x")),
+                (210, Bytes::from_static(b"y")),
+                (220, Bytes::from_static(b"z")),
+            ],
+        )); // offsets 2-4, LAST entry
+        std::fs::write(&log_path, &raw).unwrap();
+
+        let mut index_segment = open_fresh_index(&dir.0, 0);
+        let seg =
+            LogSegment::open_at_path(log_path, 0, 1_000_000, 0, false, &mut index_segment).unwrap();
+
+        assert_eq!(
+            seg.next_offset, 5,
+            "next_offset must be past the batch's last offset (4)"
+        );
+        assert_eq!(seg.physical_size, raw.len() as u64);
+    }
+
+    /// A frame-only segment must scan identically to how it always has — this stage adds
+    /// batch handling but must not perturb the plain-frame path at all.
+    #[test]
+    fn full_scan_of_frame_only_segment_is_unaffected() {
+        let dir = TempDir::new("frame_only_regression");
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+
+        let mut raw = Vec::new();
+        for i in 0..5u64 {
+            raw.extend(frame_bytes(i, i * 10, format!("payload-{i}").as_bytes()));
+        }
+        std::fs::write(&log_path, &raw).unwrap();
+
+        let mut index_segment = open_fresh_index(&dir.0, 0);
+        let seg =
+            LogSegment::open_at_path(log_path, 0, 1_000_000, 0, false, &mut index_segment).unwrap();
+
+        assert_eq!(seg.next_offset, 5);
+        assert_eq!(seg.physical_size, raw.len() as u64);
+        assert_eq!(index_segment.entries_count(), 5);
+    }
+
+    /// A batch cut short at the end of the segment (crash mid-write) must be discarded and
+    /// the log truncated back to the last complete entry — exactly the treatment a
+    /// truncated frame already gets. Both scenarios are built here side by side so the
+    /// comparison is direct: same shape of damage, same recovery outcome.
+    #[test]
+    fn truncated_batch_at_end_matches_truncated_frame_behavior() {
+        let dir = TempDir::new("truncated_entry");
+
+        // Frame-only baseline: one full frame, then a second frame missing its last 10
+        // bytes (mid-write crash).
+        let frame_log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+        let good_frame = frame_bytes(0, 0, b"complete-frame");
+        let mut frame_raw = good_frame.clone();
+        let partial_frame = frame_bytes(1, 10, b"never-finished-writing-this-payload");
+        frame_raw.extend(&partial_frame[..partial_frame.len() - 10]);
+        std::fs::write(&frame_log_path, &frame_raw).unwrap();
+
+        let mut frame_index = open_fresh_index(&dir.0, 0);
+        let frame_seg = LogSegment::open_at_path(
+            frame_log_path.clone(),
+            0,
+            1_000_000,
+            0,
+            false,
+            &mut frame_index,
+        )
+        .unwrap();
+
+        // Batch equivalent: one full frame, then a batch missing its last 10 bytes.
+        let batch_dir = TempDir::new("truncated_entry_batch");
+        let batch_log_path = batch_dir
+            .0
+            .join(format!("{}.log", format_segment_filename(0)));
+        let mut batch_raw = good_frame.clone();
+        let partial_batch = batch_bytes(
+            1,
+            &[
+                (10, Bytes::from_static(b"one")),
+                (20, Bytes::from_static(b"two")),
+                (30, Bytes::from_static(b"three")),
+            ],
+        );
+        batch_raw.extend(&partial_batch[..partial_batch.len() - 10]);
+        std::fs::write(&batch_log_path, &batch_raw).unwrap();
+
+        let mut batch_index = open_fresh_index(&batch_dir.0, 0);
+        let batch_seg = LogSegment::open_at_path(
+            batch_log_path.clone(),
+            0,
+            1_000_000,
+            0,
+            false,
+            &mut batch_index,
+        )
+        .unwrap();
+
+        // Same recovery outcome in both cases: only the one complete entry survives, and
+        // the file on disk is truncated back to exactly its length.
+        assert_eq!(frame_seg.next_offset, 1);
+        assert_eq!(batch_seg.next_offset, 1);
+        assert_eq!(frame_seg.physical_size, good_frame.len() as u64);
+        assert_eq!(batch_seg.physical_size, good_frame.len() as u64);
+        assert_eq!(
+            std::fs::metadata(&frame_log_path).unwrap().len(),
+            good_frame.len() as u64,
+            "truncated frame tail must be removed from disk"
+        );
+        assert_eq!(
+            std::fs::metadata(&batch_log_path).unwrap().len(),
+            good_frame.len() as u64,
+            "truncated batch tail must be removed from disk, identically to a truncated frame"
+        );
+    }
+
+    /// The trusted-clean-segment fast path (`open_at_path_with_trust`'s tail-only decode
+    /// from the last sparse index entry) must handle a batch there too, not just a frame —
+    /// this is the other of log.rs's two scan sites.
+    #[test]
+    fn trusted_fast_path_resolves_next_offset_past_a_trailing_batch() {
+        let dir = TempDir::new("fast_path_batch_tail");
+        let log_path = dir.0.join(format!("{}.log", format_segment_filename(0)));
+
+        let frame0 = frame_bytes(0, 0, b"frame0");
+        let frame1 = frame_bytes(1, 10, b"frame1");
+        let batch = batch_bytes(
+            2,
+            &[
+                (200, Bytes::from_static(b"x")),
+                (210, Bytes::from_static(b"y")),
+                (220, Bytes::from_static(b"z")),
+            ],
+        ); // offsets 2-4, last entry, and where the sparse index's last entry points.
+
+        let mut raw = Vec::new();
+        raw.extend(&frame0);
+        raw.extend(&frame1);
+        let batch_pos = raw.len() as u64;
+        raw.extend(&batch);
+        std::fs::write(&log_path, &raw).unwrap();
+
+        // Simulate a previous session's sparse index whose last entry points at the
+        // batch's start (as `SegmentManager::append_batch` would have left it), and a
+        // clean marker matching the file's exact length so the fast path is trusted.
+        let mut index_segment = open_fresh_index(&dir.0, 0);
+        index_segment.append(0, 0).unwrap();
+        index_segment.append(2, batch_pos).unwrap();
+        write_clean_marker(&log_path, raw.len() as u64);
+
+        let seg = LogSegment::open_at_path_with_trust(
+            log_path,
+            0,
+            1_000_000,
+            0,
+            false,
+            &mut index_segment,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            seg.next_offset, 5,
+            "fast path must decode the trailing batch and land past its last offset (4)"
+        );
+        assert_eq!(seg.physical_size, raw.len() as u64);
+    }
 }
