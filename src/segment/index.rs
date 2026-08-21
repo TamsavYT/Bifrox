@@ -60,9 +60,8 @@ impl IndexSegment {
         let mut raw_buf = vec![0u8; file_len];
         if file_len > 0 {
             file.read_exact(&mut raw_buf)?;
-            for chunk in raw_buf.chunks_exact(INDEX_ENTRY_SIZE) {
-                let chunk_arr: &[u8; INDEX_ENTRY_SIZE] = chunk.try_into().unwrap();
-                entries.push(IndexEntry::decode(chunk_arr));
+            for chunk in raw_buf.as_chunks::<INDEX_ENTRY_SIZE>().0 {
+                entries.push(IndexEntry::decode(chunk));
             }
         }
 

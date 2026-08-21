@@ -7588,3 +7588,102 @@ async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two
         vec![(topic.to_string(), target_map["member-b"].clone())]
     );
 }
+
+/// Sabotages the OS-level file descriptor backing `path` so the next `sync()` through any
+/// `std::fs::File` still pointing at it fails, without ever fully closing the fd. Used to
+/// force a real I/O failure in a durability-sensitive step without any fault-injection seam
+/// in production code.
+///
+/// Finds the fd via `/proc/self/fd`, then `dup2`s a pipe's write end onto it after closing
+/// the pipe's read end: a write end whose reader is gone still accepts `close()` normally,
+/// but `fsync`/`fdatasync` on a pipe always fails with `EINVAL` (pipes aren't syncable
+/// objects). Redirecting instead of outright closing matters: closing a fd the standard
+/// library still owns is exactly the double-close pattern its IO-safety hardening watches
+/// for, and it aborts the whole process the moment the owning `File`'s `Drop` tries to close
+/// the same fd again. `dup2` keeps the fd number continuously open (just repointed), so that
+/// `Drop` closes a live fd like any other and nothing aborts.
+///
+/// Linux-only: relies on `/proc/self/fd` and `libc`, unavailable on the Windows CI target.
+#[cfg(target_os = "linux")]
+fn sabotage_fd_for(path: &std::path::Path) {
+    let target = std::fs::canonicalize(path).expect("path must exist to steal its fd");
+    let fd_dir = std::fs::read_dir("/proc/self/fd").expect("/proc/self/fd must be readable");
+    let mut target_fd: Option<i32> = None;
+    for entry in fd_dir.flatten() {
+        let fd_path = entry.path();
+        if std::fs::read_link(&fd_path).ok().as_deref() != Some(target.as_path()) {
+            continue;
+        }
+        target_fd = fd_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse().ok());
+        break;
+    }
+    let target_fd = target_fd.unwrap_or_else(|| panic!("no open fd found for {:?}", target));
+
+    unsafe {
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(libc::pipe(pipe_fds.as_mut_ptr()), 0, "pipe() failed");
+        let [read_end, write_end] = pipe_fds;
+        assert_eq!(libc::close(read_end), 0, "closing pipe read end failed");
+        assert_eq!(
+            libc::dup2(write_end, target_fd),
+            target_fd,
+            "dup2 onto the target fd failed"
+        );
+        assert_eq!(
+            libc::close(write_end),
+            0,
+            "closing spare pipe write end failed"
+        );
+    }
+}
+
+/// Issue #24's remaining item, leader side: `await_metadata_commit`'s doc comment says "the
+/// leader counts itself: the record is already durable in its own log by the time this is
+/// called" — but under `FlushPolicy::AsyncPeriodic` (the default), the leader's own append
+/// via `produce_frame` was never actually forced durable, so that claim was false. This
+/// proves the leader's own append is now genuinely on the critical path: when it cannot be
+/// made durable, `create_topic` must fail outright rather than silently counting an unsynced
+/// local copy toward the majority and applying it anyway.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_counts_itself() {
+    let dir = TestDataDirGuard::new("leader_meta_durability");
+    // A sole controller (no peer_addrs) with the default `FlushPolicy::AsyncPeriodic` —
+    // exactly the configuration under which the leader's self-append durability claim was
+    // false before this fix.
+    let engine = StorageEngine::new(EngineConfig {
+        node_id: 1,
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    assert!(engine.is_leader(), "a sole node is its own controller");
+
+    // Prime `__cluster_metadata`'s on-disk files — they don't exist before the first write.
+    engine
+        .create_topic("prime", 1)
+        .await
+        .expect("priming write must succeed with the fd intact");
+
+    let index_path = dir
+        .path
+        .join("__cluster_metadata-0")
+        .join(format!("{:020}.index", 0u64));
+    sabotage_fd_for(&index_path);
+
+    let result = engine.create_topic("should_not_apply", 1).await;
+    assert!(
+        result.is_err(),
+        "the leader's own metadata append must fail loudly when it cannot be made durable, \
+         not silently succeed on an unsynced local copy"
+    );
+    assert!(
+        !engine.topic_is_registered("should_not_apply"),
+        "a metadata record whose durability could not be confirmed must not be applied, even \
+         on the leader that proposed it"
+    );
+}

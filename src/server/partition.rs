@@ -361,6 +361,35 @@ impl PartitionManager {
         Ok(())
     }
 
+    /// Syncs the segment to disk unconditionally, ignoring the configured flush policy.
+    ///
+    /// `flush_if_sync_policy` is a no-op under `FlushPolicy::AsyncPeriodic` (the default)
+    /// until its time interval or byte threshold is reached, which is the right trade for
+    /// data topics — Kafka's model is that durability comes from replication, not fsync,
+    /// and paying an fsync per produce there would be a large, unrequested performance
+    /// regression. `__cluster_metadata` is different: it is low-volume control-plane
+    /// traffic (topic/ACL/partition-assignment changes), so an unconditional fsync costs
+    /// almost nothing, and a majority acknowledgement of a metadata record is supposed to
+    /// *be* a durability guarantee — the record drives authorization and partition
+    /// placement, so applying it (locally or on a follower, per issue #24) must be safe
+    /// even across a correlated crash. Callers use this instead of `flush_if_sync_policy`
+    /// specifically for the `__cluster_metadata` replication and self-append paths.
+    pub fn flush_durable(&self) -> IoResult<()> {
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.sync()?;
+        self.unsynced_bytes.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Test-only observation hook: `unsynced_bytes` resets to 0 only along a path that
+    /// actually called `sync()` successfully, so reading it back after an operation is a
+    /// way to tell, from outside this module, whether a real sync happened — without
+    /// exposing any way for production code to read it.
+    #[cfg(test)]
+    pub(crate) fn unsynced_bytes_for_test(&self) -> u64 {
+        self.unsynced_bytes.load(Ordering::Acquire)
+    }
+
     /// Appends a frame received from another node (leader push or catch-up fetch) verbatim,
     /// preserving its original offset/timestamp/magic/CRC exactly rather than reassigning
     /// them locally. See `SegmentManager::append_verbatim`.
