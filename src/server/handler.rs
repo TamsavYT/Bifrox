@@ -268,6 +268,33 @@ where
                     }
                 },
 
+                // Inter-node versioned replication push (0xB0,
+                // `crate::replication::REPLICATION_PUSH_V2_MAGIC`) — issue #48. Sent only
+                // to peers that advertised support for it; `0xAA` above keeps serving
+                // everyone else, unchanged.
+                0xB0 => match decode_replication_packet_v2(&engine, slice) {
+                    Ok((bytes_used, response)) => {
+                        consumed += bytes_used;
+                        if let Err(e) = socket.write_all(&response).await {
+                            tracing::error!(
+                                "Failed to send v2 replication ACK to {}: {}",
+                                peer_addr,
+                                e
+                            );
+                            return;
+                        }
+                    }
+                    Err(PacketError::NeedMoreData) => break,
+                    Err(PacketError::Fatal(msg)) => {
+                        tracing::warn!(
+                            "Malformed v2 replication packet from {}: {}",
+                            peer_addr,
+                            msg
+                        );
+                        return;
+                    }
+                },
+
                 // Client wire protocol commands (0x01..0x0A)
                 _ => {
                     match WireRequest::decode_framed(slice) {
@@ -1311,6 +1338,286 @@ fn decode_replication_packet(
     Ok((bytes_consumed, vec![0u8]))
 }
 
+/// Reads a versioned replication push's trailing `[ext_count: 1b]
+/// ([tag: 1b][len: 2b][bytes: len])*` extension section (see
+/// `decode_replication_packet_v2`'s wire-format doc) and returns whatever's left of `src`
+/// after it.
+///
+/// Unlike a heartbeat's compatible trailing section, this one is mandatory framing
+/// *within* `0xB0` itself — both ends of any `0xB0` exchange already run code that knows
+/// this section exists, so a truncated one is a split TCP read (`NeedMoreData`, handled by
+/// the connection loop re-invoking this decoder once more bytes arrive), never an old,
+/// unaware peer. What IS tolerated is a tag this build doesn't recognize: it is skipped by
+/// its declared length rather than rejected, which is what lets a future build add one
+/// without this build failing to parse the rest of the packet — the entire reason this
+/// section exists.
+fn skip_replication_v2_extensions(mut src: &[u8]) -> Result<&[u8], PacketError> {
+    if src.is_empty() {
+        return Err(PacketError::NeedMoreData);
+    }
+    let ext_count = src[0];
+    src = &src[1..];
+    for _ in 0..ext_count {
+        if src.len() < 3 {
+            return Err(PacketError::NeedMoreData);
+        }
+        // `_tag` isn't inspected: every tag this build doesn't know about is skipped by
+        // length alone, which today is all of them — nothing has ever been written into
+        // this section yet.
+        let _tag = src[0];
+        let len = u16::from_be_bytes([src[1], src[2]]) as usize;
+        src = &src[3..];
+        if src.len() < len {
+            return Err(PacketError::NeedMoreData);
+        }
+        src = &src[len..];
+    }
+    Ok(src)
+}
+
+/// Decodes and processes a versioned inter-node replication push
+/// (`crate::replication::REPLICATION_PUSH_V2_MAGIC`, `0xB0` — issue #48).
+///
+/// Wire format: `[0xB0] [frame_version: 1b] [ClusterId: pascal] [Topic: pascal]
+/// [Partition: 4b] [Epoch: 8b] [leader_hw: 8b] [Count: 4b] [RecordFrame...]
+/// [ext_count: 1b] ([tag: 1b][len: 2b][bytes: len])*`
+///
+/// The fixed fields, in order, are identical to `0xAA`'s — see
+/// `send_replication_push_v2_pooled`'s doc for why: this frame's job isn't to change what
+/// `0xAA` already carries, only to make the *next* addition safe via the trailing
+/// extension section (`skip_replication_v2_extensions`). `frame_version` is read but not
+/// yet branched on — this build only ever produces `1`
+/// (`crate::replication::INTER_NODE_PROTOCOL_VERSION`), and a future field is expected to
+/// arrive as a new tag rather than a reason to change the fixed layout; the byte is
+/// carried regardless, as an escape hatch if a fixed field ever genuinely needs to.
+///
+/// Deliberately does not share an implementation with `decode_replication_packet` (the
+/// `0xAA` decoder): that function's behavior is fixed by this issue's own constraints
+/// ("do not modify its decoder's behavior"), so this is a fresh implementation of the same
+/// authentication/fencing/apply logic — mirroring it field-for-field — rather than a
+/// refactor that would touch it, at the cost of some duplication between the two.
+fn decode_replication_packet_v2(
+    engine: &StorageEngine,
+    mut src: &[u8],
+) -> Result<(usize, Vec<u8>), PacketError> {
+    let original_len = src.len();
+
+    // Minimum header: magic(1) + frame_version(1) + cluster_id_len(2)
+    if src.len() < 4 {
+        return Err(PacketError::NeedMoreData);
+    }
+
+    src.get_u8(); // 0xB0
+    let _frame_version = src.get_u8();
+
+    let cid_len = src.get_u16() as usize;
+    if cid_len > MAX_CLUSTER_ID_LEN {
+        tracing::warn!(
+            "HA Replication (v2): Rejected — cluster_id length {} exceeds maximum",
+            cid_len
+        );
+        return Err(PacketError::Fatal(
+            "cluster_id too long in v2 replication packet".to_string(),
+        ));
+    }
+    if src.len() < cid_len {
+        return Err(PacketError::NeedMoreData);
+    }
+    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in v2 replication cluster_id".to_string(),
+            ))
+        }
+    };
+    src = &src[cid_len..];
+
+    let local_cluster = &engine.config().cluster_id;
+    if &incoming_cluster_id != local_cluster {
+        tracing::warn!(
+            "HA Replication (v2): REJECTED — cluster_id mismatch (got '{}', expected '{}').",
+            incoming_cluster_id,
+            local_cluster
+        );
+        return Err(PacketError::Fatal(
+            "v2 replication cluster_id mismatch".to_string(),
+        ));
+    }
+
+    if src.len() < 2 {
+        return Err(PacketError::NeedMoreData);
+    }
+    let topic_len = src.get_u16() as usize;
+    if src.len() < topic_len + 4 + 8 + 8 + 4 {
+        // topic + partition(4) + epoch(8) + leader_hw(8) + count(4)
+        return Err(PacketError::NeedMoreData);
+    }
+    let topic = match String::from_utf8(src[..topic_len].to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err(PacketError::Fatal(
+                "Invalid UTF-8 in v2 replicated topic name".to_string(),
+            ))
+        }
+    };
+    src = &src[topic_len..];
+
+    let partition = src.get_u32();
+    let incoming_epoch = src.get_u64();
+    let leader_hw = src.get_u64();
+    let count = src.get_u32() as usize;
+
+    if count > MAX_REPLICATION_BATCH_COUNT {
+        tracing::warn!(
+            "HA Replication (v2): Rejected — record count {} exceeds maximum {}",
+            count,
+            MAX_REPLICATION_BATCH_COUNT
+        );
+        return Err(PacketError::Fatal(format!(
+            "v2 replication batch count {} too large",
+            count
+        )));
+    }
+
+    // Two-pass, exactly like the 0xAA decoder's C3 fix: parse every frame and the whole
+    // extension section — computing the true `bytes_consumed` for this packet — before
+    // any epoch check or write, so `NeedMoreData` can only ever be returned before a
+    // single byte has been applied, and every return path (accept, stale-epoch reject,
+    // fatal) accounts for the same number of bytes.
+    let mut parsed_frames: Vec<RecordFrame> = Vec::with_capacity(count);
+    for _ in 0..count {
+        if src.len() < HEADER_SIZE {
+            return Err(PacketError::NeedMoreData);
+        }
+        match RecordFrame::decode(src) {
+            Ok((frame, frame_bytes)) => {
+                src = &src[frame_bytes..];
+                parsed_frames.push(frame);
+            }
+            Err(crate::protocol::FrameError::BufferTooShort { .. }) => {
+                return Err(PacketError::NeedMoreData);
+            }
+            Err(e) => {
+                return Err(PacketError::Fatal(format!("Frame decode error: {}", e)));
+            }
+        }
+    }
+    src = skip_replication_v2_extensions(src)?;
+
+    let bytes_consumed = original_len - src.len();
+
+    let is_cluster_meta_topic = topic == "__cluster_metadata";
+    let current_epoch = if is_cluster_meta_topic {
+        engine.replication().get_epoch()
+    } else {
+        engine
+            .get_partition(&topic, partition)
+            .map(|pm| pm.leader_epoch() as u64)
+            .unwrap_or(0)
+    };
+    if incoming_epoch < current_epoch {
+        tracing::warn!(
+            "HA Replication (v2): Stale epoch {} (current {}) from leader for topic '{}' partition {} – rejecting",
+            incoming_epoch, current_epoch, topic, partition
+        );
+        return Ok((bytes_consumed, vec![0x02]));
+    }
+    if incoming_epoch > current_epoch && is_cluster_meta_topic {
+        engine.replication().set_epoch(incoming_epoch);
+        tracing::info!(
+            "HA Replication (v2): Updated controller epoch to {} from leader for topic '{}' partition {}",
+            incoming_epoch,
+            topic,
+            partition
+        );
+    }
+
+    let pm = engine
+        .get_or_create_partition(&topic, partition)
+        .map_err(|e| PacketError::Fatal(format!("Partition create error: {}", e)))?;
+
+    let is_cluster_meta = is_cluster_meta_topic;
+    let mut write_failed = false;
+    let mut pending_metadata: Vec<(u64, crate::replication::MetadataRecord)> = Vec::new();
+    for frame in parsed_frames.iter() {
+        match pm.append_replica_frame_verbatim(frame) {
+            Ok(crate::segment::VerbatimAppendResult::Appended) => {}
+            Ok(crate::segment::VerbatimAppendResult::AlreadyApplied) => {}
+            Ok(crate::segment::VerbatimAppendResult::Gap { expected }) => {
+                tracing::warn!(
+                    "HA Replication (v2): Gap on '{}' P{} — got offset {} but expected {}. Rejecting batch.",
+                    topic,
+                    partition,
+                    frame.offset,
+                    expected
+                );
+                write_failed = true;
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "HA Replication (v2): Failed to persist record on '{}' P{}: {}",
+                    topic,
+                    partition,
+                    e
+                );
+                write_failed = true;
+                continue;
+            }
+        }
+
+        if is_cluster_meta {
+            if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
+                pending_metadata.push((frame.offset, meta_rec));
+            }
+        }
+    }
+
+    pm.advance_committed_hw(leader_hw.min(pm.latest_offset()));
+
+    let flush_result = if is_cluster_meta {
+        pm.flush_durable()
+    } else {
+        pm.flush_if_sync_policy()
+    };
+    if let Err(e) = flush_result {
+        tracing::error!(
+            "HA Replication (v2): Failed to sync '{}' P{} after replicated batch: {}",
+            topic,
+            partition,
+            e
+        );
+        write_failed = true;
+    }
+
+    if !write_failed {
+        for (offset, record) in pending_metadata {
+            engine.apply_metadata_record(offset, record);
+        }
+    } else if !pending_metadata.is_empty() {
+        tracing::error!(
+            "HA Replication (v2): '{}' P{} batch was not durable — {} metadata record(s) left \
+             unapplied so in-memory state cannot run ahead of disk",
+            topic,
+            partition,
+            pending_metadata.len()
+        );
+    }
+
+    tracing::info!(
+        "HA Replication (v2): Follower persisted {} replicated record(s) on Topic '{}' Partition {}",
+        count,
+        topic,
+        partition
+    );
+
+    if write_failed {
+        return Ok((bytes_consumed, vec![1u8]));
+    }
+    Ok((bytes_consumed, vec![0u8]))
+}
+
 /// Decodes and validates an inter-node heartbeat PING packet (0xAC).
 ///
 /// P4 Wire format: `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [leader_bind_addr: pascal]`
@@ -1383,6 +1690,21 @@ fn decode_heartbeat_packet(
     };
     src = &src[addr_len..];
 
+    // Leader's inter-node protocol version (issue #48; PARKED, see
+    // `replication::INTER_NODE_PROTOCOL_VERSION`'s doc — not a supported upgrade path
+    // yet), appended after the mandatory fields. Read as "stop here, treat as 0" rather
+    // than `PacketError::NeedMoreData` if `src` is already empty at this point, purely so
+    // THIS function's own parsing never blocks waiting for a byte that may not be coming
+    // in this read — that is a local robustness property of this decoder only. It is NOT
+    // a claim that a pre-`1` leader is supported end to end: this field's whole design
+    // assumes every node is already `>= 1` before any of them sends it (see
+    // `INTER_NODE_PROTOCOL_VERSION`'s doc for the unmitigated failure mode in the reverse
+    // direction, over a pooled connection, if that assumption doesn't hold).
+    let leader_version = src.first().copied().unwrap_or(0);
+    if !src.is_empty() {
+        src = &src[1..];
+    }
+
     let local_cluster_id = &engine.config().cluster_id;
     let bytes_consumed = original_len - src.len();
 
@@ -1435,6 +1757,14 @@ fn decode_heartbeat_packet(
         return Ok((bytes_consumed, vec![1u8]));
     }
 
+    // Issue #48: record the leader's advertised version regardless of term freshness —
+    // this is protocol metadata about which build is on the other end of the wire, not
+    // consensus state, so even a stale-term heartbeat's version is as valid a data point
+    // as a fresh one.
+    engine
+        .replication()
+        .note_peer_version(peer_node_id, leader_version);
+
     let our_epoch = engine.replication().get_epoch();
     if incoming_term >= our_epoch {
         // Valid heartbeat from current or newer leader — update state
@@ -1475,12 +1805,21 @@ fn decode_heartbeat_packet(
     // or an ephemeral `:0` port), neither of which the Leader could ever dial back.
     let self_advertised_addr = engine.replication().advertised_addr();
     let role_bytes = crate::config::roles_to_bytes(&engine.config().roles);
-    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_advertised_addr.len() + 1 + role_bytes.len());
+    let mut ack =
+        Vec::with_capacity(1 + 4 + 2 + self_advertised_addr.len() + 1 + role_bytes.len() + 1);
     ack.put_u8(0u8);
     ack.put_u32(engine.config().node_id);
     crate::protocol::wire::write_pascal_string(&mut ack, &self_advertised_addr);
     ack.put_u8(role_bytes.len() as u8);
     ack.extend_from_slice(&role_bytes);
+    // Issue #48 (PARKED — see `replication::INTER_NODE_PROTOCOL_VERSION`'s doc): this
+    // node's inter-node protocol version, appended after the role list. UNSAFE against a
+    // pre-`1` leader: it stops reading before this byte, leaves it unread, and — because
+    // `get_or_connect_peer` pools this connection — reads it back as the *next*
+    // heartbeat's status byte, i.e. a permanent false rejection of this node from that
+    // leader's point of view. Writing it unconditionally is only correct once every node
+    // in the cluster is already `>= 1`; see `INTER_NODE_PROTOCOL_VERSION`'s doc.
+    ack.put_u8(crate::replication::INTER_NODE_PROTOCOL_VERSION);
     Ok((bytes_consumed, ack))
 }
 
@@ -3563,6 +3902,294 @@ mod cluster_metadata_durability_tests {
         assert!(
             !engine.topic_is_registered("should_not_apply"),
             "metadata whose durability could not be confirmed must not be applied"
+        );
+    }
+}
+
+/// Issue #48 — request-side half of heartbeat version discovery
+/// (`decode_heartbeat_packet`'s new trailing byte) and the versioned replication push
+/// decoder (`decode_replication_packet_v2`, `0xB0`). The ACK-side half (leader reading a
+/// follower's version) and the `0xAA`-vs-`0xB0` framing decision live in
+/// `replication::protocol_version_tests`.
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::replication::MetadataRecord;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_handler_protocol_version_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_engine(dir: &TempDir) -> StorageEngine {
+        StorageEngine::new(EngineConfig {
+            data_dir: dir.0.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            ..EngineConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Builds a `0xAC` heartbeat request exactly the way `send_leader_heartbeat_pooled`
+    /// frames it, with the trailing leader-version byte either present (`Some`) or
+    /// omitted (`None`) to exercise this decoder's own absence handling in isolation.
+    /// `None` is NOT a supported peer topology end-to-end (see
+    /// `replication::INTER_NODE_PROTOCOL_VERSION`'s doc) — it only tests that this one
+    /// function doesn't block or error when `src` runs out early.
+    fn build_heartbeat_packet(
+        cluster_id: &str,
+        node_id: u32,
+        term: u64,
+        bind_addr: &str,
+        leader_version: Option<u8>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put_u8(0xAC);
+        crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
+        buf.put_u32(node_id);
+        buf.put_u64(term);
+        crate::protocol::wire::write_pascal_string(&mut buf, bind_addr);
+        if let Some(v) = leader_version {
+            buf.put_u8(v);
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_with_a_version_byte_is_recorded_and_bytes_fully_consumed() {
+        let dir = TempDir::new("version_present");
+        let engine = open_engine(&dir);
+        let cluster_id = engine.config().cluster_id.clone();
+
+        let packet = build_heartbeat_packet(&cluster_id, 7, 1, "127.0.0.1:9111", Some(3));
+        let (consumed, ack) = decode_heartbeat_packet(&engine, &packet).unwrap();
+
+        assert_eq!(
+            consumed,
+            packet.len(),
+            "the version byte must be consumed too"
+        );
+        assert_eq!(ack[0], 0, "expected an accepted heartbeat");
+        assert_eq!(
+            engine.replication().peer_protocol_version_by_node_id(7),
+            3,
+            "the leader's advertised version must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_without_a_version_byte_is_treated_as_pre_versioning() {
+        let dir = TempDir::new("version_absent");
+        let engine = open_engine(&dir);
+        let cluster_id = engine.config().cluster_id.clone();
+
+        // No trailing byte at all. This decoder must not treat that as `NeedMoreData`
+        // (which would stall this function waiting for a byte that isn't in this
+        // buffered slice) and must not error — a purely local robustness property, not a
+        // claim that talking to whatever sent this is supported end-to-end.
+        let packet = build_heartbeat_packet(&cluster_id, 8, 1, "127.0.0.1:9112", None);
+        let (consumed, ack) = decode_heartbeat_packet(&engine, &packet).unwrap();
+
+        assert_eq!(consumed, packet.len());
+        assert_eq!(ack[0], 0, "expected an accepted heartbeat");
+        assert_eq!(
+            engine.replication().peer_protocol_version_by_node_id(8),
+            0,
+            "a request with no version byte must decode as version 0, not fail the heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ack_always_carries_this_nodes_version_regardless_of_the_request() {
+        let dir = TempDir::new("ack_version");
+        let engine = open_engine(&dir);
+        let cluster_id = engine.config().cluster_id.clone();
+
+        // A request with no trailing version byte — this node still advertises its own
+        // version back, since the ACK's extension is this node's to write regardless of
+        // what the request contained.
+        let packet = build_heartbeat_packet(&cluster_id, 9, 1, "127.0.0.1:9113", None);
+        let (_, ack) = decode_heartbeat_packet(&engine, &packet).unwrap();
+
+        // ack = [status:1][node_id:4][addr_len:2][addr][role_count:1][roles...][version:1]
+        assert_eq!(ack[0], 0);
+        let version_byte = *ack.last().unwrap();
+        assert_eq!(
+            version_byte,
+            crate::replication::INTER_NODE_PROTOCOL_VERSION,
+            "the ACK's trailing byte must be this node's own version"
+        );
+    }
+
+    /// Builds a `0xB0` versioned replication-push packet the way
+    /// `send_replication_push_v2_pooled` frames it, but with the extension section
+    /// replaced by whatever raw `extension_bytes` the caller supplies — letting tests
+    /// probe absence, truncation, and unrecognized tags directly.
+    fn build_push_packet_v2(
+        engine: &StorageEngine,
+        topic: &str,
+        partition: u32,
+        epoch: u64,
+        leader_hw: u64,
+        frames: &[RecordFrame],
+        extension_bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put_u8(0xB0);
+        buf.put_u8(crate::replication::INTER_NODE_PROTOCOL_VERSION);
+        crate::protocol::wire::write_pascal_string(&mut buf, &engine.config().cluster_id);
+        crate::protocol::wire::write_pascal_string(&mut buf, topic);
+        buf.put_u32(partition);
+        buf.put_u64(epoch);
+        buf.put_u64(leader_hw);
+        buf.put_u32(frames.len() as u32);
+        for frame in frames {
+            frame.encode_into(&mut buf);
+        }
+        buf.extend_from_slice(extension_bytes);
+        buf
+    }
+
+    #[tokio::test]
+    async fn v2_push_with_an_empty_extension_section_applies_the_batch() {
+        let dir = TempDir::new("v2_empty_ext");
+        let engine = open_engine(&dir);
+
+        let record = MetadataRecord::TopicCreated {
+            topic: "v2_topic".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+        };
+        let frame = RecordFrame::create(0, 0, record.encode());
+        let epoch = engine.replication().get_epoch();
+        let packet = build_push_packet_v2(
+            &engine,
+            "__cluster_metadata",
+            0,
+            epoch,
+            1,
+            &[frame],
+            &[0u8], // ext_count = 0
+        );
+
+        let (consumed, ack) = decode_replication_packet_v2(&engine, &packet).unwrap();
+        assert_eq!(consumed, packet.len());
+        assert_eq!(ack, vec![0u8]);
+        assert!(engine.topic_is_registered("v2_topic"));
+    }
+
+    #[tokio::test]
+    async fn v2_push_skips_an_unrecognized_tag_and_still_applies_the_batch() {
+        let dir = TempDir::new("v2_unknown_tag");
+        let engine = open_engine(&dir);
+
+        let record = MetadataRecord::TopicCreated {
+            topic: "v2_forward_compat_topic".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+        };
+        let frame = RecordFrame::create(0, 0, record.encode());
+        let epoch = engine.replication().get_epoch();
+
+        // One extension entry this build has never heard of: tag 0xFF, 3 bytes of
+        // arbitrary payload. A future build could put a real field behind exactly this
+        // shape — this build must skip it by length and keep going, not reject the batch.
+        let mut ext = vec![1u8]; // ext_count = 1
+        ext.push(0xFF); // tag
+        ext.extend_from_slice(&3u16.to_be_bytes()); // len = 3
+        ext.extend_from_slice(&[9, 9, 9]); // payload
+
+        let packet =
+            build_push_packet_v2(&engine, "__cluster_metadata", 0, epoch, 1, &[frame], &ext);
+
+        let (consumed, ack) = decode_replication_packet_v2(&engine, &packet).unwrap();
+        assert_eq!(
+            consumed,
+            packet.len(),
+            "the unknown tag's bytes must be consumed too"
+        );
+        assert_eq!(ack, vec![0u8]);
+        assert!(engine.topic_is_registered("v2_forward_compat_topic"));
+    }
+
+    #[tokio::test]
+    async fn v2_push_reports_need_more_data_for_a_truncated_extension_section() {
+        let dir = TempDir::new("v2_truncated_ext");
+        let engine = open_engine(&dir);
+        let epoch = engine.replication().get_epoch();
+
+        // ext_count says 2 tags follow, but the buffer stops partway through the first
+        // one's declared length — a genuine split TCP read, not an old/unaware peer
+        // (both ends of any `0xB0` exchange already know this section exists), so this
+        // must ask for more data rather than silently truncate or reject.
+        let mut ext = vec![2u8];
+        ext.push(0x01); // tag
+        ext.extend_from_slice(&10u16.to_be_bytes()); // declares 10 bytes...
+        ext.extend_from_slice(&[1, 2, 3]); // ...but only 3 are actually present
+
+        let packet = build_push_packet_v2(&engine, "__cluster_metadata", 0, epoch, 0, &[], &ext);
+
+        match decode_replication_packet_v2(&engine, &packet) {
+            Err(PacketError::NeedMoreData) => {}
+            other => panic!("expected NeedMoreData, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_push_reports_need_more_data_when_the_extension_section_is_missing_entirely() {
+        let dir = TempDir::new("v2_missing_ext");
+        let engine = open_engine(&dir);
+        let epoch = engine.replication().get_epoch();
+
+        // No `ext_count` byte at all — this is mandatory framing within `0xB0` itself
+        // (both ends already agree the section exists), so its absence means the packet
+        // hasn't fully arrived yet, not that some older peer omitted it.
+        let packet = build_push_packet_v2(&engine, "__cluster_metadata", 0, epoch, 0, &[], &[]);
+
+        match decode_replication_packet_v2(&engine, &packet) {
+            Err(PacketError::NeedMoreData) => {}
+            other => panic!("expected NeedMoreData, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_push_stale_epoch_is_rejected_with_correct_byte_accounting() {
+        let dir = TempDir::new("v2_stale_epoch");
+        let engine = open_engine(&dir);
+        // Bump this node's epoch so the packet below (epoch 0) is stale.
+        engine.replication().set_epoch(5);
+
+        let frame = RecordFrame::create(0, 0, b"stale".to_vec());
+        let packet = build_push_packet_v2(&engine, "__cluster_metadata", 0, 0, 0, &[frame], &[0u8]);
+
+        let (consumed, ack) = decode_replication_packet_v2(&engine, &packet).unwrap();
+        assert_eq!(ack, vec![0x02], "expected the STALE_EPOCH sentinel");
+        assert_eq!(
+            consumed,
+            packet.len(),
+            "the whole packet (frames + extensions) must be consumed even on rejection, \
+             or the next bytes on this connection would be misread as a new message"
         );
     }
 }

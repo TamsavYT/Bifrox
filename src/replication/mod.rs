@@ -59,6 +59,89 @@ pub const VOTE_REQUEST_MAGIC: u8 = 0xAE;
 /// Magic byte for vote-response RPC (Peer -> Candidate)
 pub const VOTE_RESPONSE_MAGIC: u8 = 0xAF;
 
+/// This build's inter-node protocol version, advertised to every peer via the
+/// heartbeat's compatible trailing section (see `note_peer_version`) the same way
+/// process roles already are.
+///
+/// STATUS: this mechanism (issue #48) is implemented but PARKED — not adopted as part of
+/// a shipped upgrade path. Hermes/Kafka functional parity is the current priority;
+/// enabling this for real is a separate decision with its own rollout communication. The
+/// notes below are for whoever resumes that work.
+///
+/// IMPORTANT — this is a one-time flag day, not a rolling-upgrade boundary: adopting
+/// version `1` (this mechanism's introduction, issue #48) requires every broker in the
+/// cluster to be upgraded together. A pre-`1` peer's heartbeat handling has no concept of
+/// a trailing version byte at all — appended to the *request*, it desyncs that peer's own
+/// framing (see `handler::decode_heartbeat_packet`'s module doc); appended to the *ACK*
+/// over a pooled connection, it is read back as the *next* heartbeat's status byte by a
+/// pre-`1` leader, which then sees this node as permanently rejecting it. Neither
+/// direction degrades gracefully — mixing a pre-`1` and a `>= 1` node is not a supported
+/// topology, full stop.
+///
+/// `0` is still tracked (see `peer_protocol_version`) purely as a defensive value for a
+/// cluster caught *mid* flag-day (some brokers already restarted onto this build, some
+/// not yet): it lets an incompletely-upgraded cluster keep talking over the original
+/// `0xAA` framing rather than corrupting a connection, but it is not itself a supported
+/// end state to run in — see `MIN_VERSION_FOR_VERSIONED_PUSH`.
+///
+/// Once every node is on version `1` or later, THAT boundary is the one issue #48 is
+/// actually for: bump this constant when a new inter-node wire capability is added that a
+/// receiver must be able to opt into per-peer, and it rolls out one broker at a time from
+/// here on — see `REPLICATION_PUSH_V2_MAGIC`, the first such capability.
+pub const INTER_NODE_PROTOCOL_VERSION: u8 = 1;
+
+/// Minimum peer-advertised `INTER_NODE_PROTOCOL_VERSION` before the leader will send the
+/// versioned replication push (`REPLICATION_PUSH_V2_MAGIC`) instead of the original
+/// `0xAA` layout. A peer advertising less than this — including one tracked as `0`
+/// because it has never advertised anything (see `INTER_NODE_PROTOCOL_VERSION`'s doc for
+/// why that is a mid-upgrade fallback, not a peer this cluster is expected to run
+/// alongside indefinitely) — keeps receiving `0xAA` byte-for-byte, unchanged.
+const MIN_VERSION_FOR_VERSIONED_PUSH: u8 = 1;
+
+/// Magic byte for the versioned inter-node replication push: the same push `0xAA` carries,
+/// framed behind an explicit version byte instead of a layout every peer must simply
+/// assume, so a receiver always knows which fields follow rather than having to trust
+/// that every broker in the cluster runs the same build. That trust requirement is
+/// exactly what issue #48 exists to remove — `0xAA` carries no version field today, so a
+/// receiver reading `0xAA` cannot tell an old sender from a new one, and adding a version
+/// byte to `0xAA` itself would just be one more lockstep-only change, the precise thing
+/// this issue is about ending.
+///
+/// This mirrors how the client protocol already solved the identical problem:
+/// `VERSIONED_ENVELOPE_MAGIC` (`0xF1`, see `protocol::wire`) sits in front of a versioned
+/// request while the legacy `[cmd][len][payload]` framing still decodes completely
+/// unchanged. Being self-describing at the very first byte is what makes a mixed-version
+/// cluster safe — matching a pattern already proven in this codebase is worth more than
+/// inventing a second one.
+///
+/// `0xB0` was chosen deliberately: it collides with no magic byte used anywhere on the
+/// wire today. It sits immediately next to the other inter-node magics without matching
+/// any of them (`0xAA` push, `0xAC` heartbeat, `0xAE`/`0xAF` Raft vote, `0xBB` gRPC-style
+/// pull fetch); it is outside the `RecordFrame` magic bytes used *inside* a push at a
+/// nested framing level (`protocol::frame`'s `0xAB`/`0xAC`/`0xAD`/`0xAE`, which a receiver
+/// only ever interprets once already inside a decoded `0xAA`/`0xB0` payload, so those
+/// bytes are never compared against a fresh connection's first byte); and it is nowhere
+/// near the client protocol's command-code range (`0x01..0x0A`) or its own `0xF1`
+/// versioned-envelope magic.
+pub const REPLICATION_PUSH_V2_MAGIC: u8 = 0xB0;
+
+/// Bound on how long a leader waits for the bytes of a heartbeat ACK's compatible
+/// trailing extensions — the role list, then the protocol version — once the mandatory
+/// `[status][node_id][addr]` prefix has already been read successfully.
+///
+/// A fully compliant peer (version `>= 1`, see `INTER_NODE_PROTOCOL_VERSION`) writes its
+/// entire ACK — prefix and both extensions — in one `write_all` call, so on a live
+/// connection those extension bytes are normally already sitting in the socket's receive
+/// buffer by the time this fires; this is not a meaningful latency budget for the
+/// ordinary case. It exists as general defensive hardening against any peer that hangs
+/// mid-response for whatever reason (a stall, a bug, a partial write never completed) —
+/// this read would otherwise have no bound at all and could wedge a pooled connection
+/// open forever. It is NOT a mechanism for tolerating a pre-`1` peer: talking to one over
+/// a pooled connection has a different, unmitigated failure mode entirely (see
+/// `INTER_NODE_PROTOCOL_VERSION`'s doc) that this timeout does not and cannot fix — a
+/// timeout here only ever fires against a peer that is already `>= 1` but has stalled.
+const HEARTBEAT_EXT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Leader,
@@ -163,6 +246,12 @@ pub struct ReplicationManager {
     /// Used to decide which peers are eligible for data-partition assignment (`Broker`
     /// role) versus the metadata Raft quorum (`Controller` role).
     broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
+    /// Shared broker inter-node protocol-version registry (node_id -> version), kept in
+    /// sync from the same heartbeat round trip as `broker_addrs`/`broker_roles` — see
+    /// `note_peer_version`. A node id never present here has never advertised a version at
+    /// all and is treated as `0` ("pre-versioning") by `peer_protocol_version`/
+    /// `peer_protocol_version_by_node_id` — see issue #48.
+    broker_versions: Arc<DashMap<u32, u8>>,
     /// Persistent peer TCP connection pool (peer_addr -> Arc<Mutex<Option<TcpStream>>>)
     /// Prevents ephemeral OS port exhaustion under high-throughput replication & heartbeats.
     peer_connections: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<TcpStream>>>>>,
@@ -232,6 +321,7 @@ impl ReplicationManager {
             fetchers: Arc::new(DashMap::new()),
             broker_addrs,
             broker_roles,
+            broker_versions: Arc::new(DashMap::new()),
             peer_connections: Arc::new(DashMap::new()),
         };
 
@@ -419,6 +509,43 @@ impl ReplicationManager {
             .insert(node_id, std::time::Instant::now());
     }
 
+    /// Records the inter-node protocol version `node_id` most recently advertised via a
+    /// heartbeat — called from both directions: the leader learns a follower's version
+    /// from its ACK (`send_leader_heartbeat_pooled`/`send_leader_heartbeat`), and a
+    /// follower learns the leader's version from the heartbeat request itself
+    /// (`handler::decode_heartbeat_packet`). Monotonicity is deliberately NOT enforced
+    /// (unlike `set_local_metadata_log_index`): a peer's advertised version is a live fact
+    /// about which build it is currently running, not a counter that only ever grows — a
+    /// restart onto an older binary is a real (if unusual) event this should reflect, not
+    /// resist.
+    pub fn note_peer_version(&self, node_id: u32, version: u8) {
+        self.broker_versions.insert(node_id, version);
+    }
+
+    /// The inter-node protocol version `node_id` last advertised, or `0`
+    /// ("pre-versioning") if this node has never heard from it at all.
+    pub fn peer_protocol_version_by_node_id(&self, node_id: u32) -> u8 {
+        self.broker_versions
+            .get(&node_id)
+            .map(|v| *v.value())
+            .unwrap_or(0)
+    }
+
+    /// The inter-node protocol version most recently advertised by the peer reachable at
+    /// `peer_addr`, or `0` if unknown. Versions are tracked per `node_id` — the identity a
+    /// peer states about itself in its heartbeat (see `note_peer_version`) — while
+    /// replication is addressed by `peer_addr` (see `replication_targets`), so this
+    /// resolves between the two via `broker_addrs`' reverse mapping, the same way
+    /// `replication_targets` itself already cross-references `broker_roles` by `node_id`
+    /// while working in terms of addresses.
+    pub fn peer_protocol_version(&self, peer_addr: &str) -> u8 {
+        self.broker_addrs
+            .iter()
+            .find(|entry| entry.value() == peer_addr)
+            .map(|entry| self.peer_protocol_version_by_node_id(*entry.key()))
+            .unwrap_or(0)
+    }
+
     /// Leader heartbeat broadcaster: sends periodic heartbeats to all follower peers,
     /// announcing this node as the cluster leader and providing its bind address.
     fn start_leader_heartbeat_loop(&self) {
@@ -473,13 +600,14 @@ impl ReplicationManager {
                     )
                     .await
                     {
-                        Ok((follower_id, follower_addr, follower_roles)) => {
+                        Ok((follower_id, follower_addr, follower_roles, follower_version)) => {
                             // Learn the follower's own identity from its heartbeat ACK so this
                             // leader's broker_addrs registry stays complete even without any
                             // manual registration step (fixes real-cluster broker discovery).
                             broker_addrs.insert(follower_id, follower_addr);
                             broker_roles.insert(follower_id, follower_roles);
                             manager.note_broker_alive(follower_id);
+                            manager.note_peer_version(follower_id, follower_version);
                             tracing::info!(
                                 "HA Cluster [{}]: Heartbeat OK — peer {} acknowledged leader",
                                 cluster_id,
@@ -737,6 +865,7 @@ impl ReplicationManager {
         let advertised_addr = self.advertised_addr.clone();
         let broker_addrs = self.broker_addrs.clone();
         let broker_roles = self.broker_roles.clone();
+        let broker_versions = self.broker_versions.clone();
         let local_metadata_log_index = self.local_metadata_log_index.clone();
         let broker_last_seen = self.broker_last_seen.clone();
 
@@ -878,6 +1007,7 @@ impl ReplicationManager {
                         let consensus_c = consensus.clone();
                         let broker_addrs_c = broker_addrs.clone();
                         let broker_roles_c = broker_roles.clone();
+                        let broker_versions_c = broker_versions.clone();
                         let broker_last_seen_c = broker_last_seen.clone();
                         tokio::spawn(async move {
                             loop {
@@ -892,18 +1022,23 @@ impl ReplicationManager {
                                     epoch_c.load(std::sync::atomic::Ordering::Acquire);
                                 let current_addr = advertised_addr_c.read().clone();
                                 for peer in &peer_addrs_c {
-                                    if let Ok((follower_id, follower_addr, follower_roles)) =
-                                        send_leader_heartbeat(
-                                            peer,
-                                            &cluster_id_c,
-                                            node_id,
-                                            current_term,
-                                            &current_addr,
-                                        )
-                                        .await
+                                    if let Ok((
+                                        follower_id,
+                                        follower_addr,
+                                        follower_roles,
+                                        follower_version,
+                                    )) = send_leader_heartbeat(
+                                        peer,
+                                        &cluster_id_c,
+                                        node_id,
+                                        current_term,
+                                        &current_addr,
+                                    )
+                                    .await
                                     {
                                         broker_addrs_c.insert(follower_id, follower_addr);
                                         broker_roles_c.insert(follower_id, follower_roles);
+                                        broker_versions_c.insert(follower_id, follower_version);
                                         broker_last_seen_c
                                             .insert(follower_id, std::time::Instant::now());
                                     }
@@ -1027,17 +1162,34 @@ impl ReplicationManager {
         }
         let last_offset = frames.last().unwrap().offset;
         let peer_conn = self.get_or_connect_peer(peer_addr);
-        send_replication_push_pooled(
-            &peer_conn,
-            peer_addr,
-            &self.config.cluster_id,
-            topic,
-            partition,
-            fencing_epoch,
-            leader_hw,
-            frames,
-        )
-        .await?;
+        // Issue #48: use the versioned frame only once this peer has told us (via
+        // heartbeat) that it understands it — everyone else, including a peer we've never
+        // heard a version from at all, keeps getting `0xAA` byte-for-byte.
+        if self.peer_protocol_version(peer_addr) >= MIN_VERSION_FOR_VERSIONED_PUSH {
+            send_replication_push_v2_pooled(
+                &peer_conn,
+                peer_addr,
+                &self.config.cluster_id,
+                topic,
+                partition,
+                fencing_epoch,
+                leader_hw,
+                frames,
+            )
+            .await?;
+        } else {
+            send_replication_push_pooled(
+                &peer_conn,
+                peer_addr,
+                &self.config.cluster_id,
+                topic,
+                partition,
+                fencing_epoch,
+                leader_hw,
+                frames,
+            )
+            .await?;
+        }
         self.update_replica_watermark(topic, partition, peer_addr, last_offset);
         Ok(())
     }
@@ -1062,18 +1214,35 @@ impl ReplicationManager {
             let cid = cluster_id.clone();
             let topic_name = topic.to_string();
             let peer_conn = self.get_or_connect_peer(&peer_addr);
+            // Decided synchronously, before the peer's own send task spawns — see the
+            // matching comment in `push_frames_to_peer`.
+            let use_v2 = self.peer_protocol_version(&peer_addr) >= MIN_VERSION_FOR_VERSIONED_PUSH;
             handles.push(tokio::spawn(async move {
-                let result = send_replication_push_pooled(
-                    &peer_conn,
-                    &peer_addr,
-                    &cid,
-                    &topic_name,
-                    partition,
-                    epoch,
-                    leader_hw,
-                    &[],
-                )
-                .await;
+                let result = if use_v2 {
+                    send_replication_push_v2_pooled(
+                        &peer_conn,
+                        &peer_addr,
+                        &cid,
+                        &topic_name,
+                        partition,
+                        epoch,
+                        leader_hw,
+                        &[],
+                    )
+                    .await
+                } else {
+                    send_replication_push_pooled(
+                        &peer_conn,
+                        &peer_addr,
+                        &cid,
+                        &topic_name,
+                        partition,
+                        epoch,
+                        leader_hw,
+                        &[],
+                    )
+                    .await
+                };
                 (peer_addr, result)
             }));
         }
@@ -1141,19 +1310,38 @@ impl ReplicationManager {
             let frames_vec = frames.to_vec();
             let cid = cluster_id.clone();
             let peer_conn = self.get_or_connect_peer(&peer_addr);
+            // Issue #48: pick the versioned frame only for a peer that has advertised
+            // support for it — decided synchronously, before this peer's send task
+            // spawns, from the version this leader last learned via that peer's
+            // heartbeat ACK (see `peer_protocol_version`/`note_peer_version`).
+            let use_v2 = self.peer_protocol_version(&peer_addr) >= MIN_VERSION_FOR_VERSIONED_PUSH;
             handles.push(tokio::spawn(async move {
                 // CRIT-01: pass cluster_id so the follower can authenticate this replication push.
-                let result = send_replication_push_pooled(
-                    &peer_conn,
-                    &peer_addr,
-                    &cid,
-                    &topic_name,
-                    partition,
-                    epoch,
-                    leader_hw,
-                    &frames_vec,
-                )
-                .await;
+                let result = if use_v2 {
+                    send_replication_push_v2_pooled(
+                        &peer_conn,
+                        &peer_addr,
+                        &cid,
+                        &topic_name,
+                        partition,
+                        epoch,
+                        leader_hw,
+                        &frames_vec,
+                    )
+                    .await
+                } else {
+                    send_replication_push_pooled(
+                        &peer_conn,
+                        &peer_addr,
+                        &cid,
+                        &topic_name,
+                        partition,
+                        epoch,
+                        leader_hw,
+                        &frames_vec,
+                    )
+                    .await
+                };
                 (peer_addr, result)
             }));
         }
@@ -1234,14 +1422,29 @@ impl ReplicationManager {
 
 /// Sends a leader heartbeat packet (0xAC) including the leader's bind address and current term.
 ///
-/// Wire format (request):  `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [bind_addr: pascal]`
-/// Wire format (response): `[0x00] [follower_node_id: 4b] [follower_bind_addr: pascal]` on success,
-///                          `[0x01]` on rejection (cluster mismatch / not whitelisted).
+/// Wire format (request):  `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b]
+/// [bind_addr: pascal] [leader_version: 1b]`
+/// Wire format (response): `[0x00] [follower_node_id: 4b] [follower_bind_addr: pascal]
+/// [role_count: 1b][role_bytes...] [follower_version: 1b]` on success, `[0x01]` on
+/// rejection (cluster mismatch / not whitelisted).
 ///
 /// Returning the follower's own node_id + bind_addr lets the Leader populate its broker
 /// address registry purely from the existing heartbeat round-trip, without requiring any
 /// out-of-band broker registration step — followers are otherwise unable to publish their
 /// own address since only the partition leader for `__cluster_metadata` may write to it.
+///
+/// `leader_version`/`follower_version` (issue #48) are each appended as a trailing byte,
+/// in the same position the ACK's role list occupies. This is NOT the same compatibility
+/// guarantee roles have: a pre-`1` peer has no code path that skips an unrecognized
+/// trailing byte, so on either end this desyncs that peer's own framing rather than being
+/// harmlessly ignored (see `INTER_NODE_PROTOCOL_VERSION`'s doc for exactly how, in each
+/// direction). Adopting this field is therefore a one-time flag day, not a rolling
+/// upgrade — every node must already be `>= 1` before any of them appends it. What
+/// `read_heartbeat_ack_version`/`handler::decode_heartbeat_packet` tolerate is a *missing*
+/// byte from a peer that IS `>= 1` (a stalled write, a slow peer, or simply this node's
+/// own bookkeeping not having heard from that peer yet) — never a genuinely pre-`1` peer,
+/// which this mechanism does not and cannot support.
+///
 /// Reads the trailing `[role_count: 1b][role_bytes...]` that
 /// `handler::decode_heartbeat_packet` now appends to its ACK, after the caller has
 /// already consumed the `[status][node_id][addr_len][addr_bytes]` prefix.
@@ -1259,6 +1462,95 @@ where
     Ok(crate::config::parse_process_role_bytes(&role_buf))
 }
 
+/// Reads the trailing `[protocol_version: 1b]` a version-aware follower appends to its
+/// heartbeat ACK immediately after the role list `read_heartbeat_ack_roles` reads (issue
+/// #48; see `handler::decode_heartbeat_packet`, which writes both, in that order).
+///
+/// Absence here is never propagated as an error, unlike `read_heartbeat_ack_roles`:
+/// failing the whole heartbeat over one missing byte would throw away the
+/// already-successfully-read prefix and role list too. This is deliberately NOT a claim
+/// that a genuinely pre-`1` peer is being tolerated — see `INTER_NODE_PROTOCOL_VERSION`'s
+/// doc; talking to one over a pooled connection is unsafe regardless of what this
+/// function does, because a pre-`1` peer never reaches this point on its own side (it
+/// stopped reading before this byte and moved on to reusing the connection). What this
+/// *does* correctly handle is this node's own bookkeeping being incomplete or a `>= 1`
+/// peer stalling mid-response — bounded by `HEARTBEAT_EXT_READ_TIMEOUT` so such a peer
+/// cannot hold this read open forever. A timeout, a short read, or a closed connection all
+/// resolve the same way — to version `0` — which also happens to be the value a genuinely
+/// pre-`1` peer would be tracked as, if a connection to one somehow reaches this function
+/// at all.
+async fn read_heartbeat_ack_version<S>(stream: &mut S) -> u8
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut version_buf = [0u8; 1];
+    match timeout(
+        HEARTBEAT_EXT_READ_TIMEOUT,
+        stream.read_exact(&mut version_buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => version_buf[0],
+        _ => 0,
+    }
+}
+
+/// Reads a heartbeat ACK's full body from an already-connected stream, immediately after
+/// the request has been written: the mandatory `[status][node_id][addr]` prefix, then both
+/// of its compatible trailing extensions — the role list, then the protocol version (see
+/// `read_heartbeat_ack_roles`/`read_heartbeat_ack_version`).
+///
+/// Returns `Ok(None)` for a cluster-mismatch rejection (`status != 0`) and `Ok(Some(..))`
+/// on success, complete with whatever extensions the peer actually sent. Only a genuine
+/// I/O failure while reading the mandatory prefix or the role list produces `Err` — a
+/// missing protocol-version byte never does (see `read_heartbeat_ack_version`).
+async fn read_heartbeat_ack_body<S>(
+    stream: &mut S,
+) -> IoResult<Option<(u32, String, Vec<crate::config::ProcessRole>, u8)>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status).await?;
+    if status[0] != 0 {
+        return Ok(None);
+    }
+
+    let mut id_buf = [0u8; 4];
+    stream.read_exact(&mut id_buf).await?;
+    let follower_node_id = u32::from_be_bytes(id_buf);
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let addr_len = u16::from_be_bytes(len_buf) as usize;
+    let mut addr_buf = vec![0u8; addr_len];
+    stream.read_exact(&mut addr_buf).await?;
+    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
+
+    let roles = read_heartbeat_ack_roles(stream).await?;
+    let version = read_heartbeat_ack_version(stream).await;
+
+    Ok(Some((follower_node_id, follower_bind_addr, roles, version)))
+}
+
+/// Bound on the *entire* heartbeat ACK read (from right after the request is written
+/// through to the end of both trailing extensions), wrapped around
+/// `read_heartbeat_ack_body`. This is broader than `HEARTBEAT_EXT_READ_TIMEOUT`: it also
+/// covers the mandatory prefix, protecting this node against ANY peer that stalls before
+/// writing a response at all — a hung process, a slow disk, a network stall, or any other
+/// reason a live `>= 1` peer can fail to answer promptly. This read had no bound before
+/// this constant existed, which is the actual gap it closes; it is general hardening, not
+/// a mechanism for surviving a pre-`1` peer.
+///
+/// It does NOT make talking to a pre-`1` peer safe, and does not attempt to. A pre-`1`
+/// leader reading this node's version-tagged ACK over a *pooled* connection stops before
+/// the version byte, leaves it unread, and reads it back as the *next* heartbeat's status
+/// byte — a nonzero status, i.e. a permanent false rejection — with no timeout able to
+/// help, because that leader never even reaches a blocked read: it gets a (wrong) answer
+/// immediately. See `INTER_NODE_PROTOCOL_VERSION`'s doc; this is exactly why the version
+/// field is a one-time flag day rather than a rolling-upgrade boundary.
+const HEARTBEAT_ACK_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub async fn send_leader_heartbeat_pooled(
     peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
     peer_addr: &str,
@@ -1266,35 +1558,29 @@ pub async fn send_leader_heartbeat_pooled(
     node_id: u32,
     term: u64,
     leader_bind_addr: &str,
-) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
+) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>, u8)> {
     let mut buf = Vec::with_capacity(128);
     buf.put_u8(0xAC);
     crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
     buf.put_u32(node_id);
     buf.put_u64(term);
     crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
+    // Issue #48: advertise this node's inter-node protocol version (see
+    // `note_peer_version` on the receiving end). Unconditional: a pre-`1` receiver
+    // desyncs its own framing on this byte rather than skipping it (see
+    // `INTER_NODE_PROTOCOL_VERSION`'s doc) — writing it is safe ONLY because adopting
+    // this field requires every node already be `>= 1` before any of them sends it (a
+    // one-time flag day, not a rolling upgrade).
+    buf.put_u8(INTER_NODE_PROTOCOL_VERSION);
 
     let mut lock = peer_conn.lock().await;
 
     if let Some(ref mut stream) = *lock {
         if stream.write_all(&buf).await.is_ok() {
-            let mut status = [0u8; 1];
-            if stream.read_exact(&mut status).await.is_ok() && status[0] == 0 {
-                let mut id_buf = [0u8; 4];
-                if stream.read_exact(&mut id_buf).await.is_ok() {
-                    let follower_node_id = u32::from_be_bytes(id_buf);
-                    let mut len_buf = [0u8; 2];
-                    if stream.read_exact(&mut len_buf).await.is_ok() {
-                        let addr_len = u16::from_be_bytes(len_buf) as usize;
-                        let mut addr_buf = vec![0u8; addr_len];
-                        if stream.read_exact(&mut addr_buf).await.is_ok() {
-                            let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-                            if let Ok(roles) = read_heartbeat_ack_roles(stream).await {
-                                return Ok((follower_node_id, follower_bind_addr, roles));
-                            }
-                        }
-                    }
-                }
+            if let Ok(Ok(Some((follower_node_id, follower_bind_addr, roles, version)))) =
+                timeout(HEARTBEAT_ACK_READ_TIMEOUT, read_heartbeat_ack_body(stream)).await
+            {
+                return Ok((follower_node_id, follower_bind_addr, roles, version));
             }
         }
     }
@@ -1312,29 +1598,26 @@ pub async fn send_leader_heartbeat_pooled(
     };
 
     stream.write_all(&buf).await?;
-    let mut status = [0u8; 1];
-    stream.read_exact(&mut status).await?;
-    if status[0] != 0 {
-        return Err(std::io::Error::new(
+    match timeout(
+        HEARTBEAT_ACK_READ_TIMEOUT,
+        read_heartbeat_ack_body(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(Some((follower_node_id, follower_bind_addr, roles, version)))) => {
+            *lock = Some(stream);
+            Ok((follower_node_id, follower_bind_addr, roles, version))
+        }
+        Ok(Ok(None)) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
-        ));
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Heartbeat ACK from {} timed out", peer_addr),
+        )),
     }
-
-    let mut id_buf = [0u8; 4];
-    stream.read_exact(&mut id_buf).await?;
-    let follower_node_id = u32::from_be_bytes(id_buf);
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let addr_len = u16::from_be_bytes(len_buf) as usize;
-    let mut addr_buf = vec![0u8; addr_len];
-    stream.read_exact(&mut addr_buf).await?;
-    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-    let roles = read_heartbeat_ack_roles(&mut stream).await?;
-
-    *lock = Some(stream);
-    Ok((follower_node_id, follower_bind_addr, roles))
 }
 
 pub async fn send_leader_heartbeat(
@@ -1343,7 +1626,7 @@ pub async fn send_leader_heartbeat(
     node_id: u32,
     term: u64,
     leader_bind_addr: &str,
-) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
+) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>, u8)> {
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
@@ -1361,31 +1644,30 @@ pub async fn send_leader_heartbeat(
     buf.put_u32(node_id);
     buf.put_u64(term); // P4: include current term
     crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
+    // Issue #48: see the identical line (and its doc) in `send_leader_heartbeat_pooled`.
+    buf.put_u8(INTER_NODE_PROTOCOL_VERSION);
 
     stream.write_all(&buf).await?;
 
-    let mut status = [0u8; 1];
-    stream.read_exact(&mut status).await?;
-    if status[0] != 0 {
-        return Err(std::io::Error::new(
+    match timeout(
+        HEARTBEAT_ACK_READ_TIMEOUT,
+        read_heartbeat_ack_body(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(Some((follower_node_id, follower_bind_addr, roles, version)))) => {
+            Ok((follower_node_id, follower_bind_addr, roles, version))
+        }
+        Ok(Ok(None)) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
-        ));
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Heartbeat ACK from {} timed out", peer_addr),
+        )),
     }
-
-    let mut id_buf = [0u8; 4];
-    stream.read_exact(&mut id_buf).await?;
-    let follower_node_id = u32::from_be_bytes(id_buf);
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let addr_len = u16::from_be_bytes(len_buf) as usize;
-    let mut addr_buf = vec![0u8; addr_len];
-    stream.read_exact(&mut addr_buf).await?;
-    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-    let roles = read_heartbeat_ack_roles(&mut stream).await?;
-
-    Ok((follower_node_id, follower_bind_addr, roles))
 }
 
 /// Streams replication batch frames to a peer follower node over TCP (0xAA protocol).
@@ -1419,13 +1701,108 @@ pub async fn send_replication_push_pooled(
     // committed — a pushed record is not committed until the ISR has acknowledged it, so a
     // follower that advanced its HW on append was marking uncommitted data as readable.
     //
-    // NOTE: this is an inter-node wire change. All brokers in a cluster must run a build
-    // that agrees on this layout; there is no version negotiation on this path yet.
+    // This layout is intentionally frozen (issue #48): it has no version field, so every
+    // peer must already agree on it byte-for-byte, and it stays that way — a future field
+    // goes on `REPLICATION_PUSH_V2_MAGIC`'s versioned frame instead
+    // (`send_replication_push_v2_pooled`), sent only to peers that have advertised support
+    // for it. This function keeps serving every other peer, including a pre-versioning one,
+    // exactly as it always has.
     buf.put_u64(leader_hw);
     buf.put_u32(frames.len() as u32);
     for frame in frames {
         frame.encode_into(&mut buf);
     }
+
+    let mut lock = peer_conn.lock().await;
+
+    if let Some(ref mut stream) = *lock {
+        if stream.write_all(&buf).await.is_ok() {
+            let mut ack = [0u8; 1];
+            if stream.read_exact(&mut ack).await.is_ok() {
+                if ack[0] == 0 {
+                    return Ok(());
+                } else if ack[0] == 0x02 {
+                    return Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"));
+                }
+            }
+        }
+    }
+
+    *lock = None;
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Replication push connection to {} timed out", peer_addr),
+            ));
+        }
+    };
+
+    stream.write_all(&buf).await?;
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).await?;
+    if ack[0] == 0 {
+        *lock = Some(stream);
+        Ok(())
+    } else if ack[0] == 0x02 {
+        *lock = Some(stream);
+        Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
+    } else {
+        Err(std::io::Error::other(format!(
+            "Peer {} returned error ACK 0x{:02X}",
+            peer_addr, ack[0]
+        )))
+    }
+}
+
+/// Streams replication batch frames to a peer follower node over TCP using the versioned
+/// push frame (issue #48). Sent in place of `send_replication_push_pooled` only once the
+/// peer has advertised (via heartbeat) a protocol version that supports it — see
+/// `ReplicationManager::replicate_batch`/`broadcast_high_watermark`/`push_frames_to_peer`
+/// and `MIN_VERSION_FOR_VERSIONED_PUSH`. Every other peer, including a pre-versioning one,
+/// keeps receiving `0xAA` byte-for-byte from the function above, unchanged.
+///
+/// Wire format: `[0xB0] [frame_version: 1b] [ClusterId: pascal] [Topic: pascal]
+/// [Partition: 4b] [Epoch: 8b] [leader_hw: 8b] [Count: 4b] [RecordFrame...]
+/// [ext_count: 1b] ([tag: 1b][len: 2b][bytes: len])*`
+///
+/// The fixed fields are identical, in the same order, to `0xAA` — this frame's purpose
+/// isn't to change what's already there, only to make the *next* change safe. That's what
+/// the trailing `[ext_count][(tag, len, bytes)]*` section is for: a future field is added
+/// as one more tagged entry here, never by widening the fixed header. A receiver that
+/// doesn't recognize a tag skips exactly `len` bytes of it and moves on (see
+/// `decode_replication_packet_v2` in `server::handler`) — the same tolerant, additive
+/// pattern the client protocol already uses for its own tagged fields
+/// (`protocol::wire`'s `RequestTags`). Today that section is always empty: no field has
+/// needed it yet.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_replication_push_v2_pooled(
+    peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    peer_addr: &str,
+    cluster_id: &str,
+    topic: &str,
+    partition: u32,
+    epoch: u64,
+    leader_hw: u64,
+    frames: &[RecordFrame],
+) -> IoResult<()> {
+    let mut buf = Vec::with_capacity(256 + frames.len() * 64);
+    buf.put_u8(REPLICATION_PUSH_V2_MAGIC);
+    buf.put_u8(INTER_NODE_PROTOCOL_VERSION);
+    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
+    crate::protocol::wire::write_pascal_string(&mut buf, topic);
+    buf.put_u32(partition);
+    buf.put_u64(epoch);
+    buf.put_u64(leader_hw);
+    buf.put_u32(frames.len() as u32);
+    for frame in frames {
+        frame.encode_into(&mut buf);
+    }
+    // Extension count: always 0 today — see the wire-format doc above for how a future
+    // field is added here without breaking a peer still on this exact build.
+    buf.put_u8(0u8);
 
     let mut lock = peer_conn.lock().await;
 
@@ -1593,4 +1970,174 @@ pub async fn send_vote_request(
     stream.read_exact(&mut resp).await?;
 
     Ok(resp[0] == 0x01)
+}
+
+/// Issue #48 — inter-node protocol versioning: version discovery over the heartbeat's
+/// compatible trailing section, per-peer version bookkeeping, and the `0xAA`-vs-`0xB0`
+/// framing decision it drives. See `server::handler`'s tests for the matching coverage of
+/// the `0xB0` decoder's own extension section.
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+    use crate::config::ProcessRole;
+    use tokio::io::AsyncWriteExt;
+
+    fn test_config(node_id: u32, peer_addrs: Vec<String>) -> ClusterConfig {
+        ClusterConfig {
+            cluster_id: "test-cluster".to_string(),
+            node_id,
+            role: NodeRole::Leader,
+            peer_addrs,
+            min_insync_replicas: 1,
+            roles: vec![ProcessRole::Controller, ProcessRole::Broker],
+            controller_peer_addrs: vec![],
+        }
+    }
+
+    fn test_manager(node_id: u32, peer_addrs: Vec<String>) -> ReplicationManager {
+        ReplicationManager::new(
+            test_config(node_id, peer_addrs.clone()),
+            "127.0.0.1:0".to_string(),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        )
+    }
+
+    // --- read_heartbeat_ack_version: absence, presence, and never-hanging tolerance ---
+
+    #[tokio::test]
+    async fn read_heartbeat_ack_version_reads_a_present_byte() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        writer.write_all(&[7u8]).await.unwrap();
+        assert_eq!(read_heartbeat_ack_version(&mut reader).await, 7);
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn read_heartbeat_ack_version_treats_a_closed_connection_as_pre_versioning() {
+        // A function-level property only: if nothing more ever arrives on this stream,
+        // this read must resolve to 0 rather than error the whole ACK read. This does NOT
+        // model a supported pre-`1` peer — see `INTER_NODE_PROTOCOL_VERSION`'s doc for why
+        // a genuinely pre-`1` peer never gets a connection into this state in the first
+        // place (it's read back as a status byte before this function is ever called).
+        let (mut reader, writer) = tokio::io::duplex(64);
+        drop(writer);
+        assert_eq!(read_heartbeat_ack_version(&mut reader).await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_heartbeat_ack_version_resolves_within_its_bound_on_an_idle_connection() {
+        // The connection stays open but nothing more ever arrives — the harder case than
+        // an outright close, and the one `HEARTBEAT_EXT_READ_TIMEOUT` exists for: this
+        // must resolve on its own, not hang the caller forever.
+        let (mut reader, writer) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        assert_eq!(read_heartbeat_ack_version(&mut reader).await, 0);
+        assert!(
+            started.elapsed() < HEARTBEAT_EXT_READ_TIMEOUT + Duration::from_secs(1),
+            "must not block past its own bound"
+        );
+        drop(writer);
+    }
+
+    // --- per-peer version bookkeeping ---
+
+    #[tokio::test]
+    async fn peer_protocol_version_defaults_to_zero_for_an_unknown_peer() {
+        let mgr = test_manager(1, vec![]);
+        assert_eq!(mgr.peer_protocol_version("127.0.0.1:1"), 0);
+        assert_eq!(mgr.peer_protocol_version_by_node_id(99), 0);
+    }
+
+    #[tokio::test]
+    async fn note_peer_version_is_retrievable_by_node_id_and_by_address() {
+        let mgr = test_manager(1, vec![]);
+        mgr.broker_addrs.insert(2, "127.0.0.1:9999".to_string());
+        mgr.note_peer_version(2, INTER_NODE_PROTOCOL_VERSION);
+        assert_eq!(
+            mgr.peer_protocol_version_by_node_id(2),
+            INTER_NODE_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            mgr.peer_protocol_version("127.0.0.1:9999"),
+            INTER_NODE_PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn note_peer_version_is_not_monotonic() {
+        // A peer's advertised version is a live fact about the build it's currently
+        // running, not a high-water mark — a downgrade/restart must be reflected.
+        let mgr = test_manager(1, vec![]);
+        mgr.note_peer_version(5, 9);
+        mgr.note_peer_version(5, 1);
+        assert_eq!(mgr.peer_protocol_version_by_node_id(5), 1);
+    }
+
+    // --- the key interop guarantee: which magic byte a push actually uses ---
+
+    /// Spins up a bare TCP listener that captures the first byte (the magic) of whatever
+    /// it's sent, ACKs with a plain success byte so the sender's write path completes
+    /// normally, and reports the captured magic back over the returned channel.
+    async fn spawn_magic_capturing_peer() -> (String, tokio::sync::oneshot::Receiver<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut magic = [0u8; 1];
+                if sock.read_exact(&mut magic).await.is_ok() {
+                    let _ = tx.send(magic[0]);
+                }
+                let _ = sock.write_all(&[0u8]).await;
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn push_uses_legacy_0xaa_for_a_peer_that_has_never_advertised_a_version() {
+        // NOTE: this only proves the send-side framing default is safe when this node's
+        // own bookkeeping has no confirmed version for a peer — a defensive fallback for
+        // an incomplete/in-progress upgrade, not a claim that a genuinely pre-`1` peer is
+        // supported (heartbeat exchange with one is unsafe in both directions; see
+        // `INTER_NODE_PROTOCOL_VERSION`'s doc).
+        let (peer_addr, magic_rx) = spawn_magic_capturing_peer().await;
+        let mgr = test_manager(1, vec![peer_addr]);
+        let frame = RecordFrame::create(0, 0, b"hello".to_vec());
+        let _ = mgr
+            .replicate_batch("__cluster_metadata", 0, 0, 0, &[], &[frame])
+            .await;
+
+        let magic = tokio::time::timeout(Duration::from_secs(2), magic_rx)
+            .await
+            .expect("peer never received a byte")
+            .unwrap();
+        assert_eq!(
+            magic, 0xAA,
+            "a pre-versioning peer must keep receiving the original frame byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_uses_the_versioned_frame_for_a_peer_that_advertised_support() {
+        let (peer_addr, magic_rx) = spawn_magic_capturing_peer().await;
+        let mgr = test_manager(1, vec![peer_addr.clone()]);
+        mgr.broker_addrs.insert(2, peer_addr);
+        mgr.note_peer_version(2, INTER_NODE_PROTOCOL_VERSION);
+
+        let frame = RecordFrame::create(0, 0, b"hello".to_vec());
+        let _ = mgr
+            .replicate_batch("__cluster_metadata", 0, 0, 0, &[], &[frame])
+            .await;
+
+        let magic = tokio::time::timeout(Duration::from_secs(2), magic_rx)
+            .await
+            .expect("peer never received a byte")
+            .unwrap();
+        assert_eq!(
+            magic, REPLICATION_PUSH_V2_MAGIC,
+            "a peer that advertised support must receive the versioned frame"
+        );
+    }
 }

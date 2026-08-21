@@ -6468,12 +6468,17 @@ async fn test_scenario_73_empty_peer_allowlist_accepts_heartbeat_from_any_distin
          is configured; got {:?}",
         result.err()
     );
-    let (follower_id, follower_addr, _roles) = result.unwrap();
+    let (follower_id, follower_addr, _roles, follower_version) = result.unwrap();
     assert_eq!(follower_id, 9);
     assert_eq!(
         follower_addr,
         addr.to_string(),
         "the ACK must carry this node's real advertised address"
+    );
+    assert_eq!(
+        follower_version,
+        hermes::replication::INTER_NODE_PROTOCOL_VERSION,
+        "the ACK must also carry this node's advertised protocol version (issue #48)"
     );
 }
 
@@ -7686,4 +7691,213 @@ async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_count
         "a metadata record whose durability could not be confirmed must not be applied, even \
          on the leader that proposed it"
     );
+}
+
+/// Issue #48 — inter-node protocol versioning. Two real nodes, both running this build,
+/// form a cluster the normal way; version discovery over the heartbeat's compatible
+/// trailing section must complete in *both* directions purely from that round trip, with
+/// no separate handshake — the leader learning the follower's version from its ACK, and
+/// the follower learning the leader's version from the heartbeat request itself.
+#[tokio::test]
+async fn test_scenario_85_heartbeat_discovers_protocol_version_in_both_directions() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("proto_version_test_{}_{}", pid, count));
+
+    let node1_dir = base_dir.join("node1_data");
+    let node2_dir = base_dir.join("node2_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    // Follower (Node 2)
+    let config_node2 = EngineConfig {
+        node_id: 2,
+        role: hermes::NodeRole::Follower,
+        data_dir: node2_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    };
+    let engine_node2 = StorageEngine::new(config_node2).unwrap();
+    let server_node2 = Server::new(engine_node2.clone());
+    let (listener_node2, addr_node2) = server_node2.bind().unwrap();
+    let server_node2_task = tokio::spawn(async move {
+        let _ = server_node2.run_with_listener(listener_node2).await;
+    });
+
+    // Leader (Node 1), with Node 2 as its only peer
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![addr_node2.to_string()],
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1.clone());
+    let (listener_node1, _addr_node1) = server_node1.bind().unwrap();
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    // Poll rather than a fixed sleep: the first heartbeat fires immediately on election/
+    // startup, but scheduling under test load is not instant.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut leader_knows_follower_version = 0u8;
+    let mut follower_knows_leader_version = 0u8;
+    while std::time::Instant::now() < deadline {
+        leader_knows_follower_version = engine_node1
+            .replication()
+            .peer_protocol_version_by_node_id(2);
+        follower_knows_leader_version = engine_node2
+            .replication()
+            .peer_protocol_version_by_node_id(1);
+        if leader_knows_follower_version != 0 && follower_knows_leader_version != 0 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        leader_knows_follower_version,
+        hermes::replication::INTER_NODE_PROTOCOL_VERSION,
+        "the leader must learn the follower's version from its heartbeat ACK"
+    );
+    assert_eq!(
+        follower_knows_leader_version,
+        hermes::replication::INTER_NODE_PROTOCOL_VERSION,
+        "the follower must learn the leader's version from the heartbeat request itself"
+    );
+
+    server_node1_task.abort();
+    server_node2_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// Issue #48 is PARKED — see `replication::INTER_NODE_PROTOCOL_VERSION`'s doc — because
+/// this mechanism turned out to require a one-time, all-brokers-together flag day rather
+/// than a rolling upgrade: appending the version byte desyncs a pre-`1` peer's own
+/// framing in BOTH directions (heartbeat request and ACK), and the ACK direction is
+/// unmitigated because `get_or_connect_peer` pools the connection — a second heartbeat on
+/// the same connection reads the previous ACK's unread version byte back as ITS status
+/// byte, a permanent false rejection.
+///
+/// This test does NOT prove pre-`1` interop; it proves something narrower and still true:
+/// a single, fresh, one-shot connection's first heartbeat exchange decodes fine even
+/// against a peer that never sends a version byte back (a real pre-`1` peer, or simply
+/// this node's own bookkeeping not having heard from a peer yet — see
+/// `replication::protocol_version_tests::
+/// push_uses_legacy_0xaa_for_a_peer_that_has_never_advertised_a_version` for the matching
+/// send-side default). The mock below deliberately closes its listener after that one
+/// exchange, so it never exercises the pooled-reuse desync above — a real pre-`1` peer's
+/// *second* heartbeat on the same connection would already be broken. Proving genuine
+/// rolling-upgrade interop instead — a v1 node and a hypothetical v2 node exchanging a
+/// `0xB0` push with an unrecognized extension tag at the scenario level, extending the
+/// unit coverage in `server::handler::protocol_version_tests::
+/// v2_push_skips_an_unrecognized_tag_and_still_applies_the_batch` — is the test worth
+/// adding when this work resumes.
+#[tokio::test]
+async fn test_scenario_86_pre_versioning_peers_first_heartbeat_still_decodes() {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let base_dir = std::env::temp_dir().join(format!("pre_version_peer_test_{}_{}", pid, count));
+    let node1_dir = base_dir.join("node1_data");
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    const OLD_FOLLOWER_NODE_ID: u32 = 77;
+
+    let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old_addr = old_listener.local_addr().unwrap();
+
+    // A deliberately simplified stand-in for a pre-#48 broker's heartbeat handling: reads
+    // exactly the fields that wire format ever had — cluster_id, node_id, term, bind_addr
+    // — and replies with exactly the ACK shape that build ever wrote — status, node_id,
+    // addr, an empty role list — never looking for (or sending) a trailing version byte.
+    //
+    // Unlike this mock, a real pre-#48 broker's connection handling
+    // (`handler::handle_connection_stream`) does NOT close after one exchange — it loops,
+    // reading further messages off the same persistent, pooled connection. This mock
+    // closing early is what keeps this test from exercising the actual, unmitigated
+    // pooled-reuse desync described in this test's doc comment; it is a simplification,
+    // not a faithful model of the real failure mode.
+    let old_peer_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if let Ok((mut sock, _)) = old_listener.accept().await {
+            let mut magic = [0u8; 1];
+            if sock.read_exact(&mut magic).await.is_err() || magic[0] != 0xAC {
+                return;
+            }
+            let mut len_buf = [0u8; 2];
+            sock.read_exact(&mut len_buf).await.unwrap();
+            let cid_len = u16::from_be_bytes(len_buf) as usize;
+            let mut cid_buf = vec![0u8; cid_len];
+            sock.read_exact(&mut cid_buf).await.unwrap();
+            let mut rest = [0u8; 4 + 8]; // node_id + term
+            sock.read_exact(&mut rest).await.unwrap();
+            sock.read_exact(&mut len_buf).await.unwrap();
+            let addr_len = u16::from_be_bytes(len_buf) as usize;
+            let mut addr_buf = vec![0u8; addr_len];
+            sock.read_exact(&mut addr_buf).await.unwrap();
+            // The real leader also wrote a trailing version byte here; this stand-in
+            // never reads it and closes the connection right after replying, discarding
+            // it along with the socket — see the mock's doc above for why that sidesteps,
+            // rather than reproduces, the real pooled-connection failure mode.
+
+            let mut ack = Vec::new();
+            ack.push(0u8); // status: accepted
+            ack.extend_from_slice(&OLD_FOLLOWER_NODE_ID.to_be_bytes());
+            let self_addr = format!("127.0.0.1:{}", old_addr.port());
+            ack.extend_from_slice(&(self_addr.len() as u16).to_be_bytes());
+            ack.extend_from_slice(self_addr.as_bytes());
+            ack.push(0u8); // role_count = 0 (pre-#48 shape, roles already existed)
+            let _ = sock.write_all(&ack).await;
+        }
+    });
+
+    let config_node1 = EngineConfig {
+        node_id: 1,
+        role: hermes::NodeRole::Leader,
+        data_dir: node1_dir.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        peer_addrs: vec![old_addr.to_string()],
+        ..EngineConfig::default()
+    };
+    let engine_node1 = StorageEngine::new(config_node1).unwrap();
+    let server_node1 = Server::new(engine_node1.clone());
+    let (listener_node1, _addr_node1) = server_node1.bind().unwrap();
+    let server_node1_task = tokio::spawn(async move {
+        let _ = server_node1.run_with_listener(listener_node1).await;
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut heartbeat_succeeded = false;
+    while std::time::Instant::now() < deadline {
+        if engine_node1
+            .replication()
+            .broker_last_seen_age(OLD_FOLLOWER_NODE_ID)
+            .is_some()
+        {
+            heartbeat_succeeded = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        heartbeat_succeeded,
+        "a single fresh connection's first heartbeat exchange must still decode even \
+         without a version byte in the ACK — NOT a claim that a *second* heartbeat reusing \
+         a pooled connection to a genuinely pre-`1` peer would (see this test's doc)"
+    );
+    assert_eq!(
+        engine_node1
+            .replication()
+            .peer_protocol_version_by_node_id(OLD_FOLLOWER_NODE_ID),
+        0,
+        "a peer that never advertises a version is tracked as 0, which is what keeps the \
+         send-side framing decision defaulting to the legacy 0xAA frame"
+    );
+
+    server_node1_task.abort();
+    old_peer_task.abort();
+    let _ = std::fs::remove_dir_all(&base_dir);
 }
