@@ -2178,45 +2178,75 @@ impl StorageEngine {
         let pm_blocking = pm.clone();
         let records_owned: Vec<Bytes> = records.to_vec();
         let num_records = records_owned.len();
-        let (first_offset, last_offset, _frames) =
-            tokio::task::spawn_blocking(move || -> IoResult<(u64, u64, Vec<RecordFrame>)> {
-                let mut first_offset = 0u64;
-                let mut last_offset = 0u64;
-                let mut frames = Vec::with_capacity(num_records);
-                let mut current_seq = base_sequence;
-
-                for (idx, record) in records_owned.iter().enumerate() {
-                    match pm_blocking.produce_frame_eos(
-                        record.clone(),
+        // Whether to write these records as one `RecordBatch` (issue #18 stage 1b-ii)
+        // instead of one `RecordFrame` per record — gated off by default (see
+        // `EngineConfig::produce_record_batches_enable`'s doc comment) because
+        // replication's verbatim-append paths and log compaction's `extract_key` still
+        // only understand frames. Computed as a plain `bool` (not `transaction_id`
+        // itself) so it can move into the `'static` blocking closure below without
+        // fighting `params`' borrow.
+        let write_as_batch = self.config.produce_record_batches_enable;
+        let transactional = transaction_id.is_some();
+        let (first_offset, last_offset) =
+            tokio::task::spawn_blocking(move || -> IoResult<(u64, u64)> {
+                let (first_offset, last_offset) = if write_as_batch {
+                    match pm_blocking.produce_batch_eos(
+                        &records_owned,
                         producer_id,
                         producer_epoch,
-                        current_seq,
+                        base_sequence,
+                        transactional,
                     )? {
-                        Ok(frame) => {
-                            if idx == 0 {
-                                first_offset = frame.offset;
-                            }
-                            last_offset = frame.offset;
-                            frames.push(frame);
-                        }
+                        Ok(batch) => (
+                            batch.base_offset,
+                            batch.base_offset + batch.last_offset_delta as u64,
+                        ),
                         Err(dup_last_offset) => {
-                            if idx == 0 {
-                                last_offset = dup_last_offset;
-                                first_offset = last_offset.saturating_sub(num_records as u64 - 1);
-                            }
+                            let last_offset = dup_last_offset;
+                            let first_offset = last_offset.saturating_sub(num_records as u64 - 1);
+                            (first_offset, last_offset)
                         }
                     }
-                    if producer_id != 0 {
-                        current_seq += 1;
-                    }
-                }
+                } else {
+                    let mut first_offset = 0u64;
+                    let mut last_offset = 0u64;
+                    let mut current_seq = base_sequence;
 
-                // Group commit: one fsync for the whole batch instead of one per record
-                // (see `PartitionManager::flush_if_sync_policy`). `produce_frame_eos`
-                // itself never syncs for exactly this reason.
+                    for (idx, record) in records_owned.iter().enumerate() {
+                        match pm_blocking.produce_frame_eos(
+                            record.clone(),
+                            producer_id,
+                            producer_epoch,
+                            current_seq,
+                        )? {
+                            Ok(frame) => {
+                                if idx == 0 {
+                                    first_offset = frame.offset;
+                                }
+                                last_offset = frame.offset;
+                            }
+                            Err(dup_last_offset) => {
+                                if idx == 0 {
+                                    last_offset = dup_last_offset;
+                                    first_offset =
+                                        last_offset.saturating_sub(num_records as u64 - 1);
+                                }
+                            }
+                        }
+                        if producer_id != 0 {
+                            current_seq += 1;
+                        }
+                    }
+                    (first_offset, last_offset)
+                };
+
+                // Group commit: one fsync for the whole batch instead of one per record/
+                // one for the whole `RecordBatch` (see `PartitionManager::
+                // flush_if_sync_policy`) — neither `produce_frame_eos` nor
+                // `produce_batch_eos` syncs itself for exactly this reason.
                 pm_blocking.flush_if_sync_policy()?;
 
-                Ok((first_offset, last_offset, frames))
+                Ok((first_offset, last_offset))
             })
             .await
             .map_err(|e| std::io::Error::other(format!("produce_batch join error: {}", e)))??;

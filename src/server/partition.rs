@@ -1,5 +1,5 @@
 use crate::config::EngineConfig;
-use crate::protocol::RecordFrame;
+use crate::protocol::{RecordBatch, RecordFrame};
 use crate::segment::SegmentManager;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
@@ -330,6 +330,120 @@ impl PartitionManager {
         Ok(Ok(frame))
     }
 
+    /// Appends a whole produce request's records as one atomic [`RecordBatch`] (issue
+    /// #18 stage 1b-ii), instead of one `RecordFrame` per record via
+    /// `produce_frame_eos`. Only called when `produce.record.batches.enable` is on (see
+    /// `EngineConfig::produce_record_batches_enable`) — `StorageEngine::produce_batch`
+    /// picks between this and the per-record frame loop.
+    ///
+    /// Offset assignment mirrors `produce_frame_eos` exactly for the "assign fresh
+    /// offsets" case: the batch's base offset is the current log-end-offset, same as the
+    /// first frame a per-record loop would get, so a client sees the same
+    /// `(first_offset, last_offset)` for the same produce request whichever path wrote
+    /// it (see `StorageEngine::produce_batch`'s round-trip tests, which assert this).
+    ///
+    /// Idempotent-producer dedup here is necessarily batch-level rather than per-record:
+    /// a batch is atomic on disk (`SegmentManager::append_batch`), so a retried produce
+    /// can only be recognized as "the whole batch was already durably written" (checked
+    /// once, via `base_sequence`) or "the whole batch is new" — there's no such thing as
+    /// writing half of one. This is actually closer to real Kafka's own idempotent-
+    /// producer semantics, which dedups by `(baseSequence, lastSequence)` per batch, than
+    /// the frame path's per-record check is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn produce_batch_eos(
+        &self,
+        records: &[Bytes],
+        producer_id: u64,
+        epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+    ) -> IoResult<Result<RecordBatch, u64>> {
+        let mut psm = self.producer_state_manager.lock();
+        if producer_id != 0 {
+            if let Err((is_duplicate, last_offset)) =
+                psm.validate_sequence(producer_id, epoch, base_sequence)
+            {
+                if is_duplicate {
+                    return Ok(Err(last_offset));
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Out of order sequence",
+                    ));
+                }
+            }
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Every record in the batch shares this one server-assigned timestamp — the
+        // frame path effectively does the same in practice (each `produce_frame_eos`
+        // call stamps "now" independently, but back-to-back calls in a tight loop land
+        // within the same millisecond in all but pathological cases), and the batch
+        // format has no room for genuinely independent per-record wall-clock capture
+        // here without a client-supplied timestamp per record, which produce requests
+        // don't carry.
+        let batch_records: Vec<(u64, Bytes)> =
+            records.iter().map(|r| (timestamp, r.clone())).collect();
+
+        let codec = match *self.compression_codec.read() {
+            crate::config::CompressionCodec::None => crate::protocol::BatchCompression::None,
+            crate::config::CompressionCodec::Lz4 => crate::protocol::BatchCompression::Lz4,
+            crate::config::CompressionCodec::Zstd => crate::protocol::BatchCompression::Zstd,
+        };
+
+        let (batch, rolled) = {
+            let mut seg_guard = self.segment_manager.lock();
+            let base_before = seg_guard.active_base_offset();
+            let batch = seg_guard.append_batch(
+                timestamp,
+                self.leader_epoch(),
+                producer_id,
+                epoch,
+                base_sequence,
+                transactional,
+                codec,
+                &batch_records,
+            )?;
+            let base_after = seg_guard.active_base_offset();
+
+            let last_offset = batch.base_offset + batch.last_offset_delta as u64;
+            // Same LEO-only-advances contract as `produce_frame_eos` — see its comment.
+            self.log_end_offset
+                .store(last_offset + 1, Ordering::Release);
+
+            (batch, base_before != base_after)
+        };
+
+        if producer_id != 0 {
+            let last_sequence = base_sequence.wrapping_add(records.len() as i32 - 1);
+            let last_offset = batch.base_offset + batch.last_offset_delta as u64;
+            psm.update(producer_id, epoch, last_sequence, last_offset);
+        }
+
+        if rolled {
+            let _ = psm.take_snapshot();
+        }
+
+        // Same group-commit contract as `produce_frame_eos`: this never syncs itself for
+        // `SyncEveryBatch`/`UnbufferedSync` — the caller (`StorageEngine::produce_batch`)
+        // syncs once via `flush_if_sync_policy()` after this call returns.
+        let batch_size = batch.encoded_size() as u64;
+        let prev_unsynced = self.unsynced_bytes.fetch_add(batch_size, Ordering::AcqRel);
+        if let crate::config::FlushPolicy::AsyncPeriodic { max_bytes, .. } = &self.flush_policy {
+            let max_bytes = *max_bytes as u64;
+            if max_bytes > 0 && prev_unsynced + batch_size >= max_bytes {
+                let mut seg_guard = self.segment_manager.lock();
+                seg_guard.sync()?;
+                self.unsynced_bytes.store(0, Ordering::Release);
+            }
+        }
+
+        Ok(Ok(batch))
+    }
+
     /// Appends a record and immediately marks it committed. Used by every internal
     /// system-partition writer (cluster metadata proposals, DLQ routing, consumer-offset
     /// commits, transaction-state records, bootstrap) that doesn't itself integrate with
@@ -446,15 +560,26 @@ impl PartitionManager {
     /// Discards any locally-stored entries at or beyond `offset` (Raft-style conflicting-
     /// suffix truncation). Also rewinds LEO, and clamps the committed HW down if it had
     /// advanced past the truncation point (it can never legitimately exceed LEO).
+    ///
+    /// Rewinds to `SegmentManager::truncate_after`'s own resulting high watermark, not
+    /// blindly to the requested `offset` — the same reason that function no longer
+    /// trusts `offset` unconditionally: when `offset` lands inside a batch, the whole
+    /// batch is physically removed (a batch is atomic on disk), so the log's real end
+    /// drops to that batch's base offset instead. Storing the literal `offset` here would
+    /// leave LEO claiming data that no longer exists, right after truncation was supposed
+    /// to resolve exactly that kind of divergence.
     pub fn truncate_after(&self, offset: u64) -> IoResult<()> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.truncate_after(offset)?;
-        self.log_end_offset.store(offset, Ordering::Release);
+        let effective_offset = seg_guard.high_watermark();
+        drop(seg_guard);
+        self.log_end_offset
+            .store(effective_offset, Ordering::Release);
         let mut hw = self.committed_hw.load(Ordering::Acquire);
-        while hw > offset {
+        while hw > effective_offset {
             match self.committed_hw.compare_exchange_weak(
                 hw,
-                offset,
+                effective_offset,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {

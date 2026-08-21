@@ -411,6 +411,16 @@ pub struct EngineConfig {
     /// here at replay time since Hermes has no live producer session to time out against
     /// across a restart).
     pub transaction_timeout_ms: u64,
+    /// Whether `StorageEngine::produce_batch` writes a produced request's records as a
+    /// single [`crate::protocol::RecordBatch`] (issue #18 stage 1b-ii) instead of one
+    /// `RecordFrame` per record (today's format, matching Kafka's `log.message.format.version`
+    /// in spirit — a log-format gate, not a per-request knob). Defaults to **false**:
+    /// batches on disk are so far only *tolerated* by replication's verbatim append paths
+    /// and log compaction's `extract_key` (`src/segment/manager.rs`), not understood by
+    /// them — enabling this before those land (issue #18 stage 1b-iii) would corrupt
+    /// replication and compaction the moment a batch appeared. Flip only once stage
+    /// 1b-iii has merged.
+    pub produce_record_batches_enable: bool,
 }
 
 impl Default for EngineConfig {
@@ -447,8 +457,9 @@ impl Default for EngineConfig {
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
             transaction_timeout_ms: 60_000, // matches Kafka's transaction.timeout.ms default
+            produce_record_batches_enable: false,
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
-            retention_millis: Some(86400 * 1000), // 24 hours retention
+            retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
             cleanup_policy: CleanupPolicy::Delete,
             security_protocol: SecurityProtocol::Plaintext,
@@ -687,6 +698,11 @@ impl EngineConfig {
                     "transaction.timeout.ms" | "transaction.max.timeout.ms" => {
                         if let Ok(v) = value.parse() {
                             config.transaction_timeout_ms = v;
+                        }
+                    }
+                    "produce.record.batches.enable" => {
+                        if let Ok(v) = value.parse::<bool>() {
+                            config.produce_record_batches_enable = v;
                         }
                     }
                     "log.preallocate" | "preallocate.segments" => {
