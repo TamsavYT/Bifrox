@@ -1,5 +1,5 @@
 use crate::config::EngineConfig;
-use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, HEADER_SIZE};
+use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
 use crate::segment::entry::{decode_entry, LogEntry};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
@@ -606,13 +606,20 @@ impl SegmentManager {
             crate::segment::log::fsync_dir(&self.dir);
         }
 
+        // The high watermark after truncation: normally `offset`, but see
+        // `truncate_segment_pair`'s doc comment — if `offset` lands inside a batch, the
+        // whole batch is physically removed (a batch is atomic on disk) and the
+        // watermark must drop to that batch's base offset instead, or it would claim an
+        // offset for data that no longer exists.
+        let effective_offset;
+
         if offset < self.active.base_offset {
             // The truncation point falls inside a historical segment (rare: it means the
             // divergence predates the most recent rotation). Promote the highest-based
             // remaining historical segment to active, truncated at `offset`, and discard
             // the old active segment's on-disk files entirely.
             if let Some(mut promoted) = self.historical.pop() {
-                Self::truncate_segment_pair(&mut promoted, offset)?;
+                effective_offset = Self::truncate_segment_pair(&mut promoted, offset)?;
                 let old_active = std::mem::replace(&mut self.active, promoted);
                 let _ = fs::remove_file(&old_active.log.path);
                 let _ = fs::remove_file(old_active.index.path());
@@ -621,33 +628,44 @@ impl SegmentManager {
             } else {
                 // No historical segment covers `offset` (shouldn't happen if `offset`
                 // is a valid previously-seen index) — fall back to truncating active.
-                Self::truncate_segment_pair(&mut self.active, offset)?;
+                effective_offset = Self::truncate_segment_pair(&mut self.active, offset)?;
             }
         } else {
-            Self::truncate_segment_pair(&mut self.active, offset)?;
+            effective_offset = Self::truncate_segment_pair(&mut self.active, offset)?;
         }
 
-        self.high_watermark = offset;
-        self.active.log.next_offset = offset;
+        self.high_watermark = effective_offset;
+        self.active.log.next_offset = effective_offset;
         self.bytes_since_last_index = 0;
         crate::segment::log::fsync_dir(&self.dir);
         Ok(())
     }
 
     /// Truncates a single segment pair so no frame with offset >= `offset` remains.
-    fn truncate_segment_pair(pair: &mut SegmentPair, offset: u64) -> IoResult<()> {
-        let phys = Self::physical_pos_for_offset(pair, offset)?;
+    /// Returns the *effective* truncation offset: normally just `offset`, but when
+    /// `offset` falls inside a batch (batches are atomic on disk — see
+    /// `physical_pos_for_offset`), the whole batch is removed and the effective offset
+    /// drops to that batch's own base offset. Callers must use the returned value (not
+    /// the requested `offset`) for anything claiming what the log now ends at, e.g. the
+    /// high watermark — see `truncate_after`.
+    fn truncate_segment_pair(pair: &mut SegmentPair, offset: u64) -> IoResult<u64> {
+        let (phys, effective_offset) = Self::physical_pos_for_offset(pair, offset)?;
         pair.log.truncate_to(phys)?;
-        pair.index.truncate_after(offset)?;
-        pair.time_index.truncate_after(offset)?;
-        pair.txn_index.truncate_after(offset)?;
+        pair.index.truncate_after(effective_offset)?;
+        pair.time_index.truncate_after(effective_offset)?;
+        pair.txn_index.truncate_after(effective_offset)?;
         pair.mmap = None;
-        Ok(())
+        Ok(effective_offset)
     }
 
     /// Scans forward from the nearest sparse-index entry to find the physical byte
-    /// position at which `offset` begins within this segment pair.
-    fn physical_pos_for_offset(pair: &mut SegmentPair, offset: u64) -> IoResult<u64> {
+    /// position at which `offset` begins within this segment pair. Also returns the
+    /// *effective* offset that position corresponds to: `offset` itself, unless `offset`
+    /// falls inside a batch's range, in which case it is that batch's own base offset —
+    /// a batch is atomic, so the only physical position reachable for any offset within
+    /// it is the batch's start, and a caller truncating there is removing the whole
+    /// batch, not just the tail of it from `offset` onward.
+    fn physical_pos_for_offset(pair: &mut SegmentPair, offset: u64) -> IoResult<(u64, u64)> {
         let seek_entry = pair.index.find_nearest_physical_pos(offset);
         let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
         let raw = pair
@@ -663,7 +681,7 @@ impl SegmentManager {
             match decode_entry(&raw[cursor..]) {
                 Ok((LogEntry::Frame(frame), consumed)) => {
                     if frame.offset == offset {
-                        return Ok(phys);
+                        return Ok((phys, offset));
                     }
                     cursor += consumed;
                     phys += consumed as u64;
@@ -673,9 +691,10 @@ impl SegmentManager {
                     // partway through it, only for the batch as a whole. Any target
                     // offset within its range (including its base) can only be reached
                     // by truncating at the batch's own start, since discarding one of a
-                    // batch's records means discarding the whole batch.
+                    // batch's records means discarding the whole batch. The effective
+                    // offset drops to the batch's base offset accordingly.
                     if offset <= batch.base_offset + batch.last_offset_delta as u64 {
-                        return Ok(phys);
+                        return Ok((phys, batch.base_offset));
                     }
                     cursor += consumed;
                     phys += consumed as u64;
@@ -685,7 +704,7 @@ impl SegmentManager {
         }
         // `offset` not found in this segment (e.g. it's exactly the segment's end) —
         // truncating at the current physical size is a safe no-op.
-        Ok(pair.log.physical_size)
+        Ok((pair.log.physical_size, offset))
     }
 
     /// Append a control marker frame into active segment. Performs segment rotation if size limit reached.
@@ -826,6 +845,15 @@ impl SegmentManager {
     }
 
     /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
+    ///
+    /// A `RecordBatch` encountered along the way is decoded and its records surfaced as
+    /// synthetic uncompressed `RecordFrame`s (`RecordFrame::create`, magic `0xAB`) — one
+    /// per decoded, already-decompressed `BatchRecord`, filtered to `offset >=
+    /// start_offset` exactly like a real frame is. This gives callers the same records,
+    /// offsets, and payload bytes a frame-per-record produce would have returned; a
+    /// caller that only wants `start_offset` from the middle of a batch still gets it,
+    /// because a batch is atomic on disk and must be decoded whole (see
+    /// `physical_pos_for_offset`) before its later records can be filtered out.
     pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
         let segment_pair = self.find_segment_pair_mut(start_offset);
         let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
@@ -836,6 +864,7 @@ impl SegmentManager {
         }
 
         let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
+        let raw_bytes = Self::ensure_first_batch_fits(segment_pair, start_pos, raw_bytes)?;
 
         let mut frames = Vec::new();
         let mut cursor = 0usize;
@@ -844,19 +873,77 @@ impl SegmentManager {
             if cursor + HEADER_SIZE > raw_bytes.len() {
                 break;
             }
-            let slice = &raw_bytes[cursor..];
-            match RecordFrame::decode(slice) {
-                Ok((frame, consumed)) => {
+            match decode_entry(&raw_bytes[cursor..]) {
+                Ok((LogEntry::Frame(frame), consumed)) => {
                     cursor += consumed;
                     if frame.offset >= start_offset {
                         frames.push(frame);
                     }
+                }
+                Ok((LogEntry::Batch(batch), consumed)) => {
+                    let Ok(records) = batch.records() else {
+                        // Corrupt batch payload — treat exactly like a corrupt frame
+                        // would be treated below: stop the scan rather than propagate a
+                        // partial/garbage record into the response.
+                        break;
+                    };
+                    for record in records {
+                        if record.offset >= start_offset {
+                            frames.push(RecordFrame::create(
+                                record.offset,
+                                record.timestamp,
+                                record.payload,
+                            ));
+                        }
+                    }
+                    cursor += consumed;
                 }
                 Err(_) => break,
             }
         }
 
         Ok(frames)
+    }
+
+    /// If `raw` begins with a [`RecordBatch`] (magic [`BATCH_MAGIC_BYTE`]) whose
+    /// self-declared length is longer than what `raw` already holds, re-reads with a
+    /// budget sized to cover the whole batch and returns that instead. A batch is atomic
+    /// — there is no such thing as decoding "the first part" of one — so if the entry a
+    /// caller's `start_offset` needs is a batch cut short purely because `max_bytes`
+    /// happened to be smaller than it, the fetch must still serve it (mirroring Kafka's
+    /// own "always return at least one message even if it exceeds the requested budget"
+    /// fetch behavior) rather than silently returning nothing for that offset range.
+    ///
+    /// A no-op (returns `raw` unchanged, no extra read) whenever `raw` is empty, doesn't
+    /// start with a batch, or already covers the whole batch.
+    fn ensure_first_batch_fits(
+        pair: &mut SegmentPair,
+        start_pos: u64,
+        raw: Vec<u8>,
+    ) -> IoResult<Vec<u8>> {
+        const PREFIX: usize = 5; // magic + batch_length, see RecordBatch::decode
+        if raw.first() != Some(&BATCH_MAGIC_BYTE) {
+            return Ok(raw);
+        }
+        let prefix: Vec<u8> = if raw.len() >= PREFIX {
+            raw[..PREFIX].to_vec()
+        } else {
+            // The initial read didn't even cover the 5-byte prefix — go get it directly
+            // rather than guessing.
+            pair.log.read_at(start_pos, PREFIX)?
+        };
+        if prefix.len() < PREFIX {
+            // Truncated even for the fixed prefix (e.g. right at the physical end of the
+            // segment) — leave it for `decode_entry` to report cleanly.
+            return Ok(raw);
+        }
+        let batch_length = u32::from_be_bytes(prefix[1..5].try_into().unwrap()) as usize;
+        let total_needed = PREFIX + batch_length;
+        if raw.len() >= total_needed {
+            Ok(raw)
+        } else {
+            pair.log.read_at(start_pos, total_needed)
+        }
     }
 
     /// Plans a zero-copy fetch: locates the exact, frame-aligned physical byte range
@@ -900,6 +987,58 @@ impl SegmentManager {
             let header = segment_pair.log.read_at(phys, HEADER_SIZE)?;
             if header.len() < HEADER_SIZE {
                 break; // reached the end of this segment's valid data
+            }
+            if header[0] == BATCH_MAGIC_BYTE {
+                // This path ships raw bytes straight to the socket (`ZeroCopyFetchPlan::
+                // transmit`) with no per-entry reinterpretation at send time — the client
+                // parses exactly `frame_count` `RecordFrame`s out of what it receives.
+                // A `RecordBatch` is a different wire format entirely, and its header
+                // isn't even frame-shaped (the bytes this loop otherwise reads as
+                // `frame_offset`/`payload_len` would land on the batch's CRC and base
+                // offset fields instead). Sending it through this path would corrupt the
+                // client's parse — decided deliberately, not left to chance, precisely
+                // because this path already caused one silent bug before (#54, bypassing
+                // `record_progress`) by assuming every on-disk entry needed no special
+                // handling.
+                //
+                // `base_offset` (bytes 9..17) and `last_offset_delta` (bytes 17..21) both
+                // land within the 25-byte header already read above, so a batch entirely
+                // before `start_offset` can still be skipped by its own declared length
+                // (`batch_length`, bytes 1..5) exactly like an ordinary too-early frame —
+                // no need to decline just because a batch happens to sit earlier in the
+                // scan than anything relevant.
+                let batch_length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as u64;
+                let batch_base_offset = u64::from_be_bytes(header[9..17].try_into().unwrap());
+                let batch_last_offset_delta =
+                    u32::from_be_bytes(header[17..21].try_into().unwrap());
+                let batch_end_offset = batch_base_offset + batch_last_offset_delta as u64;
+                const BATCH_PREFIX: u64 = 5; // magic + batch_length, see RecordBatch::decode
+                let batch_total_len = BATCH_PREFIX + batch_length;
+
+                if batch_base_offset >= high_watermark {
+                    break; // never expose data beyond the committed high watermark
+                }
+                if plan_start.is_none() && batch_end_offset < start_offset {
+                    // Nothing in this batch is relevant — skip clean over it and keep
+                    // scanning for start_offset, same as skipping an earlier frame.
+                    phys += batch_total_len;
+                    continue;
+                }
+                // Either `start_offset` falls inside this batch (or it's entirely past
+                // it, since HW is never checked on this path before the fact), or whole
+                // frames were already planned before reaching it. Either way, this batch
+                // itself can never be part of a zero-copy plan:
+                //   - nothing planned yet: this batch is (or covers) the very entry
+                //     `start_offset` needs — decline entirely so the buffered `fetch`
+                //     path, which does understand batches, serves this request instead.
+                //   - something already planned: stop here and ship just the whole
+                //     frames collected so far; the batch itself will be picked up whole
+                //     by the buffered path on the caller's next fetch, which naturally
+                //     starts at this batch's base offset.
+                if plan_start.is_none() {
+                    return Ok(None);
+                }
+                break;
             }
             let frame_offset = u64::from_be_bytes(header[5..13].try_into().unwrap());
             let payload_len = u32::from_be_bytes(header[21..25].try_into().unwrap()) as usize;
@@ -1850,6 +1989,178 @@ mod tests {
         assert!(mgr.plan_zero_copy_fetch(0, 4096, 0).unwrap().is_none());
     }
 
+    /// `fetch` must decode a batch's records and hand back the same offsets/timestamps/
+    /// payloads a per-record frame produce would have — and, critically, a fetch whose
+    /// `start_offset` lands in the *middle* of a batch's range must still return exactly
+    /// the records from there onward, never the whole batch and never nothing. This is
+    /// the buffered-path half of stage 1b-ii's "fetch must serve batches" requirement.
+    #[test]
+    fn fetch_starting_mid_batch_returns_only_records_from_that_offset_onward() {
+        let dir = TempDir::new("fetch_mid_batch");
+        let mut mgr = open_manager(&dir);
+
+        mgr.append(b"frame0", 0).unwrap(); // offset 0
+        let records = sample_batch_records(5);
+        mgr.append_batch(
+            1_700_000_000_000,
+            3,
+            42,
+            7,
+            11,
+            false,
+            BatchCompression::Zstd,
+            &records,
+        )
+        .unwrap(); // offsets 1..=5
+        mgr.append(b"frame6", 6).unwrap(); // offset 6
+
+        // Starting exactly at the batch's base offset returns every record in the batch,
+        // plus the frame after it.
+        let from_base = mgr.fetch(1, 65536).unwrap();
+        assert_eq!(
+            from_base.iter().map(|f| f.offset).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+
+        // Starting in the middle of the batch must skip the earlier records in that same
+        // batch, not return them and not return nothing.
+        let mid = mgr.fetch(3, 65536).unwrap();
+        assert_eq!(
+            mid.iter().map(|f| f.offset).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(mid[0].payload.as_ref(), records[2].1.as_ref());
+        assert_eq!(mid[0].timestamp, records[2].0);
+
+        // Starting at the batch's last offset returns just that one record plus what
+        // follows.
+        let last = mgr.fetch(5, 65536).unwrap();
+        assert_eq!(
+            last.iter().map(|f| f.offset).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
+
+    /// A batch decoded by `fetch` is handed back as an uncompressed synthetic
+    /// `RecordFrame` per record — the payload must already be decompressed, exactly what
+    /// a client calling `decompress_payload()` on a per-record-compressed frame would
+    /// have gotten, so a batch-compression-vs-per-record-compression choice on the
+    /// produce side is invisible on the fetch side.
+    #[test]
+    fn fetch_decodes_compressed_batch_records_to_plain_payloads() {
+        let dir = TempDir::new("fetch_batch_compressed");
+        let mut mgr = open_manager(&dir);
+
+        let records = sample_batch_records(4);
+        mgr.append_batch(
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::Lz4,
+            &records,
+        )
+        .unwrap();
+
+        let fetched = mgr.fetch(0, 65536).unwrap();
+        assert_eq!(fetched.len(), 4);
+        for (i, frame) in fetched.iter().enumerate() {
+            assert_eq!(frame.offset, i as u64);
+            assert_eq!(frame.payload.as_ref(), records[i].1.as_ref());
+            // Synthesized frames are always plain/uncompressed magic — decompressing
+            // them is a safe no-op, exactly matching a client's existing
+            // `decompress_payload()` call on any already-uncompressed frame.
+            assert_eq!(
+                frame.decompress_payload().unwrap().as_ref(),
+                records[i].1.as_ref()
+            );
+        }
+    }
+
+    /// `fetch` must still make progress when `max_bytes` is smaller than a single batch:
+    /// a batch is atomic, so a byte budget that only covers part of it must still return
+    /// every record from `start_offset` onward in that batch, mirroring how the buffered
+    /// frame path already guarantees at least one record even under a tiny budget.
+    #[test]
+    fn fetch_expands_read_when_max_bytes_is_smaller_than_the_batch() {
+        let dir = TempDir::new("fetch_batch_tiny_budget");
+        let mut mgr = open_manager(&dir);
+
+        let records = sample_batch_records(20);
+        mgr.append_batch(
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        )
+        .unwrap();
+
+        // A budget far smaller than the whole batch's encoded size.
+        let fetched = mgr.fetch(0, 32).unwrap();
+        assert_eq!(
+            fetched.len(),
+            20,
+            "a batch cut short only by max_bytes must still be served whole"
+        );
+    }
+
+    /// `plan_zero_copy_fetch` must decline (return `None`) rather than stream a batch's
+    /// raw bytes to the socket, when `start_offset` needs data from within that batch —
+    /// the zero-copy wire format is exactly `frame_count` `RecordFrame`s, which a batch's
+    /// bytes are not. Declining here is what makes `try_zero_copy_fetch` fall back to the
+    /// buffered `fetch` path, which does understand batches.
+    #[test]
+    fn plan_zero_copy_fetch_declines_when_start_offset_needs_a_batch() {
+        let dir = TempDir::new("zero_copy_declines_on_batch");
+        let mut mgr = open_manager(&dir);
+
+        mgr.append(b"frame0", 0).unwrap(); // offset 0
+        mgr.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap(); // offsets 1..=3
+        mgr.append(b"frame4", 40).unwrap(); // offset 4
+        let hw = mgr.high_watermark();
+        assert_eq!(hw, 5);
+
+        // Starting at the batch's base offset, or anywhere inside it: decline.
+        for start in [1u64, 2, 3] {
+            assert!(
+                mgr.plan_zero_copy_fetch(start, 65536, hw)
+                    .unwrap()
+                    .is_none(),
+                "start_offset {start} lands in the batch; zero-copy must decline"
+            );
+        }
+
+        // Starting before the batch: zero-copy still serves what it can (just frame0)
+        // whole frames before stopping at the batch, rather than declining outright.
+        let plan = mgr.plan_zero_copy_fetch(0, 65536, hw).unwrap().unwrap();
+        assert_eq!(plan.frame_count, 1);
+        assert_eq!(read_plan_bytes(&plan), {
+            let mut expected = Vec::new();
+            mgr.fetch(0, 65536).unwrap()[0].encode_into(&mut expected);
+            expected
+        });
+
+        // Starting at the frame right after the batch: normal zero-copy, unaffected.
+        let plan = mgr.plan_zero_copy_fetch(4, 65536, hw).unwrap().unwrap();
+        assert_eq!(plan.frame_count, 1);
+    }
+
     fn compact_config(
         delete_retention_millis: Option<u64>,
         min_cleanable_dirty_ratio: f64,
@@ -2404,18 +2715,25 @@ mod tests {
         assert_eq!(f4.offset, 4);
 
         for target in [1u64, 2, 3] {
-            let phys = SegmentManager::physical_pos_for_offset(&mut mgr.active, target).unwrap();
+            let (phys, effective) =
+                SegmentManager::physical_pos_for_offset(&mut mgr.active, target).unwrap();
             assert_eq!(
                 phys, f0_end,
                 "offset {target} is inside the batch [1,3]; must resolve to the batch's start"
             );
+            assert_eq!(
+                effective, 1,
+                "offset {target} is inside the batch [1,3]; effective offset must be the batch's base"
+            );
         }
 
-        let phys = SegmentManager::physical_pos_for_offset(&mut mgr.active, 4).unwrap();
+        let (phys, effective) =
+            SegmentManager::physical_pos_for_offset(&mut mgr.active, 4).unwrap();
         assert_eq!(
             phys, batch_end,
             "offset 4 is the frame right after the batch"
         );
+        assert_eq!(effective, 4);
     }
 
     /// End-to-end: truncating exactly at a batch's base offset (the well-defined case,
@@ -2451,5 +2769,76 @@ mod tests {
         // The freed offset range is reusable, exactly as it is after truncating a frame.
         let refilled = mgr.append(b"replacement", 99).unwrap();
         assert_eq!(refilled.offset, 1);
+    }
+
+    /// Regression for the divergence bug this stage fixes: a batch is atomic on disk, so
+    /// `physical_pos_for_offset` resolves any offset *inside* a batch's range to that
+    /// batch's own start — meaning `truncate_after` physically removes the whole batch
+    /// even when the requested truncation point was one of its later records. The high
+    /// watermark must reflect that: it has to drop all the way to the batch's base
+    /// offset, not stop at the offset that was actually requested, or it would claim an
+    /// offset for a record that no longer exists on disk.
+    #[test]
+    fn truncate_after_mid_batch_drops_high_watermark_to_batch_base_offset() {
+        let dir = TempDir::new("truncate_after_mid_batch");
+        let mut mgr = open_manager(&dir);
+
+        mgr.append(b"frame0", 0).unwrap(); // offset 0
+        mgr.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap(); // batch occupies offsets 1,2,3
+        mgr.append(b"frame4", 40).unwrap(); // offset 4
+        assert_eq!(mgr.high_watermark(), 5);
+
+        // Ask to truncate after offset 2 — the middle of the batch. Since the whole
+        // batch [1,3] must be removed, the watermark cannot land at 2: nothing on disk
+        // claims that offset any more. It must drop to the batch's base offset, 1.
+        mgr.truncate_after(2).unwrap();
+        assert_eq!(
+            mgr.high_watermark(),
+            1,
+            "truncating mid-batch must drop the high watermark to the batch's base offset, \
+             not the requested offset, since the whole batch was physically removed"
+        );
+
+        // Only frame0 (offset 0) remains on disk — the whole batch and frame4 are gone.
+        let frames = mgr.active.read_all_frames().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset, 0);
+
+        // The freed range starting at the batch's base offset must be reusable, and the
+        // watermark and the physical log must agree: the next append lands at 1, exactly
+        // where the batch used to start.
+        let refilled = mgr.append(b"replacement", 99).unwrap();
+        assert_eq!(refilled.offset, 1);
+
+        // Truncating at the batch's last offset (3, still "mid-batch" in the sense that
+        // it doesn't fall on a frame boundary of its own — the whole batch is one atomic
+        // entry) must land at the same base offset too.
+        let dir2 = TempDir::new("truncate_after_mid_batch_last_offset");
+        let mut mgr2 = open_manager(&dir2);
+        mgr2.append(b"frame0", 0).unwrap();
+        mgr2.append_batch(
+            10,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &sample_batch_records(3),
+        )
+        .unwrap();
+        mgr2.append(b"frame4", 40).unwrap();
+        mgr2.truncate_after(3).unwrap();
+        assert_eq!(mgr2.high_watermark(), 1);
     }
 }

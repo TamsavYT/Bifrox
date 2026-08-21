@@ -7687,3 +7687,341 @@ async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_count
          on the leader that proposed it"
     );
 }
+
+/// Issue #18 stage 1b-ii, headline claim: `produce.record.batches.enable` must be
+/// perfectly transparent to a client. The same produce request, sent against two
+/// otherwise-identical engines that differ only in this flag, must land at the same
+/// offsets and be fetchable back to the same records either way — one engine is writing
+/// a `RecordFrame` per record on disk, the other one `RecordBatch` for the whole
+/// request, and nothing outside `StorageEngine`/`SegmentManager` should be able to tell
+/// the difference. Asserted as equality between the two modes' results, not as two
+/// separate checks, per the plan's explicit ask.
+#[tokio::test]
+async fn test_scenario_85_produce_batch_flag_on_and_off_are_indistinguishable_to_a_client() {
+    let dir_off = TestDataDirGuard::new("batch_flag_off_roundtrip");
+    let dir_on = TestDataDirGuard::new("batch_flag_on_roundtrip");
+
+    let engine_off = StorageEngine::new(EngineConfig {
+        data_dir: dir_off.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let engine_on = StorageEngine::new(EngineConfig {
+        data_dir: dir_on.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: true,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "batch_flag_roundtrip_topic";
+    let records: Vec<bytes::Bytes> = (0..7)
+        .map(|i| bytes::Bytes::from(format!("record-payload-{i}")))
+        .collect();
+
+    fn make_params<'a>(
+        topic: &'a str,
+        records: &'a [bytes::Bytes],
+    ) -> hermes::server::engine::ProduceBatchParams<'a> {
+        hermes::server::engine::ProduceBatchParams {
+            topic,
+            key: "",
+            transaction_id: None,
+            num_partitions: 1,
+            producer_id: 555,
+            producer_epoch: 2,
+            base_sequence: 0,
+            records,
+        }
+    }
+
+    let (partition_off, first_off, last_off) = engine_off
+        .produce_batch(make_params(topic, &records))
+        .await
+        .unwrap();
+    let (partition_on, first_on, last_on) = engine_on
+        .produce_batch(make_params(topic, &records))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (partition_off, first_off, last_off),
+        (partition_on, first_on, last_on),
+        "partition assignment and offset range must be identical whichever path wrote it"
+    );
+
+    let fetched_off = engine_off
+        .fetch(topic, partition_off, 0, 1024 * 1024)
+        .await
+        .unwrap();
+    let fetched_on = engine_on
+        .fetch(topic, partition_on, 0, 1024 * 1024)
+        .await
+        .unwrap();
+
+    assert_eq!(fetched_off.len(), records.len());
+    assert_eq!(fetched_on.len(), records.len());
+    for i in 0..records.len() {
+        assert_eq!(
+            fetched_off[i].offset, fetched_on[i].offset,
+            "offset mismatch at record {i}"
+        );
+        assert_eq!(
+            fetched_off[i].decompress_payload().unwrap(),
+            fetched_on[i].decompress_payload().unwrap(),
+            "decoded payload mismatch at record {i}"
+        );
+        assert_eq!(
+            fetched_off[i].decompress_payload().unwrap().as_ref(),
+            records[i].as_ref(),
+            "decoded payload must match what was produced, record {i}"
+        );
+    }
+}
+
+/// A batch is atomic on disk, so serving a fetch whose `start_offset` lands in the
+/// middle of one requires decoding the whole batch and filtering — never returning
+/// records the caller didn't ask for, and never returning nothing just because the
+/// requested offset isn't the batch's own base offset.
+#[tokio::test]
+async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_records_from_there_on() {
+    let dir = TestDataDirGuard::new("batch_mid_fetch");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: true,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "batch_mid_fetch_topic";
+    let records: Vec<bytes::Bytes> = (0..6)
+        .map(|i| bytes::Bytes::from(format!("rec-{i}")))
+        .collect();
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records,
+    };
+    let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
+    assert_eq!(first_offset, 0);
+    assert_eq!(last_offset, 5, "all six records must land in one batch");
+
+    for start in 0u64..=5 {
+        let fetched = engine
+            .fetch(topic, partition, start, 1024 * 1024)
+            .await
+            .unwrap();
+        let offsets: Vec<u64> = fetched.iter().map(|f| f.offset).collect();
+        let expected: Vec<u64> = (start..=5).collect();
+        assert_eq!(
+            offsets, expected,
+            "fetch starting at offset {start} (inside the batch) must return exactly the \
+             records from there onward"
+        );
+        for (i, frame) in fetched.iter().enumerate() {
+            assert_eq!(
+                frame.payload.as_ref(),
+                records[(start as usize) + i].as_ref()
+            );
+        }
+    }
+}
+
+/// With the flag on, the `RecordBatch` actually written to disk must carry the
+/// producer id, producer epoch, and base sequence from `ProduceBatchParams`, plus the
+/// partition's own `leader_epoch()` — that's the entire point of giving the batch
+/// header those fields in stage 1a. Verified by reading the segment file directly and
+/// decoding it, bypassing `fetch` (which synthesizes plain frames and would hide
+/// exactly what this test needs to see).
+#[tokio::test]
+async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metadata() {
+    let dir = TestDataDirGuard::new("batch_metadata");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: true,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "batch_metadata_topic";
+    // Force the partition to exist with a distinctive, non-default leader_epoch first,
+    // so the assertion below can't pass by coincidence with a zero-valued default.
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+    pm.update_leadership(1, 42, vec![1], vec![1]);
+
+    let records: Vec<bytes::Bytes> = vec![
+        bytes::Bytes::from_static(b"a"),
+        bytes::Bytes::from_static(b"b"),
+        bytes::Bytes::from_static(b"c"),
+    ];
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 777_888,
+        producer_epoch: 5,
+        base_sequence: 3,
+        records: &records,
+    };
+    engine.produce_batch(params).await.unwrap();
+
+    let log_path = dir
+        .path
+        .join(format!("{}-0", topic))
+        .join(format!("{:020}.log", 0u64));
+    let raw = std::fs::read(&log_path).unwrap();
+    let (entry, consumed) = hermes::segment::decode_entry(&raw).unwrap();
+    assert_eq!(
+        consumed,
+        raw.len(),
+        "exactly one entry — the whole batch — should be on disk"
+    );
+    let batch = match entry {
+        hermes::segment::LogEntry::Batch(b) => b,
+        hermes::segment::LogEntry::Frame(_) => {
+            panic!("expected a RecordBatch on disk with produce.record.batches.enable on")
+        }
+    };
+
+    assert_eq!(batch.producer_id, 777_888);
+    assert_eq!(batch.producer_epoch, 5);
+    assert_eq!(batch.base_sequence, 3);
+    assert_eq!(
+        batch.leader_epoch, 42,
+        "leader_epoch must come from the partition's own leader_epoch(), not a default"
+    );
+    assert_eq!(batch.record_count, 3);
+}
+
+/// With the flag off (the default), every entry written to disk must still be a plain
+/// `RecordFrame` — this is the "verified beyond existing tests pass" check the plan
+/// asks for: it inspects the actual on-disk bytes rather than trusting that no other
+/// test happened to notice a `RecordBatch` sneak in.
+#[tokio::test]
+async fn test_scenario_88_batch_flag_off_still_writes_only_plain_frames_on_disk() {
+    let dir = TestDataDirGuard::new("batch_flag_off_raw");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    assert!(
+        !engine.config().produce_record_batches_enable,
+        "false must be the config default even when not set explicitly"
+    );
+
+    let topic = "batch_flag_off_raw_topic";
+    let records: Vec<bytes::Bytes> = (0..4)
+        .map(|i| bytes::Bytes::from(format!("r{i}")))
+        .collect();
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records,
+    };
+    let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
+    assert_eq!(first_offset, 0);
+    assert_eq!(last_offset, 3);
+
+    let log_path = dir
+        .path
+        .join(format!("{}-{}", topic, partition))
+        .join(format!("{:020}.log", 0u64));
+    let raw = std::fs::read(&log_path).unwrap();
+    let mut cursor = 0usize;
+    let mut decoded_offsets = Vec::new();
+    while cursor < raw.len() {
+        let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..]).unwrap();
+        match entry {
+            hermes::segment::LogEntry::Frame(f) => decoded_offsets.push(f.offset),
+            hermes::segment::LogEntry::Batch(_) => panic!(
+                "the flag is off — every on-disk entry must still be a plain RecordFrame, \
+                 exactly as before this stage; a RecordBatch appearing here means the gate leaked"
+            ),
+        }
+        cursor += consumed;
+    }
+    assert_eq!(decoded_offsets, vec![0, 1, 2, 3]);
+}
+
+/// `PartitionManager::truncate_after` end-to-end: truncating at a point inside a batch
+/// must leave LEO and the committed high watermark consistent with what's actually left
+/// on disk (the batch's base offset), not the literal offset that was requested — the
+/// same divergence bug fixed in `SegmentManager::truncate_after`, one layer up.
+#[tokio::test]
+async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_watermarks() {
+    let dir = TestDataDirGuard::new("batch_truncate_partition");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        produce_record_batches_enable: true,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "batch_truncate_partition_topic";
+    let records: Vec<bytes::Bytes> = (0..5)
+        .map(|i| bytes::Bytes::from(format!("v{i}")))
+        .collect();
+    let params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &records,
+    };
+    let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
+    assert_eq!((first_offset, last_offset), (0, 4), "one 5-record batch");
+
+    let pm = engine.get_or_create_partition(topic, partition).unwrap();
+    assert_eq!(pm.latest_offset(), 5);
+
+    // Truncate at offset 3 — inside the batch [0, 4]. The whole batch must be removed,
+    // and LEO must reflect that (0), not the literal requested offset (3).
+    pm.truncate_after(3).unwrap();
+    assert_eq!(
+        pm.latest_offset(),
+        0,
+        "LEO must drop to the batch's base offset, not the requested mid-batch offset"
+    );
+    assert_eq!(
+        pm.high_watermark(),
+        0,
+        "committed HW must never exceed LEO after truncation"
+    );
+
+    // The freed range is reusable and the log is genuinely empty of the old batch.
+    let refill: Vec<bytes::Bytes> = vec![bytes::Bytes::from_static(b"replacement")];
+    let refill_params = hermes::server::engine::ProduceBatchParams {
+        topic,
+        key: "",
+        transaction_id: None,
+        num_partitions: 1,
+        producer_id: 0,
+        producer_epoch: 0,
+        base_sequence: 0,
+        records: &refill,
+    };
+    let (_, refill_first, refill_last) = engine.produce_batch(refill_params).await.unwrap();
+    assert_eq!((refill_first, refill_last), (0, 0));
+}
