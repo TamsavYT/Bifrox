@@ -8025,3 +8025,114 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
     let (_, refill_first, refill_last) = engine.produce_batch(refill_params).await.unwrap();
     assert_eq!((refill_first, refill_last), (0, 0));
 }
+
+/// End-to-end headline case for issue #18 stage 1b-iii: `SegmentManager::compact_segments`
+/// must see and correctly process records written through the batch path
+/// (`PartitionManager::produce_batch_eos`), not just plain frames — before this stage,
+/// `compact_segments` read segments via `read_all_frames`, which silently skips
+/// `RecordBatch` entries, so once a segment's dirty ratio triggered a rewrite, every
+/// record inside a batch in that segment — even records that were never stale — was
+/// permanently destroyed rather than merely skipped.
+///
+/// The historical segment built below mixes a never-superseded plain frame (`zzz`), a
+/// 3-record batch (only one of whose keys, `k1`, gets superseded), and a superseded plain
+/// frame (`www`) — so the segment does get rewritten, and this is what makes the test able
+/// to fail. Confirmed directly: temporarily reverting `compact_segments`'s three call
+/// sites back to the pre-fix `read_all_frames()` makes this test fail at its first
+/// assertion — `compacted` comes back `1` instead of `2`, because the batch (and its
+/// stale `k1` record) is entirely invisible to compaction's dedup scan, not merely
+/// wrongly retained. See `compact_segments_keeps_surviving_batch_records` in
+/// `src/segment/manager.rs` for the focused unit-level version of this same scenario.
+#[tokio::test]
+async fn test_scenario_90_compaction_keeps_records_inside_batches() {
+    let dir = TestDataDirGuard::new("compact_keeps_batch_records");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        // Sized to force an automatic rotation at exactly the right point — see the
+        // comment above the `www:fresh` write below.
+        max_segment_bytes: 200,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "compact_keeps_batch_records_topic";
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+    pm.set_cleanup_policy(hermes::config::CleanupPolicy::Compact);
+    pm.set_min_cleanable_dirty_ratio(0.0);
+
+    // A plain frame that is never superseded — ensures the historical segment below ends
+    // up a mix of frame + batch entries (not a batch-only segment), so it's genuinely
+    // rewritten by compaction rather than skipped outright for having no discardable
+    // record at all.
+    pm.produce(b"zzz:keep").unwrap(); // offset 0
+
+    // A batch of 3 records, written through the batch path directly
+    // (`produce_batch_eos`), independent of the `produce_record_batches_enable` gate.
+    let batch = pm
+        .produce_batch_eos(
+            &[
+                bytes::Bytes::from_static(b"k1:v1"),
+                bytes::Bytes::from_static(b"k2:v2"),
+                bytes::Bytes::from_static(b"k3:v3"),
+            ],
+            0,
+            0,
+            0,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (batch.base_offset, batch.last_offset_delta),
+        (1, 2),
+        "offsets 1..=3"
+    );
+
+    let plain_frame = pm.produce_frame(b"www:stale").unwrap(); // offset 4 — superseded below
+    assert_eq!(plain_frame.offset, 4);
+
+    // `max_segment_bytes: 200` (set below on the engine config) is sized so that the
+    // three writes above (33 + 116 + 34 = 183 bytes) fit in one segment, but the next
+    // write would push it past the limit — forcing an automatic rotation right here. That
+    // puts `zzz`/the batch/`www:stale` together in the segment that becomes historical,
+    // and `www:fresh`/`k1:v2` below into a fresh active segment, without needing direct
+    // access to `SegmentManager::rotate_segment` (private, and rightly so, to this
+    // black-box `PartitionManager`-level test).
+    let fresh_www = pm.produce_frame(b"www:fresh").unwrap(); // offset 5
+    assert_eq!(fresh_www.offset, 5);
+    let fresh_k1 = pm.produce_frame(b"k1:v2").unwrap(); // offset 6 — supersedes the batch's k1
+    assert_eq!(fresh_k1.offset, 6);
+
+    let mut compacted = 0usize;
+    for _ in 0..10 {
+        let n = pm.apply_retention().unwrap();
+        compacted += n;
+        if n == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        compacted, 2,
+        "offset 1 (stale batch record k1) and offset 4 (stale frame www) should be dropped"
+    );
+
+    // The rewritten historical segment and the untouched active segment are fetched
+    // separately and concatenated, same as `SegmentManager::fetch`'s single-segment
+    // contract requires at the unit level.
+    let mut remaining = pm.fetch(0, 65536).unwrap();
+    remaining.extend(pm.fetch(5, 65536).unwrap());
+    let payloads: Vec<&[u8]> = remaining.iter().map(|f| f.payload.as_ref()).collect();
+    assert_eq!(
+        payloads,
+        vec![
+            b"zzz:keep".as_ref(),
+            b"k2:v2".as_ref(),
+            b"k3:v3".as_ref(),
+            b"www:fresh".as_ref(),
+            b"k1:v2".as_ref(),
+        ],
+        "k2/k3 came from inside the batch and were never superseded — compaction must not \
+         drop them just because they arrived batched"
+    );
+}
