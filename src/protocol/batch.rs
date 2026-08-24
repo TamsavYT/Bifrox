@@ -228,6 +228,35 @@ impl RecordBatch {
         self.attributes & ATTR_TRANSACTIONAL_FLAG != 0
     }
 
+    /// Stamps this batch with the offset and leader epoch the broker assigns it, then
+    /// recomputes the CRC to match.
+    ///
+    /// This is what lets the broker accept a batch built and compressed by a producer and
+    /// store those bytes as-is: the base offset, leader epoch and CRC all live in the
+    /// plaintext 53-byte header, so assigning them touches only the header. `record_data`
+    /// is moved through untouched — never decompressed, never re-encoded, never
+    /// reallocated — which is the property that keeps a produce cheap and lets the same
+    /// stored bytes be handed to followers and consumers later.
+    ///
+    /// Per-record offsets follow automatically: records carry deltas from the base offset,
+    /// so shifting the base shifts every record in the batch without rewriting any of them.
+    pub fn assign_base_offset_and_leader_epoch(&mut self, base_offset: u64, leader_epoch: u32) {
+        self.base_offset = base_offset;
+        self.leader_epoch = leader_epoch;
+        self.crc = Self::calculate_crc(
+            self.base_offset,
+            self.last_offset_delta,
+            self.base_timestamp,
+            self.producer_id,
+            self.producer_epoch,
+            self.base_sequence,
+            self.leader_epoch,
+            self.attributes,
+            self.record_count,
+            &self.record_data,
+        );
+    }
+
     /// Recomputes the CRC32 over the batch's fields and compares it against `self.crc`.
     pub fn verify_crc(&self) -> Result<(), BatchError> {
         let calculated = Self::calculate_crc(
@@ -1116,6 +1145,124 @@ mod tests {
 
         assert_eq!(decoded_records[0].key, None);
         assert_eq!(decoded_records[0].value, Some(json_value));
+    }
+
+    /// The broker stamps a batch's offset and leader epoch without ever touching the
+    /// records. On a compressed batch that is the whole point: `record_data` must come out
+    /// byte-identical, so storing a producer's batch costs a header rewrite and nothing
+    /// else — no decompress, no re-compress, no re-encode.
+    #[test]
+    fn assigning_offset_leaves_compressed_record_data_byte_identical() {
+        for codec in [
+            BatchCompression::Zstd,
+            BatchCompression::Lz4,
+            BatchCompression::None,
+        ] {
+            let records = sample_records(6);
+            let mut batch =
+                RecordBatch::create(0, 1_700_000_000_000, 0, 42, 3, 9, false, codec, &records);
+            let data_before = batch.record_data.clone();
+            let ptr_before = batch.record_data.as_ptr();
+            let crc_before = batch.crc;
+
+            batch.assign_base_offset_and_leader_epoch(5_000, 7);
+
+            // Byte-equality alone would prove nothing here: compression is deterministic,
+            // so decompressing and re-compressing yields the same bytes. Pointer identity
+            // is the real assertion — `record_data` must be the *same allocation*, moved
+            // through rather than rebuilt. `data_before` holds a reference, so the original
+            // buffer cannot have been freed and its address coincidentally reused.
+            assert_eq!(
+                batch.record_data.as_ptr(),
+                ptr_before,
+                "{codec:?}: record data must be the same allocation, not a rebuilt one"
+            );
+            assert_eq!(
+                batch.record_data, data_before,
+                "{codec:?}: record data must be moved through untouched"
+            );
+            assert_eq!(batch.base_offset, 5_000);
+            assert_eq!(batch.leader_epoch, 7);
+            assert_ne!(
+                batch.crc, crc_before,
+                "{codec:?}: the CRC covers the base offset, so it must have changed"
+            );
+            batch.verify_crc().expect("recomputed CRC must validate");
+
+            // Records carry deltas, so shifting the base shifts all of them.
+            let decoded = batch.records().unwrap();
+            assert_eq!(decoded.len(), 6);
+            for (i, (ts, _k, v)) in records.iter().enumerate() {
+                assert_eq!(decoded[i].offset, 5_000 + i as u64, "{codec:?}");
+                assert_eq!(decoded[i].timestamp, *ts, "{codec:?}");
+                assert_eq!(&decoded[i].value, v, "{codec:?}");
+            }
+        }
+    }
+
+    /// Stamping must not require the record data to be *interpretable* at all. Handing it
+    /// a batch whose zstd payload is garbage still has to work and leave the payload
+    /// untouched — an implementation that decompressed in order to stamp could not.
+    #[test]
+    fn assigning_offset_does_not_require_decompressable_record_data() {
+        let records = sample_records(3);
+        let mut batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            42,
+            3,
+            9,
+            false,
+            BatchCompression::Zstd,
+            &records,
+        );
+        let garbage = Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02]);
+        batch.record_data = garbage.clone();
+        assert!(
+            batch.records().is_err(),
+            "precondition: this record data must not be decompressable"
+        );
+
+        batch.assign_base_offset_and_leader_epoch(77, 2);
+
+        assert_eq!(
+            batch.record_data, garbage,
+            "payload must pass through as-is"
+        );
+        assert_eq!(batch.base_offset, 77);
+        assert_eq!(batch.leader_epoch, 2);
+        batch
+            .verify_crc()
+            .expect("CRC must cover the stored bytes, decompressable or not");
+    }
+
+    /// A batch that has been stamped and encoded must survive a full round trip through
+    /// disk bytes — this is what a follower or consumer will later be handed verbatim.
+    #[test]
+    fn assigned_batch_round_trips_through_encoded_bytes() {
+        let records = sample_records(4);
+        let mut batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            42,
+            3,
+            9,
+            false,
+            BatchCompression::Zstd,
+            &records,
+        );
+        batch.assign_base_offset_and_leader_epoch(918, 4);
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, consumed) = RecordBatch::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, batch);
+        assert_eq!(decoded.base_offset, 918);
+        assert_eq!(decoded.leader_epoch, 4);
+        assert_eq!(decoded.records().unwrap()[0].offset, 918);
     }
 
     #[test]

@@ -383,8 +383,11 @@ impl PartitionManager {
         // format has no room for genuinely independent per-record wall-clock capture
         // here without a client-supplied timestamp per record, which produce requests
         // don't carry.
-        let batch_records: Vec<(u64, Bytes)> =
-            records.iter().map(|r| (timestamp, r.clone())).collect();
+        // Null key, payload as value: a produce request carries no per-record key yet.
+        let batch_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|r| (timestamp, None, Some(r.clone())))
+            .collect();
 
         let codec = match *self.compression_codec.read() {
             crate::config::CompressionCodec::None => crate::protocol::BatchCompression::None,
@@ -392,19 +395,27 @@ impl PartitionManager {
             crate::config::CompressionCodec::Zstd => crate::protocol::BatchCompression::Zstd,
         };
 
+        // Built with a placeholder base offset of 0: the real offset is this log's end,
+        // which is only known under the segment lock below. `append_batch` stamps it (and
+        // the leader epoch) into the plaintext header and fixes the CRC, without touching
+        // the record data. A producer that builds its own batch is in exactly this
+        // position, which is why the broker can accept one and store it as-is.
+        let prebuilt = crate::protocol::RecordBatch::create(
+            0,
+            timestamp,
+            0,
+            producer_id,
+            epoch,
+            base_sequence,
+            transactional,
+            codec,
+            &batch_records,
+        );
+
         let (batch, rolled) = {
             let mut seg_guard = self.segment_manager.lock();
             let base_before = seg_guard.active_base_offset();
-            let batch = seg_guard.append_batch(
-                timestamp,
-                self.leader_epoch(),
-                producer_id,
-                epoch,
-                base_sequence,
-                transactional,
-                codec,
-                &batch_records,
-            )?;
+            let batch = seg_guard.append_batch(prebuilt, self.leader_epoch())?;
             let base_after = seg_guard.active_base_offset();
 
             let last_offset = batch.base_offset + batch.last_offset_delta as u64;
