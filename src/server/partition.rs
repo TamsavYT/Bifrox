@@ -348,18 +348,12 @@ impl PartitionManager {
     /// producer semantics, which dedups by `(baseSequence, lastSequence)` per batch, than
     /// the frame path's per-record check is.
     #[allow(clippy::too_many_arguments)]
-    pub fn produce_batch_eos(
-        &self,
-        records: &[Bytes],
-        producer_id: u64,
-        epoch: i16,
-        base_sequence: i32,
-        transactional: bool,
-    ) -> IoResult<Result<RecordBatch, u64>> {
+    pub fn produce_batch_eos(&self, batch: RecordBatch) -> IoResult<Result<RecordBatch, u64>> {
+        let producer_id = batch.producer_id;
         let mut psm = self.producer_state_manager.lock();
         if producer_id != 0 {
             if let Err((is_duplicate, last_offset)) =
-                psm.validate_sequence(producer_id, epoch, base_sequence)
+                psm.validate_sequence(producer_id, batch.producer_epoch, batch.base_sequence)
             {
                 if is_duplicate {
                     return Ok(Err(last_offset));
@@ -372,50 +366,10 @@ impl PartitionManager {
             }
         }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        // Every record in the batch shares this one server-assigned timestamp — the
-        // frame path effectively does the same in practice (each `produce_frame_eos`
-        // call stamps "now" independently, but back-to-back calls in a tight loop land
-        // within the same millisecond in all but pathological cases), and the batch
-        // format has no room for genuinely independent per-record wall-clock capture
-        // here without a client-supplied timestamp per record, which produce requests
-        // don't carry.
-        // Null key, payload as value: a produce request carries no per-record key yet.
-        let batch_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
-            .iter()
-            .map(|r| (timestamp, None, Some(r.clone())))
-            .collect();
-
-        let codec = match *self.compression_codec.read() {
-            crate::config::CompressionCodec::None => crate::protocol::BatchCompression::None,
-            crate::config::CompressionCodec::Lz4 => crate::protocol::BatchCompression::Lz4,
-            crate::config::CompressionCodec::Zstd => crate::protocol::BatchCompression::Zstd,
-        };
-
-        // Built with a placeholder base offset of 0: the real offset is this log's end,
-        // which is only known under the segment lock below. `append_batch` stamps it (and
-        // the leader epoch) into the plaintext header and fixes the CRC, without touching
-        // the record data. A producer that builds its own batch is in exactly this
-        // position, which is why the broker can accept one and store it as-is.
-        let prebuilt = crate::protocol::RecordBatch::create(
-            0,
-            timestamp,
-            0,
-            producer_id,
-            epoch,
-            base_sequence,
-            transactional,
-            codec,
-            &batch_records,
-        );
-
         let (batch, rolled) = {
             let mut seg_guard = self.segment_manager.lock();
             let base_before = seg_guard.active_base_offset();
-            let batch = seg_guard.append_batch(prebuilt, self.leader_epoch())?;
+            let batch = seg_guard.append_batch(batch, self.leader_epoch())?;
             let base_after = seg_guard.active_base_offset();
 
             let last_offset = batch.base_offset + batch.last_offset_delta as u64;
@@ -427,9 +381,16 @@ impl PartitionManager {
         };
 
         if producer_id != 0 {
-            let last_sequence = base_sequence.wrapping_add(records.len() as i32 - 1);
+            let last_sequence = batch
+                .base_sequence
+                .wrapping_add(batch.record_count as i32 - 1);
             let last_offset = batch.base_offset + batch.last_offset_delta as u64;
-            psm.update(producer_id, epoch, last_sequence, last_offset);
+            psm.update(
+                producer_id,
+                batch.producer_epoch,
+                last_sequence,
+                last_offset,
+            );
         }
 
         if rolled {

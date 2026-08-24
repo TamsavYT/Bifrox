@@ -2039,10 +2039,7 @@ async fn process_request(
             key,
             transaction_id,
             num_partitions,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            records,
+            batch,
         } => {
             if !engine.authorize(
                 principal,
@@ -2072,7 +2069,16 @@ async fn process_request(
             // any resulting throttle delay *before* the write rather than after — a
             // post-write delay would let an over-quota burst hit the disk in full and
             // only then slow the client down. See `apply_produce_quota`.
-            let produced_bytes: u64 = records.iter().map(|r| r.len() as u64).sum();
+            // The batch is CRC-checked here and nowhere else on the way in. Decoding the
+            // 53-byte header also validates the stored bytes without decompressing them,
+            // since the CRC covers `record_data` in its compressed form.
+            let batch = match crate::protocol::RecordBatch::decode(&batch) {
+                Ok((b, _)) => b,
+                Err(e) => return WireResponse::error(&format!("Malformed record batch: {}", e)),
+            };
+            let record_count = batch.record_count as u64;
+            // Quota is charged on the bytes actually stored, i.e. the compressed size.
+            let produced_bytes: u64 = batch.encoded_size() as u64;
             engine.apply_produce_quota(&quota_key, produced_bytes).await;
             let produce_start = std::time::Instant::now();
             match engine
@@ -2085,10 +2091,7 @@ async fn process_request(
                         Some(&transaction_id)
                     },
                     num_partitions,
-                    producer_id,
-                    producer_epoch,
-                    base_sequence,
-                    records: &records,
+                    batch,
                 })
                 .await
             {
@@ -2097,7 +2100,7 @@ async fn process_request(
                         .metrics()
                         .produce_latency_ms
                         .record(produce_start.elapsed());
-                    engine.record_produce_metrics(&topic, produced_bytes, records.len() as u64);
+                    engine.record_produce_metrics(&topic, produced_bytes, record_count);
                     let mut buf = Vec::with_capacity(20);
                     buf.put_u32(assigned_partition);
                     buf.put_u64(first_offset);

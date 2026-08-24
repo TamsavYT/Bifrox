@@ -1,6 +1,7 @@
 use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
 use crate::protocol::frame::CONTROL_MAGIC_BYTE;
+use crate::protocol::RecordBatch;
 use crate::protocol::RecordFrame;
 use crate::replication::{ClusterConfig, ReplicationManager};
 use crate::server::coordinator::GroupCoordinator;
@@ -9,7 +10,6 @@ use crate::server::quota::QuotaManager;
 use crate::server::transaction::{
     decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus,
 };
-use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use std::io::Result as IoResult;
 use std::sync::Arc;
@@ -209,10 +209,11 @@ pub struct ProduceBatchParams<'a> {
     pub key: &'a str,
     pub transaction_id: Option<&'a str>,
     pub num_partitions: u32,
-    pub producer_id: u64,
-    pub producer_epoch: i16,
-    pub base_sequence: i32,
-    pub records: &'a [Bytes],
+    /// The batch exactly as the producer built it, compressed in the producer's own
+    /// codec. The broker stores these bytes; it does not decode the records inside.
+    /// `producer_id`, `producer_epoch` and `base_sequence` are read from the batch's
+    /// plaintext header rather than passed alongside it.
+    pub batch: RecordBatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2109,10 +2110,11 @@ impl StorageEngine {
         let key = params.key;
         let transaction_id = params.transaction_id;
         let num_partitions = params.num_partitions;
-        let producer_id = params.producer_id;
-        let producer_epoch = params.producer_epoch;
-        let base_sequence = params.base_sequence;
-        let records = params.records;
+        let batch = params.batch;
+        // Idempotence identity travels inside the batch header, where Kafka keeps it —
+        // readable without touching the (possibly compressed) records.
+        let producer_id = batch.producer_id;
+        let producer_epoch = batch.producer_epoch;
         if let Some(tx_id) = transaction_id {
             if self.transactions.has_transactional_producer(tx_id) {
                 if producer_id == 0 {
@@ -2132,18 +2134,17 @@ impl StorageEngine {
                 ));
             }
         }
-        // Enforce `message.max.bytes` before doing any disk work: an oversized record
-        // should be rejected outright rather than partially written and then discovered
-        // to be too large, and rejecting the whole batch keeps the offsets contiguous
-        // (no half-applied batch).
+        // Enforce `message.max.bytes` before doing any disk work. This is measured on the
+        // batch as stored — its encoded, compressed size — which is both what Kafka limits
+        // and the only size the broker can know without decompressing.
+        let batch_encoded_size = batch.encoded_size() as u64;
         if let Some(max_bytes) = self.config.message_max_bytes {
-            if let Some(oversized) = records.iter().find(|r| r.len() as u64 > max_bytes) {
+            if batch_encoded_size > max_bytes {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Record of {} bytes exceeds message.max.bytes ({})",
-                        oversized.len(),
-                        max_bytes
+                        "Batch of {} bytes exceeds message.max.bytes ({})",
+                        batch_encoded_size, max_bytes
                     ),
                 ));
             }
@@ -2176,23 +2177,15 @@ impl StorageEngine {
         // task in the meantime. `spawn_blocking` moves it to Tokio's dedicated blocking
         // thread pool instead, so a slow disk only stalls this one request.
         let pm_blocking = pm.clone();
-        let records_owned: Vec<Bytes> = records.to_vec();
-        let num_records = records_owned.len();
-        // Computed as a plain `bool` (not `transaction_id` itself) so it can move into the
-        // `'static` blocking closure below without fighting `params`' borrow.
-        let transactional = transaction_id.is_some();
+        // `record_count` is read off the header before the batch moves into the blocking
+        // closure; it is only needed to reconstruct `first_offset` on the duplicate path.
+        let num_records = batch.record_count as usize;
         let (first_offset, last_offset) =
             tokio::task::spawn_blocking(move || -> IoResult<(u64, u64)> {
                 // Every produced request is written as exactly one `RecordBatch`. There is
                 // no per-record-frame alternative: a single record format keeps the produce,
                 // replication, compaction and fetch paths from having to agree on two.
-                let (first_offset, last_offset) = match pm_blocking.produce_batch_eos(
-                    &records_owned,
-                    producer_id,
-                    producer_epoch,
-                    base_sequence,
-                    transactional,
-                )? {
+                let (first_offset, last_offset) = match pm_blocking.produce_batch_eos(batch)? {
                     Ok(batch) => (
                         batch.base_offset,
                         batch.base_offset + batch.last_offset_delta as u64,
