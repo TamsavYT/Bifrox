@@ -330,15 +330,13 @@ impl PartitionManager {
         Ok(Ok(frame))
     }
 
-    /// Appends a whole produce request's records as one atomic [`RecordBatch`] (issue
-    /// #18 stage 1b-ii), instead of one `RecordFrame` per record via
-    /// `produce_frame_eos`. Only called when `produce.record.batches.enable` is on (see
-    /// `EngineConfig::produce_record_batches_enable`) — `StorageEngine::produce_batch`
-    /// picks between this and the per-record frame loop.
+    /// Appends a whole produce request's records as one atomic [`RecordBatch`]. This is the
+    /// only way client-produced records reach the log — `StorageEngine::produce_batch`
+    /// calls it once per request.
     ///
-    /// Offset assignment mirrors `produce_frame_eos` exactly for the "assign fresh
-    /// offsets" case: the batch's base offset is the current log-end-offset, same as the
-    /// first frame a per-record loop would get, so a client sees the same
+    /// Offset assignment matches `produce_frame_eos`'s "assign fresh offsets" case: the
+    /// batch's base offset is the current log-end-offset, same as the first frame a
+    /// per-record loop would get, so a client sees the same
     /// `(first_offset, last_offset)` for the same produce request whichever path wrote
     /// it (see `StorageEngine::produce_batch`'s round-trip tests, which assert this).
     ///
@@ -447,8 +445,8 @@ impl PartitionManager {
     /// Appends a record and immediately marks it committed. Used by every internal
     /// system-partition writer (cluster metadata proposals, DLQ routing, consumer-offset
     /// commits, transaction-state records, bootstrap) that doesn't itself integrate with
-    /// ISR-quorum gating — unlike `produce_batch`'s per-record use of `produce_frame_eos`
-    /// directly, which leaves `committed_hw` ungated so it can advance only after quorum.
+    /// ISR-quorum gating — unlike `produce_batch`'s use of `produce_batch_eos`, which
+    /// leaves `committed_hw` ungated so it can advance only after quorum.
     pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
         let f = self.produce_frame_eos(Bytes::copy_from_slice(payload), 0, 0, 0)?;
         let frame = f.unwrap();
