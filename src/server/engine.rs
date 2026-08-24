@@ -2266,6 +2266,33 @@ impl StorageEngine {
     /// Entries are clamped to the committed high watermark, and an entry containing
     /// `offset` is returned whole — a batch is atomic on disk, so a consumer asking from
     /// the middle of one gets the whole batch and filters it itself, as in Kafka.
+    /// The transactional metadata a read-committed consumer needs to filter for itself:
+    /// the last stable offset and the aborted offset ranges.
+    ///
+    /// The broker cannot drop aborted records out of a compressed batch without decoding
+    /// it, and it does not decode — so it reports what was aborted and lets the consumer
+    /// drop them. Read-uncommitted gets `u64::MAX` and an empty list, i.e. filter nothing.
+    pub fn read_committed_filter(
+        &self,
+        topic: &str,
+        partition: u32,
+        isolation: crate::protocol::wire::IsolationLevel,
+    ) -> (u64, Vec<(u64, u64)>) {
+        if isolation != crate::protocol::wire::IsolationLevel::ReadCommitted {
+            return (u64::MAX, Vec::new());
+        }
+        let lso = self.transactions.last_stable_offset(topic, partition);
+        let mut aborted = self.transactions.aborted_ranges(topic, partition);
+        // The in-memory transaction manager only knows about transactions this broker has
+        // seen since start-up; the partition's own txn index is what survives a restart.
+        if let Ok(Some(pm)) = self.partition_for_read(topic, partition) {
+            aborted.extend(pm.aborted_ranges());
+        }
+        aborted.sort_unstable();
+        aborted.dedup();
+        (lso, aborted)
+    }
+
     pub async fn fetch_entries(
         &self,
         topic: &str,
@@ -2345,6 +2372,27 @@ impl StorageEngine {
     }
 
     /// BUG-02: Fetch records starting from nearest offset for target_timestamp
+    /// Stored bytes from the first offset reaching `target_timestamp`. The timestamp
+    /// filter is the reader's to apply — see [`PartitionManager::fetch_entries_by_timestamp`].
+    pub async fn fetch_entries_by_timestamp(
+        &self,
+        topic: &str,
+        partition: u32,
+        target_timestamp: u64,
+        max_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(Bytes::new());
+        };
+        tokio::task::spawn_blocking(move || {
+            pm.fetch_entries_by_timestamp(target_timestamp, max_bytes)
+        })
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!("fetch_entries_by_timestamp join error: {}", e))
+        })?
+    }
+
     pub async fn fetch_by_timestamp(
         &self,
         topic: &str,

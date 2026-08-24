@@ -919,6 +919,24 @@ impl SegmentManager {
     }
 
     /// Checks if a given offset belongs to an aborted transaction
+    /// The aborted transaction ranges this partition has recorded, as
+    /// `(first_offset, last_offset)` inclusive pairs.
+    ///
+    /// Sent to read-committed consumers so they can drop aborted records themselves: the
+    /// broker cannot filter them out of a compressed batch without decoding it, and it does
+    /// not decode. This is what Kafka's `aborted_transactions` fetch-response field is for.
+    pub fn aborted_ranges(&self) -> Vec<(u64, u64)> {
+        // Active *and* historical, matching `is_offset_aborted`'s coverage — a consumer
+        // reading from an old offset must be told about aborts recorded in rolled segments
+        // too, not just the active one.
+        self.historical
+            .iter()
+            .flat_map(|pair| pair.txn_index.entries())
+            .chain(self.active.txn_index.entries())
+            .map(|e| (e.first_offset, e.last_offset))
+            .collect()
+    }
+
     pub fn is_offset_aborted(&self, offset: u64) -> bool {
         if self.active.txn_index.is_aborted(offset) {
             return true;
@@ -1795,6 +1813,24 @@ impl SegmentManager {
     }
 
     /// Read records starting at target timestamp (BUG-02)
+    /// Stored bytes from the first offset whose timestamp reaches `target_timestamp`,
+    /// resolved through the time index — no entry is decoded to find it.
+    ///
+    /// Unlike [`Self::fetch_by_timestamp`], records are **not** filtered to
+    /// `timestamp >= target_timestamp` here: doing that would mean decoding, and
+    /// decompressing, every batch. The reader filters instead, exactly as a Kafka consumer
+    /// does after resolving an offset through `ListOffsets`. The time index is sparse, so
+    /// the returned range can begin slightly before the target.
+    pub fn fetch_entries_by_timestamp(
+        &mut self,
+        target_timestamp: u64,
+        max_bytes: usize,
+        max_offset_exclusive: u64,
+    ) -> IoResult<Bytes> {
+        let start_offset = self.find_offset_for_timestamp(target_timestamp);
+        self.fetch_entries(start_offset, max_bytes, max_offset_exclusive)
+    }
+
     pub fn fetch_by_timestamp(
         &mut self,
         target_timestamp: u64,

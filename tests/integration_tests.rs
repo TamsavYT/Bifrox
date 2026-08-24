@@ -7904,6 +7904,86 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// A fetch must hand back the log's stored bytes, still compressed in the producer's
+/// codec. The broker does not decompress to serve a read — that is the consumer's job —
+/// so what comes off the fetch path has to be byte-for-byte what is on disk.
+#[tokio::test]
+async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
+    use hermes::config::EngineConfig;
+
+    let dir = TestDataDirGuard::new("fetch_serves_stored_bytes");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "fetch_stored_bytes_topic";
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+
+    // Highly compressible, so an uncompressed re-encoding would be visibly larger and this
+    // cannot pass by coincidence.
+    let records: Vec<bytes::Bytes> = (0..16)
+        .map(|i| {
+            bytes::Bytes::from(format!(
+                "{}-{i}",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        })
+        .collect();
+    let produced = pm
+        .produce_batch_eos(producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::Zstd,
+        ))
+        .unwrap()
+        .unwrap();
+    pm.advance_committed_hw(produced.base_offset + produced.last_offset_delta as u64 + 1);
+
+    let served = engine
+        .fetch_entries(topic, 0, 0, 1024 * 1024)
+        .await
+        .unwrap();
+    let on_disk = std::fs::read(
+        dir.path
+            .join(format!("{topic}-0"))
+            .join("00000000000000000000.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        served.as_ref(),
+        on_disk.as_slice(),
+        "a fetch must return the stored bytes, not a re-encoding of them"
+    );
+
+    let (batch, _) = hermes::protocol::RecordBatch::decode(&served).unwrap();
+    assert_eq!(
+        batch.compression().unwrap(),
+        hermes::protocol::BatchCompression::Zstd,
+        "the served batch must still be compressed — the broker must not decompress to serve"
+    );
+
+    // Decompressing is the reader's job, and doing it must yield exactly what was produced.
+    let decoded = batch.records().unwrap();
+    assert_eq!(decoded.len(), records.len());
+    for (i, expected) in records.iter().enumerate() {
+        assert_eq!(decoded[i].value.as_deref(), Some(expected.as_ref()));
+    }
+
+    let uncompressed_total: usize = records.iter().map(|r| r.len()).sum();
+    assert!(
+        served.len() < uncompressed_total,
+        "served {} bytes for {} bytes of payload — compression did not survive the fetch path",
+        served.len(),
+        uncompressed_total
+    );
+}
+
 /// A follower's log must end up byte-identical to its leader's, still batched and still
 /// compressed in the codec the *producer* chose. Replication carries the leader's stored
 /// bytes; it does not decode records or decompress anything on the way across.

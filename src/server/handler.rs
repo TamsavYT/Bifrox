@@ -1606,6 +1606,40 @@ async fn try_zero_copy_fetch(
     Ok(true)
 }
 
+/// Encodes a record-bearing fetch response.
+///
+/// ```text
+/// [last_stable_offset: 8b] [aborted_count: 4b] [(start: 8b, end: 8b) * aborted_count]
+/// [entries_len: 4b] [entry bytes]
+/// ```
+///
+/// `entry bytes` are the log's stored bytes, handed over exactly as written — the broker
+/// does not decode records out of them and never decompresses a batch. Deciding what a
+/// record means, and decompressing it, is the consumer's job.
+///
+/// The transactional metadata is what makes read-committed work without the broker
+/// decoding anything: aborted records cannot be filtered out of a compressed batch
+/// server-side, so the broker reports which offset ranges were aborted and how far the log
+/// is stable, and the consumer drops them after decompressing. Kafka's fetch response
+/// carries `last_stable_offset` and `aborted_transactions` for exactly this reason.
+/// `u64::MAX` with an empty list means "nothing to filter" (read-uncommitted).
+fn encode_fetch_entries_response(
+    last_stable_offset: u64,
+    aborted: &[(u64, u64)],
+    entries: &bytes::Bytes,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + aborted.len() * 16 + entries.len());
+    buf.put_u64(last_stable_offset);
+    buf.put_u32(aborted.len() as u32);
+    for (start, end) in aborted {
+        buf.put_u64(*start);
+        buf.put_u64(*end);
+    }
+    buf.put_u32(entries.len() as u32);
+    buf.put_slice(entries);
+    buf
+}
+
 /// Routes a decoded client WireRequest to the appropriate StorageEngine method.
 // The parameters are this connection's mutable state (principal, client id, SCRAM session
 // and negotiated mechanism), not independent knobs — bundling them into a struct purely to
@@ -2154,29 +2188,18 @@ async fn process_request(
             // tag — including every legacy-framed request — means read-uncommitted, which
             // is exactly what `Fetch` has always done.
             let isolation = framing.isolation_level();
-            let result = match isolation {
-                crate::protocol::wire::IsolationLevel::ReadCommitted => {
-                    engine
-                        .fetch_committed(&topic, partition, offset, max_bytes)
-                        .await
-                }
-                crate::protocol::wire::IsolationLevel::ReadUncommitted => {
-                    engine.fetch(&topic, partition, offset, max_bytes).await
-                }
-            };
-            match result {
-                Ok(frames) => {
+            match engine
+                .fetch_entries(&topic, partition, offset, max_bytes)
+                .await
+            {
+                Ok(entries) => {
                     engine
                         .metrics()
                         .fetch_latency_ms
                         .record(fetch_start.elapsed());
-                    let mut buf = Vec::new();
-                    buf.put_u32(frames.len() as u32);
-                    let mut fetched_bytes: u64 = 0;
-                    for frame in frames {
-                        fetched_bytes += frame.encoded_size() as u64;
-                        frame.encode_into(&mut buf);
-                    }
+                    let (lso, aborted) = engine.read_committed_filter(&topic, partition, isolation);
+                    let fetched_bytes = entries.len() as u64;
+                    let buf = encode_fetch_entries_response(lso, &aborted, &entries);
                     engine
                         .throttle_fetch(&topic, &quota_key, fetched_bytes)
                         .await;
@@ -2204,17 +2227,17 @@ async fn process_request(
                 return WireResponse::error("NotLeaderForPartition");
             }
             match engine
-                .fetch_committed(&topic, partition, offset, max_bytes)
+                .fetch_entries(&topic, partition, offset, max_bytes)
                 .await
             {
-                Ok(frames) => {
-                    let mut buf = Vec::new();
-                    buf.put_u32(frames.len() as u32);
-                    let mut fetched_bytes: u64 = 0;
-                    for frame in frames {
-                        fetched_bytes += frame.encoded_size() as u64;
-                        frame.encode_into(&mut buf);
-                    }
+                Ok(entries) => {
+                    let (lso, aborted) = engine.read_committed_filter(
+                        &topic,
+                        partition,
+                        crate::protocol::wire::IsolationLevel::ReadCommitted,
+                    );
+                    let fetched_bytes = entries.len() as u64;
+                    let buf = encode_fetch_entries_response(lso, &aborted, &entries);
                     engine
                         .throttle_fetch(&topic, &quota_key, fetched_bytes)
                         .await;
@@ -2447,17 +2470,14 @@ async fn process_request(
                 return WireResponse::error("TopicAuthorizationFailed");
             }
             match engine
-                .fetch_by_timestamp(&topic, partition, target_timestamp, max_bytes)
+                .fetch_entries_by_timestamp(&topic, partition, target_timestamp, max_bytes)
                 .await
             {
-                Ok(frames) => {
-                    let mut buf = Vec::new();
-                    buf.put_u32(frames.len() as u32);
-                    let mut fetched_bytes: u64 = 0;
-                    for frame in frames {
-                        fetched_bytes += frame.encoded_size() as u64;
-                        frame.encode_into(&mut buf);
-                    }
+                Ok(entries) => {
+                    let fetched_bytes = entries.len() as u64;
+                    // The timestamp filter is the consumer's — the broker resolves the
+                    // starting offset through the time index and hands over stored bytes.
+                    let buf = encode_fetch_entries_response(u64::MAX, &[], &entries);
                     engine
                         .throttle_fetch(&topic, &quota_key, fetched_bytes)
                         .await;

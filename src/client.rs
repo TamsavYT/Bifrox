@@ -721,6 +721,103 @@ impl TestClient {
         }
     }
 
+    /// Decodes a fetch response into records.
+    ///
+    /// The response carries the broker's stored bytes — whole log entries, exactly as
+    /// written. Everything that turns them into records happens here, on the client:
+    /// decoding entries, decompressing batches, and dropping what a read-committed
+    /// consumer must not see. The broker does none of it.
+    ///
+    /// Filtering is applied in this order, matching Kafka's consumer:
+    /// - records below `start_offset` (a batch containing it is returned whole, so its
+    ///   earlier records arrive too and are dropped here)
+    /// - control markers, which are transaction bookkeeping rather than data
+    /// - records at or beyond the last stable offset
+    /// - records inside an aborted transaction's offset range
+    ///
+    /// Under read-uncommitted the broker sends `u64::MAX` and no ranges, so only the
+    /// start-offset trim applies.
+    fn decode_fetch_entries_response(
+        payload: &[u8],
+        start_offset: u64,
+        drop_control_and_aborted: bool,
+    ) -> IoResult<Vec<RecordFrame>> {
+        let short =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Fetch response too short");
+        if payload.len() < 12 {
+            return Err(short());
+        }
+        let mut cursor = payload;
+        let last_stable_offset = cursor.get_u64();
+        let aborted_count = cursor.get_u32() as usize;
+        if cursor.len() < aborted_count * 16 + 4 {
+            return Err(short());
+        }
+        let mut aborted = Vec::with_capacity(aborted_count);
+        for _ in 0..aborted_count {
+            let start = cursor.get_u64();
+            let end = cursor.get_u64();
+            aborted.push((start, end));
+        }
+        let entries_len = cursor.get_u32() as usize;
+        if cursor.len() < entries_len {
+            return Err(short());
+        }
+        let entries = &cursor[..entries_len];
+
+        let is_aborted = |offset: u64| aborted.iter().any(|(s, e)| offset >= *s && offset <= *e);
+
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < entries.len() {
+            let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[pos..]) else {
+                break;
+            };
+            pos += consumed;
+            match entry {
+                crate::segment::LogEntry::Frame(mut frame) => {
+                    if let Ok(decompressed) = frame.decompress_payload() {
+                        frame.payload = decompressed;
+                    }
+                    if frame.offset < start_offset {
+                        continue;
+                    }
+                    if drop_control_and_aborted
+                        && (frame.is_control_marker()
+                            || frame.offset >= last_stable_offset
+                            || is_aborted(frame.offset))
+                    {
+                        continue;
+                    }
+                    out.push(frame);
+                }
+                crate::segment::LogEntry::Batch(batch) => {
+                    // Decompressing the batch is this side's job; a corrupt one ends the
+                    // scan rather than yielding partial records.
+                    let Ok(records) = batch.records() else {
+                        break;
+                    };
+                    for record in records {
+                        if record.offset < start_offset {
+                            continue;
+                        }
+                        if drop_control_and_aborted
+                            && (record.offset >= last_stable_offset || is_aborted(record.offset))
+                        {
+                            continue;
+                        }
+                        out.push(RecordFrame::create(
+                            record.offset,
+                            record.timestamp,
+                            record.value.unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn fetch(
         &mut self,
         topic: &str,
@@ -750,31 +847,7 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            if resp_payload.len() < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Payload too short",
-                ));
-            }
-            let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
-            let mut frames = Vec::with_capacity(count);
-            let mut cursor = 4usize;
-            for _ in 0..count {
-                if cursor >= resp_payload.len() {
-                    break;
-                }
-                match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((mut frame, consumed)) => {
-                        cursor += consumed;
-                        if let Ok(decompressed) = frame.decompress_payload() {
-                            frame.payload = decompressed;
-                        }
-                        frames.push(frame);
-                    }
-                    Err(_) => break,
-                }
-            }
-            Ok(frames)
+            Self::decode_fetch_entries_response(&resp_payload, offset, false)
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
@@ -858,36 +931,11 @@ impl TestClient {
                 String::from_utf8_lossy(&resp.payload).to_string(),
             ));
         }
-        Self::decode_fetch_frames(&resp.payload)
-    }
-
-    /// Shared decoder for a fetch response payload: `[count: 4b]` then that many frames.
-    fn decode_fetch_frames(payload: &[u8]) -> IoResult<Vec<RecordFrame>> {
-        if payload.len() < 4 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Payload too short",
-            ));
-        }
-        let count = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let mut frames = Vec::with_capacity(count);
-        let mut cursor = 4usize;
-        for _ in 0..count {
-            if cursor >= payload.len() {
-                break;
-            }
-            match RecordFrame::decode(&payload[cursor..]) {
-                Ok((mut frame, consumed)) => {
-                    cursor += consumed;
-                    if let Ok(decompressed) = frame.decompress_payload() {
-                        frame.payload = decompressed;
-                    }
-                    frames.push(frame);
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(frames)
+        Self::decode_fetch_entries_response(
+            &resp.payload,
+            offset,
+            isolation == crate::protocol::wire::IsolationLevel::ReadCommitted,
+        )
     }
 
     /// Fetch attributed to a specific consumer group member, via the `GROUP_MEMBER`
@@ -933,7 +981,8 @@ impl TestClient {
                 String::from_utf8_lossy(&resp.payload).to_string(),
             ));
         }
-        Self::decode_fetch_frames(&resp.payload)
+        // No isolation tag on this request, so the broker answers read-uncommitted.
+        Self::decode_fetch_entries_response(&resp.payload, offset, false)
     }
 
     /// Asks the broker which protocol versions and commands it supports.
@@ -1902,31 +1951,14 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            if resp_payload.len() < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Payload too short",
-                ));
-            }
-            let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
-            let mut frames = Vec::with_capacity(count);
-            let mut cursor = 4usize;
-            for _ in 0..count {
-                if cursor >= resp_payload.len() {
-                    break;
-                }
-                match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((mut frame, consumed)) => {
-                        cursor += consumed;
-                        if let Ok(decompressed) = frame.decompress_payload() {
-                            frame.payload = decompressed;
-                        }
-                        frames.push(frame);
-                    }
-                    Err(_) => break,
-                }
-            }
-            Ok(frames)
+            let frames = Self::decode_fetch_entries_response(&resp_payload, 0, false)?;
+            // The broker resolves a starting offset through its (sparse) time index and
+            // hands over stored bytes from there; it cannot apply the timestamp predicate
+            // without decoding every batch, so the filter belongs here.
+            Ok(frames
+                .into_iter()
+                .filter(|f| f.timestamp >= target_timestamp)
+                .collect())
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
@@ -1965,31 +1997,7 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            if resp_payload.len() < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Payload too short",
-                ));
-            }
-            let count = u32::from_be_bytes(resp_payload[0..4].try_into().unwrap()) as usize;
-            let mut frames = Vec::with_capacity(count);
-            let mut cursor = 4usize;
-            for _ in 0..count {
-                if cursor >= resp_payload.len() {
-                    break;
-                }
-                match RecordFrame::decode(&resp_payload[cursor..]) {
-                    Ok((mut frame, consumed)) => {
-                        cursor += consumed;
-                        if let Ok(decompressed) = frame.decompress_payload() {
-                            frame.payload = decompressed;
-                        }
-                        frames.push(frame);
-                    }
-                    Err(_) => break,
-                }
-            }
-            Ok(frames)
+            Self::decode_fetch_entries_response(&resp_payload, offset, true)
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
