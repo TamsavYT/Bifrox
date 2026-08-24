@@ -170,6 +170,38 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
     }
 }
 
+/// Builds the batch a producer would send: null keys, payloads as values, a placeholder
+/// base offset of 0 for the broker to stamp, and no compression unless a test asks for it.
+/// Mirrors what `TestClient::produce_batch_eos` does over the wire.
+fn producer_batch(
+    records: &[bytes::Bytes],
+    producer_id: u64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    transactional: bool,
+    codec: hermes::protocol::BatchCompression,
+) -> hermes::protocol::RecordBatch {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let triples: Vec<(u64, Option<bytes::Bytes>, Option<bytes::Bytes>)> = records
+        .iter()
+        .map(|r| (timestamp, None, Some(r.clone())))
+        .collect();
+    hermes::protocol::RecordBatch::create(
+        0,
+        timestamp,
+        0,
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        transactional,
+        codec,
+        &triples,
+    )
+}
+
 #[tokio::test]
 async fn test_scenario_1_connection_and_handshake() {
     let env = start_test_server().await;
@@ -1372,10 +1404,14 @@ async fn test_scenario_19_relative_index_and_txnindex() {
         key: "",
         transaction_id: Some(tx_id),
         num_partitions: 1,
-        producer_id: pid,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            pid,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     engine.produce_batch(params).await.unwrap();
 
@@ -1389,10 +1425,14 @@ async fn test_scenario_19_relative_index_and_txnindex() {
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records_ok,
+        batch: producer_batch(
+            &records_ok,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     engine.produce_batch(params_ok).await.unwrap();
 
@@ -1661,7 +1701,13 @@ async fn test_scenario_22_per_client_quota_throttling() {
 
     // 4. Two clients behind the same source IP can opt into separate quota buckets by
     // setting distinct logical client_ids on their connections.
-    let env_client_id_quota = start_test_server_with_quota(Some(100), None).await;
+    // Produce quota is charged on the batch as stored — its encoded, compressed size —
+    // rather than the sum of record payloads, matching how Kafka charges request bytes.
+    // A 100-byte payload therefore costs ~173 (53-byte batch header + 20-byte record
+    // entry + payload). The quota is sized to sit between one such produce and two, so
+    // one produce per bucket passes but two against a shared bucket would throttle —
+    // which is exactly what this assertion is testing.
+    let env_client_id_quota = start_test_server_with_quota(Some(200), None).await;
     let mut client_a = TestClient::connect(env_client_id_quota.addr).await.unwrap();
     let mut client_b = TestClient::connect(env_client_id_quota.addr).await.unwrap();
     client_a.set_client_id("producer-a").await.unwrap();
@@ -2351,6 +2397,9 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
 
     // Test Real End-to-End Client Produce & Fetch over LZ4-compressed storage engine
     let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    // Compression is the producer's job now: the client compresses, the broker
+    // stores those bytes untouched and serves them back the same way.
+    client.set_compression(hermes::protocol::BatchCompression::Lz4);
     let raw_payload_str = "end_to_end_lz4_wire_compressed_payload_0123456789_0123456789_0123456789";
     let recs = vec![bytes::Bytes::from(raw_payload_str)];
     let prod_res = client
@@ -2439,6 +2488,9 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    // Compression is the producer's job now: the client compresses, the broker
+    // stores those bytes untouched and serves them back the same way.
+    client.set_compression(hermes::protocol::BatchCompression::Zstd);
 
     // Also verify "zstd" parses correctly through the same dynamic-config path clients use.
     client.create_topic("zstd_wire_topic", 1).await.unwrap();
@@ -2572,10 +2624,14 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
             key: "",
             transaction_id: Some(transactional_id),
             num_partitions: 1,
-            producer_id,
-            producer_epoch,
-            base_sequence: 0,
-            records: &first_record,
+            batch: producer_batch(
+                &first_record,
+                producer_id,
+                producer_epoch,
+                0,
+                true,
+                hermes::protocol::BatchCompression::None,
+            ),
         })
         .await
         .unwrap();
@@ -2620,10 +2676,14 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
             key: "",
             transaction_id: Some(transactional_id),
             num_partitions: 1,
-            producer_id: recovered_pid,
-            producer_epoch: recovered_epoch,
-            base_sequence: 0,
-            records: &second_record,
+            batch: producer_batch(
+                &second_record,
+                recovered_pid,
+                recovered_epoch,
+                0,
+                false,
+                hermes::protocol::BatchCompression::None,
+            ),
         })
         .await
         .unwrap();
@@ -3877,10 +3937,14 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     engine.produce_batch(params).await.unwrap();
 
@@ -7735,10 +7799,14 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
     assert_eq!(first_offset, 0);
@@ -7797,10 +7865,14 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 777_888,
-        producer_epoch: 5,
-        base_sequence: 3,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            777_888,
+            5,
+            3,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     engine.produce_batch(params).await.unwrap();
 
@@ -7832,6 +7904,92 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// The broker must not compress and must not re-compress: what lands on disk is the codec
+/// the *producer* chose, whatever the broker's own `compression.type` says. Asserted in
+/// both directions, because either one alone is satisfiable by accident — a broker that
+/// always compressed would pass the "producer chose zstd" case, and a broker that never
+/// compressed would pass the "producer chose none" case.
+#[tokio::test]
+async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
+    use hermes::config::EngineConfig;
+
+    async fn stored_codec(
+        dir_name: &str,
+        topic: &str,
+        broker_codec: hermes::config::CompressionCodec,
+        client_codec: hermes::protocol::BatchCompression,
+    ) -> hermes::protocol::BatchCompression {
+        let dir_guard = TestDataDirGuard::new(dir_name);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = EngineConfig {
+            node_id: 1,
+            data_dir: dir_guard.path.clone(),
+            bind_addr: addr.to_string(),
+            compression_codec: broker_codec,
+            ..Default::default()
+        };
+        let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+        let server = hermes::server::Server::new(engine.clone());
+        tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+        client.set_compression(client_codec);
+
+        let payload = bytes::Bytes::from(
+            "compressible_payload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        client
+            .produce_batch(topic, "", None, 1, std::slice::from_ref(&payload))
+            .await
+            .unwrap();
+
+        let log_bytes = std::fs::read(
+            dir_guard
+                .path
+                .join(format!("{topic}-0"))
+                .join("00000000000000000000.log"),
+        )
+        .unwrap();
+        let (batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+        assert_eq!(
+            batch.records().unwrap()[0].value.as_deref(),
+            Some(payload.as_ref()),
+            "whatever the codec, the payload must survive"
+        );
+        batch.compression().unwrap()
+    }
+
+    // Broker says zstd, producer says none -> stored uncompressed.
+    assert_eq!(
+        stored_codec(
+            "codec_broker_zstd_client_none",
+            "codec_broker_zstd_client_none_topic",
+            hermes::config::CompressionCodec::Zstd,
+            hermes::protocol::BatchCompression::None,
+        )
+        .await,
+        hermes::protocol::BatchCompression::None,
+        "the broker must not compress a batch the producer left uncompressed"
+    );
+
+    // Broker says none, producer says zstd -> stored zstd.
+    assert_eq!(
+        stored_codec(
+            "codec_broker_none_client_zstd",
+            "codec_broker_none_client_zstd_topic",
+            hermes::config::CompressionCodec::None,
+            hermes::protocol::BatchCompression::Zstd,
+        )
+        .await,
+        hermes::protocol::BatchCompression::Zstd,
+        "the broker must store the producer's codec, not strip or change it"
+    );
+}
+
 /// Every entry a client produce writes to disk must be a `RecordBatch` — there is no
 /// per-record-frame write path any more. This inspects the actual on-disk bytes rather
 /// than trusting that no other test happened to notice a stray `RecordFrame`, and it is
@@ -7855,10 +8013,14 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
     assert_eq!(first_offset, 0);
@@ -7919,10 +8081,14 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &records,
+        batch: producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
     assert_eq!((first_offset, last_offset), (0, 4), "one 5-record batch");
@@ -7951,10 +8117,14 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
         key: "",
         transaction_id: None,
         num_partitions: 1,
-        producer_id: 0,
-        producer_epoch: 0,
-        base_sequence: 0,
-        records: &refill,
+        batch: producer_batch(
+            &refill,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::None,
+        ),
     };
     let (_, refill_first, refill_last) = engine.produce_batch(refill_params).await.unwrap();
     assert_eq!((refill_first, refill_last), (0, 0));
@@ -8004,7 +8174,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     // A batch of 3 records, written through the batch path directly
     // (`produce_batch_eos`), which is now the only client produce write path.
     let batch = pm
-        .produce_batch_eos(
+        .produce_batch_eos(producer_batch(
             &[
                 bytes::Bytes::from_static(b"k1:v1"),
                 bytes::Bytes::from_static(b"k2:v2"),
@@ -8014,7 +8184,8 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
             0,
             0,
             false,
-        )
+            hermes::protocol::BatchCompression::None,
+        ))
         .unwrap()
         .unwrap();
     assert_eq!(

@@ -88,6 +88,28 @@ impl KafkaWireAdapter {
                 };
 
                 let record_bytes = Bytes::copy_from_slice(p_buf);
+                // Produce now carries one encoded `RecordBatch`. This adapter still treats
+                // the remaining bytes as a single opaque record, so it wraps them in a
+                // one-record uncompressed batch with a placeholder base offset the broker
+                // will stamp. (Passing a real Kafka v2 batch straight through is part of
+                // the wider Kafka-protocol work, not this shim.)
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let batch = crate::protocol::RecordBatch::create(
+                    0,
+                    timestamp,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    crate::protocol::BatchCompression::None,
+                    &[(timestamp, None, Some(record_bytes))],
+                );
+                let mut encoded = Vec::new();
+                batch.encode_into(&mut encoded);
                 WireRequest {
                     cmd: CommandCode::ProduceBatch,
                     payload: RequestPayload::ProduceBatch {
@@ -95,10 +117,7 @@ impl KafkaWireAdapter {
                         key: "".to_string(),
                         transaction_id: "".to_string(),
                         num_partitions: 1,
-                        producer_id: 0,
-                        producer_epoch: 0,
-                        base_sequence: 0,
-                        records: vec![record_bytes],
+                        batch: Bytes::from(encoded),
                     },
                 }
             }

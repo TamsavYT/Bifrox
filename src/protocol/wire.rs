@@ -464,10 +464,11 @@ pub enum RequestPayload {
         key: String,
         transaction_id: String,
         num_partitions: u32,
-        producer_id: u64,
-        producer_epoch: i16,
-        base_sequence: i32,
-        records: Vec<Bytes>,
+        /// One encoded [`crate::protocol::RecordBatch`], built and compressed by the
+        /// producer. The broker never decodes the records inside it — the producer id,
+        /// epoch and base sequence it needs for idempotence all live in the batch's
+        /// plaintext header, which is why they are not repeated in this envelope.
+        batch: Bytes,
     },
     Fetch {
         topic: String,
@@ -882,47 +883,29 @@ impl WireRequest {
                 let topic = read_pascal_string(&mut payload_buf)?;
                 let key = read_pascal_string(&mut payload_buf)?;
                 let transaction_id = read_pascal_string(&mut payload_buf)?;
-                if payload_buf.len() < 22 {
+                // num_partitions (4) + batch_len (4)
+                if payload_buf.len() < 8 {
                     return Err(WireError::Incomplete {
-                        needed: 22,
+                        needed: 8,
                         available: payload_buf.len(),
                     });
                 }
                 let num_partitions = payload_buf.get_u32();
-                let producer_id = payload_buf.get_u64();
-                let producer_epoch = payload_buf.get_i16();
-                let base_sequence = payload_buf.get_i32();
-                let record_count = payload_buf.get_u32() as usize;
-
-                let mut records = Vec::with_capacity(record_count);
-                for _ in 0..record_count {
-                    if payload_buf.len() < 4 {
-                        return Err(WireError::Incomplete {
-                            needed: 4,
-                            available: payload_buf.len(),
-                        });
-                    }
-                    let rec_len = payload_buf.get_u32() as usize;
-                    if payload_buf.len() < rec_len {
-                        return Err(WireError::Incomplete {
-                            needed: rec_len,
-                            available: payload_buf.len(),
-                        });
-                    }
-                    let rec_bytes = Bytes::copy_from_slice(&payload_buf[..rec_len]);
-                    payload_buf = &payload_buf[rec_len..];
-                    records.push(rec_bytes);
+                let batch_len = payload_buf.get_u32() as usize;
+                if payload_buf.len() < batch_len {
+                    return Err(WireError::Incomplete {
+                        needed: batch_len,
+                        available: payload_buf.len(),
+                    });
                 }
+                let batch = Bytes::copy_from_slice(&payload_buf[..batch_len]);
 
                 RequestPayload::ProduceBatch {
                     topic,
                     key,
                     transaction_id,
                     num_partitions,
-                    producer_id,
-                    producer_epoch,
-                    base_sequence,
-                    records,
+                    batch,
                 }
             }
             CommandCode::Fetch => {

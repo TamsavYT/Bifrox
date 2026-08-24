@@ -1,7 +1,7 @@
-use crate::protocol::{CommandCode, RecordFrame, WireResponse};
+use crate::protocol::{BatchCompression, CommandCode, RecordBatch, RecordFrame, WireResponse};
 use crate::scram;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use std::collections::VecDeque;
 use std::io::Result as IoResult;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -275,6 +275,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 pub struct TestClient {
     addr: SocketAddr,
     stream: Option<ClientStream>,
+    /// The codec this client compresses its batches with before sending. Compression is
+    /// the producer's job: the broker stores whatever arrives and serves those same bytes
+    /// back, so what a consumer decompresses is what this client chose here.
+    compression: BatchCompression,
 }
 
 impl TestClient {
@@ -438,6 +442,7 @@ impl TestClient {
         Ok(Self {
             addr,
             stream: Some(ClientStream::Plain(stream)),
+            compression: BatchCompression::None,
         })
     }
 
@@ -568,7 +573,13 @@ impl TestClient {
         Ok(Self {
             addr,
             stream: Some(ClientStream::Tls(tls_stream)),
+            compression: BatchCompression::None,
         })
+    }
+
+    /// Sets the codec this client compresses produced batches with.
+    pub fn set_compression(&mut self, codec: BatchCompression) {
+        self.compression = codec;
     }
 
     pub fn is_connected(&self) -> bool {
@@ -643,20 +654,38 @@ impl TestClient {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::ProduceBatch as u8);
 
+        // The client builds and compresses the batch. The broker assigns its base offset
+        // and stores these bytes as they are — it never compresses, and never decompresses
+        // to serve a fetch. Base offset 0 is a placeholder the broker stamps over.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let batch_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|r| (timestamp, None, Some(Bytes::copy_from_slice(r.as_ref()))))
+            .collect();
+        let batch = RecordBatch::create(
+            0,
+            timestamp,
+            0,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            transaction_id.is_some(),
+            self.compression,
+            &batch_records,
+        );
+        let mut encoded_batch = Vec::new();
+        batch.encode_into(&mut encoded_batch);
+
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, topic);
         crate::protocol::wire::write_pascal_string(&mut inner, key);
         crate::protocol::wire::write_pascal_string(&mut inner, transaction_id.unwrap_or(""));
         inner.put_u32(num_partitions);
-        inner.put_u64(producer_id);
-        inner.put_i16(producer_epoch);
-        inner.put_i32(base_sequence);
-        inner.put_u32(records.len() as u32);
-        for rec in records {
-            let slice = rec.as_ref();
-            inner.put_u32(slice.len() as u32);
-            inner.put_slice(slice);
-        }
+        inner.put_u32(encoded_batch.len() as u32);
+        inner.put_slice(&encoded_batch);
 
         req_buf.put_u32(inner.len() as u32);
         req_buf.extend_from_slice(&inner);

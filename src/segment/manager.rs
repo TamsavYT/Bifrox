@@ -1,5 +1,5 @@
 use crate::config::EngineConfig;
-use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
+use crate::protocol::{RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
 use crate::segment::entry::{decode_entry, LogEntry};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
@@ -540,39 +540,18 @@ impl SegmentManager {
     /// scan indexes a batch it finds on disk: the rest of the batch's offsets are reached
     /// by decoding forward from there, never by their own index entry.
     ///
-    /// Nothing on the produce path calls this yet (stage 1b-ii) — this only makes it
-    /// possible for a batch to be written and read back correctly.
-    #[allow(clippy::too_many_arguments)]
+    /// Takes the batch as given and stamps only what the broker owns: the base offset
+    /// (this log's current end) and the leader epoch. `record_data` is stored exactly as
+    /// handed over — never decompressed, never rebuilt — so a batch a producer compressed
+    /// stays compressed on disk in the producer's own codec.
     pub fn append_batch(
         &mut self,
-        base_timestamp: u64,
+        mut batch: RecordBatch,
         leader_epoch: u32,
-        producer_id: u64,
-        producer_epoch: i16,
-        base_sequence: i32,
-        transactional: bool,
-        codec: BatchCompression,
-        records: &[(u64, Bytes)],
     ) -> IoResult<RecordBatch> {
         let assigned_base_offset = self.high_watermark;
-        // `RecordBatch::create` now takes an explicit, nullable key alongside the value —
-        // this call site has no key to give it, so it passes a null key and the payload as
-        // the value, preserving today's behavior exactly.
-        let keyed_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
-            .iter()
-            .map(|(ts, payload)| (*ts, None, Some(payload.clone())))
-            .collect();
-        let batch = RecordBatch::create(
-            assigned_base_offset,
-            base_timestamp,
-            leader_epoch,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            transactional,
-            codec,
-            &keyed_records,
-        );
+        let base_timestamp = batch.base_timestamp;
+        batch.assign_base_offset_and_leader_epoch(assigned_base_offset, leader_epoch);
         let batch_size = batch.encoded_size() as u64;
 
         self.maybe_rotate_before_append(batch_size)?;
@@ -1797,6 +1776,7 @@ impl SegmentManager {
 mod tests {
     use super::*;
     use crate::protocol::frame::MAGIC_BYTE;
+    use crate::protocol::BatchCompression;
 
     struct TempDir(PathBuf);
 
@@ -2082,7 +2062,8 @@ mod tests {
 
         mgr.append(b"frame0", 0).unwrap(); // offset 0
         let records = sample_batch_records(5);
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             1_700_000_000_000,
             3,
             42,
@@ -2133,7 +2114,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         let records = sample_batch_records(4);
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             1_700_000_000_000,
             0,
             0,
@@ -2170,7 +2152,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         let records = sample_batch_records(20);
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             1_700_000_000_000,
             0,
             0,
@@ -2202,7 +2185,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         mgr.append(b"frame0", 0).unwrap(); // offset 0
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             10,
             0,
             0,
@@ -2396,7 +2380,8 @@ mod tests {
         let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
 
         mgr.append(b"zzz:keep", 1).unwrap(); // offset 0 — plain frame, never superseded
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             2,
             0,
             0,
@@ -2453,7 +2438,8 @@ mod tests {
         let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
 
         mgr.append(b"keyA:stale", 1).unwrap(); // offset 0 — frame, superseded by the batch below
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             2,
             0,
             0,
@@ -2501,7 +2487,8 @@ mod tests {
             .as_millis() as u64;
 
         mgr.append(b"user1:val_1", 1000).unwrap(); // offset 0 — stale, superseded below
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             now_ms,
             0,
             0,
@@ -2537,7 +2524,8 @@ mod tests {
 
         mgr.append(b"keyA:val1", 1).unwrap(); // offset 0 — stale
         mgr.append(b"keyA:val2", 1).unwrap(); // offset 1 — current
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             1,
             0,
             0,
@@ -2871,6 +2859,38 @@ mod tests {
         );
     }
 
+    /// Builds a batch the way a producer does — placeholder base offset, its own codec —
+    /// and hands it to `append_batch`, which stamps the real offset and leader epoch.
+    #[allow(clippy::too_many_arguments)]
+    fn append_built_batch(
+        mgr: &mut SegmentManager,
+        base_timestamp: u64,
+        leader_epoch: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+        codec: BatchCompression,
+        records: &[(u64, Bytes)],
+    ) -> IoResult<RecordBatch> {
+        let keyed: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|(ts, payload)| (*ts, None, Some(payload.clone())))
+            .collect();
+        let prebuilt = RecordBatch::create(
+            0,
+            base_timestamp,
+            0,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            transactional,
+            codec,
+            &keyed,
+        );
+        mgr.append_batch(prebuilt, leader_epoch)
+    }
+
     fn sample_batch_records(n: usize) -> Vec<(u64, Bytes)> {
         (0..n)
             .map(|i| {
@@ -2891,18 +2911,18 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         let records = sample_batch_records(4);
-        let written = mgr
-            .append_batch(
-                1_700_000_000_000,
-                7,
-                42,
-                3,
-                9,
-                false,
-                BatchCompression::None,
-                &records,
-            )
-            .unwrap();
+        let written = append_built_batch(
+            &mut mgr,
+            1_700_000_000_000,
+            7,
+            42,
+            3,
+            9,
+            false,
+            BatchCompression::None,
+            &records,
+        )
+        .unwrap();
         assert_eq!(written.base_offset, 0);
         assert_eq!(written.record_count, 4);
 
@@ -2930,8 +2950,18 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         let records = sample_batch_records(5);
-        mgr.append_batch(0, 0, 0, 0, 0, false, BatchCompression::None, &records)
-            .unwrap();
+        append_built_batch(
+            &mut mgr,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        )
+        .unwrap();
         assert_eq!(mgr.high_watermark(), 5);
 
         let frame = mgr.append(b"after-the-batch", 123).unwrap();
@@ -2951,7 +2981,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         let f0 = mgr.append(b"frame0", 0).unwrap();
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             10,
             0,
             0,
@@ -3000,7 +3031,8 @@ mod tests {
         let f0 = mgr.append(b"frame0", 0).unwrap();
         let f0_end = mgr.active.log.physical_size;
         // base_offset=1, 3 records -> offsets 1,2,3
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             10,
             0,
             0,
@@ -3048,7 +3080,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         mgr.append(b"frame0", 0).unwrap();
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             10,
             0,
             0,
@@ -3087,7 +3120,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         mgr.append(b"frame0", 0).unwrap(); // offset 0
-        mgr.append_batch(
+        append_built_batch(
+            &mut mgr,
             10,
             0,
             0,
@@ -3129,7 +3163,8 @@ mod tests {
         let dir2 = TempDir::new("truncate_after_mid_batch_last_offset");
         let mut mgr2 = open_manager(&dir2);
         mgr2.append(b"frame0", 0).unwrap();
-        mgr2.append_batch(
+        append_built_batch(
+            &mut mgr2,
             10,
             0,
             0,
