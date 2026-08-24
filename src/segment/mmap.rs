@@ -98,10 +98,13 @@ impl MmapLogSegment {
                     };
                     for record in records {
                         if record.offset >= start_offset {
+                            // Batch records now carry an explicit, nullable value;
+                            // append_batch never writes a null one, so this unwrap
+                            // preserves existing behavior (see `SegmentManager::fetch`).
                             frames.push(RecordFrame::create(
                                 record.offset,
                                 record.timestamp,
-                                record.payload,
+                                record.value.unwrap_or_default(),
                             ));
                         }
                     }

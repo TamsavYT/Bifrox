@@ -27,9 +27,10 @@ pub const BATCH_HEADER_SIZE: usize = 53;
 /// `crc` too): `BATCH_HEADER_SIZE - 1 (magic) - 4 (batch_length)`.
 const BATCH_LENGTH_COVERED_FIXED: usize = BATCH_HEADER_SIZE - 1 - 4;
 
-/// Bytes fixed per record entry inside (decompressed) `record_data`:
-/// `4(offset_delta) + 8(timestamp_delta) + 4(payload_len)`.
-const RECORD_ENTRY_HEADER_SIZE: usize = 16;
+/// Bytes fixed per record entry inside (decompressed) `record_data`, i.e. present even when
+/// both key and value are null: `4(offset_delta) + 8(timestamp_delta) + 4(key_len) +
+/// 4(value_len)`.
+const RECORD_ENTRY_MIN_SIZE: usize = 20;
 
 const ATTR_COMPRESSION_MASK: u16 = 0x0007;
 const ATTR_TRANSACTIONAL_FLAG: u16 = 0x0008;
@@ -83,14 +84,16 @@ impl BatchCompression {
     }
 }
 
-/// One record decoded out of a batch: its absolute offset and timestamp (base + delta) and
-/// its opaque payload. Structured key/value decomposition is out of scope for this format —
-/// the payload stays an opaque length-prefixed blob (stage 2).
+/// One record decoded out of a batch: its absolute offset and timestamp (base + delta), and
+/// its explicit key and value. Both are nullable opaque byte strings — `None` is a genuine
+/// null (Kafka-style, distinct from present-but-empty `Some(Bytes::new())`) — and neither is
+/// ever decoded or interpreted by the broker; it only ever compares or hashes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchRecord {
     pub offset: u64,
     pub timestamp: u64,
-    pub payload: Bytes,
+    pub key: Option<Bytes>,
+    pub value: Option<Bytes>,
 }
 
 /// Disk/wire binary representation of a batch of records sharing one header, one CRC, and
@@ -119,9 +122,13 @@ pub struct BatchRecord {
 /// single unit per `Attributes` (the surrounding header above is never compressed, so a
 /// reader can inspect offsets/length/attributes without decompressing anything). Each
 /// decompressed record entry is:
-/// `[Offset Delta: 4b] | [Timestamp Delta: 8b, signed] | [Payload Len: 4b] | [Payload Bytes]`
+/// `[Offset Delta: 4b] | [Timestamp Delta: 8b, signed] | [Key Len: 4b, signed] | [Key Bytes] |
+///  [Value Len: 4b, signed] | [Value Bytes]`
 /// — `Offset Delta` added to `Base Offset` and `Timestamp Delta` added to `Base Timestamp`
-/// (as signed arithmetic) give the record's absolute offset and timestamp.
+/// (as signed arithmetic) give the record's absolute offset and timestamp. `Key Len`/
+/// `Value Len` are `-1` for null (matching Kafka), distinguishable from present-but-empty
+/// (`0`); key and value are opaque bytes the broker never decodes or interprets — only
+/// hashed (partitioning) or compared byte-for-byte (compaction).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordBatch {
     pub magic: u8,
@@ -142,9 +149,10 @@ pub struct RecordBatch {
 
 impl RecordBatch {
     /// Builds a batch from a base offset, batch-level metadata, and the records to include.
-    /// Each record is `(timestamp, payload)`; offsets are assigned sequentially starting at
-    /// `base_offset` (record `i` gets offset `base_offset + i`), which is how batches are
-    /// always produced — there are no gaps to express within a single batch.
+    /// Each record is `(timestamp, key, value)`, both `key` and `value` nullable opaque
+    /// bytes; offsets are assigned sequentially starting at `base_offset` (record `i` gets
+    /// offset `base_offset + i`), which is how batches are always produced — there are no
+    /// gaps to express within a single batch.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         base_offset: u64,
@@ -155,17 +163,17 @@ impl RecordBatch {
         base_sequence: i32,
         transactional: bool,
         codec: BatchCompression,
-        records: &[(u64, Bytes)],
+        records: &[(u64, Option<Bytes>, Option<Bytes>)],
     ) -> Self {
         let record_count = records.len() as u32;
         let last_offset_delta = record_count.saturating_sub(1);
 
         let mut raw = Vec::new();
-        for (i, (timestamp, payload)) in records.iter().enumerate() {
+        for (i, (timestamp, key, value)) in records.iter().enumerate() {
             raw.put_u32(i as u32);
             raw.put_i64(*timestamp as i64 - base_timestamp as i64);
-            raw.put_u32(payload.len() as u32);
-            raw.put_slice(payload);
+            encode_opt_bytes(&mut raw, key);
+            encode_opt_bytes(&mut raw, value);
         }
 
         let record_data: Bytes = match codec {
@@ -406,9 +414,45 @@ impl RecordBatch {
     }
 }
 
+/// Encodes a nullable opaque byte string as `[Len: 4b signed][Bytes]`, `-1` signaling null
+/// (matching Kafka) so a null key/value stays distinguishable from a present-but-empty one.
+fn encode_opt_bytes(buf: &mut impl BufMut, bytes: &Option<Bytes>) {
+    match bytes {
+        None => buf.put_i32(-1),
+        Some(b) => {
+            buf.put_i32(b.len() as i32);
+            buf.put_slice(b);
+        }
+    }
+}
+
+/// Decodes one `[Len: 4b signed][Bytes]` field, `-1` meaning null. Defensive: the length
+/// field is always available-checked before being read, any negative value other than `-1`
+/// (never legal) is rejected outright rather than cast to a huge `usize`, and the byte count
+/// is checked against the remaining buffer before any copy is attempted.
+fn decode_opt_bytes(cursor: &mut &[u8]) -> Result<Option<Bytes>, BatchError> {
+    if cursor.remaining() < 4 {
+        return Err(BatchError::TruncatedRecord);
+    }
+    let len = cursor.get_i32();
+    if len == -1 {
+        return Ok(None);
+    }
+    if len < -1 {
+        return Err(BatchError::TruncatedRecord);
+    }
+    let len = len as usize;
+    if cursor.remaining() < len {
+        return Err(BatchError::TruncatedRecord);
+    }
+    let bytes = Bytes::copy_from_slice(&cursor[..len]);
+    cursor.advance(len);
+    Ok(Some(bytes))
+}
+
 /// Parses `record_count` record entries out of already-decompressed `data`, resolving each
 /// record's offset/timestamp deltas against `base_offset`/`base_timestamp`. Defensive: never
-/// trusts a `payload_len` before checking it against the remaining slice, and never
+/// trusts a key/value length before checking it against the remaining slice, and never
 /// pre-allocates based on the untrusted `record_count` alone (capacity is clamped to what the
 /// buffer could actually hold).
 fn decode_records(
@@ -417,28 +461,24 @@ fn decode_records(
     base_timestamp: u64,
     data: &[u8],
 ) -> Result<Vec<BatchRecord>, BatchError> {
-    let max_possible_records = data.len() / RECORD_ENTRY_HEADER_SIZE;
+    let max_possible_records = data.len() / RECORD_ENTRY_MIN_SIZE;
     let mut records = Vec::with_capacity((record_count as usize).min(max_possible_records));
 
     let mut cursor = data;
     for _ in 0..record_count {
-        if cursor.remaining() < RECORD_ENTRY_HEADER_SIZE {
+        if cursor.remaining() < 12 {
             return Err(BatchError::TruncatedRecord);
         }
         let offset_delta = cursor.get_u32();
         let timestamp_delta = cursor.get_i64();
-        let payload_len = cursor.get_u32() as usize;
-
-        if cursor.remaining() < payload_len {
-            return Err(BatchError::TruncatedRecord);
-        }
-        let payload = Bytes::copy_from_slice(&cursor[..payload_len]);
-        cursor.advance(payload_len);
+        let key = decode_opt_bytes(&mut cursor)?;
+        let value = decode_opt_bytes(&mut cursor)?;
 
         records.push(BatchRecord {
             offset: base_offset + offset_delta as u64,
             timestamp: (base_timestamp as i64 + timestamp_delta) as u64,
-            payload,
+            key,
+            value,
         });
     }
 
@@ -457,7 +497,9 @@ mod tests {
     use super::*;
     use crate::protocol::frame::RecordFrame;
 
-    fn sample_records(n: usize) -> Vec<(u64, Bytes)> {
+    /// `(timestamp, key, value)` triples with a null key and the payload as the value —
+    /// matching how `SegmentManager::append_batch` populates records today.
+    fn sample_records(n: usize) -> Vec<(u64, Option<Bytes>, Option<Bytes>)> {
         (0..n)
             .map(|i| {
                 let ts = 1_700_000_000_000u64 + i as u64 * 10;
@@ -465,7 +507,7 @@ mod tests {
                     "{{\"user_id\":{},\"event\":\"page_view\",\"path\":\"/home\",\"referrer\":\"https://example.com/search\"}}",
                     i
                 );
-                (ts, Bytes::from(payload))
+                (ts, None, Some(Bytes::from(payload)))
             })
             .collect()
     }
@@ -501,10 +543,11 @@ mod tests {
 
         let decoded_records = decoded.records().unwrap();
         assert_eq!(decoded_records.len(), records.len());
-        for (i, (ts, payload)) in records.iter().enumerate() {
+        for (i, (ts, _key, value)) in records.iter().enumerate() {
             assert_eq!(decoded_records[i].offset, 1000 + i as u64);
             assert_eq!(decoded_records[i].timestamp, *ts);
-            assert_eq!(decoded_records[i].payload, *payload);
+            assert_eq!(decoded_records[i].key, None);
+            assert_eq!(&decoded_records[i].value, value);
         }
     }
 
@@ -531,10 +574,10 @@ mod tests {
 
         let decoded_records = decoded.records().unwrap();
         assert_eq!(decoded_records.len(), records.len());
-        for (i, (ts, payload)) in records.iter().enumerate() {
+        for (i, (ts, _key, value)) in records.iter().enumerate() {
             assert_eq!(decoded_records[i].offset, 500 + i as u64);
             assert_eq!(decoded_records[i].timestamp, *ts);
-            assert_eq!(decoded_records[i].payload, *payload);
+            assert_eq!(&decoded_records[i].value, value);
         }
     }
 
@@ -563,10 +606,10 @@ mod tests {
 
         let decoded_records = decoded.records().unwrap();
         assert_eq!(decoded_records.len(), records.len());
-        for (i, (ts, payload)) in records.iter().enumerate() {
+        for (i, (ts, _key, value)) in records.iter().enumerate() {
             assert_eq!(decoded_records[i].offset, i as u64);
             assert_eq!(decoded_records[i].timestamp, *ts);
-            assert_eq!(decoded_records[i].payload, *payload);
+            assert_eq!(&decoded_records[i].value, value);
         }
     }
 
@@ -585,7 +628,7 @@ mod tests {
 
     #[test]
     fn single_record_batch_round_trips() {
-        let records = vec![(123u64, Bytes::from_static(b"only record"))];
+        let records = vec![(123u64, None, Some(Bytes::from_static(b"only record")))];
         let batch =
             RecordBatch::create(10, 100, 1, 1, 1, 1, false, BatchCompression::None, &records);
         assert_eq!(batch.record_count, 1);
@@ -598,7 +641,11 @@ mod tests {
         assert_eq!(decoded_records.len(), 1);
         assert_eq!(decoded_records[0].offset, 10);
         assert_eq!(decoded_records[0].timestamp, 123);
-        assert_eq!(decoded_records[0].payload.as_ref(), b"only record");
+        assert_eq!(decoded_records[0].key, None);
+        assert_eq!(
+            decoded_records[0].value.as_deref(),
+            Some(b"only record".as_ref())
+        );
     }
 
     #[test]
@@ -796,16 +843,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_corrupt_payload_len_field() {
-        // Corrupt payload_len of the first record entry — layout is
-        // offset_delta[0..4] | timestamp_delta[4..12] | payload_len[12..16] — to a huge
-        // value; must be a clean decode error from `records()`, not a panic or an attempt to
-        // allocate gigabytes.
+    fn decode_rejects_corrupt_key_len_field() {
+        // Corrupt key_len of the first record entry — layout is
+        // offset_delta[0..4] | timestamp_delta[4..12] | key_len[12..16] — to a huge
+        // *positive* value (i32::MAX; u32::MAX would read back as the -1 null sentinel, not
+        // what this test wants); must be a clean decode error from `records()`, not a panic
+        // or an attempt to allocate gigabytes.
         let records = sample_records(2);
         let mut batch =
             RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
         let mut raw = batch.record_data.to_vec();
-        raw[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+        raw[12..16].copy_from_slice(&i32::MAX.to_be_bytes());
         batch.record_data = Bytes::from(raw);
         batch.crc = RecordBatch::calculate_crc(
             batch.base_offset,
@@ -871,8 +919,9 @@ mod tests {
         let individual_total: usize = records
             .iter()
             .enumerate()
-            .map(|(i, (ts, payload))| {
-                RecordFrame::create_compressed_zstd(i as u64, *ts, payload).encoded_size()
+            .map(|(i, (ts, _key, value))| {
+                RecordFrame::create_compressed_zstd(i as u64, *ts, value.as_ref().unwrap())
+                    .encoded_size()
             })
             .sum();
 
@@ -915,8 +964,9 @@ mod tests {
         let individual_total: usize = records
             .iter()
             .enumerate()
-            .map(|(i, (ts, payload))| {
-                RecordFrame::create_compressed_lz4(i as u64, *ts, payload).encoded_size()
+            .map(|(i, (ts, _key, value))| {
+                RecordFrame::create_compressed_lz4(i as u64, *ts, value.as_ref().unwrap())
+                    .encoded_size()
             })
             .sum();
 
@@ -948,5 +998,149 @@ mod tests {
             "expected the batch to be less than half the size of individually compressed records: \
              batch={batch_total}b individual={individual_total}b"
         );
+    }
+
+    /// Round-trips every combination of null/present key and null/present value, checking
+    /// that null stays distinguishable from present-but-empty (`Some(Bytes::new())`) in both
+    /// directions — this is the whole point of the `-1` sentinel over a plain length.
+    #[test]
+    fn key_and_value_nullability_combinations_round_trip_distinctly() {
+        let combos: Vec<(Option<Bytes>, Option<Bytes>)> = vec![
+            (None, None),
+            (None, Some(Bytes::new())),
+            (None, Some(Bytes::from_static(b"value"))),
+            (Some(Bytes::new()), None),
+            (Some(Bytes::new()), Some(Bytes::new())),
+            (Some(Bytes::from_static(b"key")), None),
+            (
+                Some(Bytes::from_static(b"key")),
+                Some(Bytes::from_static(b"value")),
+            ),
+            (Some(Bytes::new()), Some(Bytes::from_static(b"value"))),
+            (Some(Bytes::from_static(b"key")), Some(Bytes::new())),
+        ];
+        let records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = combos
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| (1_700_000_000_000 + i as u64, k.clone(), v.clone()))
+            .collect();
+
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        );
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+        let decoded_records = decoded.records().unwrap();
+
+        assert_eq!(decoded_records.len(), combos.len());
+        for (i, (expected_key, expected_value)) in combos.iter().enumerate() {
+            assert_eq!(&decoded_records[i].key, expected_key, "combo {i} key");
+            assert_eq!(&decoded_records[i].value, expected_value, "combo {i} value");
+        }
+
+        // Explicitly pin down null vs. present-but-empty is not conflated anywhere: a null
+        // key/value must not equal an empty-but-present one, and vice versa.
+        assert_ne!(decoded_records[0].value, decoded_records[1].value); // None vs Some(empty)
+        assert_ne!(decoded_records[0].key, decoded_records[3].key); // None vs Some(empty)
+        assert_eq!(decoded_records[3].key, Some(Bytes::new()));
+        assert_eq!(decoded_records[0].key, None);
+    }
+
+    /// A key is opaque bytes, never UTF-8-decoded or otherwise interpreted — a binary key
+    /// with no valid UTF-8 interpretation must round-trip byte-identical.
+    #[test]
+    fn binary_non_utf8_key_round_trips_byte_identical() {
+        let binary_key = Bytes::from_static(&[0xFF, 0x00, 0xFE, 0x01, 0x80, 0x81, 0xC0, 0xC1]);
+        assert!(
+            std::str::from_utf8(&binary_key).is_err(),
+            "test key must not be valid UTF-8"
+        );
+
+        let records = vec![(
+            1_700_000_000_000u64,
+            Some(binary_key.clone()),
+            Some(Bytes::from_static(b"value")),
+        )];
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        );
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+        let decoded_records = decoded.records().unwrap();
+
+        assert_eq!(decoded_records[0].key, Some(binary_key));
+    }
+
+    /// The value is opaque bytes too — never split, parsed, or otherwise interpreted. A JSON
+    /// payload containing a `:` (the very character `extract_key_value`'s payload-sniffing
+    /// used to split on) must round-trip byte-identical, proving the broker isn't peeking
+    /// inside it.
+    #[test]
+    fn json_value_round_trips_byte_identical() {
+        let json_value = Bytes::from_static(br#"{"a":1,"b":"x:y"}"#);
+
+        let records = vec![(1_700_000_000_000u64, None, Some(json_value.clone()))];
+        let batch = RecordBatch::create(
+            0,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        );
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+        let decoded_records = decoded.records().unwrap();
+
+        assert_eq!(decoded_records[0].key, None);
+        assert_eq!(decoded_records[0].value, Some(json_value));
+    }
+
+    #[test]
+    fn decode_rejects_key_len_below_null_sentinel() {
+        // A key_len of -2 (or any value below the -1 null sentinel) is never legal; it must
+        // be a clean decode error, not a cast to a huge usize.
+        let records = sample_records(2);
+        let mut batch =
+            RecordBatch::create(0, 0, 0, 0, 0, 0, false, BatchCompression::None, &records);
+        let mut raw = batch.record_data.to_vec();
+        raw[12..16].copy_from_slice(&(-2i32).to_be_bytes());
+        batch.record_data = Bytes::from(raw);
+        batch.crc = RecordBatch::calculate_crc(
+            batch.base_offset,
+            batch.last_offset_delta,
+            batch.base_timestamp,
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.leader_epoch,
+            batch.attributes,
+            batch.record_count,
+            &batch.record_data,
+        );
+        let err = batch.records().unwrap_err();
+        assert!(matches!(err, BatchError::TruncatedRecord));
     }
 }

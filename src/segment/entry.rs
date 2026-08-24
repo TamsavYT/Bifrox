@@ -93,8 +93,8 @@ mod tests {
             false,
             BatchCompression::None,
             &[
-                (1_700_000_000_000, Bytes::from_static(b"one")),
-                (1_700_000_000_010, Bytes::from_static(b"two")),
+                (1_700_000_000_000, None, Some(Bytes::from_static(b"one"))),
+                (1_700_000_000_010, None, Some(Bytes::from_static(b"two"))),
             ],
         )
     }

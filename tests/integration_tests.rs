@@ -2365,15 +2365,27 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
 
     // Verify on-disk log segment file directly: confirm 0xAC magic byte stored on disk
+    // Verify the on-disk log segment directly. Compression is a batch-level attribute
+    // (as in Kafka), not a per-record frame magic — so the codec is asserted on the
+    // stored `RecordBatch`'s attributes, and the records must still decompress back to
+    // exactly what was produced.
     let log_file_path = dir_guard
         .path
         .join("lz4_wire_topic-0")
         .join("00000000000000000000.log");
     let log_bytes = std::fs::read(&log_file_path).unwrap();
-    let (disk_frame, _) = hermes::protocol::RecordFrame::decode(&log_bytes).unwrap();
+    let (disk_batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
     assert_eq!(
-        disk_frame.magic,
-        hermes::protocol::COMPRESSED_LZ4_MAGIC_BYTE
+        disk_batch.compression().unwrap(),
+        hermes::protocol::BatchCompression::Lz4,
+        "records must be stored LZ4-compressed at the batch level"
+    );
+    let disk_records = disk_batch.records().unwrap();
+    assert_eq!(disk_records.len(), 1);
+    assert_eq!(
+        disk_records[0].value.as_deref(),
+        Some(raw_payload_str.as_bytes()),
+        "the compressed batch must decompress back to the produced payload"
     );
 
     // Query Prometheus HTTP /metrics Endpoint
@@ -2453,15 +2465,27 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
     assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
 
     // Verify on-disk log segment file directly: confirm 0xAE magic byte stored on disk.
+    // Verify the on-disk log segment directly. Compression is a batch-level attribute
+    // (as in Kafka), not a per-record frame magic — so the codec is asserted on the
+    // stored `RecordBatch`'s attributes, and the records must still decompress back to
+    // exactly what was produced.
     let log_file_path = dir_guard
         .path
         .join("zstd_wire_topic-0")
         .join("00000000000000000000.log");
     let log_bytes = std::fs::read(&log_file_path).unwrap();
-    let (disk_frame, _) = hermes::protocol::RecordFrame::decode(&log_bytes).unwrap();
+    let (disk_batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
     assert_eq!(
-        disk_frame.magic,
-        hermes::protocol::COMPRESSED_ZSTD_MAGIC_BYTE
+        disk_batch.compression().unwrap(),
+        hermes::protocol::BatchCompression::Zstd,
+        "records must be stored zstd-compressed at the batch level"
+    );
+    let disk_records = disk_batch.records().unwrap();
+    assert_eq!(disk_records.len(), 1);
+    assert_eq!(
+        disk_records[0].value.as_deref(),
+        Some(raw_payload_str.as_bytes()),
+        "the compressed batch must decompress back to the produced payload"
     );
 }
 
@@ -7688,99 +7712,6 @@ async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_count
     );
 }
 
-/// Issue #18 stage 1b-ii, headline claim: `produce.record.batches.enable` must be
-/// perfectly transparent to a client. The same produce request, sent against two
-/// otherwise-identical engines that differ only in this flag, must land at the same
-/// offsets and be fetchable back to the same records either way — one engine is writing
-/// a `RecordFrame` per record on disk, the other one `RecordBatch` for the whole
-/// request, and nothing outside `StorageEngine`/`SegmentManager` should be able to tell
-/// the difference. Asserted as equality between the two modes' results, not as two
-/// separate checks, per the plan's explicit ask.
-#[tokio::test]
-async fn test_scenario_85_produce_batch_flag_on_and_off_are_indistinguishable_to_a_client() {
-    let dir_off = TestDataDirGuard::new("batch_flag_off_roundtrip");
-    let dir_on = TestDataDirGuard::new("batch_flag_on_roundtrip");
-
-    let engine_off = StorageEngine::new(EngineConfig {
-        data_dir: dir_off.path.clone(),
-        bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: false,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-    let engine_on = StorageEngine::new(EngineConfig {
-        data_dir: dir_on.path.clone(),
-        bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: true,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-
-    let topic = "batch_flag_roundtrip_topic";
-    let records: Vec<bytes::Bytes> = (0..7)
-        .map(|i| bytes::Bytes::from(format!("record-payload-{i}")))
-        .collect();
-
-    fn make_params<'a>(
-        topic: &'a str,
-        records: &'a [bytes::Bytes],
-    ) -> hermes::server::engine::ProduceBatchParams<'a> {
-        hermes::server::engine::ProduceBatchParams {
-            topic,
-            key: "",
-            transaction_id: None,
-            num_partitions: 1,
-            producer_id: 555,
-            producer_epoch: 2,
-            base_sequence: 0,
-            records,
-        }
-    }
-
-    let (partition_off, first_off, last_off) = engine_off
-        .produce_batch(make_params(topic, &records))
-        .await
-        .unwrap();
-    let (partition_on, first_on, last_on) = engine_on
-        .produce_batch(make_params(topic, &records))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        (partition_off, first_off, last_off),
-        (partition_on, first_on, last_on),
-        "partition assignment and offset range must be identical whichever path wrote it"
-    );
-
-    let fetched_off = engine_off
-        .fetch(topic, partition_off, 0, 1024 * 1024)
-        .await
-        .unwrap();
-    let fetched_on = engine_on
-        .fetch(topic, partition_on, 0, 1024 * 1024)
-        .await
-        .unwrap();
-
-    assert_eq!(fetched_off.len(), records.len());
-    assert_eq!(fetched_on.len(), records.len());
-    for i in 0..records.len() {
-        assert_eq!(
-            fetched_off[i].offset, fetched_on[i].offset,
-            "offset mismatch at record {i}"
-        );
-        assert_eq!(
-            fetched_off[i].decompress_payload().unwrap(),
-            fetched_on[i].decompress_payload().unwrap(),
-            "decoded payload mismatch at record {i}"
-        );
-        assert_eq!(
-            fetched_off[i].decompress_payload().unwrap().as_ref(),
-            records[i].as_ref(),
-            "decoded payload must match what was produced, record {i}"
-        );
-    }
-}
-
 /// A batch is atomic on disk, so serving a fetch whose `start_offset` lands in the
 /// middle of one requires decoding the whole batch and filtering — never returning
 /// records the caller didn't ask for, and never returning nothing just because the
@@ -7791,7 +7722,6 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
     let engine = StorageEngine::new(EngineConfig {
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: true,
         ..EngineConfig::default()
     })
     .unwrap();
@@ -7847,7 +7777,6 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     let engine = StorageEngine::new(EngineConfig {
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: true,
         ..EngineConfig::default()
     })
     .unwrap();
@@ -7903,26 +7832,21 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
-/// With the flag off (the default), every entry written to disk must still be a plain
-/// `RecordFrame` — this is the "verified beyond existing tests pass" check the plan
-/// asks for: it inspects the actual on-disk bytes rather than trusting that no other
-/// test happened to notice a `RecordBatch` sneak in.
+/// Every entry a client produce writes to disk must be a `RecordBatch` — there is no
+/// per-record-frame write path any more. This inspects the actual on-disk bytes rather
+/// than trusting that no other test happened to notice a stray `RecordFrame`, and it is
+/// what catches a frame write path being reintroduced by accident.
 #[tokio::test]
-async fn test_scenario_88_batch_flag_off_still_writes_only_plain_frames_on_disk() {
-    let dir = TestDataDirGuard::new("batch_flag_off_raw");
+async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() {
+    let dir = TestDataDirGuard::new("produce_always_batches_raw");
     let engine = StorageEngine::new(EngineConfig {
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: false,
         ..EngineConfig::default()
     })
     .unwrap();
-    assert!(
-        !engine.config().produce_record_batches_enable,
-        "false must be the config default even when not set explicitly"
-    );
 
-    let topic = "batch_flag_off_raw_topic";
+    let topic = "produce_always_batches_raw_topic";
     let records: Vec<bytes::Bytes> = (0..4)
         .map(|i| bytes::Bytes::from(format!("r{i}")))
         .collect();
@@ -7946,18 +7870,29 @@ async fn test_scenario_88_batch_flag_off_still_writes_only_plain_frames_on_disk(
         .join(format!("{:020}.log", 0u64));
     let raw = std::fs::read(&log_path).unwrap();
     let mut cursor = 0usize;
+    let mut batch_count = 0usize;
     let mut decoded_offsets = Vec::new();
     while cursor < raw.len() {
         let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..]).unwrap();
         match entry {
-            hermes::segment::LogEntry::Frame(f) => decoded_offsets.push(f.offset),
-            hermes::segment::LogEntry::Batch(_) => panic!(
-                "the flag is off — every on-disk entry must still be a plain RecordFrame, \
-                 exactly as before this stage; a RecordBatch appearing here means the gate leaked"
+            hermes::segment::LogEntry::Batch(b) => {
+                batch_count += 1;
+                for record in b.records().unwrap() {
+                    decoded_offsets.push(record.offset);
+                }
+            }
+            hermes::segment::LogEntry::Frame(f) => panic!(
+                "client produce must write RecordBatches only; found a plain RecordFrame at \
+                 offset {} — the per-record frame write path has come back",
+                f.offset
             ),
         }
         cursor += consumed;
     }
+    assert_eq!(
+        batch_count, 1,
+        "one produce request must land as exactly one batch, not one batch per record"
+    );
     assert_eq!(decoded_offsets, vec![0, 1, 2, 3]);
 }
 
@@ -7971,7 +7906,6 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
     let engine = StorageEngine::new(EngineConfig {
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
-        produce_record_batches_enable: true,
         ..EngineConfig::default()
     })
     .unwrap();
@@ -8068,7 +8002,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     pm.produce(b"zzz:keep").unwrap(); // offset 0
 
     // A batch of 3 records, written through the batch path directly
-    // (`produce_batch_eos`), independent of the `produce_record_batches_enable` gate.
+    // (`produce_batch_eos`), which is now the only client produce write path.
     let batch = pm
         .produce_batch_eos(
             &[
