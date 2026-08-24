@@ -10,6 +10,7 @@ use crate::server::quota::QuotaManager;
 use crate::server::transaction::{
     decode_tx_state_record, encode_tx_state_record, TransactionManager, TxStatus,
 };
+use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use std::io::Result as IoResult;
 use std::sync::Arc;
@@ -2256,6 +2257,28 @@ impl StorageEngine {
         pm.advance_committed_hw(last_offset + 1);
 
         Ok((partition_id, first_offset, last_offset))
+    }
+
+    /// Serves a fetch as stored bytes: whole log entries, exactly as written, never
+    /// decoded into records and never decompressed. What a consumer receives is what the
+    /// producer wrote, and decompressing it is the consumer's job.
+    ///
+    /// Entries are clamped to the committed high watermark, and an entry containing
+    /// `offset` is returned whole — a batch is atomic on disk, so a consumer asking from
+    /// the middle of one gets the whole batch and filters it itself, as in Kafka.
+    pub async fn fetch_entries(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(Bytes::new());
+        };
+        tokio::task::spawn_blocking(move || pm.fetch_entries(offset, max_bytes))
+            .await
+            .map_err(|e| std::io::Error::other(format!("fetch_entries join error: {}", e)))?
     }
 
     pub async fn fetch(

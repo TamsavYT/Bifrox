@@ -477,6 +477,57 @@ impl PartitionManager {
     /// Appends a frame received from another node (leader push or catch-up fetch) verbatim,
     /// preserving its original offset/timestamp/magic/CRC exactly rather than reassigning
     /// them locally. See `SegmentManager::append_verbatim`.
+    /// Applies a leader's stored bytes to this replica's log, entry by entry, byte-for-byte.
+    ///
+    /// Each entry — frame or batch — is appended exactly as the leader stored it, so the
+    /// replica's log is a byte-identical copy rather than a re-encoded one. A batch stays
+    /// batched and stays compressed in the producer's codec; nothing here decodes records
+    /// or decompresses anything.
+    ///
+    /// Returns the outcome of the last entry attempted, so a caller can react to a gap.
+    /// Stops at the first entry that is not `Appended`.
+    pub fn append_replica_entries_verbatim(
+        &self,
+        entries: &[u8],
+    ) -> IoResult<(usize, crate::segment::VerbatimAppendResult)> {
+        let mut cursor = 0usize;
+        let mut appended = 0usize;
+        let mut last = crate::segment::VerbatimAppendResult::AlreadyApplied;
+
+        while cursor < entries.len() {
+            let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[cursor..]) else {
+                break;
+            };
+            let (result, next_offset) = {
+                let mut seg_guard = self.segment_manager.lock();
+                match &entry {
+                    crate::segment::LogEntry::Frame(frame) => {
+                        (seg_guard.append_verbatim(frame)?, frame.offset + 1)
+                    }
+                    crate::segment::LogEntry::Batch(batch) => (
+                        seg_guard.append_batch_verbatim(batch)?,
+                        batch.base_offset + batch.last_offset_delta as u64 + 1,
+                    ),
+                }
+            };
+            last = result;
+            match result {
+                crate::segment::VerbatimAppendResult::Appended => {
+                    // Same contract as `append_replica_frame_verbatim`: advance the log end
+                    // but deliberately not the committed high watermark, which only moves
+                    // once the leader tells this follower the record is ISR-committed.
+                    self.log_end_offset.store(next_offset, Ordering::Release);
+                    appended += 1;
+                }
+                crate::segment::VerbatimAppendResult::AlreadyApplied => {}
+                crate::segment::VerbatimAppendResult::Gap { .. } => break,
+            }
+            cursor += consumed;
+        }
+
+        Ok((appended, last))
+    }
+
     pub fn append_replica_frame_verbatim(
         &self,
         frame: &RecordFrame,
@@ -613,6 +664,33 @@ impl PartitionManager {
     pub fn fetch(&self, start_offset: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch(start_offset, max_bytes as usize)
+    }
+
+    /// Reads the stored bytes for `start_offset` onward without decoding or decompressing
+    /// anything, stopping at the committed high watermark. This is the consumer-facing
+    /// bound: a consumer must never be shown data that is not yet ISR-committed.
+    /// See [`SegmentManager::fetch_entries`].
+    pub fn fetch_entries(&self, start_offset: u64, max_bytes: u32) -> IoResult<Bytes> {
+        let hw = self.high_watermark();
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.fetch_entries(start_offset, max_bytes as usize, hw)
+    }
+
+    /// Same as [`Self::fetch_entries`], but bounded by the log end rather than the
+    /// committed high watermark.
+    ///
+    /// A follower *must* be able to read past the committed point: the high watermark only
+    /// advances once the ISR has acknowledged, and it can only acknowledge what it has
+    /// fetched. Bounding replication at the high watermark would make the watermark unable
+    /// to advance at all.
+    pub fn fetch_entries_for_replication(
+        &self,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let leo = self.latest_offset();
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.fetch_entries(start_offset, max_bytes as usize, leo)
     }
 
     /// Plans a zero-copy fetch (frame-aligned physical byte range + a cloned file handle)
