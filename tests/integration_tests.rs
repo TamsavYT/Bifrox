@@ -7904,6 +7904,101 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// A follower's log must end up byte-identical to its leader's, still batched and still
+/// compressed in the codec the *producer* chose. Replication carries the leader's stored
+/// bytes; it does not decode records or decompress anything on the way across.
+///
+/// Before this, the leader served followers records unwound from its batches and re-encoded
+/// as plain uncompressed frames, so a follower stored materially more bytes than its leader
+/// for the same offsets.
+#[tokio::test]
+async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
+    use hermes::config::EngineConfig;
+
+    let leader_dir = TestDataDirGuard::new("replica_identical_leader");
+    let follower_dir = TestDataDirGuard::new("replica_identical_follower");
+
+    let leader = StorageEngine::new(EngineConfig {
+        data_dir: leader_dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let follower = StorageEngine::new(EngineConfig {
+        data_dir: follower_dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "replica_identical_topic";
+    let leader_pm = leader.get_or_create_partition(topic, 0).unwrap();
+    let follower_pm = follower.get_or_create_partition(topic, 0).unwrap();
+
+    // A producer-compressed batch — highly compressible, so an uncompressed copy would be
+    // obviously larger and this cannot pass by coincidence.
+    let records: Vec<bytes::Bytes> = (0..8)
+        .map(|i| bytes::Bytes::from(format!("{}-{}", "compressible_payload_aaaaaaaaaaaaaaaa", i)))
+        .collect();
+    let produced = leader_pm
+        .produce_batch_eos(producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::Zstd,
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(produced.record_count, 8);
+
+    // What the leader would hand a follower on a replication fetch.
+    let entries = leader_pm
+        .fetch_entries_for_replication(0, 1024 * 1024)
+        .unwrap();
+    let (appended, _last) = follower_pm
+        .append_replica_entries_verbatim(&entries)
+        .unwrap();
+    assert_eq!(appended, 1, "the batch must apply as a single atomic entry");
+
+    let leader_bytes = std::fs::read(
+        leader_dir
+            .path
+            .join(format!("{topic}-0"))
+            .join("00000000000000000000.log"),
+    )
+    .unwrap();
+    let follower_bytes = std::fs::read(
+        follower_dir
+            .path
+            .join(format!("{topic}-0"))
+            .join("00000000000000000000.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        follower_bytes, leader_bytes,
+        "the follower's log must be a byte-for-byte copy of the leader's"
+    );
+
+    // And it is still a compressed batch on the follower, not flattened frames.
+    let (follower_batch, _) = hermes::protocol::RecordBatch::decode(&follower_bytes).unwrap();
+    assert_eq!(
+        follower_batch.compression().unwrap(),
+        hermes::protocol::BatchCompression::Zstd,
+        "the follower must store the producer's codec, not an uncompressed re-encoding"
+    );
+    assert_eq!(follower_batch.base_offset, produced.base_offset);
+    assert_eq!(follower_batch.record_count, 8);
+    let follower_records = follower_batch.records().unwrap();
+    for (i, expected) in records.iter().enumerate() {
+        assert_eq!(
+            follower_records[i].value.as_deref(),
+            Some(expected.as_ref())
+        );
+    }
+}
+
 /// The broker must not compress and must not re-compress: what lands on disk is the codec
 /// the *producer* chose, whatever the broker's own `compression.type` says. Asserted in
 /// both directions, because either one alone is satisfiable by accident — a broker that

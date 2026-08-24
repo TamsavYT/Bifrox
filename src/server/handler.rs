@@ -952,13 +952,16 @@ fn decode_grpc_replication_fetch_packet(
         crate::replication::ReplicationFetchResponse {
             leader_watermark: 0,
             isr_count: 0,
-            frames: Vec::new(),
+            entries: bytes::Bytes::new(),
         }
     } else {
         match engine.get_or_create_partition(&req.topic, req.partition) {
             Ok(pm) => {
-                let frames = pm
-                    .fetch(req.fetch_offset, req.max_bytes)
+                // Served as the leader's stored bytes, not decoded records: the follower
+                // appends them verbatim so its log stays byte-identical to this one —
+                // still batched, still compressed in the producer's codec.
+                let entries = pm
+                    .fetch_entries_for_replication(req.fetch_offset, req.max_bytes)
                     .unwrap_or_default();
 
                 // A Fetch request at offset X is itself proof the follower already durably
@@ -978,13 +981,13 @@ fn decode_grpc_replication_fetch_packet(
                 crate::replication::ReplicationFetchResponse {
                     leader_watermark: pm.high_watermark(),
                     isr_count: 1,
-                    frames,
+                    entries,
                 }
             }
             Err(_) => crate::replication::ReplicationFetchResponse {
                 leader_watermark: 0,
                 isr_count: 0,
-                frames: Vec::new(),
+                entries: bytes::Bytes::new(),
             },
         }
     };
@@ -3195,6 +3198,33 @@ mod grpc_replication_fetch_tests {
 
     /// Mirrors how `send_grpc_replication_fetch` reads the leader's response back:
     /// `[u32 resp_len][resp_payload]`.
+    /// Walks the raw entry bytes a replication fetch returns, flattening them into frames
+    /// for assertion purposes only — the follower itself appends the bytes verbatim and
+    /// never does this.
+    fn decode_entries_as_frames(entries: &[u8]) -> Vec<crate::protocol::RecordFrame> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < entries.len() {
+            let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[cursor..]) else {
+                break;
+            };
+            match entry {
+                crate::segment::LogEntry::Frame(f) => out.push(f),
+                crate::segment::LogEntry::Batch(b) => {
+                    for r in b.records().unwrap() {
+                        out.push(crate::protocol::RecordFrame::create(
+                            r.offset,
+                            r.timestamp,
+                            r.value.unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            cursor += consumed;
+        }
+        out
+    }
+
     fn decode_response(bytes: &[u8]) -> ReplicationFetchResponse {
         assert!(bytes.len() >= 4);
         let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
@@ -3231,15 +3261,14 @@ mod grpc_replication_fetch_tests {
         assert_eq!(bytes_consumed, framed.len());
 
         let resp = decode_response(&response_bytes);
-        assert_eq!(
-            resp.frames.len(),
-            2,
-            "expected offsets 1 and 2 (fetch_offset=1)"
-        );
-        assert_eq!(resp.frames[0].offset, 1);
-        assert_eq!(resp.frames[0].payload.as_ref(), b"rec1");
-        assert_eq!(resp.frames[1].offset, 2);
-        assert_eq!(resp.frames[1].payload.as_ref(), b"rec2");
+        // The response carries the leader's stored bytes, so decode entries out of it the
+        // way a follower does rather than expecting pre-decoded frames.
+        let frames = decode_entries_as_frames(&resp.entries);
+        assert_eq!(frames.len(), 2, "expected offsets 1 and 2 (fetch_offset=1)");
+        assert_eq!(frames[0].offset, 1);
+        assert_eq!(frames[0].payload.as_ref(), b"rec1");
+        assert_eq!(frames[1].offset, 2);
+        assert_eq!(frames[1].payload.as_ref(), b"rec2");
     }
 
     #[tokio::test]
@@ -3299,7 +3328,7 @@ mod grpc_replication_fetch_tests {
 
         let (_, response_bytes) = decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
         let resp = decode_response(&response_bytes);
-        assert!(resp.frames.is_empty());
+        assert!(resp.entries.is_empty());
     }
 
     #[tokio::test]

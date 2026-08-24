@@ -580,52 +580,44 @@ impl ReplicationManager {
                                                     if let Ok(pm) = engine_c
                                                         .get_or_create_partition(&topic_c, p_id)
                                                     {
-                                                        let mut applied_any = false;
-                                                        for frame in &resp.frames {
-                                                            // Verbatim, not
-                                                            // `produce_frame_eos`: preserves
-                                                            // the leader's exact
-                                                            // offset/timestamp/magic/CRC so
-                                                            // this replica's log stays
-                                                            // byte-identical to the leader's
-                                                            // for the same offset range,
-                                                            // matching the push-replication
-                                                            // path's guarantee.
-                                                            match pm
-                                                                .append_replica_frame_verbatim(
-                                                                    frame,
-                                                                ) {
-                                                                Ok(
-                                                                    crate::segment::VerbatimAppendResult::Appended,
-                                                                ) => applied_any = true,
-                                                                Ok(
-                                                                    crate::segment::VerbatimAppendResult::AlreadyApplied,
-                                                                ) => {}
-                                                                Ok(
-                                                                    crate::segment::VerbatimAppendResult::Gap {
-                                                                        expected,
-                                                                    },
-                                                                ) => {
+                                                        // Verbatim, entry by entry:
+                                                        // preserves the leader's exact
+                                                        // bytes — offsets, timestamps,
+                                                        // CRCs, batch framing and the
+                                                        // producer's compression codec —
+                                                        // so this replica's log stays
+                                                        // byte-identical to the leader's
+                                                        // for the same offset range.
+                                                        // Nothing here decodes records or
+                                                        // decompresses anything.
+                                                        let applied_any = match pm
+                                                            .append_replica_entries_verbatim(
+                                                                &resp.entries,
+                                                            ) {
+                                                            Ok((appended, last)) => {
+                                                                if let crate::segment::VerbatimAppendResult::Gap {
+                                                                    expected,
+                                                                } = last
+                                                                {
                                                                     tracing::warn!(
-                                                                        "Pull Replication: Gap on '{}' P{} — got offset {} but expected {}. Will retry from current LEO.",
+                                                                        "Pull Replication: Gap on '{}' P{} — expected offset {}. Will retry from current LEO.",
                                                                         topic_c,
                                                                         p_id,
-                                                                        frame.offset,
                                                                         expected
                                                                     );
-                                                                    break;
                                                                 }
-                                                                Err(e) => {
-                                                                    tracing::error!(
-                                                                        "Pull Replication: Failed to persist frame on '{}' P{}: {}",
-                                                                        topic_c,
-                                                                        p_id,
-                                                                        e
-                                                                    );
-                                                                    break;
-                                                                }
+                                                                appended > 0
                                                             }
-                                                        }
+                                                            Err(e) => {
+                                                                tracing::error!(
+                                                                    "Pull Replication: Failed to persist entries on '{}' P{}: {}",
+                                                                    topic_c,
+                                                                    p_id,
+                                                                    e
+                                                                );
+                                                                false
+                                                            }
+                                                        };
                                                         if applied_any {
                                                             let _ = pm.flush_if_sync_policy();
                                                         }

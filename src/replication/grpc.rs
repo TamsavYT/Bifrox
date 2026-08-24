@@ -1,5 +1,4 @@
-use crate::protocol::{RecordFrame, HEADER_SIZE};
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use std::io::Result as IoResult;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -80,7 +79,11 @@ impl ReplicationFetchRequest {
 pub struct ReplicationFetchResponse {
     pub leader_watermark: u64,
     pub isr_count: u32,
-    pub frames: Vec<RecordFrame>,
+    /// The leader's stored bytes for the requested range: whole log entries exactly as
+    /// they sit in its log, never decoded into records and never decompressed. The
+    /// follower appends them verbatim, so its log ends up byte-identical to the leader's
+    /// — still batched, still compressed in the producer's codec.
+    pub entries: Bytes,
 }
 
 impl ReplicationFetchResponse {
@@ -88,10 +91,8 @@ impl ReplicationFetchResponse {
         let mut buf = Vec::new();
         buf.put_u64(self.leader_watermark);
         buf.put_u32(self.isr_count);
-        buf.put_u32(self.frames.len() as u32);
-        for frame in &self.frames {
-            frame.encode_into(&mut buf);
-        }
+        buf.put_u32(self.entries.len() as u32);
+        buf.put_slice(&self.entries);
         buf
     }
 
@@ -102,26 +103,16 @@ impl ReplicationFetchResponse {
         }
         let leader_watermark = src.get_u64();
         let isr_count = src.get_u32();
-        let frame_count = src.get_u32() as usize;
-
-        let mut frames = Vec::with_capacity(frame_count);
-        for _ in 0..frame_count {
-            if src.len() < HEADER_SIZE {
-                break;
-            }
-            match RecordFrame::decode(src) {
-                Ok((frame, consumed)) => {
-                    src = &src[consumed..];
-                    frames.push(frame);
-                }
-                Err(_) => break,
-            }
+        let entries_len = src.get_u32() as usize;
+        if src.len() < entries_len {
+            return Err(());
         }
+        let entries = Bytes::copy_from_slice(&src[..entries_len]);
 
         Ok(Self {
             leader_watermark,
             isr_count,
-            frames,
+            entries,
         })
     }
 }

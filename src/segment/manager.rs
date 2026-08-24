@@ -590,6 +590,55 @@ impl SegmentManager {
     /// path re-derived offset/timestamp/codec through `append_with_codec` on every
     /// replicated record). `frame` has already been CRC-validated by `RecordFrame::decode`,
     /// so no additional integrity check is needed here.
+    /// Appends a batch produced elsewhere (a leader's `RecordBatch`) byte-for-byte: base
+    /// offset, leader epoch, producer metadata, compression and CRC are all taken exactly
+    /// as given, never restamped and never re-compressed. This is what makes a replica's
+    /// log byte-identical to its leader's — including staying compressed in the codec the
+    /// original producer chose, rather than being decompressed into loose records on the
+    /// way across.
+    pub fn append_batch_verbatim(&mut self, batch: &RecordBatch) -> IoResult<VerbatimAppendResult> {
+        // A batch is atomic: it is either wholly present or wholly absent. Its last offset
+        // being below the log end means the whole thing is already here.
+        let last_offset = batch.base_offset + batch.last_offset_delta as u64;
+        if last_offset < self.high_watermark {
+            return Ok(VerbatimAppendResult::AlreadyApplied);
+        }
+        if batch.base_offset > self.high_watermark {
+            return Ok(VerbatimAppendResult::Gap {
+                expected: self.high_watermark,
+            });
+        }
+        if batch.base_offset < self.high_watermark {
+            // Straddles the log end — the local log holds part of this batch already, which
+            // cannot happen for atomic entries and means the follower is out of step.
+            return Ok(VerbatimAppendResult::Gap {
+                expected: self.high_watermark,
+            });
+        }
+
+        let batch_size = batch.encoded_size() as u64;
+        self.maybe_rotate_before_append(batch_size)?;
+
+        let physical_pos = self.append_batch_to_active(batch)?;
+
+        if self.bytes_since_last_index >= self.config.index_interval_bytes
+            || self.active.index.entries_count() == 0
+        {
+            self.active.index.append(batch.base_offset, physical_pos)?;
+            let _ = self
+                .active
+                .time_index
+                .append(batch.base_timestamp, batch.base_offset);
+            self.bytes_since_last_index = 0;
+        }
+
+        self.bytes_since_last_index += batch_size;
+        self.high_watermark = last_offset + 1;
+        self.active.log.next_offset = self.high_watermark;
+
+        Ok(VerbatimAppendResult::Appended)
+    }
+
     pub fn append_verbatim(&mut self, frame: &RecordFrame) -> IoResult<VerbatimAppendResult> {
         if frame.offset < self.high_watermark {
             return Ok(VerbatimAppendResult::AlreadyApplied);
@@ -955,6 +1004,80 @@ impl SegmentManager {
         }
 
         Ok(frames)
+    }
+
+    /// Reads the stored bytes covering `start_offset` onward, **exactly as they sit on
+    /// disk** — entries are never decoded into records, and a compressed batch is never
+    /// decompressed.
+    ///
+    /// This is what a fetch and a replication read are served from. The broker's job on
+    /// this path is to find the right byte range and hand it over; deciding what the
+    /// records inside mean is the consumer's job. It is also what lets a follower's log
+    /// end up byte-identical to its leader's rather than a re-encoded copy.
+    ///
+    /// Only whole entries are returned. An entry whose offset range *contains*
+    /// `start_offset` is included in full — a batch is atomic on disk and cannot be cut in
+    /// half — so a caller asking from the middle of a batch receives the whole batch and
+    /// filters it itself, exactly as a Kafka consumer does. Entries that end strictly
+    /// before `start_offset` are skipped.
+    ///
+    /// Offset ranges are read from each entry's plaintext header (`base_offset` plus
+    /// `last_offset_delta` for a batch), so deciding what to include costs no
+    /// decompression either.
+    ///
+    /// `max_offset_exclusive` is the committed high watermark. An entry is returned only
+    /// if it lies entirely below it.
+    pub fn fetch_entries(
+        &mut self,
+        start_offset: u64,
+        max_bytes: usize,
+        max_offset_exclusive: u64,
+    ) -> IoResult<Bytes> {
+        let segment_pair = self.find_segment_pair_mut(start_offset);
+        let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
+        let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
+
+        let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
+        let raw_bytes = Self::ensure_first_batch_fits(segment_pair, start_pos, raw_bytes)?;
+
+        let mut cursor = 0usize;
+        let mut first_included: Option<usize> = None;
+        let mut end = 0usize;
+
+        while cursor < raw_bytes.len() {
+            if cursor + HEADER_SIZE > raw_bytes.len() {
+                break;
+            }
+            let Ok((entry, consumed)) = decode_entry(&raw_bytes[cursor..]) else {
+                // Same contract as `fetch`: stop the scan rather than hand back bytes we
+                // could not account for.
+                break;
+            };
+            let last_offset = match &entry {
+                LogEntry::Frame(frame) => frame.offset,
+                LogEntry::Batch(batch) => batch.base_offset + batch.last_offset_delta as u64,
+            };
+            // An entry is included only if it is *entirely* below the committed high
+            // watermark. Records inside a batch cannot be filtered individually without
+            // decoding it, so a batch straddling the watermark is withheld whole rather
+            // than exposing uncommitted records — it becomes visible once the watermark
+            // moves past its last offset.
+            if last_offset >= max_offset_exclusive {
+                break;
+            }
+            if last_offset >= start_offset {
+                if first_included.is_none() {
+                    first_included = Some(cursor);
+                }
+                end = cursor + consumed;
+            }
+            cursor += consumed;
+        }
+
+        Ok(match first_included {
+            Some(begin) => Bytes::copy_from_slice(&raw_bytes[begin..end]),
+            None => Bytes::new(),
+        })
     }
 
     /// If `raw` begins with a [`RecordBatch`] (magic [`BATCH_MAGIC_BYTE`]) whose
