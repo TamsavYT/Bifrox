@@ -183,11 +183,13 @@ fn expand_entries_for_compaction(entries: Vec<LogEntry>) -> Vec<RecordFrame> {
             LogEntry::Frame(frame) => out.push(frame),
             LogEntry::Batch(batch) => {
                 if let Ok(records) = batch.records() {
-                    out.extend(
-                        records
-                            .into_iter()
-                            .map(|r| RecordFrame::create(r.offset, r.timestamp, r.payload)),
-                    );
+                    out.extend(records.into_iter().map(|r| {
+                        // Batch records now carry an explicit, nullable value; nothing on
+                        // the produce path writes a null value today (append_batch always
+                        // supplies the payload as the value), so this unwrap mirrors that
+                        // invariant rather than introducing a new one.
+                        RecordFrame::create(r.offset, r.timestamp, r.value.unwrap_or_default())
+                    }));
                 }
             }
         }
@@ -553,6 +555,13 @@ impl SegmentManager {
         records: &[(u64, Bytes)],
     ) -> IoResult<RecordBatch> {
         let assigned_base_offset = self.high_watermark;
+        // `RecordBatch::create` now takes an explicit, nullable key alongside the value —
+        // this call site has no key to give it, so it passes a null key and the payload as
+        // the value, preserving today's behavior exactly.
+        let keyed_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|(ts, payload)| (*ts, None, Some(payload.clone())))
+            .collect();
         let batch = RecordBatch::create(
             assigned_base_offset,
             base_timestamp,
@@ -562,7 +571,7 @@ impl SegmentManager {
             base_sequence,
             transactional,
             codec,
-            records,
+            &keyed_records,
         );
         let batch_size = batch.encoded_size() as u64;
 
@@ -950,10 +959,13 @@ impl SegmentManager {
                     };
                     for record in records {
                         if record.offset >= start_offset {
+                            // See `expand_entries_for_compaction`: batch records now carry
+                            // an explicit, nullable value; append_batch never writes a null
+                            // one, so this unwrap preserves existing behavior.
                             frames.push(RecordFrame::create(
                                 record.offset,
                                 record.timestamp,
-                                record.payload,
+                                record.value.unwrap_or_default(),
                             ));
                         }
                     }

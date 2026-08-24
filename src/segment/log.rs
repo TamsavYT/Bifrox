@@ -684,6 +684,13 @@ mod tests {
     }
 
     fn batch_bytes(base_offset: u64, records: &[(u64, Bytes)]) -> Vec<u8> {
+        // `RecordBatch::create` takes an explicit, nullable key alongside the value; this
+        // helper has no key to give it, so it passes a null key and the payload as the
+        // value.
+        let keyed_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|(ts, payload)| (*ts, None, Some(payload.clone())))
+            .collect();
         let batch = RecordBatch::create(
             base_offset,
             1_700_000_000_000,
@@ -693,7 +700,7 @@ mod tests {
             0,
             false,
             BatchCompression::None,
-            records,
+            &keyed_records,
         );
         let mut buf = Vec::new();
         batch.encode_into(&mut buf);
