@@ -107,6 +107,28 @@ fn next_correlation_id() -> u32 {
     NEXT_CORRELATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// One record on the produce side: `(key, value)`, both nullable opaque bytes.
+///
+/// A `None` value is a tombstone on a compacted topic — distinct from `Some(&[])`, an
+/// ordinary record whose value happens to be empty.
+pub type KeyedRecord<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// A record as a consumer sees it: its offset and timestamp, and the key and value the
+/// producer wrote, both nullable opaque bytes.
+///
+/// [`TestClient::fetch`] and friends return [`RecordFrame`]s, which have no key field and
+/// so cannot represent one. Anything that cares about keys — a compacted topic, or routing
+/// by key — needs this instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerRecord {
+    pub offset: u64,
+    pub timestamp: u64,
+    pub key: Option<Bytes>,
+    /// `None` is a tombstone on a compacted topic: it marks the key deleted. That is
+    /// distinct from `Some(Bytes::new())`, an ordinary record with an empty value.
+    pub value: Option<Bytes>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProduceResult {
     pub assigned_partition: u32,
@@ -640,6 +662,9 @@ impl TestClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Produces values with no per-record key — the common case for a non-compacted topic.
+    /// Delegates to [`Self::produce_keyed_batch_eos`] with a null key on every record.
+    #[allow(clippy::too_many_arguments)]
     pub async fn produce_batch_eos(
         &mut self,
         topic: &str,
@@ -650,6 +675,44 @@ impl TestClient {
         producer_epoch: i16,
         base_sequence: i32,
         records: &[impl AsRef<[u8]>],
+    ) -> IoResult<ProduceResult> {
+        let pairs: Vec<KeyedRecord<'_>> =
+            records.iter().map(|r| (None, Some(r.as_ref()))).collect();
+        self.produce_keyed_batch_eos(
+            topic,
+            key,
+            transaction_id,
+            num_partitions,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            &pairs,
+        )
+        .await
+    }
+
+    /// Produces records that carry an explicit per-record key.
+    ///
+    /// Each record is `(key, value)`, both nullable opaque bytes. The broker never
+    /// interprets either — it hashes keys for partitioning and compares them byte-for-byte
+    /// for compaction, nothing more. A `None` value is a tombstone on a compacted topic,
+    /// which is distinct from `Some(&[])`, an ordinary record whose value happens to be
+    /// empty.
+    ///
+    /// `key` (the `&str` argument) is a separate thing: it is the *request's* partitioning
+    /// key, used to choose which partition the whole batch lands in. Per-record keys do not
+    /// affect partition routing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn produce_keyed_batch_eos(
+        &mut self,
+        topic: &str,
+        key: &str,
+        transaction_id: Option<&str>,
+        num_partitions: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        records: &[KeyedRecord<'_>],
     ) -> IoResult<ProduceResult> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::ProduceBatch as u8);
@@ -663,7 +726,13 @@ impl TestClient {
             .as_millis() as u64;
         let batch_records: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
             .iter()
-            .map(|r| (timestamp, None, Some(Bytes::copy_from_slice(r.as_ref()))))
+            .map(|(k, v)| {
+                (
+                    timestamp,
+                    k.map(Bytes::copy_from_slice),
+                    v.map(Bytes::copy_from_slice),
+                )
+            })
             .collect();
         let batch = RecordBatch::create(
             0,
@@ -719,6 +788,125 @@ impl TestClient {
                 String::from_utf8_lossy(&resp_payload).to_string(),
             ))
         }
+    }
+
+    /// Fetches records including their per-record keys.
+    ///
+    /// [`Self::fetch`] returns [`RecordFrame`]s, which have no key field, so keys are
+    /// dropped there. Use this on any topic where the key matters — a compacted topic in
+    /// particular, where the key is what compaction dedupes by and a null value is a
+    /// tombstone.
+    pub async fn fetch_records(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Vec<ConsumerRecord>> {
+        let mut req_buf = Vec::new();
+        req_buf.put_u8(CommandCode::Fetch as u8);
+
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u64(offset);
+        inner.put_u32(max_bytes);
+        req_buf.put_u32(inner.len() as u32);
+        req_buf.extend_from_slice(&inner);
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+        stream.write_all(&req_buf).await?;
+        let resp = Self::read_wire_response(stream).await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_fetch_entries_records(&resp.payload, offset, false)
+    }
+
+    /// Like [`Self::decode_fetch_entries_response`] but keeps each record's key.
+    ///
+    /// A `RecordFrame` has no key, so one decoded out of the log surfaces with `key: None`
+    /// and its payload as the value.
+    fn decode_fetch_entries_records(
+        payload: &[u8],
+        start_offset: u64,
+        drop_control_and_aborted: bool,
+    ) -> IoResult<Vec<ConsumerRecord>> {
+        let short =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Fetch response too short");
+        if payload.len() < 12 {
+            return Err(short());
+        }
+        let mut cursor = payload;
+        let last_stable_offset = cursor.get_u64();
+        let aborted_count = cursor.get_u32() as usize;
+        if cursor.len() < aborted_count * 16 + 4 {
+            return Err(short());
+        }
+        let mut aborted = Vec::with_capacity(aborted_count);
+        for _ in 0..aborted_count {
+            let start = cursor.get_u64();
+            let end = cursor.get_u64();
+            aborted.push((start, end));
+        }
+        let entries_len = cursor.get_u32() as usize;
+        if cursor.len() < entries_len {
+            return Err(short());
+        }
+        let entries = &cursor[..entries_len];
+        let is_aborted = |offset: u64| aborted.iter().any(|(s, e)| offset >= *s && offset <= *e);
+        let excluded = |offset: u64| {
+            drop_control_and_aborted && (offset >= last_stable_offset || is_aborted(offset))
+        };
+
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < entries.len() {
+            let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[pos..]) else {
+                break;
+            };
+            pos += consumed;
+            match entry {
+                crate::segment::LogEntry::Frame(mut frame) => {
+                    if let Ok(decompressed) = frame.decompress_payload() {
+                        frame.payload = decompressed;
+                    }
+                    if frame.offset < start_offset
+                        || excluded(frame.offset)
+                        || (drop_control_and_aborted && frame.is_control_marker())
+                    {
+                        continue;
+                    }
+                    out.push(ConsumerRecord {
+                        offset: frame.offset,
+                        timestamp: frame.timestamp,
+                        key: None,
+                        value: Some(frame.payload),
+                    });
+                }
+                crate::segment::LogEntry::Batch(batch) => {
+                    let Ok(records) = batch.records() else {
+                        break;
+                    };
+                    for record in records {
+                        if record.offset < start_offset || excluded(record.offset) {
+                            continue;
+                        }
+                        out.push(ConsumerRecord {
+                            offset: record.offset,
+                            timestamp: record.timestamp,
+                            key: record.key,
+                            value: record.value,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Decodes a fetch response into records.

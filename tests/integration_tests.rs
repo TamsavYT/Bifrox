@@ -7904,6 +7904,66 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// Per-record keys must survive the whole round trip — producer to disk to consumer —
+/// byte-for-byte, with null distinguishable from present-but-empty at every hop.
+///
+/// The broker never interprets a key or a value: a binary key with no valid UTF-8 reading
+/// and a JSON value containing the `:` the old payload-sniffing used to split on must both
+/// come back exactly as sent.
+#[tokio::test]
+async fn test_scenario_94_per_record_keys_round_trip_produce_to_consumer() {
+    let env = start_test_server().await;
+    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    client.set_compression(hermes::protocol::BatchCompression::Zstd);
+
+    // Not valid UTF-8 — clippy verifies this statically, so no runtime assert is needed.
+    let binary_key: &[u8] = &[0xFF, 0x00, 0xFE, 0x01, 0x80];
+    let json_value: &[u8] = br#"{"a":1,"b":"x:y"}"#;
+
+    let records: Vec<hermes::client::KeyedRecord<'_>> = vec![
+        (Some(b"user-1"), Some(b"first")),
+        (Some(b"user-2"), None),              // tombstone
+        (Some(b"user-3"), Some(b"")),         // present but empty — NOT a tombstone
+        (None, Some(b"keyless")),             // no key at all
+        (Some(binary_key), Some(json_value)), // opaque both ways
+    ];
+
+    let topic = "keyed_round_trip_topic";
+    client
+        .produce_keyed_batch_eos(topic, "", None, 1, 0, 0, 0, &records)
+        .await
+        .unwrap();
+
+    let fetched = client.fetch_records(topic, 0, 0, 64 * 1024).await.unwrap();
+    assert_eq!(fetched.len(), records.len());
+
+    for (i, (expected_key, expected_value)) in records.iter().enumerate() {
+        assert_eq!(
+            fetched[i].key.as_deref(),
+            *expected_key,
+            "record {i}: key must round-trip byte-for-byte"
+        );
+        assert_eq!(
+            fetched[i].value.as_deref(),
+            *expected_value,
+            "record {i}: value must round-trip byte-for-byte"
+        );
+    }
+
+    // The distinction the -1 null sentinel exists for: a tombstone is not an empty value.
+    assert_eq!(fetched[1].value, None, "record 1 is a tombstone");
+    assert_eq!(
+        fetched[2].value,
+        Some(bytes::Bytes::new()),
+        "record 2 is an ordinary record whose value happens to be empty"
+    );
+    assert_ne!(
+        fetched[1].value, fetched[2].value,
+        "a tombstone must never be conflated with an empty value"
+    );
+    assert_eq!(fetched[3].key, None, "record 3 has no key");
+}
+
 /// A fetch must hand back the log's stored bytes, still compressed in the producer's
 /// codec. The broker does not decompress to serve a read — that is the consumer's job —
 /// so what comes off the fetch path has to be byte-for-byte what is on disk.
