@@ -708,6 +708,19 @@ impl PartitionManager {
     }
 
     /// Reads event records starting from target timestamp
+    /// Stored bytes from the first offset reaching `target_timestamp`, clamped to the
+    /// committed high watermark. See [`SegmentManager::fetch_entries_by_timestamp`] — the
+    /// reader applies the timestamp filter.
+    pub fn fetch_entries_by_timestamp(
+        &self,
+        target_timestamp: u64,
+        max_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let hw = self.high_watermark();
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.fetch_entries_by_timestamp(target_timestamp, max_bytes as usize, hw)
+    }
+
     pub fn fetch_by_timestamp(
         &self,
         target_timestamp: u64,
@@ -795,6 +808,13 @@ impl PartitionManager {
     }
 
     /// Checks if a given offset belongs to an aborted transaction in the partition's transaction index
+    /// Aborted transaction ranges recorded for this partition — see
+    /// [`SegmentManager::aborted_ranges`].
+    pub fn aborted_ranges(&self) -> Vec<(u64, u64)> {
+        let seg_guard = self.segment_manager.lock();
+        seg_guard.aborted_ranges()
+    }
+
     pub fn is_offset_aborted(&self, offset: u64) -> bool {
         let seg_guard = self.segment_manager.lock();
         seg_guard.is_offset_aborted(offset)

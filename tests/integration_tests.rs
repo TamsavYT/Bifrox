@@ -7904,6 +7904,146 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// Per-record keys must survive the whole round trip — producer to disk to consumer —
+/// byte-for-byte, with null distinguishable from present-but-empty at every hop.
+///
+/// The broker never interprets a key or a value: a binary key with no valid UTF-8 reading
+/// and a JSON value containing the `:` the old payload-sniffing used to split on must both
+/// come back exactly as sent.
+#[tokio::test]
+async fn test_scenario_94_per_record_keys_round_trip_produce_to_consumer() {
+    let env = start_test_server().await;
+    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    client.set_compression(hermes::protocol::BatchCompression::Zstd);
+
+    // Not valid UTF-8 — clippy verifies this statically, so no runtime assert is needed.
+    let binary_key: &[u8] = &[0xFF, 0x00, 0xFE, 0x01, 0x80];
+    let json_value: &[u8] = br#"{"a":1,"b":"x:y"}"#;
+
+    let records: Vec<hermes::client::KeyedRecord<'_>> = vec![
+        (Some(b"user-1"), Some(b"first")),
+        (Some(b"user-2"), None),              // tombstone
+        (Some(b"user-3"), Some(b"")),         // present but empty — NOT a tombstone
+        (None, Some(b"keyless")),             // no key at all
+        (Some(binary_key), Some(json_value)), // opaque both ways
+    ];
+
+    let topic = "keyed_round_trip_topic";
+    client
+        .produce_keyed_batch_eos(topic, "", None, 1, 0, 0, 0, &records)
+        .await
+        .unwrap();
+
+    let fetched = client.fetch_records(topic, 0, 0, 64 * 1024).await.unwrap();
+    assert_eq!(fetched.len(), records.len());
+
+    for (i, (expected_key, expected_value)) in records.iter().enumerate() {
+        assert_eq!(
+            fetched[i].key.as_deref(),
+            *expected_key,
+            "record {i}: key must round-trip byte-for-byte"
+        );
+        assert_eq!(
+            fetched[i].value.as_deref(),
+            *expected_value,
+            "record {i}: value must round-trip byte-for-byte"
+        );
+    }
+
+    // The distinction the -1 null sentinel exists for: a tombstone is not an empty value.
+    assert_eq!(fetched[1].value, None, "record 1 is a tombstone");
+    assert_eq!(
+        fetched[2].value,
+        Some(bytes::Bytes::new()),
+        "record 2 is an ordinary record whose value happens to be empty"
+    );
+    assert_ne!(
+        fetched[1].value, fetched[2].value,
+        "a tombstone must never be conflated with an empty value"
+    );
+    assert_eq!(fetched[3].key, None, "record 3 has no key");
+}
+
+/// A fetch must hand back the log's stored bytes, still compressed in the producer's
+/// codec. The broker does not decompress to serve a read — that is the consumer's job —
+/// so what comes off the fetch path has to be byte-for-byte what is on disk.
+#[tokio::test]
+async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
+    use hermes::config::EngineConfig;
+
+    let dir = TestDataDirGuard::new("fetch_serves_stored_bytes");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "fetch_stored_bytes_topic";
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+
+    // Highly compressible, so an uncompressed re-encoding would be visibly larger and this
+    // cannot pass by coincidence.
+    let records: Vec<bytes::Bytes> = (0..16)
+        .map(|i| {
+            bytes::Bytes::from(format!(
+                "{}-{i}",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        })
+        .collect();
+    let produced = pm
+        .produce_batch_eos(producer_batch(
+            &records,
+            0,
+            0,
+            0,
+            false,
+            hermes::protocol::BatchCompression::Zstd,
+        ))
+        .unwrap()
+        .unwrap();
+    pm.advance_committed_hw(produced.base_offset + produced.last_offset_delta as u64 + 1);
+
+    let served = engine
+        .fetch_entries(topic, 0, 0, 1024 * 1024)
+        .await
+        .unwrap();
+    let on_disk = std::fs::read(
+        dir.path
+            .join(format!("{topic}-0"))
+            .join("00000000000000000000.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        served.as_ref(),
+        on_disk.as_slice(),
+        "a fetch must return the stored bytes, not a re-encoding of them"
+    );
+
+    let (batch, _) = hermes::protocol::RecordBatch::decode(&served).unwrap();
+    assert_eq!(
+        batch.compression().unwrap(),
+        hermes::protocol::BatchCompression::Zstd,
+        "the served batch must still be compressed — the broker must not decompress to serve"
+    );
+
+    // Decompressing is the reader's job, and doing it must yield exactly what was produced.
+    let decoded = batch.records().unwrap();
+    assert_eq!(decoded.len(), records.len());
+    for (i, expected) in records.iter().enumerate() {
+        assert_eq!(decoded[i].value.as_deref(), Some(expected.as_ref()));
+    }
+
+    let uncompressed_total: usize = records.iter().map(|r| r.len()).sum();
+    assert!(
+        served.len() < uncompressed_total,
+        "served {} bytes for {} bytes of payload — compression did not survive the fetch path",
+        served.len(),
+        uncompressed_total
+    );
+}
+
 /// A follower's log must end up byte-identical to its leader's, still batched and still
 /// compressed in the codec the *producer* chose. Replication carries the leader's stored
 /// bytes; it does not decode records or decompress anything on the way across.
