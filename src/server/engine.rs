@@ -1,8 +1,6 @@
 use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
-use crate::protocol::frame::CONTROL_MAGIC_BYTE;
 use crate::protocol::RecordBatch;
-use crate::protocol::RecordFrame;
 use crate::replication::{ClusterConfig, ReplicationManager};
 use crate::server::coordinator::GroupCoordinator;
 use crate::server::partition::PartitionManager;
@@ -893,7 +891,8 @@ impl StorageEngine {
                     break;
                 }
                 for frame in &frames {
-                    if let Ok(rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
+                    let payload = frame.value.clone().unwrap_or_default();
+                    if let Ok(rec) = crate::replication::MetadataRecord::decode(&payload) {
                         self.apply_metadata_record(frame.offset, rec);
                     }
                     offset = frame.offset + 1;
@@ -1649,7 +1648,7 @@ impl StorageEngine {
 
         if !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
-            let frame_for_replication = frame.clone();
+            let entry_for_replication = crate::replication::EncodedEntry::from_batch(&frame);
             let leader_hw = meta_pm.high_watermark();
             // The metadata log is fenced by the controller's Raft term: leadership of this
             // log *is* controller leadership.
@@ -1662,7 +1661,7 @@ impl StorageEngine {
                         fencing_epoch,
                         leader_hw,
                         &[],
-                        std::slice::from_ref(&frame_for_replication),
+                        std::slice::from_ref(&entry_for_replication),
                     )
                     .await
                 {
@@ -1681,7 +1680,7 @@ impl StorageEngine {
             // divergence was not confined to the metadata layer: it changed who was allowed
             // to write and where data landed.
             if !self
-                .await_metadata_commit(frame.offset, std::time::Duration::from_secs(5))
+                .await_metadata_commit(frame.base_offset, std::time::Duration::from_secs(5))
                 .await
             {
                 return Err(std::io::Error::new(
@@ -1689,7 +1688,7 @@ impl StorageEngine {
                     format!(
                         "NOT_ENOUGH_CONTROLLERS: metadata record at offset {} was not \
                          acknowledged by a majority of the controller quorum",
-                        frame.offset
+                        frame.base_offset
                     ),
                 ));
             }
@@ -1699,7 +1698,7 @@ impl StorageEngine {
                     &meta_pm,
                     "__cluster_metadata",
                     0,
-                    frame.offset,
+                    frame.base_offset,
                     std::time::Duration::from_secs(5),
                 )
                 .await?;
@@ -1710,7 +1709,7 @@ impl StorageEngine {
             // `__cluster_metadata` has no pull fetcher at all (it is deliberately excluded,
             // to avoid applying records through two paths at once), so this broadcast is
             // the only thing that ever advances a follower's metadata watermark.
-            meta_pm.advance_committed_hw(frame.offset + 1);
+            meta_pm.advance_committed_hw(frame.base_offset + 1);
             let repl = self.replication.clone();
             let committed_hw = meta_pm.high_watermark();
             let hw_fencing_epoch = self.replication.get_epoch();
@@ -1733,9 +1732,9 @@ impl StorageEngine {
         // On a failed commit the record stays in the local log but is deliberately NOT
         // applied and the caller gets an error, so the leader never serves state the
         // cluster has not agreed on.
-        self.apply_metadata_record(frame.offset, record);
+        self.apply_metadata_record(frame.base_offset, record);
 
-        Ok(frame.offset)
+        Ok(frame.base_offset)
     }
 
     /// `JoinGroup` with the rebalance barrier applied: registers the member, then holds
@@ -2042,7 +2041,7 @@ impl StorageEngine {
                 }
                 for frame in &frames {
                     if let Some((status, producer_id, tx_id, partitions)) =
-                        decode_tx_state_record(&frame.payload)
+                        decode_tx_state_record(&frame.value.clone().unwrap_or_default())
                     {
                         latest_states.insert(tx_id, (status, producer_id, partitions));
                     }
@@ -2402,7 +2401,7 @@ impl StorageEngine {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new()); // unknown topic — empty, without creating it
         };
@@ -2419,7 +2418,7 @@ impl StorageEngine {
         // This intentionally still returns control-marker frames (magic ==
         // CONTROL_MAGIC_BYTE) alongside real records — matching real Kafka, where the
         // server exposes raw control batches at the wire level and it's the client
-        // library's job to recognize and skip them (see `RecordFrame::is_control_marker`
+        // library's job to recognize and skip them (see `Record::is_control`
         // and the client-authoring guidance in docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
         // `fetch_committed` is the path that hides them for callers that want that done
         // for them. Filtering here too would break raw log introspection (this is also
@@ -2432,31 +2431,6 @@ impl StorageEngine {
         })
         .await
         .map_err(|e| std::io::Error::other(format!("fetch join error: {}", e)))?
-    }
-
-    /// Plans a zero-copy fetch for the plain `Fetch` command: same offset/high-watermark
-    /// semantics as `fetch` (clamped to the committed HW, single segment only), but instead
-    /// of reading frame bytes into a `Vec<RecordFrame>`, resolves the exact on-disk byte
-    /// range so the caller can stream it straight to the socket via `TransmitFile`/
-    /// `sendfile` without copying payload bytes through a Rust buffer.
-    ///
-    /// Returns `Ok(None)` whenever there's nothing eligible for a zero-copy transmit (no
-    /// frames at/after `offset` within the committed HW, or the range doesn't start within
-    /// the located segment) — callers should fall back to the buffered `fetch` path in that
-    /// case, not treat it as an error.
-    pub async fn plan_zero_copy_fetch(
-        &self,
-        topic: &str,
-        partition: u32,
-        offset: u64,
-        max_bytes: u32,
-    ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
-        let Some(pm) = self.partition_for_read(topic, partition)? else {
-            return Ok(None); // unknown topic — nothing to stream, and nothing to create
-        };
-        tokio::task::spawn_blocking(move || pm.plan_zero_copy_fetch(offset, max_bytes))
-            .await
-            .map_err(|e| std::io::Error::other(format!("plan_zero_copy_fetch join error: {}", e)))?
     }
 
     /// BUG-02: Fetch records starting from nearest offset for target_timestamp
@@ -2487,7 +2461,7 @@ impl StorageEngine {
         partition: u32,
         target_timestamp: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new());
         };
@@ -2502,7 +2476,7 @@ impl StorageEngine {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new());
         };
@@ -2511,30 +2485,31 @@ impl StorageEngine {
         let all_frames = self.fetch(topic, partition, offset, max_bytes).await?;
 
         let pm_blocking = pm.clone();
-        let committed_frames: Vec<RecordFrame> = tokio::task::spawn_blocking(move || {
-            all_frames
-                .into_iter()
-                .filter(|frame| {
-                    if frame.magic == CONTROL_MAGIC_BYTE {
-                        return false;
-                    }
-                    if frame.offset >= lso {
-                        return false;
-                    }
-                    if pm_blocking.is_offset_aborted(frame.offset) {
-                        return false;
-                    }
-                    for (start, end) in &aborted {
-                        if frame.offset >= *start && frame.offset <= *end {
+        let committed_frames: Vec<crate::segment::Record> =
+            tokio::task::spawn_blocking(move || {
+                all_frames
+                    .into_iter()
+                    .filter(|frame| {
+                        if frame.is_control {
                             return false;
                         }
-                    }
-                    true
-                })
-                .collect()
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("fetch_committed join error: {}", e)))?;
+                        if frame.offset >= lso {
+                            return false;
+                        }
+                        if pm_blocking.is_offset_aborted(frame.offset) {
+                            return false;
+                        }
+                        for (start, end) in &aborted {
+                            if frame.offset >= *start && frame.offset <= *end {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("fetch_committed join error: {}", e)))?;
 
         Ok(committed_frames)
     }
@@ -2723,7 +2698,7 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            end_offsets.push((topic.clone(), *partition, marker_frame.offset));
+            end_offsets.push((topic.clone(), *partition, marker_frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Commit marker written to '{}' partition {}",
                 topic,
@@ -2822,8 +2797,8 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.offset);
-            end_offsets.push((topic.clone(), *partition, frame.offset));
+            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset);
+            end_offsets.push((topic.clone(), *partition, frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Abort marker written to '{}' partition {}",
                 topic,
@@ -3163,10 +3138,32 @@ impl StorageEngine {
                 continue; // already current
             }
 
-            let frames = match meta_pm.fetch(from, MAX_CATCHUP_BYTES) {
-                Ok(frames) if !frames.is_empty() => frames,
+            // Read as stored bytes and decode the frames back out, rather than going
+            // through `fetch`, which yields decoded records. The follower appends what
+            // arrives verbatim, so the frames pushed here must be the leader's own bytes —
+            // rebuilding them from decoded payloads would produce different bytes (an
+            // uncompressed frame where the leader stored a compressed one) and break the
+            // byte-identity the replica relies on.
+            let entry_bytes = match meta_pm.fetch_entries_for_replication(from, MAX_CATCHUP_BYTES) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
                 _ => continue,
             };
+            let mut frames = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < entry_bytes.len() {
+                let Ok((entry, consumed)) = crate::segment::decode_entry(&entry_bytes[cursor..])
+                else {
+                    break;
+                };
+                let bytes = entry_bytes.slice(cursor..cursor + consumed);
+                cursor += consumed;
+                let crate::segment::LogEntry::Batch(b) = &entry;
+                let last_offset = b.base_offset + b.last_offset_delta as u64;
+                frames.push(crate::replication::EncodedEntry { bytes, last_offset });
+            }
+            if frames.is_empty() {
+                continue;
+            }
 
             match self
                 .replication
@@ -4140,7 +4137,7 @@ impl StorageEngine {
                     for &off in dlq_offsets {
                         if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
                             if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
-                                let _ = dlq_pm.produce_frame(&f.payload);
+                                let _ = dlq_pm.produce_frame(&f.value.unwrap_or_default());
                             }
                         }
                     }
@@ -4183,7 +4180,7 @@ impl StorageEngine {
                     for &off in dlq_offsets {
                         if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
                             if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
-                                let _ = dlq_pm.produce_frame(&f.payload);
+                                let _ = dlq_pm.produce_frame(&f.value.unwrap_or_default());
                             }
                         }
                     }

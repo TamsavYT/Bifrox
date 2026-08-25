@@ -1,5 +1,4 @@
 use crate::protocol::wire::{AckBatch, AcknowledgeType};
-use crate::protocol::RecordFrame;
 use crate::server::partition::PartitionManager;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -79,7 +78,7 @@ pub struct SharePartition {
 pub struct AcquiredRecordInfo {
     pub offset: u64,
     pub delivery_count: u16,
-    pub frame: RecordFrame,
+    pub frame: crate::segment::Record,
 }
 
 impl SharePartition {

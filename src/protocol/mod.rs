@@ -1,13 +1,15 @@
 pub mod batch;
-pub mod frame;
 pub mod kafka_adapter;
 pub mod wire;
 
-pub use batch::{BatchCompression, BatchError, BatchRecord, RecordBatch, BATCH_MAGIC_BYTE};
-pub use frame::{
-    FrameError, RecordFrame, COMPRESSED_LZ4_MAGIC_BYTE, COMPRESSED_ZSTD_MAGIC_BYTE, HEADER_SIZE,
-    MAGIC_BYTE,
+pub use batch::{
+    BatchCompression, BatchError, BatchRecord, RecordBatch, BATCH_HEADER_SIZE, BATCH_MAGIC_BYTE,
 };
+
+/// Smallest number of bytes any log entry can occupy, used by scans to know when a buffer
+/// cannot possibly hold another entry. Every entry is a [`RecordBatch`], so this is the
+/// batch header.
+pub const HEADER_SIZE: usize = BATCH_HEADER_SIZE;
 pub use kafka_adapter::{KafkaHeader, KafkaWireAdapter};
 pub use wire::{
     AckBatch, AcknowledgeType, AcquiredRecordBatch, CommandCode, RequestPayload, WireError,

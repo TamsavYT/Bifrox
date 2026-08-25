@@ -376,9 +376,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Match the plain fetch/consume command: control markers
                             // occupy real offsets (advance next_offset) but aren't
                             // real records for throughput accounting.
-                            if !frame.is_control_marker() {
+                            if !frame.is_control {
                                 consumed += 1;
-                                consumed_bytes += frame.payload.len() as u64;
+                                consumed_bytes +=
+                                    frame.value.as_ref().map_or(0, |v| v.len()) as u64;
                             }
                         }
                     }
@@ -460,10 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // markers — the server exposes them at the wire level (same as real Kafka)
             // and expects the client to skip them. Filter them out here so the CLI never
             // prints a control marker's raw payload as if it were a real record.
-            let frames: Vec<_> = frames
-                .into_iter()
-                .filter(|f| !f.is_control_marker())
-                .collect();
+            let frames: Vec<_> = frames.into_iter().filter(|f| !f.is_control).collect();
 
             if let Some(ref group_id) = group_opt {
                 println!(
@@ -482,10 +480,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("------------------------------------------------------------------");
 
             for (idx, frame) in frames.iter().enumerate() {
-                let payload_str = String::from_utf8_lossy(&frame.payload);
+                let payload_str =
+                    String::from_utf8_lossy(frame.value.as_deref().unwrap_or_default());
+                // The CRC belongs to the entry on disk, not to a record decoded out of
+                // one, so it is no longer available here. The key is, and is more useful.
+                let key_str = frame
+                    .key
+                    .as_deref()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .unwrap_or_else(|| "<none>".to_string());
                 println!(
-                    "  [{:03}] Offset: {:<6} | CRC32: 0x{:08X} | Timestamp: {} | Payload: '{}'",
-                    idx, frame.offset, frame.crc, frame.timestamp, payload_str
+                    "  [{:03}] Offset: {:<6} | Key: {:<12} | Timestamp: {} | Payload: '{}'",
+                    idx, frame.offset, key_str, frame.timestamp, payload_str
                 );
             }
 
@@ -565,7 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match consumer.poll().await {
                             Ok(records) => {
                                 for (partition, frame) in &records {
-                                    let payload_str = String::from_utf8_lossy(&frame.payload);
+                                    let payload_str = String::from_utf8_lossy(frame.value.as_deref().unwrap_or_default());
                                     println!(
                                         "📥 Group '{}' consumed Partition {} Offset {:<6} | Timestamp: {} | Payload: '{}'",
                                         group_id, partition, frame.offset, frame.timestamp, payload_str

@@ -7,7 +7,7 @@
 //!
 //! Benchmarked paths, chosen because they're the ones every produce/fetch request goes
 //! through and the ones most likely to regress silently:
-//! - `RecordFrame` encode/decode (CRC + header serialization, per record)
+//! - `RecordBatch` encode/decode (CRC + header serialization)
 //! - `SegmentManager::append_with_codec` across each compression codec
 //! - `SegmentManager::fetch` (sparse-index seek + frame decode)
 //! - `SegmentManager::compact_segments` (the retention GC's most expensive operation)
@@ -16,7 +16,23 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hermes::config::CompressionCodec;
-use hermes::{hash_key, CleanupPolicy, EngineConfig, RecordFrame, SegmentManager};
+use hermes::protocol::{BatchCompression, RecordBatch};
+use hermes::{hash_key, CleanupPolicy, EngineConfig, SegmentManager};
+
+/// One record wrapped in a batch — the only record shape the log has.
+fn single_record_batch(payload: Vec<u8>) -> RecordBatch {
+    RecordBatch::create(
+        42,
+        1_700_000_000_000,
+        0,
+        0,
+        0,
+        0,
+        false,
+        BatchCompression::None,
+        &[(1_700_000_000_000, None, Some(bytes::Bytes::from(payload)))],
+    )
+}
 use std::path::PathBuf;
 
 /// Self-cleaning unique temp directory, so repeated bench runs never accumulate data or
@@ -57,27 +73,27 @@ fn bench_config(dir: &BenchDir) -> EngineConfig {
 }
 
 fn bench_frame_codec(c: &mut Criterion) {
-    let mut group = c.benchmark_group("frame_codec");
+    let mut group = c.benchmark_group("record_codec");
 
     for size in [64usize, 1024, 16 * 1024] {
         let payload = vec![b'x'; size];
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("encode", size), &payload, |b, payload| {
-            let frame = RecordFrame::create(42, 1_700_000_000_000, payload.clone());
+            let batch = single_record_batch(payload.clone());
             b.iter(|| {
-                let mut buf = Vec::with_capacity(frame.encoded_size());
-                frame.encode_into(&mut buf);
+                let mut buf = Vec::with_capacity(batch.encoded_size());
+                batch.encode_into(&mut buf);
                 black_box(buf);
             });
         });
 
         group.bench_with_input(BenchmarkId::new("decode", size), &payload, |b, payload| {
-            let frame = RecordFrame::create(42, 1_700_000_000_000, payload.clone());
-            let mut encoded = Vec::with_capacity(frame.encoded_size());
-            frame.encode_into(&mut encoded);
+            let batch = single_record_batch(payload.clone());
+            let mut encoded = Vec::with_capacity(batch.encoded_size());
+            batch.encode_into(&mut encoded);
             b.iter(|| {
-                let (decoded, consumed) = RecordFrame::decode(black_box(&encoded)).unwrap();
+                let (decoded, consumed) = RecordBatch::decode(black_box(&encoded)).unwrap();
                 black_box((decoded, consumed));
             });
         });
@@ -106,7 +122,7 @@ fn bench_segment_append(c: &mut Criterion) {
             b.iter(|| {
                 ts += 1;
                 let frame = mgr
-                    .append_with_codec(black_box(payload.clone()), ts, codec)
+                    .append_record(black_box(payload.clone()), ts, codec)
                     .unwrap();
                 black_box(frame);
             });
