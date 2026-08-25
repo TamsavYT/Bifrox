@@ -152,6 +152,13 @@ pub struct PartitionManager {
     isr: RwLock<Vec<u32>>,
     compression_codec: RwLock<crate::config::CompressionCodec>,
     flush_policy: crate::config::FlushPolicy,
+    /// Woken every time the committed high watermark advances, i.e. whenever new data
+    /// becomes visible to consumers.
+    ///
+    /// This is what lets a fetch wait for data instead of returning empty and being polled
+    /// again. A consumer can only read up to the committed watermark, so that is the only
+    /// event worth waking a waiting fetch for.
+    hw_notify: tokio::sync::Notify,
 }
 
 impl PartitionManager {
@@ -187,6 +194,7 @@ impl PartitionManager {
             isr: RwLock::new(vec![config.node_id]),
             compression_codec: RwLock::new(config.compression_codec),
             flush_policy: config.flush_policy,
+            hw_notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -247,7 +255,35 @@ impl PartitionManager {
     /// Monotonically advances the committed high watermark to `candidate` (a no-op if
     /// `candidate` isn't past the current value).
     pub fn advance_committed_hw(&self, candidate: u64) {
-        self.committed_hw.fetch_max(candidate, Ordering::AcqRel);
+        let previous = self.committed_hw.fetch_max(candidate, Ordering::AcqRel);
+        // Only wake waiting fetches when the watermark actually moved. `fetch_max` returns
+        // the previous value, so a no-op advance (a candidate at or below where we already
+        // are) costs nothing and wakes nobody.
+        if candidate > previous {
+            self.hw_notify.notify_waiters();
+        }
+    }
+
+    /// Waits for the committed high watermark to exceed `current`, or for `timeout` to
+    /// elapse, whichever comes first. Returns `true` if the watermark moved.
+    ///
+    /// This is the broker half of a long-poll fetch: rather than answering an idle
+    /// consumer with an empty response and being asked again milliseconds later, the fetch
+    /// parks here until there is something to send. It cuts request volume on an idle
+    /// partition *and* lowers delivery latency, since the consumer is woken the instant
+    /// data commits rather than on its next poll tick.
+    pub async fn await_hw_beyond(&self, current: u64, timeout: std::time::Duration) -> bool {
+        // Registered before the watermark is re-checked, so a commit landing between the
+        // check and the wait cannot be missed. `Notified::enable()` is what arms the
+        // registration without awaiting it.
+        let notified = self.hw_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if self.high_watermark() > current {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
     /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame.

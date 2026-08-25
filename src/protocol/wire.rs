@@ -177,6 +177,25 @@ pub mod tags {
     /// consuming is otherwise indistinguishable from a healthy one). Payload is two
     /// pascal strings back to back: `[group_id][member_id]`.
     pub const GROUP_MEMBER: u8 = 0x04;
+
+    /// How long a fetch may wait for data before answering empty, in milliseconds. Payload
+    /// is a big-endian `u32`. Kafka's `fetch.max.wait.ms`.
+    ///
+    /// Without it a fetch against an idle partition returns empty immediately and the
+    /// consumer asks again, burning a round trip per poll tick for nothing. With it the
+    /// broker holds the request until data arrives, which cuts request volume *and* lowers
+    /// delivery latency — a polling consumer waits on average half its poll interval for a
+    /// record that already landed, a parked one is woken as soon as it commits.
+    ///
+    /// An absent tag means zero: answer immediately, exactly as before.
+    pub const MAX_WAIT_MS: u8 = 0x05;
+
+    /// How many bytes must accumulate before a waiting fetch is answered. Payload is a
+    /// big-endian `u32`. Kafka's `fetch.min.bytes`.
+    ///
+    /// Only meaningful alongside [`MAX_WAIT_MS`], which bounds the wait. An absent tag
+    /// means 1: any data at all completes the fetch.
+    pub const MIN_BYTES: u8 = 0x06;
 }
 
 /// Read isolation requested by a fetch.
@@ -237,6 +256,10 @@ pub struct RequestTags {
     /// `(group_id, member_id)` a consuming-path request is made on behalf of — see
     /// [`tags::GROUP_MEMBER`].
     pub group_member: Option<(String, String)>,
+    /// `fetch.max.wait.ms` — see [`tags::MAX_WAIT_MS`]. `None` means answer immediately.
+    pub max_wait_ms: Option<u32>,
+    /// `fetch.min.bytes` — see [`tags::MIN_BYTES`]. `None` means 1.
+    pub min_bytes: Option<u32>,
 }
 
 /// How a request arrived, which determines how its response must be framed.
@@ -300,6 +323,19 @@ impl RequestFraming {
         self.tags().session_timeout_ms
     }
 
+    /// How long this fetch may wait for data — see [`tags::MAX_WAIT_MS`]. Zero when
+    /// untagged, meaning answer immediately, which is what every fetch did before long
+    /// polling existed.
+    pub fn max_wait_ms(&self) -> u32 {
+        self.tags().max_wait_ms.unwrap_or(0)
+    }
+
+    /// How many bytes must accumulate before a waiting fetch is answered — see
+    /// [`tags::MIN_BYTES`]. Defaults to 1: any data at all is enough.
+    pub fn min_bytes(&self) -> u32 {
+        self.tags().min_bytes.unwrap_or(1).max(1)
+    }
+
     /// `(group_id, member_id)` this request is attributed to via
     /// [`tags::GROUP_MEMBER`], or `None` if untagged.
     pub fn group_member(&self) -> Option<(String, String)> {
@@ -341,6 +377,18 @@ pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> 
         tag_section.put_u8(tags::SESSION_TIMEOUT_MS);
         tag_section.put_u16(4);
         tag_section.put_u32(session_timeout_ms);
+        tag_count += 1;
+    }
+    if let Some(max_wait_ms) = tags.max_wait_ms {
+        tag_section.put_u8(tags::MAX_WAIT_MS);
+        tag_section.put_u16(4);
+        tag_section.put_u32(max_wait_ms);
+        tag_count += 1;
+    }
+    if let Some(min_bytes) = tags.min_bytes {
+        tag_section.put_u8(tags::MIN_BYTES);
+        tag_section.put_u16(4);
+        tag_section.put_u32(min_bytes);
         tag_count += 1;
     }
     if let Some((group_id, member_id)) = &tags.group_member {
@@ -825,6 +873,13 @@ impl WireRequest {
                     tags::SESSION_TIMEOUT_MS if len >= 4 => {
                         tags.session_timeout_ms =
                             Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
+                    }
+                    tags::MAX_WAIT_MS if len >= 4 => {
+                        tags.max_wait_ms =
+                            Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
+                    }
+                    tags::MIN_BYTES if len >= 4 => {
+                        tags.min_bytes = Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
                     }
                     tags::GROUP_MEMBER => {
                         let mut v = value;

@@ -2266,6 +2266,65 @@ impl StorageEngine {
     /// Entries are clamped to the committed high watermark, and an entry containing
     /// `offset` is returned whole — a batch is atomic on disk, so a consumer asking from
     /// the middle of one gets the whole batch and filters it itself, as in Kafka.
+    /// A fetch that waits for data rather than answering an idle partition with an empty
+    /// response.
+    ///
+    /// Returns as soon as at least `min_bytes` are available, or when `max_wait_ms`
+    /// elapses, whichever comes first — Kafka's `fetch.max.wait.ms` / `fetch.min.bytes`.
+    /// With `max_wait_ms` of 0 (an untagged request) this is exactly
+    /// [`Self::fetch_entries`], so nothing changes for a client that does not ask to wait.
+    ///
+    /// The wait is driven by the partition's high-watermark notification, not by polling:
+    /// the request parks until data actually commits. That cuts request volume on an idle
+    /// partition and *lowers* delivery latency at the same time, since a parked consumer is
+    /// woken the moment a record commits instead of on its next poll tick.
+    pub async fn fetch_entries_waiting(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        max_wait_ms: u32,
+        min_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let entries = self
+            .fetch_entries(topic, partition, offset, max_bytes)
+            .await?;
+        if max_wait_ms == 0 || entries.len() as u32 >= min_bytes {
+            return Ok(entries);
+        }
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(entries);
+        };
+
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(max_wait_ms as u64);
+        let mut best = entries;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // The watermark this fetch has already accounted for. Waiting for it to move
+            // past this point is what distinguishes "no new data yet" from "data arrived
+            // while we were reading", so a commit landing mid-read cannot be slept through.
+            let seen_hw = pm.high_watermark();
+            let woke = pm.await_hw_beyond(seen_hw, deadline - now).await;
+
+            // Re-read unconditionally, including on timeout. Returning the snapshot taken
+            // before the wait would hand back an empty response for data that arrived
+            // during it: the notification says *when* to look, it is never the authority
+            // on whether there is anything to find.
+            best = self
+                .fetch_entries(topic, partition, offset, max_bytes)
+                .await?;
+            if best.len() as u32 >= min_bytes || !woke {
+                break;
+            }
+        }
+        Ok(best)
+    }
+
     /// The transactional metadata a read-committed consumer needs to filter for itself:
     /// the last stable offset and the aborted offset ranges.
     ///

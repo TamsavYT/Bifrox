@@ -7904,6 +7904,84 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// A long-polling fetch must actually park, and must be woken by data arriving rather
+/// than by its own timeout — that is what makes it cheaper *and* faster than polling.
+///
+/// Three things are asserted, because any one alone can be satisfied by accident: a
+/// caught-up consumer holds the request for roughly the full wait and returns empty; a
+/// record produced mid-wait returns well before the deadline; and a request that does not
+/// ask to wait still answers immediately, so nothing regresses for a client that never
+/// opts in.
+#[tokio::test]
+async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
+    let env = start_test_server().await;
+    let topic = "long_poll_topic";
+
+    // Bring the partition into existence first: a fetch against a topic the broker has
+    // never seen has no partition to wait on and answers immediately by design, which is
+    // not what is under test here.
+    let mut producer = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(topic, "", None, 1, &[bytes::Bytes::from_static(b"seed")])
+        .await
+        .unwrap();
+
+    // 1. Caught up at the log end: the fetch is held for about the full wait, then empty.
+    let mut idle_client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let started = std::time::Instant::now();
+    let idle = idle_client
+        .fetch_records_waiting(topic, 0, 1, 64 * 1024, Duration::from_millis(600), 1)
+        .await
+        .unwrap();
+    let idle_elapsed = started.elapsed();
+    assert!(
+        idle.is_empty(),
+        "offset 1 is the log end — nothing to return yet"
+    );
+    assert!(
+        idle_elapsed >= Duration::from_millis(500),
+        "an idle long poll must hold the request, not answer immediately (took {idle_elapsed:?})"
+    );
+
+    // 2. A record produced mid-wait must wake the parked fetch well before its deadline.
+    let mut consumer = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let waiter = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let records = consumer
+            .fetch_records_waiting(topic, 0, 1, 64 * 1024, Duration::from_millis(5_000), 1)
+            .await
+            .unwrap();
+        (records, started.elapsed())
+    });
+
+    // Long enough that the fetch is definitely parked before this lands.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    producer
+        .produce_batch(topic, "", None, 1, &[bytes::Bytes::from_static(b"woken")])
+        .await
+        .unwrap();
+
+    let (records, woke_after) = waiter.await.unwrap();
+    assert_eq!(records.len(), 1, "the produced record must be returned");
+    assert_eq!(records[0].value.as_deref(), Some(b"woken".as_ref()));
+    assert!(
+        woke_after < Duration::from_millis(2_000),
+        "the fetch must be woken by the record arriving, not by its own 5s timeout \
+         (took {woke_after:?})"
+    );
+
+    // 3. A fetch that does not ask to wait still answers immediately.
+    let mut plain = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let started = std::time::Instant::now();
+    let empty = plain.fetch_records(topic, 0, 99, 64 * 1024).await.unwrap();
+    assert!(empty.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "a fetch with no wait tag must not be held (took {:?})",
+        started.elapsed()
+    );
+}
+
 /// Per-record keys must survive the whole round trip — producer to disk to consumer —
 /// byte-for-byte, with null distinguishable from present-but-empty at every hop.
 ///
