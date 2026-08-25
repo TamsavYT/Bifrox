@@ -1752,15 +1752,23 @@ async fn test_scenario_22_per_client_quota_throttling() {
     // setting distinct logical client_ids on their connections.
     // Produce quota is charged on the batch as stored — its encoded, compressed size —
     // rather than the sum of record payloads, matching how Kafka charges request bytes.
-    // A 100-byte payload therefore costs ~173 (53-byte batch header + 20-byte record
-    // entry + payload). The quota is sized to sit between one such produce and two, so
-    // one produce per bucket passes but two against a shared bucket would throttle —
-    // which is exactly what this assertion is testing.
+    // A 100-byte payload costs 173 (53-byte batch header + 20-byte record entry +
+    // payload). The bucket starts full at one second's worth of quota, so with a 200 B/s
+    // rate the first such produce passes with 27 tokens left and a second one must wait.
     let env_client_id_quota = start_test_server_with_quota(Some(200), None).await;
     let mut client_a = TestClient::connect(env_client_id_quota.addr).await.unwrap();
     let mut client_b = TestClient::connect(env_client_id_quota.addr).await.unwrap();
     client_a.set_client_id("producer-a").await.unwrap();
     client_b.set_client_id("producer-b").await.unwrap();
+
+    // Both topics are created up front, deliberately. Producing to a topic that does not
+    // exist yet drags controller-mediated topic creation — a metadata proposal and its
+    // commit — into whatever window measures the produce. That is unrelated to quota and
+    // on a loaded machine can take longer than the throttle being measured, which is
+    // exactly how this test used to fail in CI while passing locally.
+    for topic in ["quota_client_id_topic_a", "quota_client_id_topic_b"] {
+        client_a.create_topic(topic, 1).await.unwrap();
+    }
 
     client_a
         .produce_single("quota_client_id_topic_a", "", None, 1, vec![2u8; 100])
@@ -1772,10 +1780,33 @@ async fn test_scenario_22_per_client_quota_throttling() {
         .produce_single("quota_client_id_topic_b", "", None, 1, vec![3u8; 100])
         .await
         .expect("client_b should have an independent quota bucket");
+    let independent_elapsed = start.elapsed();
+
+    // The other half of the claim, without which the check below is satisfied by any
+    // broker that never throttles at all: a *second* produce on client_a's own bucket has
+    // only 27 of the 173 bytes it needs, so it must wait for the rest to refill.
+    let start = std::time::Instant::now();
+    client_a
+        .produce_single("quota_client_id_topic_a", "", None, 1, vec![2u8; 100])
+        .await
+        .expect("an over-quota produce is delayed, not rejected");
+    let over_quota_elapsed = start.elapsed();
     assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "Distinct client_ids should avoid cross-throttling on shared source IP, took {:?}",
-        start.elapsed()
+        over_quota_elapsed >= Duration::from_millis(500),
+        "a second produce on the same bucket must be throttled — this is what makes the \
+         comparison below meaningful rather than just measuring a fast machine; took {:?}",
+        over_quota_elapsed
+    );
+
+    // Compared against that throttled produce rather than against a fixed millisecond
+    // bound. An absolute bound conflates "not throttled" with "ran on a fast machine", and
+    // fails on a loaded one for reasons that have nothing to do with quota; the ratio
+    // holds regardless of how slow the host is.
+    assert!(
+        independent_elapsed * 2 < over_quota_elapsed,
+        "distinct client_ids must not share a quota bucket: the independent produce took \
+         {independent_elapsed:?}, which is not decisively faster than the throttled one at \
+         {over_quota_elapsed:?}"
     );
 }
 
