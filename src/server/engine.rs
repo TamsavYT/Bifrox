@@ -669,29 +669,6 @@ impl StorageEngine {
         }
     }
 
-    /// Whether this partition carries any transactional data whose visibility depends on
-    /// transaction state — an in-flight transaction pinning its LSO, or a recorded aborted
-    /// range.
-    ///
-    /// Used to keep the zero-copy fetch path (which cannot filter) away from partitions
-    /// where filtering is what makes the answer correct. A partition that has never seen a
-    /// transaction answers `false` and keeps the fast path.
-    pub fn partition_has_transactional_data(&self, topic: &str, partition: u32) -> bool {
-        if self.transactions.last_stable_offset(topic, partition) != u64::MAX {
-            return true;
-        }
-        if !self
-            .transactions
-            .aborted_ranges(topic, partition)
-            .is_empty()
-        {
-            return true;
-        }
-        self.get_partition(topic, partition)
-            .map(|pm| pm.has_aborted_transactions())
-            .unwrap_or(false)
-    }
-
     /// Looks up an already-open partition without ever creating one.
     ///
     /// Read/probe paths must use this rather than `get_or_create_partition`: those are
@@ -2402,6 +2379,26 @@ impl StorageEngine {
         tokio::task::spawn_blocking(move || pm.fetch_entries(offset, max_bytes))
             .await
             .map_err(|e| std::io::Error::other(format!("fetch_entries join error: {}", e)))?
+    }
+
+    /// The zero-copy form of [`Self::fetch_entries`] — the same byte range as a physical
+    /// range plus its own file handle, for streaming to a socket via the kernel.
+    ///
+    /// `None` means there is nothing to serve, which is where the caller falls back to the
+    /// buffered path (which can also wait for data to arrive; this never waits).
+    pub async fn plan_entries_fetch(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Option<crate::segment::EntriesFetchPlan>> {
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || pm.plan_entries_fetch(offset, max_bytes))
+            .await
+            .map_err(|e| std::io::Error::other(format!("plan_entries_fetch join error: {}", e)))?
     }
 
     pub async fn fetch(

@@ -1,5 +1,8 @@
 use crate::config::EngineConfig;
-use crate::protocol::{BatchCompression, RecordBatch, BATCH_MAGIC_BYTE, HEADER_SIZE};
+use crate::protocol::{
+    BatchCompression, RecordBatch, BATCH_FRAMING_PREFIX_SIZE, BATCH_LENGTH_COVERED_FIXED,
+    BATCH_MAGIC_BYTE, HEADER_SIZE,
+};
 use crate::segment::entry::{decode_entry, records_from_entries, LogEntry, Record};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
@@ -21,6 +24,81 @@ pub enum VerbatimAppendResult {
     /// `frame.offset` is beyond the local log end; the caller must resync from `expected`
     /// before this frame (or a replacement for it) can be appended.
     Gap { expected: u64 },
+}
+
+/// How much of the log `plan_entries_range` reads ahead when walking entry headers. Big
+/// enough that framing a fetch costs a few reads rather than one per entry, small enough
+/// that framing a large fetch never reads its payload into user space — which is the whole
+/// premise of serving that fetch with `sendfile`.
+const FRAMING_SCAN_READ_AHEAD: usize = 64 * 1024;
+
+/// One entry's framing, read from its header alone: how many bytes it occupies and the
+/// last offset it carries. See [`frame_entry`].
+#[derive(Debug, Clone, Copy)]
+struct EntryFraming {
+    total_len: usize,
+    last_offset: u64,
+}
+
+/// Reads an entry's framing out of its first [`BATCH_FRAMING_PREFIX_SIZE`] bytes, or
+/// `None` if `prefix` isn't a well-formed batch header — too short, wrong magic, or a
+/// `batch_length` smaller than the fixed fields it must cover, none of which can be framed
+/// and all of which mean the scan has run off the end of valid data.
+///
+/// Byte layout (see `RecordBatch::encode`): `magic` at 0, `batch_length` at 1..5, `crc` at
+/// 5..9, `base_offset` at 9..17, `last_offset_delta` at 17..21. `batch_length` counts from
+/// just after itself, so the entry occupies `5 + batch_length` bytes in total.
+fn frame_entry(prefix: &[u8]) -> Option<EntryFraming> {
+    if prefix.len() < BATCH_FRAMING_PREFIX_SIZE || prefix[0] != BATCH_MAGIC_BYTE {
+        return None;
+    }
+    let batch_length = u32::from_be_bytes(prefix[1..5].try_into().unwrap()) as usize;
+    if batch_length < BATCH_LENGTH_COVERED_FIXED {
+        return None;
+    }
+    let base_offset = u64::from_be_bytes(prefix[9..17].try_into().unwrap());
+    let last_offset_delta = u32::from_be_bytes(prefix[17..21].try_into().unwrap());
+    Some(EntryFraming {
+        total_len: 5 + batch_length,
+        last_offset: base_offset.saturating_add(last_offset_delta as u64),
+    })
+}
+
+/// The physical byte range within one segment that answers a fetch. See
+/// `SegmentManager::plan_entries_range`.
+#[derive(Debug, Clone, Copy)]
+struct EntriesRange {
+    physical_start: u64,
+    physical_len: u64,
+}
+
+/// An entry-aligned physical byte range within one segment's log file, ready to be
+/// streamed straight to a socket by the kernel (`sendfile(2)` on Linux, `TransmitFile` on
+/// Windows) — the payload bytes never pass through a user-space buffer.
+///
+/// See `SegmentManager::plan_entries_fetch`, which produces this from the same framing
+/// scan the buffered `fetch_entries` uses, so the two always agree on what to serve.
+#[derive(Debug)]
+pub struct EntriesFetchPlan {
+    pub file: std::fs::File,
+    pub physical_start: u64,
+    pub physical_len: u64,
+}
+
+impl EntriesFetchPlan {
+    /// Streams this plan's byte range from the OS page cache to `socket` via the
+    /// platform's kernel copy primitive. `file` is an independently owned handle, so no
+    /// `SegmentManager` lock is held for the duration of this call.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub async fn transmit(&self, socket: &tokio::net::TcpStream) -> IoResult<()> {
+        crate::segment::log::transmit_zero_copy(
+            &self.file,
+            socket,
+            self.physical_start,
+            self.physical_len,
+        )
+        .await
+    }
 }
 
 /// Segment pair holding associated log segment and index segment
@@ -795,17 +873,6 @@ impl SegmentManager {
         false
     }
 
-    /// Whether any segment of this partition records an aborted transaction range.
-    ///
-    /// Cheap enough to check per fetch (it inspects index sizes, not records), and lets
-    /// the zero-copy path decline partitions whose correct answer depends on filtering.
-    pub fn has_aborted_transactions(&self) -> bool {
-        if !self.active.txn_index.is_empty() {
-            return true;
-        }
-        self.historical.iter().any(|p| !p.txn_index.is_empty())
-    }
-
     /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
     ///
     /// A batch is atomic on disk, so one containing `start_offset` is decoded whole and its
@@ -822,7 +889,7 @@ impl SegmentManager {
             mmap.raw_from(start_pos, max_bytes).to_vec()
         } else {
             let raw = segment_pair.log.read_at(start_pos, max_bytes)?;
-            Self::ensure_first_batch_fits(segment_pair, start_pos, raw)?
+            Self::widen_to_whole_first_entry(segment_pair, start_pos, raw)?
         };
 
         let mut entries = Vec::new();
@@ -842,6 +909,40 @@ impl SegmentManager {
             .into_iter()
             .filter(|r| r.offset >= start_offset)
             .collect())
+    }
+
+    /// Re-reads with a budget sized to the first entry when `raw` holds only part of it.
+    ///
+    /// An entry is atomic — there is no such thing as decoding "the first part" of a batch
+    /// — so a caller whose `start_offset` lands in an entry longer than `max_bytes` must
+    /// still be served it, mirroring Kafka's "return at least one batch even if it exceeds
+    /// the requested budget" rule, rather than being handed nothing for that offset range
+    /// forever. (`plan_entries_range` applies the same rule to the byte-serving path; this
+    /// is the record-decoding `fetch`'s copy of it, which reads into a buffer rather than
+    /// planning a range.)
+    ///
+    /// A no-op — no extra read — whenever `raw` is empty, isn't a framable entry, or
+    /// already covers the whole first one.
+    fn widen_to_whole_first_entry(
+        pair: &mut SegmentPair,
+        start_pos: u64,
+        raw: Vec<u8>,
+    ) -> IoResult<Vec<u8>> {
+        let prefix: Vec<u8> = if raw.len() >= BATCH_FRAMING_PREFIX_SIZE {
+            raw[..BATCH_FRAMING_PREFIX_SIZE].to_vec()
+        } else {
+            // The initial read didn't even cover the framing prefix — go get it directly
+            // rather than guessing.
+            pair.log.read_at(start_pos, BATCH_FRAMING_PREFIX_SIZE)?
+        };
+        let Some(frame) = frame_entry(&prefix) else {
+            return Ok(raw);
+        };
+        if raw.len() >= frame.total_len {
+            Ok(raw)
+        } else {
+            pair.log.read_at(start_pos, frame.total_len)
+        }
     }
 
     /// Reads the stored bytes covering `start_offset` onward, **exactly as they sit on
@@ -871,90 +972,155 @@ impl SegmentManager {
         max_bytes: usize,
         max_offset_exclusive: u64,
     ) -> IoResult<Bytes> {
-        let segment_pair = self.find_segment_pair_mut(start_offset);
-        let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
-        let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
+        let Some(plan) = self.plan_entries_range(start_offset, max_bytes, max_offset_exclusive)?
+        else {
+            return Ok(Bytes::new());
+        };
+        let pair = self.find_segment_pair_mut(start_offset);
+        let bytes = pair
+            .log
+            .read_at(plan.physical_start, plan.physical_len as usize)?;
+        Ok(Bytes::from(bytes))
+    }
 
-        let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
-        let raw_bytes = Self::ensure_first_batch_fits(segment_pair, start_pos, raw_bytes)?;
+    /// The same byte range [`Self::fetch_entries`] would return, expressed as a physical
+    /// range plus an independently-owned handle on the segment file holding it — so the
+    /// bytes can be streamed to a socket by the kernel (`sendfile(2)` /
+    /// `TransmitFile`) instead of being read into a Rust buffer first.
+    ///
+    /// This is the *only* difference between the two: both call
+    /// [`Self::plan_entries_range`] to decide what to serve, so a zero-copy response and
+    /// a buffered response to the same request carry identical entry bytes by
+    /// construction rather than by two implementations happening to agree.
+    ///
+    /// `None` means there is nothing to serve (same as `fetch_entries` returning empty).
+    pub fn plan_entries_fetch(
+        &mut self,
+        start_offset: u64,
+        max_bytes: usize,
+        max_offset_exclusive: u64,
+    ) -> IoResult<Option<EntriesFetchPlan>> {
+        let Some(range) = self.plan_entries_range(start_offset, max_bytes, max_offset_exclusive)?
+        else {
+            return Ok(None);
+        };
+        let pair = self.find_segment_pair_mut(start_offset);
+        Ok(Some(EntriesFetchPlan {
+            file: pair.log.try_clone_file()?,
+            physical_start: range.physical_start,
+            physical_len: range.physical_len,
+        }))
+    }
+
+    /// Decides which physical byte range of one segment answers a fetch from
+    /// `start_offset`, reading only entry *headers* to do it.
+    ///
+    /// Framing an entry needs its declared length and its offset range, and both live in
+    /// the first [`BATCH_FRAMING_PREFIX_SIZE`] bytes of a batch — so this walks the log
+    /// entry to entry reading only those headers (through a bounded sliding window, see
+    /// [`FRAMING_SCAN_READ_AHEAD`]) and never touches a payload byte, let alone
+    /// decompresses one. (It deliberately does not verify batch CRCs either: a CRC
+    /// covers the record data, which only the consumer decodes, and checking it here
+    /// would mean reading and hashing every byte of every fetch purely to decide where
+    /// entries begin. Kafka frames fetches from batch headers for exactly this reason and
+    /// leaves the CRC to the consumer, which is where a corrupt batch actually surfaces.)
+    ///
+    /// The rules, matching Kafka's fetch semantics:
+    /// - Only whole entries. An entry whose offset range *contains* `start_offset` is
+    ///   returned in full — a batch is atomic on disk and cannot be cut in half — so a
+    ///   caller asking from the middle of one receives the whole batch and filters it
+    ///   itself. Entries ending strictly before `start_offset` are skipped.
+    /// - `max_offset_exclusive` is the bound the caller is entitled to read to (the
+    ///   committed high watermark for a consumer, the log end for a follower). An entry
+    ///   is served only if it lies *entirely* below it: records inside a batch cannot be
+    ///   filtered individually without decoding it, so a batch straddling the bound is
+    ///   withheld whole and becomes visible once the bound moves past its last offset.
+    /// - `max_bytes` is a budget, except that the first entry is always served whole even
+    ///   when it alone exceeds it — Kafka's "return at least one batch" rule, without
+    ///   which a record larger than a client's fetch size would stall the log forever.
+    ///
+    /// The range never spans segments: it is bounded by the segment `start_offset` lands
+    /// in, the same single-segment limit every read here has.
+    fn plan_entries_range(
+        &mut self,
+        start_offset: u64,
+        max_bytes: usize,
+        max_offset_exclusive: u64,
+    ) -> IoResult<Option<EntriesRange>> {
+        let pair = self.find_segment_pair_mut(start_offset);
+        let seek_entry = pair.index.find_nearest_physical_pos(start_offset);
+        let base_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
+        let available = pair.log.physical_size.saturating_sub(base_pos) as usize;
 
         let mut cursor = 0usize;
+        let mut budget = max_bytes;
         let mut first_included: Option<usize> = None;
         let mut end = 0usize;
+        // Headers are read through a sliding window rather than one syscall per entry, so
+        // a log of many small batches costs a handful of reads instead of thousands. The
+        // window is capped well below a typical fetch size, which is what keeps the
+        // zero-copy path honest: framing a multi-megabyte transfer must not pull its
+        // payload into user space to do it.
+        let mut window: Vec<u8> = Vec::new();
+        let mut window_start = 0usize;
 
-        while cursor < raw_bytes.len() {
-            if cursor + HEADER_SIZE > raw_bytes.len() {
-                break;
+        while cursor + BATCH_FRAMING_PREFIX_SIZE <= available {
+            if cursor < window_start
+                || cursor + BATCH_FRAMING_PREFIX_SIZE > window_start + window.len()
+            {
+                window_start = cursor;
+                let want = FRAMING_SCAN_READ_AHEAD.min(available - cursor);
+                window = pair.log.read_at(base_pos + cursor as u64, want)?;
+                if window.len() < BATCH_FRAMING_PREFIX_SIZE {
+                    break; // no room left for another header
+                }
             }
-            let Ok((entry, consumed)) = decode_entry(&raw_bytes[cursor..]) else {
-                // Same contract as `fetch`: stop the scan rather than hand back bytes we
-                // could not account for.
+            let at = cursor - window_start;
+            let Some(frame) = frame_entry(&window[at..at + BATCH_FRAMING_PREFIX_SIZE]) else {
+                // Not something this scan can account for — stop rather than hand back
+                // bytes whose entry boundaries are unknown.
                 break;
             };
-            let LogEntry::Batch(batch) = &entry;
-            let last_offset = batch.base_offset + batch.last_offset_delta as u64;
-            // An entry is included only if it is *entirely* below the committed high
-            // watermark. Records inside a batch cannot be filtered individually without
-            // decoding it, so a batch straddling the watermark is withheld whole rather
-            // than exposing uncommitted records — it becomes visible once the watermark
-            // moves past its last offset.
-            if last_offset >= max_offset_exclusive {
+            let Some(next) = cursor.checked_add(frame.total_len) else {
+                break;
+            };
+            if next > available {
+                break; // entry runs past this segment's valid data
+            }
+            if next > budget {
+                if first_included.is_none() {
+                    // "Return at least one batch": the budget bounds what a fetch *returns*,
+                    // and nothing has been returned yet, so it cannot bound this entry.
+                    // Widening for it alone is what keeps an entry larger than the client's
+                    // fetch size reachable instead of stalling that offset forever.
+                    //
+                    // Deliberately not restricted to the entry the scan starts on. The
+                    // sparse index seeks to a position at or before `start_offset`, so the
+                    // entry a client actually asked for is routinely not the first one
+                    // walked — bounding the rule to `cursor == 0` would leave exactly that
+                    // case stalled. Once something *is* included, the budget binds again,
+                    // so this can widen at most once per fetch.
+                    budget = next;
+                } else {
+                    break;
+                }
+            }
+            if frame.last_offset >= max_offset_exclusive {
                 break;
             }
-            if last_offset >= start_offset {
+            if frame.last_offset >= start_offset {
                 if first_included.is_none() {
                     first_included = Some(cursor);
                 }
-                end = cursor + consumed;
+                end = next;
             }
-            cursor += consumed;
+            cursor = next;
         }
 
-        Ok(match first_included {
-            Some(begin) => Bytes::copy_from_slice(&raw_bytes[begin..end]),
-            None => Bytes::new(),
-        })
-    }
-
-    /// If `raw` begins with a [`RecordBatch`] (magic [`BATCH_MAGIC_BYTE`]) whose
-    /// self-declared length is longer than what `raw` already holds, re-reads with a
-    /// budget sized to cover the whole batch and returns that instead. A batch is atomic
-    /// — there is no such thing as decoding "the first part" of one — so if the entry a
-    /// caller's `start_offset` needs is a batch cut short purely because `max_bytes`
-    /// happened to be smaller than it, the fetch must still serve it (mirroring Kafka's
-    /// own "always return at least one message even if it exceeds the requested budget"
-    /// fetch behavior) rather than silently returning nothing for that offset range.
-    ///
-    /// A no-op (returns `raw` unchanged, no extra read) whenever `raw` is empty, doesn't
-    /// start with a batch, or already covers the whole batch.
-    fn ensure_first_batch_fits(
-        pair: &mut SegmentPair,
-        start_pos: u64,
-        raw: Vec<u8>,
-    ) -> IoResult<Vec<u8>> {
-        const PREFIX: usize = 5; // magic + batch_length, see RecordBatch::decode
-        if raw.first() != Some(&BATCH_MAGIC_BYTE) {
-            return Ok(raw);
-        }
-        let prefix: Vec<u8> = if raw.len() >= PREFIX {
-            raw[..PREFIX].to_vec()
-        } else {
-            // The initial read didn't even cover the 5-byte prefix — go get it directly
-            // rather than guessing.
-            pair.log.read_at(start_pos, PREFIX)?
-        };
-        if prefix.len() < PREFIX {
-            // Truncated even for the fixed prefix (e.g. right at the physical end of the
-            // segment) — leave it for `decode_entry` to report cleanly.
-            return Ok(raw);
-        }
-        let batch_length = u32::from_be_bytes(prefix[1..5].try_into().unwrap()) as usize;
-        let total_needed = PREFIX + batch_length;
-        if raw.len() >= total_needed {
-            Ok(raw)
-        } else {
-            pair.log.read_at(start_pos, total_needed)
-        }
+        Ok(first_included.map(|begin| EntriesRange {
+            physical_start: base_pos + begin as u64,
+            physical_len: (end - begin) as u64,
+        }))
     }
 
     /// Fast binary search seek ($O(\log N)$) for nearest physical byte position of logical offset
@@ -1724,6 +1890,245 @@ mod tests {
 
     fn open_manager(dir: &TempDir) -> SegmentManager {
         SegmentManager::open(&dir.0, EngineConfig::default()).unwrap()
+    }
+
+    /// Reads a plan's byte range back off disk, so it can be compared against what
+    /// `fetch_entries` hands over for the same request.
+    fn read_plan(mgr: &mut SegmentManager, plan: &EntriesFetchPlan) -> Vec<u8> {
+        let pair = mgr.find_segment_pair_mut(0);
+        // The plan's range is absolute within its segment file, which for these
+        // single-segment fixtures is the one holding offset 0.
+        pair.log
+            .read_at(plan.physical_start, plan.physical_len as usize)
+            .unwrap()
+    }
+
+    /// The zero-copy plan and the buffered read must describe the *same bytes* — that is
+    /// the whole safety argument for having two fetch paths at all. Both derive their
+    /// range from `plan_entries_range`, so this is really asserting that neither wrapper
+    /// adjusts it on the way out.
+    #[test]
+    fn a_fetch_plan_covers_exactly_the_bytes_the_buffered_fetch_returns() {
+        let dir = TempDir::new("plan_matches_fetch");
+        let mut mgr = open_manager(&dir);
+        for offset in 0..6u64 {
+            mgr.append_batch_verbatim(&verbatim_batch(
+                offset,
+                1_000 + offset,
+                format!("payload-{}", offset).into_bytes(),
+            ))
+            .unwrap();
+        }
+        let hw = mgr.high_watermark();
+        assert_eq!(hw, 6);
+
+        for start in 0..=6u64 {
+            for max_bytes in [1usize, 40, 80, 200, 4096] {
+                let buffered = mgr.fetch_entries(start, max_bytes, hw).unwrap();
+                let planned = mgr.plan_entries_fetch(start, max_bytes, hw).unwrap();
+                match planned {
+                    Some(plan) => {
+                        assert_eq!(
+                            read_plan(&mut mgr, &plan),
+                            buffered.as_ref(),
+                            "plan and buffered fetch disagreed at start {} / max_bytes {}",
+                            start,
+                            max_bytes
+                        );
+                    }
+                    None => assert!(
+                        buffered.is_empty(),
+                        "plan declined at start {} / max_bytes {} but the buffered fetch \
+                         returned {} bytes",
+                        start,
+                        max_bytes,
+                        buffered.len()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Whatever a fetch serves must decode cleanly as whole entries covering the requested
+    /// offset — the framing scan reads only headers, so this is what confirms it lands on
+    /// real entry boundaries rather than merely self-consistent ones.
+    #[test]
+    fn a_fetch_serves_whole_entries_starting_at_or_before_the_requested_offset() {
+        let dir = TempDir::new("plan_boundaries");
+        let mut mgr = open_manager(&dir);
+        for offset in 0..4u64 {
+            mgr.append_batch_verbatim(&verbatim_batch(
+                offset,
+                1,
+                vec![b'z'; 100 * (offset as usize + 1)],
+            ))
+            .unwrap();
+        }
+        let hw = mgr.high_watermark();
+
+        for start in 0..4u64 {
+            let bytes = mgr.fetch_entries(start, 4096, hw).unwrap();
+            let mut cursor = 0usize;
+            let mut entries = Vec::new();
+            while cursor < bytes.len() {
+                let (entry, consumed) = decode_entry(&bytes[cursor..]).expect("whole entry");
+                entries.push(entry);
+                cursor += consumed;
+            }
+            assert_eq!(cursor, bytes.len(), "trailing bytes belonged to no entry");
+            let records = records_from_entries(&entries);
+            assert_eq!(
+                records.first().map(|r| r.offset),
+                Some(start),
+                "the entry containing the requested offset must be served whole"
+            );
+            assert_eq!(records.last().map(|r| r.offset), Some(hw - 1));
+        }
+    }
+
+    /// A single batch larger than the caller's budget is still served whole. Without this,
+    /// a record bigger than a consumer's `max_bytes` would make its offset permanently
+    /// unreachable — the fetch would return nothing, forever, at exactly that offset.
+    #[test]
+    fn a_batch_larger_than_the_budget_is_still_served_whole() {
+        let dir = TempDir::new("plan_oversized");
+        let mut mgr = open_manager(&dir);
+        let payload = vec![b'q'; 4096];
+        mgr.append_batch_verbatim(&verbatim_batch(0, 1, payload.clone()))
+            .unwrap();
+        mgr.append_batch_verbatim(&verbatim_batch(1, 1, b"next".to_vec()))
+            .unwrap();
+        let hw = mgr.high_watermark();
+
+        let bytes = mgr.fetch_entries(0, 16, hw).unwrap();
+        assert!(
+            bytes.len() > payload.len(),
+            "expected the whole oversized batch, got {} bytes",
+            bytes.len()
+        );
+        let (entry, consumed) = decode_entry(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len(), "only the one oversized batch fits");
+        let LogEntry::Batch(batch) = &entry;
+        assert_eq!(batch.base_offset, 0);
+
+        let plan = mgr.plan_entries_fetch(0, 16, hw).unwrap().unwrap();
+        assert_eq!(read_plan(&mut mgr, &plan), bytes.as_ref());
+    }
+
+    /// The framing scan walks headers through a fixed read-ahead window, so a fetch large
+    /// enough to span several windows exercises the refill path — including the case where
+    /// an entry's header straddles a window boundary, which is where an off-by-one would
+    /// silently reframe the whole rest of the fetch.
+    #[test]
+    fn framing_stays_correct_across_read_ahead_window_refills() {
+        let dir = TempDir::new("plan_window");
+        let mut mgr = open_manager(&dir);
+        // A single-record batch here occupies `HEADER_SIZE + 20 + payload` bytes (the 20
+        // being one record entry's fixed fields). 229 is chosen so that stride divides the
+        // read-ahead window with a remainder of 2 — every window boundary therefore falls
+        // two bytes into an entry's header, which is the case that must be refilled across
+        // rather than framed from a truncated prefix. Asserted below rather than trusted,
+        // so a change to either constant fails loudly instead of quietly making this test
+        // stop covering what it says it covers.
+        const PAYLOAD: usize = 229;
+        let stride = HEADER_SIZE + 20 + PAYLOAD;
+        let straddle = FRAMING_SCAN_READ_AHEAD % stride;
+        assert!(
+            straddle > 0 && straddle < BATCH_FRAMING_PREFIX_SIZE,
+            "fixture no longer straddles a window boundary (remainder {} of {}-byte entries)",
+            straddle,
+            stride
+        );
+
+        let count = 600u64;
+        for offset in 0..count {
+            mgr.append_batch_verbatim(&verbatim_batch(
+                offset,
+                1,
+                vec![(offset % 251) as u8; PAYLOAD],
+            ))
+            .unwrap();
+        }
+        let hw = mgr.high_watermark();
+        assert_eq!(hw, count);
+        assert!(
+            count as usize * stride > 2 * FRAMING_SCAN_READ_AHEAD,
+            "fixture must span several read-ahead windows"
+        );
+
+        let max_bytes = 8 * FRAMING_SCAN_READ_AHEAD;
+        let buffered = mgr.fetch_entries(0, max_bytes, hw).unwrap();
+        let plan = mgr.plan_entries_fetch(0, max_bytes, hw).unwrap().unwrap();
+        assert_eq!(read_plan(&mut mgr, &plan), buffered.as_ref());
+
+        let mut entries = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < buffered.len() {
+            let (entry, consumed) = decode_entry(&buffered[cursor..]).expect("whole entry");
+            entries.push(entry);
+            cursor += consumed;
+        }
+        assert_eq!(
+            cursor,
+            buffered.len(),
+            "trailing bytes belonged to no entry"
+        );
+        let records = records_from_entries(&entries);
+        assert_eq!(records.len(), count as usize);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.offset, i as u64);
+            assert_eq!(
+                record.value.as_deref().unwrap()[0],
+                (i as u64 % 251) as u8,
+                "record {} came back with another record's payload",
+                i
+            );
+        }
+    }
+
+    /// An oversized batch stays reachable even when the sparse index seeks to an *earlier*
+    /// entry — the common case, since the index only marks a position every
+    /// `index_interval_bytes`.
+    ///
+    /// The "return at least one batch" rule has to key off "nothing included yet", not
+    /// "this is the first entry walked". Keyed off the latter, a client whose `max_bytes`
+    /// is smaller than a batch it seeks into gets an empty response, retries at the same
+    /// offset, and gets an empty response again — that offset is stalled forever, with no
+    /// error anywhere to say why.
+    #[test]
+    fn an_oversized_batch_stays_reachable_when_the_index_seeks_before_it() {
+        let dir = TempDir::new("plan_seek_before");
+        let mut mgr = open_manager(&dir);
+        // Both entries land inside one 4 KiB index interval, so seeking offset 1 returns
+        // offset 0's position and the scan reaches the wanted batch second.
+        mgr.append_batch_verbatim(&verbatim_batch(0, 1, b"small".to_vec()))
+            .unwrap();
+        let big = vec![b'w'; 3000];
+        mgr.append_batch_verbatim(&verbatim_batch(1, 1, big.clone()))
+            .unwrap();
+        let hw = mgr.high_watermark();
+        assert_eq!(
+            mgr.seek(1).map(|(_, pos)| pos),
+            Some(0),
+            "fixture must seek to the earlier entry for this to test anything"
+        );
+
+        let bytes = mgr.fetch_entries(1, 64, hw).unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "offset 1 must be reachable with a budget smaller than its batch"
+        );
+        let (entry, consumed) = decode_entry(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let LogEntry::Batch(batch) = &entry;
+        assert_eq!(batch.base_offset, 1);
+        assert_eq!(
+            records_from_entries(&[entry])[0].value.as_deref(),
+            Some(big.as_slice())
+        );
+
+        let plan = mgr.plan_entries_fetch(1, 64, hw).unwrap().unwrap();
+        assert_eq!(read_plan(&mut mgr, &plan), bytes.as_ref());
     }
 
     #[test]

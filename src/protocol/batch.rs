@@ -24,7 +24,13 @@ pub const BATCH_HEADER_SIZE: usize = 53;
 /// Bytes fixed between the `crc` field and `record_data`, i.e. everything `batch_length`
 /// counts (`batch_length` runs from just after itself to the end of the batch, so it covers
 /// `crc` too): `BATCH_HEADER_SIZE - 1 (magic) - 4 (batch_length)`.
-const BATCH_LENGTH_COVERED_FIXED: usize = BATCH_HEADER_SIZE - 1 - 4;
+pub const BATCH_LENGTH_COVERED_FIXED: usize = BATCH_HEADER_SIZE - 1 - 4;
+
+/// Bytes at the head of a batch that *framing* needs — magic, `batch_length`, and the
+/// offset range (`base_offset` + `last_offset_delta`) — i.e. everything up to and
+/// including byte 21. Deciding where an entry ends and whether its offsets are wanted
+/// costs exactly this much of it; the rest is the consumer's business.
+pub const BATCH_FRAMING_PREFIX_SIZE: usize = 21;
 
 /// Bytes fixed per record entry inside (decompressed) `record_data`, i.e. present even when
 /// both key and value are null: `4(offset_delta) + 8(timestamp_delta) + 4(key_len) +
