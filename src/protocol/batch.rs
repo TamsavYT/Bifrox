@@ -5,13 +5,11 @@ use crc32fast::Hasher;
 use thiserror::Error;
 
 /// Magic byte for [`RecordBatch`], the log's only entry format. Distinct from every other
-/// magic byte in use: the inter-node magics (`0xAA` replication push,
-/// `0xAE`/`0xAF` vote request/response, `0xBB` gRPC replication — `src/replication/mod.rs`,
-/// `src/replication/grpc.rs`), the client wire protocol's `0xF1` versioned envelope
-/// (`src/protocol/wire.rs`), `0xCE`/`0xCF` (share-group/consumer-offset snapshot magics), the
-/// 4-byte `0xCAFEBABE` auth preamble, and `0xB0` (reserved by the parked
-/// `inter-node-versioning` branch for a future versioned inter-node frame — avoided so that
-/// branch can still land without a collision).
+/// magic byte in use: `0xB0`, the versioned inter-node envelope every frame between
+/// brokers now travels in (`src/replication/envelope.rs`), the client wire protocol's
+/// `0xF1` versioned envelope (`src/protocol/wire.rs`), `0xCE`/`0xCF`
+/// (share-group/consumer-offset snapshot magics), and the 4-byte `0xCAFEBABE` auth
+/// preamble.
 pub const BATCH_MAGIC_BYTE: u8 = 0xC0;
 
 /// Bytes fixed for every batch, from the `magic` byte through `record_count` inclusive —

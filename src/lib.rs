@@ -20,7 +20,6 @@ pub use protocol::{
 pub use replication::{
     send_grpc_replication_fetch, ClusterConfig, ConsensusState, HermesConsensus, MetadataRecord,
     NodeRole, ReplicationFetchRequest, ReplicationFetchResponse, ReplicationManager,
-    GRPC_REPLICATION_MAGIC,
 };
 pub use segment::{
     IndexEntry, IndexSegment, LogSegment, MmapLogSegment, SegmentManager, TimeIndexEntry,

@@ -1,20 +1,23 @@
 pub mod consensus;
+pub mod envelope;
 pub mod grpc;
 pub mod metadata;
 
 pub use consensus::{ConsensusState, HermesConsensus};
-pub use grpc::{
-    send_grpc_replication_fetch, ReplicationFetchRequest, ReplicationFetchResponse,
-    GRPC_REPLICATION_MAGIC,
+pub use envelope::{
+    decode_frame, decode_header, encode_frame, encode_frame_into, exchange_frame, read_extensions,
+    read_frame, write_extensions, write_no_extensions, EnvelopeError, FrameHeader, FrameType,
+    InterNodeFrame, ENVELOPE_HEADER_SIZE, INTER_NODE_MAGIC, INTER_NODE_PROTOCOL_VERSION,
+    MAX_INTER_NODE_PAYLOAD_BYTES,
 };
+pub use grpc::{send_grpc_replication_fetch, ReplicationFetchRequest, ReplicationFetchResponse};
 pub use metadata::MetadataRecord;
 
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -52,11 +55,6 @@ fn next_election_jitter(node_id: u32, tick: u64) -> u64 {
     z ^= z >> 31;
     z % ELECTION_TIMEOUT_JITTER_SECS
 }
-
-/// Magic byte for vote-request RPC (Candidate -> Peers)
-pub const VOTE_REQUEST_MAGIC: u8 = 0xAE;
-/// Magic byte for vote-response RPC (Peer -> Candidate)
-pub const VOTE_RESPONSE_MAGIC: u8 = 0xAF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
@@ -1223,31 +1221,99 @@ impl ReplicationManager {
     }
 }
 
-/// Sends a leader heartbeat packet (0xAC) including the leader's bind address and current term.
+/// Builds a [`FrameType::Heartbeat`] frame.
 ///
-/// Wire format (request):  `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [bind_addr: pascal]`
-/// Wire format (response): `[0x00] [follower_node_id: 4b] [follower_bind_addr: pascal]` on success,
-///                          `[0x01]` on rejection (cluster mismatch / not whitelisted).
+/// Payload: `[cluster_id: pascal] [node_id: 4b] [term: 8b] [leader_bind_addr: pascal]
+/// [extensions]`
+pub fn encode_heartbeat(
+    cluster_id: &str,
+    node_id: u32,
+    term: u64,
+    leader_bind_addr: &str,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(32 + cluster_id.len() + leader_bind_addr.len());
+    crate::protocol::wire::write_pascal_string(&mut payload, cluster_id);
+    payload.put_u32(node_id);
+    payload.put_u64(term);
+    crate::protocol::wire::write_pascal_string(&mut payload, leader_bind_addr);
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::Heartbeat, &payload)
+}
+
+/// Builds a [`FrameType::HeartbeatAck`] frame.
 ///
-/// Returning the follower's own node_id + bind_addr lets the Leader populate its broker
-/// address registry purely from the existing heartbeat round-trip, without requiring any
-/// out-of-band broker registration step — followers are otherwise unable to publish their
-/// own address since only the partition leader for `__cluster_metadata` may write to it.
-/// Reads the trailing `[role_count: 1b][role_bytes...]` that
-/// `handler::decode_heartbeat_packet` now appends to its ACK, after the caller has
-/// already consumed the `[status][node_id][addr_len][addr_bytes]` prefix.
-async fn read_heartbeat_ack_roles<S>(stream: &mut S) -> IoResult<Vec<crate::config::ProcessRole>>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    let mut count_buf = [0u8; 1];
-    stream.read_exact(&mut count_buf).await?;
-    let count = count_buf[0] as usize;
-    let mut role_buf = vec![0u8; count];
-    if count > 0 {
-        stream.read_exact(&mut role_buf).await?;
+/// Payload: `[status: 1b] [node_id: 4b] [bind_addr: pascal] [role_count: 1b] [role_bytes]
+/// [extensions]` on acceptance; `[status: 1b] [extensions]` on rejection, where a nonzero
+/// status means the sender was refused (cluster mismatch, not whitelisted, claiming to be
+/// us).
+///
+/// The responder returns its *own* identity here, which is what lets a leader populate its
+/// broker-address registry from the heartbeat round trip alone. A follower has no other
+/// way to publish its address: only the `__cluster_metadata` partition leader may write a
+/// `BrokerRegister` record, so a follower's own attempt would be rejected as
+/// NOT_CONTROLLER.
+pub fn encode_heartbeat_ack(
+    status: u8,
+    node_id: u32,
+    bind_addr: &str,
+    roles: &[crate::config::ProcessRole],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16 + bind_addr.len());
+    payload.put_u8(status);
+    if status == 0 {
+        payload.put_u32(node_id);
+        crate::protocol::wire::write_pascal_string(&mut payload, bind_addr);
+        let role_bytes = crate::config::roles_to_bytes(roles);
+        payload.put_u8(role_bytes.len() as u8);
+        payload.extend_from_slice(&role_bytes);
     }
-    Ok(crate::config::parse_process_role_bytes(&role_buf))
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::HeartbeatAck, &payload)
+}
+
+/// Reads a `HeartbeatAck` payload into the peer's identity.
+///
+/// Every field is bounds-checked against what actually arrived. Previously this was a
+/// chain of `read_exact` calls straight off the socket, one per field, which is what made
+/// a truncated or unexpected ACK leave stray bytes behind on a pooled connection — see
+/// [`envelope::read_frame`].
+fn decode_heartbeat_ack(
+    payload: &[u8],
+    peer_addr: &str,
+) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
+    let mut cursor = payload;
+    let short = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Truncated heartbeat ACK from {}", peer_addr),
+        )
+    };
+    if cursor.remaining() < 1 {
+        return Err(short());
+    }
+    let status = cursor.get_u8();
+    if status != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
+        ));
+    }
+    if cursor.remaining() < 6 {
+        return Err(short());
+    }
+    let node_id = cursor.get_u32();
+    let addr_len = cursor.get_u16() as usize;
+    if cursor.remaining() < addr_len + 1 {
+        return Err(short());
+    }
+    let bind_addr = String::from_utf8_lossy(&cursor[..addr_len]).to_string();
+    cursor.advance(addr_len);
+    let role_count = cursor.get_u8() as usize;
+    if cursor.remaining() < role_count {
+        return Err(short());
+    }
+    let roles = crate::config::parse_process_role_bytes(&cursor[..role_count]);
+    Ok((node_id, bind_addr, roles))
 }
 
 pub async fn send_leader_heartbeat_pooled(
@@ -1258,34 +1324,16 @@ pub async fn send_leader_heartbeat_pooled(
     term: u64,
     leader_bind_addr: &str,
 ) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
-    let mut buf = Vec::with_capacity(128);
-    buf.put_u8(0xAC);
-    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
-    buf.put_u32(node_id);
-    buf.put_u64(term);
-    crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
+    let frame = encode_heartbeat(cluster_id, node_id, term, leader_bind_addr);
 
     let mut lock = peer_conn.lock().await;
 
     if let Some(ref mut stream) = *lock {
-        if stream.write_all(&buf).await.is_ok() {
-            let mut status = [0u8; 1];
-            if stream.read_exact(&mut status).await.is_ok() && status[0] == 0 {
-                let mut id_buf = [0u8; 4];
-                if stream.read_exact(&mut id_buf).await.is_ok() {
-                    let follower_node_id = u32::from_be_bytes(id_buf);
-                    let mut len_buf = [0u8; 2];
-                    if stream.read_exact(&mut len_buf).await.is_ok() {
-                        let addr_len = u16::from_be_bytes(len_buf) as usize;
-                        let mut addr_buf = vec![0u8; addr_len];
-                        if stream.read_exact(&mut addr_buf).await.is_ok() {
-                            let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-                            if let Ok(roles) = read_heartbeat_ack_roles(stream).await {
-                                return Ok((follower_node_id, follower_bind_addr, roles));
-                            }
-                        }
-                    }
-                }
+        if let Ok(payload) =
+            envelope::exchange_frame(stream, &frame, envelope::FrameType::HeartbeatAck).await
+        {
+            if let Ok(identity) = decode_heartbeat_ack(&payload, peer_addr) {
+                return Ok(identity);
             }
         }
     }
@@ -1302,30 +1350,14 @@ pub async fn send_leader_heartbeat_pooled(
         }
     };
 
-    stream.write_all(&buf).await?;
-    let mut status = [0u8; 1];
-    stream.read_exact(&mut status).await?;
-    if status[0] != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
-        ));
-    }
-
-    let mut id_buf = [0u8; 4];
-    stream.read_exact(&mut id_buf).await?;
-    let follower_node_id = u32::from_be_bytes(id_buf);
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let addr_len = u16::from_be_bytes(len_buf) as usize;
-    let mut addr_buf = vec![0u8; addr_len];
-    stream.read_exact(&mut addr_buf).await?;
-    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-    let roles = read_heartbeat_ack_roles(&mut stream).await?;
-
+    let payload =
+        envelope::exchange_frame(&mut stream, &frame, envelope::FrameType::HeartbeatAck).await?;
+    let identity = decode_heartbeat_ack(&payload, peer_addr)?;
+    // The whole frame was read, so the socket is positioned exactly at the next one and is
+    // safe to pool — which is precisely what could not be guaranteed when the ACK was read
+    // field by field.
     *lock = Some(stream);
-    Ok((follower_node_id, follower_bind_addr, roles))
+    Ok(identity)
 }
 
 pub async fn send_leader_heartbeat(
@@ -1346,37 +1378,10 @@ pub async fn send_leader_heartbeat(
         }
     };
 
-    let mut buf = Vec::with_capacity(128);
-    buf.put_u8(0xAC); // Heartbeat Magic
-    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
-    buf.put_u32(node_id);
-    buf.put_u64(term); // P4: include current term
-    crate::protocol::wire::write_pascal_string(&mut buf, leader_bind_addr);
-
-    stream.write_all(&buf).await?;
-
-    let mut status = [0u8; 1];
-    stream.read_exact(&mut status).await?;
-    if status[0] != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("Peer {} rejected heartbeat: cluster.id mismatch", peer_addr),
-        ));
-    }
-
-    let mut id_buf = [0u8; 4];
-    stream.read_exact(&mut id_buf).await?;
-    let follower_node_id = u32::from_be_bytes(id_buf);
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let addr_len = u16::from_be_bytes(len_buf) as usize;
-    let mut addr_buf = vec![0u8; addr_len];
-    stream.read_exact(&mut addr_buf).await?;
-    let follower_bind_addr = String::from_utf8_lossy(&addr_buf).to_string();
-    let roles = read_heartbeat_ack_roles(&mut stream).await?;
-
-    Ok((follower_node_id, follower_bind_addr, roles))
+    let frame = encode_heartbeat(cluster_id, node_id, term, leader_bind_addr);
+    let payload =
+        envelope::exchange_frame(&mut stream, &frame, envelope::FrameType::HeartbeatAck).await?;
+    decode_heartbeat_ack(&payload, peer_addr)
 }
 
 /// Streams replication batch frames to a peer follower node over TCP (0xAA protocol).
@@ -1415,6 +1420,88 @@ impl EncodedEntry {
     }
 }
 
+/// Status byte a follower returns in a [`FrameType::ReplicationPushAck`] payload.
+///
+/// Distinct values rather than a bare success/failure flag because the leader reacts
+/// differently to each: a NACK means retry or drop this follower from the ISR, while a
+/// stale epoch means this node is no longer the leader and must step down.
+pub mod push_ack {
+    /// Batch was persisted (and, for `__cluster_metadata`, fsynced).
+    pub const OK: u8 = 0;
+    /// Batch was not persisted — a write error, or a gap this follower cannot fill.
+    pub const NACK: u8 = 1;
+    /// The receiver holds a higher epoch than the sender claimed; the sender is stale.
+    pub const STALE_EPOCH: u8 = 2;
+}
+
+/// Builds a [`FrameType::ReplicationPush`] frame.
+///
+/// Payload: `[cluster_id: pascal] [topic: pascal] [partition: 4b] [epoch: 8b]
+/// [leader_hw: 8b] [entries_len: 4b] [entry bytes] [extensions]`
+///
+/// `entries_len` is a **byte** count, not a record count. Entries are self-delimiting
+/// batches, so a byte length lets a receiver find the end of the entry section — and
+/// therefore the start of the extension section — without decoding a single entry. It also
+/// bounds the work a peer can ask for up front, where the old record count could only be
+/// checked against a cap and then trusted.
+///
+/// The entry bytes are the leader's own stored bytes, handed over untouched: a follower
+/// appends them verbatim, so its log ends up byte-identical to the leader's rather than a
+/// re-encoded copy (see [`EncodedEntry`]).
+pub fn encode_replication_push(
+    cluster_id: &str,
+    topic: &str,
+    partition: u32,
+    epoch: u64,
+    leader_hw: u64,
+    entries: &[EncodedEntry],
+) -> Vec<u8> {
+    let entries_len: usize = entries.iter().map(|e| e.bytes.len()).sum();
+    let mut payload = Vec::with_capacity(64 + cluster_id.len() + topic.len() + entries_len);
+    crate::protocol::wire::write_pascal_string(&mut payload, cluster_id);
+    crate::protocol::wire::write_pascal_string(&mut payload, topic);
+    payload.put_u32(partition);
+    payload.put_u64(epoch);
+    // The leader's committed high watermark at push time. Followers clamp their own HW to
+    // this rather than assuming everything they were pushed is committed — a pushed record
+    // is not committed until the ISR has acknowledged it, so a follower that advanced its
+    // HW on append was marking uncommitted data as readable.
+    payload.put_u64(leader_hw);
+    payload.put_u32(entries_len as u32);
+    for entry in entries {
+        payload.put_slice(&entry.bytes);
+    }
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::ReplicationPush, &payload)
+}
+
+/// Builds a [`FrameType::ReplicationPushAck`] frame carrying one of [`push_ack`]'s
+/// statuses.
+pub fn encode_replication_push_ack(status: u8) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4);
+    payload.put_u8(status);
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::ReplicationPushAck, &payload)
+}
+
+/// Turns a `ReplicationPushAck` payload into this leader's outcome.
+fn interpret_push_ack(ack: &[u8], peer_addr: &str) -> IoResult<()> {
+    match ack.first().copied() {
+        Some(push_ack::OK) => Ok(()),
+        Some(push_ack::STALE_EPOCH) => {
+            Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
+        }
+        Some(other) => Err(std::io::Error::other(format!(
+            "Peer {} returned error ACK 0x{:02X}",
+            peer_addr, other
+        ))),
+        None => Err(std::io::Error::other(format!(
+            "Peer {} returned an empty replication ACK",
+            peer_addr
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_replication_push_pooled(
     peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
@@ -1426,36 +1513,23 @@ pub async fn send_replication_push_pooled(
     leader_hw: u64,
     entries: &[EncodedEntry],
 ) -> IoResult<()> {
-    let mut buf = Vec::with_capacity(256 + entries.len() * 64);
-    buf.put_u8(0xAA);
-    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
-    crate::protocol::wire::write_pascal_string(&mut buf, topic);
-    buf.put_u32(partition);
-    buf.put_u64(epoch);
-    // The leader's committed high watermark at push time. Followers clamp their own HW to
-    // this (see the 0xAA decoder) instead of assuming everything they were pushed is
-    // committed — a pushed record is not committed until the ISR has acknowledged it, so a
-    // follower that advanced its HW on append was marking uncommitted data as readable.
-    //
-    // NOTE: this is an inter-node wire change. All brokers in a cluster must run a build
-    // that agrees on this layout; there is no version negotiation on this path yet.
-    buf.put_u64(leader_hw);
-    buf.put_u32(entries.len() as u32);
-    for entry in entries {
-        buf.put_slice(&entry.bytes);
-    }
+    let frame = encode_replication_push(cluster_id, topic, partition, epoch, leader_hw, entries);
 
     let mut lock = peer_conn.lock().await;
 
+    // Try the pooled connection first. A stale-epoch answer is a real answer — the peer is
+    // reachable and has spoken — so it is returned rather than retried on a fresh socket.
+    // Anything else falls through to a reconnect, on the assumption the pooled socket is
+    // the problem.
     if let Some(ref mut stream) = *lock {
-        if stream.write_all(&buf).await.is_ok() {
-            let mut ack = [0u8; 1];
-            if stream.read_exact(&mut ack).await.is_ok() {
-                if ack[0] == 0 {
-                    return Ok(());
-                } else if ack[0] == 0x02 {
-                    return Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"));
+        if let Ok(ack) =
+            envelope::exchange_frame(stream, &frame, envelope::FrameType::ReplicationPushAck).await
+        {
+            match ack.first().copied() {
+                Some(push_ack::OK) | Some(push_ack::STALE_EPOCH) => {
+                    return interpret_push_ack(&ack, peer_addr)
                 }
+                _ => {}
             }
         }
     }
@@ -1472,107 +1546,56 @@ pub async fn send_replication_push_pooled(
         }
     };
 
-    stream.write_all(&buf).await?;
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await?;
-    if ack[0] == 0 {
+    let ack =
+        envelope::exchange_frame(&mut stream, &frame, envelope::FrameType::ReplicationPushAck)
+            .await?;
+    let outcome = interpret_push_ack(&ack, peer_addr);
+    // The connection is kept for any answer the peer actually gave — including a stale
+    // epoch, which says nothing about the socket. It is dropped only when the answer was
+    // unintelligible, since that is the case where the stream's position is in doubt.
+    if matches!(
+        ack.first().copied(),
+        Some(push_ack::OK) | Some(push_ack::STALE_EPOCH)
+    ) {
         *lock = Some(stream);
-        Ok(())
-    } else if ack[0] == 0x02 {
-        *lock = Some(stream);
-        Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
-    } else {
-        Err(std::io::Error::other(format!(
-            "Peer {} returned error ACK 0x{:02X}",
-            peer_addr, ack[0]
-        )))
     }
+    outcome
 }
 
-pub async fn send_replication_push(
-    peer_addr: &str,
+/// Builds a [`FrameType::VoteRequest`] frame.
+///
+/// Payload: `[cluster_id: pascal] [candidate_id: 4b] [term: 8b]
+/// [candidate_last_log_index: 8b] [extensions]`
+///
+/// `candidate_last_log_index` lets voters enforce Raft §5.4.1: a vote must not be granted
+/// to a candidate whose `__cluster_metadata` log is behind the voter's own, or committed
+/// metadata could be lost when that candidate wins.
+pub fn encode_vote_request(
     cluster_id: &str,
-    topic: &str,
-    partition: u32,
-    epoch: u64,
-    entries: &[EncodedEntry],
-) -> IoResult<()> {
-    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::warn!(
-                "HA Replication: Could not connect to peer {}: {}",
-                peer_addr,
-                e
-            );
-            return Err(e);
-        }
-        Err(_) => {
-            let err = std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Connection to {} timed out", peer_addr),
-            );
-            tracing::warn!("HA Replication: Connection to peer {} timed out", peer_addr);
-            return Err(err);
-        }
-    };
-
-    let first_offset = entries.first().map_or(0, |e| e.last_offset);
-    let last_offset = entries.last().map_or(0, |e| e.last_offset);
-
-    let mut buf = Vec::with_capacity(256);
-    buf.put_u8(0xAA);
-    // CRIT-01: cluster_id is the first field so the follower can reject unknown senders immediately.
-    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
-    crate::protocol::wire::write_pascal_string(&mut buf, topic);
-    buf.put_u32(partition);
-    buf.put_u64(epoch);
-    buf.put_u32(entries.len() as u32);
-    for entry in entries {
-        buf.put_slice(&entry.bytes);
-    }
-
-    stream.write_all(&buf).await.map_err(|e| {
-        tracing::error!("HA Replication: Write to peer {} failed: {}", peer_addr, e);
-        e
-    })?;
-
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await.map_err(|e| {
-        tracing::error!("HA Replication: ACK from peer {} failed: {}", peer_addr, e);
-        e
-    })?;
-
-    if ack[0] == 0 {
-        tracing::info!(
-            "HA Replication: Replicated {} record(s) [offsets {}..={}] Topic '{}' Partition {} -> peer {}",
-            entries.len(), first_offset, last_offset, topic, partition, peer_addr
-        );
-        Ok(())
-    } else if ack[0] == 0x02 {
-        // H5: Follower returned STALE_EPOCH sentinel — our epoch is behind the cluster.
-        tracing::warn!(
-            "HA Replication: Peer {} rejected with STALE_EPOCH (0x02)",
-            peer_addr
-        );
-        Err(std::io::Error::other("STALE_EPOCH: peer epoch is higher"))
-    } else {
-        tracing::warn!(
-            "HA Replication: Peer {} returned error ACK 0x{:02X}",
-            peer_addr,
-            ack[0]
-        );
-        Err(std::io::Error::other("Replication ACK failed"))
-    }
+    candidate_id: u32,
+    term: u64,
+    candidate_last_log_index: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(32 + cluster_id.len());
+    crate::protocol::wire::write_pascal_string(&mut payload, cluster_id);
+    payload.put_u32(candidate_id);
+    payload.put_u64(term);
+    payload.put_u64(candidate_last_log_index);
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::VoteRequest, &payload)
 }
 
-/// Sends a Raft VoteRequest RPC (0xAE) to a peer and returns whether the vote was granted.
+/// Builds a [`FrameType::VoteResponse`] frame.
 ///
-/// Wire format (request):  `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b] [candidate_last_log_index: 8b]`
-/// Wire format (response): `[granted: 1b]`  — 0x01 = granted, 0x00 = denied
-///
-/// `candidate_last_log_index` lets voters enforce Raft §5.4.1: they must not grant a vote
-/// to a candidate whose `__cluster_metadata` log is behind their own.
+/// Payload: `[granted: 1b] [extensions]` — 1 = granted, 0 = denied.
+pub fn encode_vote_response(granted: bool) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4);
+    payload.put_u8(u8::from(granted));
+    envelope::write_no_extensions(&mut payload);
+    envelope::encode_frame(envelope::FrameType::VoteResponse, &payload)
+}
+
+/// Solicits one peer's vote. `Ok(true)` means granted.
 pub async fn send_vote_request(
     peer_addr: &str,
     cluster_id: &str,
@@ -1598,17 +1621,228 @@ pub async fn send_vote_request(
         }
     };
 
-    let mut buf = Vec::with_capacity(64);
-    buf.put_u8(VOTE_REQUEST_MAGIC);
-    crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
-    buf.put_u32(candidate_id);
-    buf.put_u64(term);
-    buf.put_u64(candidate_last_log_index);
+    let frame = encode_vote_request(cluster_id, candidate_id, term, candidate_last_log_index);
+    let response =
+        envelope::exchange_frame(&mut stream, &frame, envelope::FrameType::VoteResponse).await?;
+    Ok(response.first().copied() == Some(1))
+}
 
-    stream.write_all(&buf).await?;
+/// The two failures this envelope exists to make unrepresentable, tested against a real
+/// socket rather than against the codec in isolation.
+#[cfg(test)]
+mod inter_node_wire_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    let mut resp = [0u8; 1];
-    stream.read_exact(&mut resp).await?;
+    /// A stand-in peer that answers each request frame it receives with `reply`, reading
+    /// requests the correct way (header, then exactly the declared payload) so the test is
+    /// measuring the *client* side.
+    async fn fake_peer(reply: Vec<u8>, exchanges: usize) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for _ in 0..exchanges {
+                let mut header = [0u8; envelope::ENVELOPE_HEADER_SIZE];
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let decoded = envelope::decode_header(&header).unwrap();
+                let mut payload = vec![0u8; decoded.payload_len];
+                if stream.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, handle)
+    }
 
-    Ok(resp[0] == 0x01)
+    /// A heartbeat ACK carrying a field this build has never heard of must be consumed
+    /// whole, so the *next* exchange on the same pooled connection still lines up.
+    ///
+    /// This is the silent failure the old field-by-field readers had. Peer connections are
+    /// pooled, and an ACK was read with one `read_exact` per known field; anything the
+    /// reader did not know to consume stayed in the socket and was picked up by the next
+    /// heartbeat as its own status byte. A nonzero leftover reads as a rejection, so a
+    /// healthy peer looked permanently offline and nothing reported why — and the trigger
+    /// was simply a peer running a build one field newer.
+    ///
+    /// The second heartbeat below is the whole test: under the old design it read the
+    /// extension's bytes instead of a status.
+    #[tokio::test]
+    async fn an_ack_with_an_unknown_field_does_not_poison_the_next_request() {
+        // An ACK as a newer build would send it: every field this build knows, plus one it
+        // does not.
+        let mut payload = Vec::new();
+        payload.put_u8(0); // status: accepted
+        payload.put_u32(77); // node_id
+        crate::protocol::wire::write_pascal_string(&mut payload, "10.0.0.7:9092");
+        payload.put_u8(0); // role_count
+        envelope::write_extensions(
+            &mut payload,
+            &[(0xBEEF, b"a field from the future".to_vec())],
+        );
+        let reply = envelope::encode_frame(envelope::FrameType::HeartbeatAck, &payload);
+
+        let (addr, peer) = fake_peer(reply, 2).await;
+        let conn = Arc::new(tokio::sync::Mutex::new(None));
+
+        let first = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 5, "10.0.0.1:9092")
+            .await
+            .expect("first heartbeat");
+        assert_eq!(first.0, 77);
+        assert_eq!(first.1, "10.0.0.7:9092");
+
+        // Same pooled connection, and the unknown field from the first ACK must be nowhere
+        // in the way of this one.
+        let second = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 6, "10.0.0.1:9092")
+            .await
+            .expect("second heartbeat on the pooled connection");
+        assert_eq!(second.0, 77);
+        assert_eq!(second.1, "10.0.0.7:9092");
+
+        assert!(
+            conn.lock().await.is_some(),
+            "a fully-read exchange must leave the connection pooled"
+        );
+        peer.abort();
+    }
+
+    /// A reply of the wrong type is an error, not something to parse hopefully. On a
+    /// pooled connection a reply out of step with its request is exactly the symptom the
+    /// old readers produced, and parsing it as the expected type is how that went unseen.
+    #[tokio::test]
+    async fn a_reply_of_the_wrong_frame_type_is_refused() {
+        let wrong = encode_vote_response(true);
+        let (addr, peer) = fake_peer(wrong, 1).await;
+        let conn = Arc::new(tokio::sync::Mutex::new(None));
+
+        let err = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 1, "10.0.0.1:9092")
+            .await
+            .expect_err("a VoteResponse must not be accepted as a HeartbeatAck");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        peer.abort();
+    }
+
+    /// Every request frame this build sends must be self-delimiting on the wire: a
+    /// receiver reading only the envelope must land exactly on the next frame's first
+    /// byte, without understanding any payload. That is the property that makes the *next*
+    /// wire change additive instead of a cluster-wide flag day.
+    #[test]
+    fn every_frame_this_build_sends_is_self_delimiting() {
+        let entries = vec![EncodedEntry {
+            bytes: bytes::Bytes::from_static(b"entry-bytes-stand-in"),
+            last_offset: 4,
+        }];
+        let frames = vec![
+            (
+                FrameType::ReplicationPush,
+                encode_replication_push("c", "t", 3, 9, 4, &entries),
+            ),
+            (
+                FrameType::ReplicationPushAck,
+                encode_replication_push_ack(push_ack::OK),
+            ),
+            (FrameType::Heartbeat, encode_heartbeat("c", 1, 7, "h:1")),
+            (
+                FrameType::HeartbeatAck,
+                encode_heartbeat_ack(0, 2, "h:2", &[crate::config::ProcessRole::Broker]),
+            ),
+            (FrameType::VoteRequest, encode_vote_request("c", 1, 7, 42)),
+            (FrameType::VoteResponse, encode_vote_response(true)),
+            (
+                FrameType::ReplicationFetch,
+                ReplicationFetchRequest {
+                    follower_node_id: 2,
+                    topic: "t".to_string(),
+                    partition: 0,
+                    fetch_offset: 5,
+                    max_bytes: 4096,
+                }
+                .encode_frame(),
+            ),
+            (
+                FrameType::ReplicationFetchResponse,
+                ReplicationFetchResponse {
+                    leader_watermark: 9,
+                    isr_count: 2,
+                    entries: bytes::Bytes::from_static(b"stored bytes"),
+                }
+                .encode_frame(),
+            ),
+        ];
+
+        // Every frame type must be represented, or this test silently stops covering
+        // whichever one was added without it.
+        assert_eq!(
+            frames.len(),
+            8,
+            "a new frame type needs a case here before it can be trusted on the wire"
+        );
+
+        // Concatenated back to back, exactly as a busy connection would carry them.
+        let mut stream = Vec::new();
+        for (_, bytes) in &frames {
+            stream.extend_from_slice(bytes);
+        }
+
+        let mut cursor = 0usize;
+        for (expected_type, bytes) in &frames {
+            let frame = decode_frame(&stream[cursor..]).expect("a self-delimiting frame");
+            assert_eq!(frame.frame_type, *expected_type);
+            assert_eq!(
+                frame.total_len,
+                bytes.len(),
+                "{:?} must declare its own length exactly",
+                expected_type
+            );
+            assert_eq!(frame.version, INTER_NODE_PROTOCOL_VERSION);
+            cursor += frame.total_len;
+        }
+        assert_eq!(
+            cursor,
+            stream.len(),
+            "the walk must consume the whole stream"
+        );
+    }
+
+    /// Every payload this build sends must end with a readable extension section, so there
+    /// is somewhere for the next field to go. A frame without one can only be extended by
+    /// widening its fixed fields — which is the flag day this whole change is spending
+    /// itself to avoid repeating.
+    #[test]
+    fn every_payload_ends_with_an_extension_section() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "ReplicationPush",
+                encode_replication_push("c", "t", 0, 0, 0, &[]),
+            ),
+            (
+                "ReplicationPushAck",
+                encode_replication_push_ack(push_ack::OK),
+            ),
+            ("Heartbeat", encode_heartbeat("c", 1, 1, "h:1")),
+            ("HeartbeatAck", encode_heartbeat_ack(0, 1, "h:1", &[])),
+            (
+                "HeartbeatAck (rejected)",
+                encode_heartbeat_ack(1, 0, "", &[]),
+            ),
+            ("VoteRequest", encode_vote_request("c", 1, 1, 1)),
+            ("VoteResponse", encode_vote_response(false)),
+        ];
+        for (name, bytes) in cases {
+            let frame = decode_frame(&bytes).unwrap();
+            // The section is the payload's last field, so reading from the end backwards is
+            // not possible — instead assert the payload ends with a well-formed, empty one.
+            let mut tail = &frame.payload[frame.payload.len() - 2..];
+            let extensions = read_extensions(&mut tail)
+                .unwrap_or_else(|e| panic!("{} has no extension section: {}", name, e));
+            assert!(extensions.is_empty(), "{} should send none today", name);
+            assert!(tail.is_empty(), "{}'s section must end the payload", name);
+        }
+    }
 }

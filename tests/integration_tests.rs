@@ -3943,9 +3943,9 @@ async fn test_scenario_41_alter_configs_rejects_invalid_values() {
 /// There is no push target list left to inspect for a data topic now, so this proves the
 /// same "no peer is ever delivered the same records twice" invariant at the wire level
 /// instead: a raw peer standing in for an assigned replica must never see a single byte
-/// from a data-topic produce (push simply never fires), while it must see an actual 0xAA
-/// push packet the moment a metadata mutation happens, since `__cluster_metadata` has no
-/// pull fetcher and is push-only by design.
+/// from a data-topic produce (push simply never fires), while it must see an actual
+/// `ReplicationPush` frame the moment a metadata mutation happens, since
+/// `__cluster_metadata` has no pull fetcher and is push-only by design.
 #[tokio::test]
 async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes() {
     use hermes::config::ProcessRole;
@@ -3965,9 +3965,13 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     // A raw, non-Hermes TCP peer standing in for a replica: nothing but a leader-side
     // wire call (replication push *or* the leader heartbeat, which shares the same
     // per-peer pooled connection) could ever make a connection land here. Only the
-    // replication-push magic byte (0xAA) counts as proof of a push; the leader heartbeat
-    // (0xAC) also legitimately connects here (`start_leader_heartbeat_loop`, started for
-    // any Leader with a non-empty `peer_addrs`) and must be ignored.
+    // `ReplicationPush` frame type counts as proof of a push; the leader heartbeat shares
+    // the same envelope and also legitimately connects here (`start_leader_heartbeat_loop`,
+    // started for any Leader with a non-empty `peer_addrs`) and must be ignored.
+    //
+    // Reading the frame *type* out of the envelope rather than sniffing a leading magic
+    // byte is what makes this precise: heartbeat and push now share a magic, and the type
+    // is the only thing that distinguishes them.
     //
     // The harness doesn't implement either wire protocol's full reply — it just reads the
     // magic byte and drops the connection. Both `send_replication_push_pooled` and
@@ -3984,9 +3988,13 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let mut magic = [0u8; 1];
-            if stream.read_exact(&mut magic).await.is_ok() && magic[0] == 0xAA {
-                magic_seen_task.store(true, Ordering::SeqCst);
+            let mut header = [0u8; hermes::replication::ENVELOPE_HEADER_SIZE];
+            if stream.read_exact(&mut header).await.is_ok() {
+                if let Ok(decoded) = hermes::replication::decode_header(&header) {
+                    if decoded.frame_type == hermes::replication::FrameType::ReplicationPush {
+                        magic_seen_task.store(true, Ordering::SeqCst);
+                    }
+                }
             }
             // Deliberately no reply: dropping here is what makes the client treat this as
             // a failed call and reconnect fresh for its next one (see comment above).
@@ -4034,7 +4042,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     assert!(engine.is_partition_leader(topic, 0));
 
     // Produce to the assigned data partition. If push still fired here, the fake peer
-    // would see a connection carrying 0xAA.
+    // would see a connection carrying a `ReplicationPush` frame.
     let records = vec![bytes::Bytes::from("no-push-payload")];
     let params = hermes::server::engine::ProduceBatchParams {
         topic,

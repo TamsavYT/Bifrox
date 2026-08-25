@@ -1,8 +1,8 @@
-use crate::protocol::{RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE};
+use crate::protocol::{RequestPayload, WireError, WireRequest, WireResponse};
 use crate::scram::{self, ScramCredential};
 use crate::server::engine::StorageEngine;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -12,6 +12,11 @@ const MAX_REPLICATION_BATCH_COUNT: usize = 100_000;
 
 /// Maximum cluster-ID / peer string length accepted in inter-node packets (SEC-MED-06)
 const MAX_CLUSTER_ID_LEN: usize = 256;
+/// Cap on a `host:port` a peer advertises for itself, matching what the heartbeat decoder
+/// has always enforced inline.
+const MAX_BIND_ADDR_LEN: usize = 256;
+/// Cap on a topic name arriving from a peer, checked before the name is allocated.
+const MAX_TOPIC_NAME_LEN: usize = 512;
 /// Timeout for reading client auth handshake bytes.
 const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -63,9 +68,9 @@ struct ScramSession {
 /// Handles incoming TCP client connections and inter-node replication/heartbeat streams.
 ///
 /// Protocol dispatch by first byte:
-/// - `0xAA` — Inter-node replication batch (Leader -> Follower)
-/// - `0xAC` — Inter-node heartbeat PING (Leader -> Follower)  
-/// - `0x01..0x0A` — Client wire protocol commands
+/// - `0xB0` — Any inter-node frame, in the versioned envelope that carries its type and
+///   length (`replication::envelope`)
+/// - `0x01..0x0A` / `0xF1` — Client wire protocol commands, legacy- or versioned-framed
 ///
 /// **Produce Forwarding**: If this node is a Follower and receives a ProduceBatch (0x01),
 /// it transparently proxies the raw request bytes to the Leader and relays the response.
@@ -185,425 +190,347 @@ where
                 break;
             }
 
-            // gRPC-style replication-fetch packets (Kafka-style follower pull) are framed
-            // as `[u32 total_len][0xBB ...]` — a length-prefixed request/response pair
-            // built for a standalone connection (see `send_grpc_replication_fetch`) —
-            // rather than a raw leading magic byte like the other inter-node packet types
-            // below. They need to be detected by peeking past the length prefix, before
-            // the magic-byte dispatch that follows.
-            if slice.len() >= 5 && slice[4] == crate::replication::GRPC_REPLICATION_MAGIC {
-                match decode_grpc_replication_fetch_packet(&engine, slice) {
-                    Ok((bytes_used, response)) => {
-                        consumed += bytes_used;
-                        if let Err(e) = socket.write_all(&response).await {
-                            tracing::error!(
-                                "Failed to send gRPC replication fetch response to {}: {}",
-                                peer_addr,
-                                e
-                            );
-                            return;
-                        }
-                        continue;
-                    }
-                    Err(PacketError::NeedMoreData) => break,
-                    Err(PacketError::Fatal(msg)) => {
-                        tracing::warn!(
-                            "Malformed gRPC replication fetch packet from {}: {}",
-                            peer_addr,
-                            msg
-                        );
-                        return;
-                    }
-                }
-            }
-
-            let first_byte = slice[0];
-
-            match first_byte {
-                // Inter-node replication batch (0xAA)
-                0xAA => match decode_replication_packet(&engine, slice) {
-                    Ok((bytes_used, response)) => {
-                        consumed += bytes_used;
-                        if let Err(e) = socket.write_all(&response).await {
-                            tracing::error!(
-                                "Failed to send replication ACK to {}: {}",
-                                peer_addr,
-                                e
-                            );
-                            return;
-                        }
-                    }
-                    Err(PacketError::NeedMoreData) => break,
-                    Err(PacketError::Fatal(msg)) => {
-                        tracing::warn!("Malformed replication packet from {}: {}", peer_addr, msg);
-                        return;
-                    }
-                },
-
-                // Inter-node heartbeat PING (0xAC)
-                0xAC => match decode_heartbeat_packet(&engine, slice) {
-                    Ok((bytes_used, response)) => {
-                        consumed += bytes_used;
-                        let _ = socket.write_all(&response).await;
-                    }
-                    Err(PacketError::NeedMoreData) => break,
-                    Err(PacketError::Fatal(msg)) => {
-                        tracing::warn!("Malformed heartbeat from {}: {}", peer_addr, msg);
-                        return;
-                    }
-                },
-
-                // Inter-node VoteRequest RPC (0xAE) — Raft leader election
-                0xAE => match decode_vote_request_packet(&engine, slice) {
-                    Ok((bytes_used, response)) => {
-                        consumed += bytes_used;
-                        let _ = socket.write_all(&response).await;
-                    }
-                    Err(PacketError::NeedMoreData) => break,
-                    Err(PacketError::Fatal(msg)) => {
-                        tracing::warn!("Malformed VoteRequest from {}: {}", peer_addr, msg);
-                        return;
-                    }
-                },
-
-                // Client wire protocol commands (0x01..0x0A)
-                _ => {
-                    match WireRequest::decode_framed(slice) {
-                        Ok((req, framing, bytes_used)) => {
-                            // Produce Forwarding: if this node is not the leader for the target
-                            // partition, transparently proxy the raw request bytes to the actual
-                            // partition leader broker and relay its response, rather than making
-                            // the client discover the leader itself.  This restores Kafka's
-                            // "connect to any broker" client experience for non-leader brokers.
-                            //
-                            // IMPORTANT: this must check *partition*-level leadership
-                            // (`is_partition_leader`), not cluster-level Raft leadership
-                            // (`engine.is_leader()`).  A node can be a Raft Follower yet still be
-                            // the assigned leader for a specific partition under KIP-392-style
-                            // per-partition leader assignment; forwarding based on Raft role alone
-                            // would incorrectly proxy those produces away from the correct broker.
-                            let target_partition = match &req.payload {
-                                RequestPayload::ProduceBatch {
-                                    topic,
-                                    key,
-                                    num_partitions,
-                                    ..
-                                } => Some((
-                                    topic.clone(),
-                                    if !key.is_empty() && *num_partitions > 0 {
-                                        crate::server::hash_key(
-                                            key.as_bytes(),
-                                            *num_partitions as usize,
-                                        )
-                                    } else {
-                                        0
-                                    },
-                                )),
-                                _ => None,
-                            };
-
-                            // Controller-mutation Forwarding: these requests write to
-                            // `__cluster_metadata` via `propose_metadata`, which only the
-                            // cluster (Raft) leader may do. Forward to it transparently —
-                            // same "connect to any broker" reasoning as produce forwarding
-                            // above, but keyed on cluster leadership rather than partition
-                            // leadership since there's a single controller, not one per
-                            // partition.
-                            let is_controller_mutation = matches!(
-                                &req.payload,
-                                RequestPayload::CreateTopic { .. }
-                                    | RequestPayload::DeleteTopic { .. }
-                                    | RequestPayload::RegisterBroker { .. }
-                                    | RequestPayload::UnregisterBroker { .. }
-                                    | RequestPayload::CreateAcls { .. }
-                                    | RequestPayload::DeleteAcls { .. }
-                                    | RequestPayload::UpsertScramUser { .. }
-                                    | RequestPayload::DeleteScramUser { .. }
-                                    | RequestPayload::AlterConfigs { .. }
-                                    | RequestPayload::IncrementalAlterConfigs { .. }
-                            );
-
-                            // Controller-mediated topic creation, deliberately *before* the
-                            // leadership check below.
-                            //
-                            // A produce naming an unregistered topic used to create a local
-                            // partition directory on whichever broker caught the request,
-                            // with no metadata record — so cluster metadata never learned
-                            // the partition existed, no follower knew to replicate it, and
-                            // neither ISR management nor failover had anything to work with.
-                            //
-                            // Creating it here means replicas are assigned before the
-                            // partition holds a single byte, and the existing forwarding
-                            // logic below then routes the produce to the assigned leader
-                            // like any other partition. Non-controllers skip this and
-                            // forward to the controller instead (see `is_partition_leader`).
-                            if let Some((topic, _)) = &target_partition {
-                                if engine.is_leader() && !engine.topic_is_registered(topic) {
-                                    let partitions = match &req.payload {
-                                        RequestPayload::ProduceBatch { num_partitions, .. } => {
-                                            *num_partitions
-                                        }
-                                        _ => 1,
-                                    };
-                                    if let Err(e) =
-                                        engine.ensure_topic_created(topic, partitions).await
-                                    {
-                                        tracing::debug!(
-                                            "Auto-create: could not create topic '{}': {}",
-                                            topic,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            // A request another broker relayed to us is served here, never
-                            // relayed again. The sender already decided we are the right
-                            // destination; bouncing it back is how the two brokers end up
-                            // ping-ponging a request that neither will serve — which is
-                            // exactly what happens when the assigned leader has not yet
-                            // received its assignment through the metadata log.
-                            if let Some((topic, partition)) = target_partition {
-                                if !framing.is_forwarded()
-                                    && !engine.is_partition_leader(&topic, partition)
-                                {
-                                    // Marked as forwarded so the receiving broker serves it rather than
-                                    // relaying it onward — see `tags::FORWARDED`. Falls back to
-                                    // the raw bytes if the request cannot be rewrapped, which
-                                    // preserves the previous behavior rather than dropping it.
-                                    let raw_request =
-                                        crate::protocol::wire::wrap_forwarded_request(
-                                            &slice[..bytes_used],
-                                        )
-                                        .unwrap_or_else(|_| slice[..bytes_used].to_vec());
-                                    consumed += bytes_used;
-
-                                    // Prefer the actual assigned leader for this partition; fall
-                                    // back to the cluster Raft leader address if the partition
-                                    // leader's broker address isn't known (e.g. not yet announced).
-                                    let target_addr = engine
-                                        .partition_leader_id(&topic, partition)
-                                        .and_then(|leader_id| engine.get_broker_address(leader_id))
-                                        .or_else(|| engine.leader_addr());
-
-                                    let response_bytes = match target_addr {
-                                        Some(leader) => {
-                                            tracing::info!(
-                                                "Produce Forwarding: Proxying produce from {} to partition leader at {}",
-                                                peer_addr,
-                                                leader
-                                            );
-                                            match forward_to_leader(
-                                                &leader,
-                                                &raw_request,
-                                                engine.config().auth_token.as_deref(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(bytes) => {
-                                                    // The relay hop is always framed (it
-                                                    // carries the forwarded marker); the
-                                                    // client may not be.
-                                                    crate::protocol::wire::relay_response(
-                                                        &bytes, &framing,
-                                                    )
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Produce Forwarding: Failed to forward to leader {}: {}",
-                                                        leader,
-                                                        e
-                                                    );
-                                                    WireResponse::error(&format!(
-                                                        "Failed to forward produce to leader: {}",
-                                                        e
-                                                    ))
-                                                    .encode_framed(&framing)
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            tracing::warn!(
-                                                "Produce Forwarding: No leader known yet, rejecting produce from {}",
-                                                peer_addr
-                                            );
-                                            WireResponse::error(
-                                                "NOT_LEADER: No leader elected for this partition. Retry later."
-                                            ).encode_framed(&framing)
-                                        }
-                                    };
-
-                                    if let Err(e) = socket.write_all(&response_bytes).await {
-                                        tracing::error!(
-                                            "Failed to relay leader response to {}: {}",
-                                            peer_addr,
-                                            e
-                                        );
-                                        return;
-                                    }
-                                } else {
-                                    consumed += bytes_used;
-                                    let response = process_request(
-                                        &engine,
-                                        req,
-                                        &client_key,
-                                        &mut client_principal,
-                                        &client_key,
-                                        &mut logical_client_id,
-                                        &mut scram_session,
-                                        &mut negotiated_scram_mechanism,
-                                        &mut negotiated_scram_is_plus,
-                                        &framing,
-                                    )
-                                    .await;
-                                    response_scratch.clear();
-                                    response.encode_framed_into(&framing, &mut response_scratch);
-                                    if let Err(e) = socket.write_all(&response_scratch).await {
-                                        tracing::error!(
-                                            "Failed to send response to {}: {}",
-                                            peer_addr,
-                                            e
-                                        );
-                                        return;
-                                    }
-                                }
-                            } else if is_controller_mutation
-                                && !engine.is_leader()
-                                && !framing.is_forwarded()
-                            {
-                                // Marked as forwarded so the receiving broker serves it rather than
-                                // relaying it onward — see `tags::FORWARDED`. Falls back to
-                                // the raw bytes if the request cannot be rewrapped, which
-                                // preserves the previous behavior rather than dropping it.
-                                let raw_request = crate::protocol::wire::wrap_forwarded_request(
-                                    &slice[..bytes_used],
-                                )
-                                .unwrap_or_else(|_| slice[..bytes_used].to_vec());
-                                consumed += bytes_used;
-
-                                let response_bytes = match engine.leader_addr() {
-                                    Some(leader) => {
-                                        tracing::info!(
-                                            "Controller Forwarding: Proxying request from {} to cluster leader at {}",
-                                            peer_addr,
-                                            leader
-                                        );
-                                        match forward_to_leader(
-                                            &leader,
-                                            &raw_request,
-                                            engine.config().auth_token.as_deref(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(bytes) => crate::protocol::wire::relay_response(
-                                                &bytes, &framing,
-                                            ),
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Controller Forwarding: Failed to forward to leader {}: {}",
-                                                    leader,
-                                                    e
-                                                );
-                                                WireResponse::error(&format!(
-                                                    "Failed to forward request to cluster leader: {}",
-                                                    e
-                                                ))
-                                                .encode_framed(&framing)
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            "Controller Forwarding: No cluster leader known yet, rejecting request from {}",
-                                            peer_addr
-                                        );
-                                        WireResponse::error(
-                                            "NOT_CONTROLLER: No cluster leader elected. Retry later.",
-                                        )
-                                        .encode_framed(&framing)
-                                    }
-                                };
-
-                                if let Err(e) = socket.write_all(&response_bytes).await {
+            // Every inter-node frame — replication push, heartbeat, vote request, and
+            // the follower pull fetch — arrives under one versioned, length-delimited
+            // envelope (issue #48, see `replication::envelope`). Five hand-rolled
+            // magic-byte formats used to be dispatched here, each parsed by reading fields
+            // until the decoder ran out of ones it knew about; a length now says where the
+            // frame ends, so this loop can advance past a frame it could not act on
+            // instead of losing sync with the peer.
+            if slice[0] == crate::replication::INTER_NODE_MAGIC {
+                match crate::replication::decode_frame(slice) {
+                    Ok(frame) => {
+                        let response = handle_inter_node_frame(&engine, &frame);
+                        // The cursor advances by the frame's own declared length, whatever
+                        // the outcome — including a frame this build could not serve.
+                        consumed += frame.total_len;
+                        match response {
+                            Ok(bytes) => {
+                                if let Err(e) = socket.write_all(&bytes).await {
                                     tracing::error!(
-                                        "Failed to relay leader response to {}: {}",
+                                        "Failed to send {:?} reply to {}: {}",
+                                        frame.frame_type,
                                         peer_addr,
                                         e
                                     );
                                     return;
                                 }
-                            } else {
-                                consumed += bytes_used;
+                            }
+                            Err(PacketError(msg)) => {
+                                tracing::warn!(
+                                    "Rejected {:?} frame from {}: {}",
+                                    frame.frame_type,
+                                    peer_addr,
+                                    msg
+                                );
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(crate::replication::EnvelopeError::Incomplete { .. }) => break,
+                    Err(e) => {
+                        tracing::warn!("Malformed inter-node frame from {}: {}", peer_addr, e);
+                        return;
+                    }
+                }
+            }
 
-                                // Zero-copy fast path: a `Fetch` on a plain (non-TLS) TCP
-                                // connection can be served by streaming the entry bytes
-                                // straight from the segment file to the socket via the
-                                // kernel (`sendfile`/`TransmitFile`), instead of
-                                // `process_request` reading them into a Vec and copying
-                                // them through the response buffer. The response bytes are
-                                // identical either way (see `try_zero_copy_fetch`).
-                                //
-                                // Any ineligible case — TLS, a request that needs to wait
-                                // for data, an unsupported OS, nothing to send — falls
-                                // straight through to the buffered handling below. This is
-                                // purely an optimization, never a behavior change.
-                                let mut zero_copy_handled = false;
-                                #[cfg(any(windows, target_os = "linux"))]
-                                if let RequestPayload::Fetch {
+            // Everything else is the client wire protocol (`protocol::wire`), which
+            // carries its own framing and its own version envelope.
+            match WireRequest::decode_framed(slice) {
+                Ok((req, framing, bytes_used)) => {
+                    // Produce Forwarding: if this node is not the leader for the target
+                    // partition, transparently proxy the raw request bytes to the actual
+                    // partition leader broker and relay its response, rather than making
+                    // the client discover the leader itself.  This restores Kafka's
+                    // "connect to any broker" client experience for non-leader brokers.
+                    //
+                    // IMPORTANT: this must check *partition*-level leadership
+                    // (`is_partition_leader`), not cluster-level Raft leadership
+                    // (`engine.is_leader()`).  A node can be a Raft Follower yet still be
+                    // the assigned leader for a specific partition under KIP-392-style
+                    // per-partition leader assignment; forwarding based on Raft role alone
+                    // would incorrectly proxy those produces away from the correct broker.
+                    let target_partition = match &req.payload {
+                        RequestPayload::ProduceBatch {
+                            topic,
+                            key,
+                            num_partitions,
+                            ..
+                        } => Some((
+                            topic.clone(),
+                            if !key.is_empty() && *num_partitions > 0 {
+                                crate::server::hash_key(key.as_bytes(), *num_partitions as usize)
+                            } else {
+                                0
+                            },
+                        )),
+                        _ => None,
+                    };
+
+                    // Controller-mutation Forwarding: these requests write to
+                    // `__cluster_metadata` via `propose_metadata`, which only the
+                    // cluster (Raft) leader may do. Forward to it transparently —
+                    // same "connect to any broker" reasoning as produce forwarding
+                    // above, but keyed on cluster leadership rather than partition
+                    // leadership since there's a single controller, not one per
+                    // partition.
+                    let is_controller_mutation = matches!(
+                        &req.payload,
+                        RequestPayload::CreateTopic { .. }
+                            | RequestPayload::DeleteTopic { .. }
+                            | RequestPayload::RegisterBroker { .. }
+                            | RequestPayload::UnregisterBroker { .. }
+                            | RequestPayload::CreateAcls { .. }
+                            | RequestPayload::DeleteAcls { .. }
+                            | RequestPayload::UpsertScramUser { .. }
+                            | RequestPayload::DeleteScramUser { .. }
+                            | RequestPayload::AlterConfigs { .. }
+                            | RequestPayload::IncrementalAlterConfigs { .. }
+                    );
+
+                    // Controller-mediated topic creation, deliberately *before* the
+                    // leadership check below.
+                    //
+                    // A produce naming an unregistered topic used to create a local
+                    // partition directory on whichever broker caught the request,
+                    // with no metadata record — so cluster metadata never learned
+                    // the partition existed, no follower knew to replicate it, and
+                    // neither ISR management nor failover had anything to work with.
+                    //
+                    // Creating it here means replicas are assigned before the
+                    // partition holds a single byte, and the existing forwarding
+                    // logic below then routes the produce to the assigned leader
+                    // like any other partition. Non-controllers skip this and
+                    // forward to the controller instead (see `is_partition_leader`).
+                    if let Some((topic, _)) = &target_partition {
+                        if engine.is_leader() && !engine.topic_is_registered(topic) {
+                            let partitions = match &req.payload {
+                                RequestPayload::ProduceBatch { num_partitions, .. } => {
+                                    *num_partitions
+                                }
+                                _ => 1,
+                            };
+                            if let Err(e) = engine.ensure_topic_created(topic, partitions).await {
+                                tracing::debug!(
+                                    "Auto-create: could not create topic '{}': {}",
                                     topic,
-                                    partition,
-                                    offset,
-                                    max_bytes,
-                                } = &req.payload
-                                {
-                                    if let Some(raw_socket) = socket.as_plain_tcp_stream() {
-                                        match try_zero_copy_fetch(
-                                            &engine,
-                                            raw_socket,
-                                            topic,
-                                            *partition,
-                                            *offset,
-                                            *max_bytes,
-                                            &client_principal,
-                                            &client_key,
-                                            &logical_client_id,
-                                            &framing,
-                                        )
-                                        .await
-                                        {
-                                            Ok(true) => zero_copy_handled = true,
-                                            Ok(false) => {}
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Zero-copy fetch transmit failed for {}: {}",
-                                                    peer_addr,
-                                                    e
-                                                );
-                                                return;
-                                            }
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // A request another broker relayed to us is served here, never
+                    // relayed again. The sender already decided we are the right
+                    // destination; bouncing it back is how the two brokers end up
+                    // ping-ponging a request that neither will serve — which is
+                    // exactly what happens when the assigned leader has not yet
+                    // received its assignment through the metadata log.
+                    if let Some((topic, partition)) = target_partition {
+                        if !framing.is_forwarded() && !engine.is_partition_leader(&topic, partition)
+                        {
+                            // Marked as forwarded so the receiving broker serves it rather than
+                            // relaying it onward — see `tags::FORWARDED`. Falls back to
+                            // the raw bytes if the request cannot be rewrapped, which
+                            // preserves the previous behavior rather than dropping it.
+                            let raw_request =
+                                crate::protocol::wire::wrap_forwarded_request(&slice[..bytes_used])
+                                    .unwrap_or_else(|_| slice[..bytes_used].to_vec());
+                            consumed += bytes_used;
+
+                            // Prefer the actual assigned leader for this partition; fall
+                            // back to the cluster Raft leader address if the partition
+                            // leader's broker address isn't known (e.g. not yet announced).
+                            let target_addr = engine
+                                .partition_leader_id(&topic, partition)
+                                .and_then(|leader_id| engine.get_broker_address(leader_id))
+                                .or_else(|| engine.leader_addr());
+
+                            let response_bytes = match target_addr {
+                                Some(leader) => {
+                                    tracing::info!(
+                                        "Produce Forwarding: Proxying produce from {} to partition leader at {}",
+                                        peer_addr,
+                                        leader
+                                    );
+                                    match forward_to_leader(
+                                        &leader,
+                                        &raw_request,
+                                        engine.config().auth_token.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(bytes) => {
+                                            // The relay hop is always framed (it
+                                            // carries the forwarded marker); the
+                                            // client may not be.
+                                            crate::protocol::wire::relay_response(&bytes, &framing)
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Produce Forwarding: Failed to forward to leader {}: {}",
+                                                leader,
+                                                e
+                                            );
+                                            WireResponse::error(&format!(
+                                                "Failed to forward produce to leader: {}",
+                                                e
+                                            ))
+                                            .encode_framed(&framing)
                                         }
                                     }
                                 }
+                                None => {
+                                    tracing::warn!(
+                                        "Produce Forwarding: No leader known yet, rejecting produce from {}",
+                                        peer_addr
+                                    );
+                                    WireResponse::error(
+                                        "NOT_LEADER: No leader elected for this partition. Retry later."
+                                    ).encode_framed(&framing)
+                                }
+                            };
 
-                                if !zero_copy_handled {
-                                    let response = process_request(
-                                        &engine,
-                                        req,
-                                        &client_key,
-                                        &mut client_principal,
-                                        &client_key,
-                                        &mut logical_client_id,
-                                        &mut scram_session,
-                                        &mut negotiated_scram_mechanism,
-                                        &mut negotiated_scram_is_plus,
-                                        &framing,
-                                    )
-                                    .await;
-                                    response_scratch.clear();
-                                    response.encode_framed_into(&framing, &mut response_scratch);
-                                    if let Err(e) = socket.write_all(&response_scratch).await {
+                            if let Err(e) = socket.write_all(&response_bytes).await {
+                                tracing::error!(
+                                    "Failed to relay leader response to {}: {}",
+                                    peer_addr,
+                                    e
+                                );
+                                return;
+                            }
+                        } else {
+                            consumed += bytes_used;
+                            let response = process_request(
+                                &engine,
+                                req,
+                                &client_key,
+                                &mut client_principal,
+                                &client_key,
+                                &mut logical_client_id,
+                                &mut scram_session,
+                                &mut negotiated_scram_mechanism,
+                                &mut negotiated_scram_is_plus,
+                                &framing,
+                            )
+                            .await;
+                            response_scratch.clear();
+                            response.encode_framed_into(&framing, &mut response_scratch);
+                            if let Err(e) = socket.write_all(&response_scratch).await {
+                                tracing::error!("Failed to send response to {}: {}", peer_addr, e);
+                                return;
+                            }
+                        }
+                    } else if is_controller_mutation
+                        && !engine.is_leader()
+                        && !framing.is_forwarded()
+                    {
+                        // Marked as forwarded so the receiving broker serves it rather than
+                        // relaying it onward — see `tags::FORWARDED`. Falls back to
+                        // the raw bytes if the request cannot be rewrapped, which
+                        // preserves the previous behavior rather than dropping it.
+                        let raw_request =
+                            crate::protocol::wire::wrap_forwarded_request(&slice[..bytes_used])
+                                .unwrap_or_else(|_| slice[..bytes_used].to_vec());
+                        consumed += bytes_used;
+
+                        let response_bytes = match engine.leader_addr() {
+                            Some(leader) => {
+                                tracing::info!(
+                                    "Controller Forwarding: Proxying request from {} to cluster leader at {}",
+                                    peer_addr,
+                                    leader
+                                );
+                                match forward_to_leader(
+                                    &leader,
+                                    &raw_request,
+                                    engine.config().auth_token.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => {
+                                        crate::protocol::wire::relay_response(&bytes, &framing)
+                                    }
+                                    Err(e) => {
                                         tracing::error!(
-                                            "Failed to send response to {}: {}",
+                                            "Controller Forwarding: Failed to forward to leader {}: {}",
+                                            leader,
+                                            e
+                                        );
+                                        WireResponse::error(&format!(
+                                            "Failed to forward request to cluster leader: {}",
+                                            e
+                                        ))
+                                        .encode_framed(&framing)
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "Controller Forwarding: No cluster leader known yet, rejecting request from {}",
+                                    peer_addr
+                                );
+                                WireResponse::error(
+                                    "NOT_CONTROLLER: No cluster leader elected. Retry later.",
+                                )
+                                .encode_framed(&framing)
+                            }
+                        };
+
+                        if let Err(e) = socket.write_all(&response_bytes).await {
+                            tracing::error!(
+                                "Failed to relay leader response to {}: {}",
+                                peer_addr,
+                                e
+                            );
+                            return;
+                        }
+                    } else {
+                        consumed += bytes_used;
+
+                        // Zero-copy fast path: a `Fetch` on a plain (non-TLS) TCP
+                        // connection can be served by streaming the entry bytes
+                        // straight from the segment file to the socket via the
+                        // kernel (`sendfile`/`TransmitFile`), instead of
+                        // `process_request` reading them into a Vec and copying
+                        // them through the response buffer. The response bytes are
+                        // identical either way (see `try_zero_copy_fetch`).
+                        //
+                        // Any ineligible case — TLS, a request that needs to wait
+                        // for data, an unsupported OS, nothing to send — falls
+                        // straight through to the buffered handling below. This is
+                        // purely an optimization, never a behavior change.
+                        let mut zero_copy_handled = false;
+                        #[cfg(any(windows, target_os = "linux"))]
+                        if let RequestPayload::Fetch {
+                            topic,
+                            partition,
+                            offset,
+                            max_bytes,
+                        } = &req.payload
+                        {
+                            if let Some(raw_socket) = socket.as_plain_tcp_stream() {
+                                match try_zero_copy_fetch(
+                                    &engine,
+                                    raw_socket,
+                                    topic,
+                                    *partition,
+                                    *offset,
+                                    *max_bytes,
+                                    &client_principal,
+                                    &client_key,
+                                    &logical_client_id,
+                                    &framing,
+                                )
+                                .await
+                                {
+                                    Ok(true) => zero_copy_handled = true,
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Zero-copy fetch transmit failed for {}: {}",
                                             peer_addr,
                                             e
                                         );
@@ -612,14 +539,36 @@ where
                                 }
                             }
                         }
-                        Err(WireError::Incomplete { .. }) => break,
-                        Err(err) => {
-                            tracing::warn!("Protocol error from {}: {}", peer_addr, err);
-                            let resp = WireResponse::error(&format!("Protocol Error: {}", err));
-                            let _ = socket.write_all(&resp.encode()).await;
-                            return;
+
+                        if !zero_copy_handled {
+                            let response = process_request(
+                                &engine,
+                                req,
+                                &client_key,
+                                &mut client_principal,
+                                &client_key,
+                                &mut logical_client_id,
+                                &mut scram_session,
+                                &mut negotiated_scram_mechanism,
+                                &mut negotiated_scram_is_plus,
+                                &framing,
+                            )
+                            .await;
+                            response_scratch.clear();
+                            response.encode_framed_into(&framing, &mut response_scratch);
+                            if let Err(e) = socket.write_all(&response_scratch).await {
+                                tracing::error!("Failed to send response to {}: {}", peer_addr, e);
+                                return;
+                            }
                         }
                     }
+                }
+                Err(WireError::Incomplete { .. }) => break,
+                Err(err) => {
+                    tracing::warn!("Protocol error from {}: {}", peer_addr, err);
+                    let resp = WireResponse::error(&format!("Protocol Error: {}", err));
+                    let _ = socket.write_all(&resp.encode()).await;
+                    return;
                 }
             }
         }
@@ -773,18 +722,123 @@ async fn forward_to_leader(
 
     Ok(response)
 }
-
-/// Internal error type for packet decoding
+/// A frame this node will not serve, with the reason.
+///
+/// Always terminal. There is deliberately no "need more data" outcome any more: the
+/// envelope guarantees a whole frame arrived before a payload is ever looked at, so a
+/// payload that runs short is malformed rather than partial. That distinction used to be
+/// every inter-node decoder's hardest job — misjudging it either dropped a healthy peer or
+/// re-applied a batch that had already been written — and it is now unrepresentable.
 #[derive(Debug)]
-enum PacketError {
-    NeedMoreData,
-    Fatal(String),
+struct PacketError(String);
+
+impl PacketError {
+    fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
 }
 
-/// Decodes a Raft VoteRequest RPC packet (0xAE) from a candidate node.
+/// Routes one decoded inter-node frame to its handler and returns the reply frame to write
+/// back.
 ///
-/// Wire format: `[0xAE] [cluster_id: pascal] [candidate_id: 4b] [term: 8b] [candidate_last_log_index: 8b]`
-/// Response:    `[0x01]` = vote granted, `[0x00]` = vote denied.
+/// Response frame types never appear here — a peer that sends one on a connection where a
+/// request is expected is confused, and saying so is better than parsing it as whatever
+/// request happened to share its shape.
+fn handle_inter_node_frame(
+    engine: &StorageEngine,
+    frame: &crate::replication::InterNodeFrame<'_>,
+) -> Result<Vec<u8>, PacketError> {
+    use crate::replication::FrameType;
+    match frame.frame_type {
+        FrameType::ReplicationPush => handle_replication_push(engine, frame.payload),
+        FrameType::Heartbeat => handle_heartbeat(engine, frame.payload),
+        FrameType::VoteRequest => handle_vote_request(engine, frame.payload),
+        FrameType::ReplicationFetch => handle_replication_fetch(engine, frame.payload),
+        FrameType::ReplicationPushAck
+        | FrameType::HeartbeatAck
+        | FrameType::VoteResponse
+        | FrameType::ReplicationFetchResponse => Err(PacketError::new(format!(
+            "received {:?}, which is a reply and never a request",
+            frame.frame_type
+        ))),
+    }
+}
+
+/// Reads fields out of an inter-node frame payload, checking each has actually arrived
+/// before reading it.
+///
+/// Every field a peer sends is length- or bounds-checked here rather than trusted: a
+/// truncated, corrupt, or hostile payload must produce a clean rejection, never a panic or
+/// an unbounded allocation. This exists as one reader because the alternative — each frame
+/// decoder open-coding its own `if src.len() < n` ladder — is where a missed check hides.
+///
+/// Unlike the pre-envelope decoders, running short here is always fatal and never "read
+/// more": the envelope already guaranteed the whole frame arrived, so a payload that ends
+/// early is a malformed frame, not a partial one.
+struct PayloadReader<'a> {
+    cursor: &'a [u8],
+    frame: &'static str,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(payload: &'a [u8], frame: &'static str) -> Self {
+        Self {
+            cursor: payload,
+            frame,
+        }
+    }
+
+    fn short(&self, field: &str) -> PacketError {
+        PacketError::new(format!(
+            "{} frame ended before its {} field",
+            self.frame, field
+        ))
+    }
+
+    fn take(&mut self, n: usize, field: &str) -> Result<&'a [u8], PacketError> {
+        if self.cursor.len() < n {
+            return Err(self.short(field));
+        }
+        let (head, tail) = self.cursor.split_at(n);
+        self.cursor = tail;
+        Ok(head)
+    }
+
+    fn u16(&mut self, field: &str) -> Result<u16, PacketError> {
+        Ok(u16::from_be_bytes(self.take(2, field)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self, field: &str) -> Result<u32, PacketError> {
+        Ok(u32::from_be_bytes(self.take(4, field)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self, field: &str) -> Result<u64, PacketError> {
+        Ok(u64::from_be_bytes(self.take(8, field)?.try_into().unwrap()))
+    }
+
+    /// A `[len: 2b][bytes]` string, capped and strictly UTF-8 validated.
+    ///
+    /// Strict rather than lossy on purpose: `from_utf8_lossy` would replace invalid bytes
+    /// with U+FFFD, which means two different byte sequences can produce the same string —
+    /// so a crafted cluster_id could be made to compare equal to the real one. The cap is
+    /// checked before any allocation, so a claimed length cannot itself be the attack.
+    fn pascal_string(&mut self, max_len: usize, field: &str) -> Result<String, PacketError> {
+        let len = self.u16(field)? as usize;
+        if len > max_len {
+            return Err(PacketError::new(format!(
+                "{} frame's {} length {} exceeds the {} byte maximum",
+                self.frame, field, len, max_len
+            )));
+        }
+        let bytes = self.take(len, field)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| {
+            PacketError::new(format!("Invalid UTF-8 in {} frame's {}", self.frame, field))
+        })
+    }
+}
+
+/// Serves a [`FrameType::VoteRequest`] from a Raft candidate, returning the encoded
+/// [`FrameType::VoteResponse`].
 ///
 /// Grant rules (Raft):
 ///   - The incoming cluster_id must match ours (CRIT-02: prevents external term manipulation).
@@ -795,52 +849,15 @@ enum PacketError {
 ///     silently roll back topics/ACLs/broker registrations that only we (and possibly
 ///     other followers) know about.
 ///   - We haven't already voted for someone else in this term.
-fn decode_vote_request_packet(
-    engine: &StorageEngine,
-    mut src: &[u8],
-) -> Result<(usize, Vec<u8>), PacketError> {
-    let original_len = src.len();
+fn handle_vote_request(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>, PacketError> {
+    let mut reader = PayloadReader::new(payload, "VoteRequest");
+    let incoming_cluster_id = reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster_id")?;
+    let candidate_id = reader.u32("candidate_id")?;
+    let term = reader.u64("term")?;
+    let candidate_last_log_index = reader.u64("candidate_last_log_index")?;
 
-    // Minimum: magic(1) + cid_len(2)
-    if src.len() < 3 {
-        return Err(PacketError::NeedMoreData);
-    }
-    src.get_u8(); // 0xAE
+    let deny = || Ok(crate::replication::encode_vote_response(false));
 
-    let cid_len = src.get_u16() as usize;
-
-    // CRIT-02: Cap cluster_id length to prevent heap pressure from malicious packets.
-    if cid_len > MAX_CLUSTER_ID_LEN {
-        tracing::warn!(
-            "VoteRequest: Rejected — cluster_id length {} exceeds maximum {}",
-            cid_len,
-            MAX_CLUSTER_ID_LEN
-        );
-        return Err(PacketError::Fatal(
-            "cluster_id too long in VoteRequest".to_string(),
-        ));
-    }
-
-    if src.len() < cid_len + 4 + 8 + 8 {
-        return Err(PacketError::NeedMoreData);
-    }
-
-    // CRIT-02: Use from_utf8 (not lossy) so crafted invalid-UTF-8 cannot spoof a valid cluster_id.
-    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            tracing::warn!("VoteRequest: Rejected — cluster_id contains invalid UTF-8");
-            return Err(PacketError::Fatal(
-                "Invalid UTF-8 in cluster_id".to_string(),
-            ));
-        }
-    };
-    src = &src[cid_len..];
-    let candidate_id = src.get_u32();
-    let term = src.get_u64();
-    let candidate_last_log_index = src.get_u64();
-
-    let bytes_consumed = original_len - src.len();
     let local_cluster = &engine.config().cluster_id;
     let our_epoch = engine.replication().get_epoch();
 
@@ -851,7 +868,7 @@ fn decode_vote_request_packet(
             incoming_cluster_id,
             local_cluster
         );
-        return Ok((bytes_consumed, vec![0x00]));
+        return deny();
     }
 
     // C2: In standalone mode (no peers configured) this node is not part of a multi-node
@@ -861,7 +878,7 @@ fn decode_vote_request_packet(
             "VoteRequest: Rejected — standalone mode, candidate {} denied",
             candidate_id
         );
-        return Ok((bytes_consumed, vec![0x00]));
+        return deny();
     }
 
     // A broker-only node is never part of the metadata Raft quorum — it must not grant
@@ -874,7 +891,7 @@ fn decode_vote_request_packet(
             "VoteRequest: Rejected — this node has no Controller role, candidate {} denied",
             candidate_id
         );
-        return Ok((bytes_consumed, vec![0x00]));
+        return deny();
     }
 
     // §5.4.1: our own last-applied `__cluster_metadata` index is the log-completeness
@@ -901,7 +918,7 @@ fn decode_vote_request_packet(
             term,
             our_epoch
         );
-        Ok((bytes_consumed, vec![0x01]))
+        Ok(crate::replication::encode_vote_response(true))
     } else {
         tracing::info!(
             "VoteRequest: DENIED — candidate {} term {} (our epoch: {}, our last_log_index: {}, candidate last_log_index: {}, log_ok: {})",
@@ -912,38 +929,18 @@ fn decode_vote_request_packet(
             candidate_last_log_index,
             log_ok
         );
-        Ok((bytes_consumed, vec![0x00]))
+        deny()
     }
 }
 
-/// Decodes and serves a Kafka-style follower pull/FETCH request (gRPC magic `0xBB`).
-///
-/// This is the leader side of `start_per_partition_fetcher_manager`'s per-partition fetch
-/// loop: a follower asks for everything from `fetch_offset` onward, and receives raw
-/// frames up to the partition's log end offset (LEO) — *not* clamped to the committed high
-/// watermark, since replication delivery is what lets the high watermark advance in the
-/// first place; clamping here would deadlock it.
-///
-/// Every successful fetch also records the follower's confirmed progress into the exact
-/// same `replica_watermarks`/`replica_ack_time` maps `replicate_batch`'s push-ack path
-/// updates (`ReplicationManager::update_replica_watermark`) — `await_isr_quorum` and the
-/// ISR-membership sweep read those maps and need no changes regardless of which mechanism
-/// is actually delivering the data.
-fn decode_grpc_replication_fetch_packet(
+/// Serves a [`FrameType::ReplicationFetch`] — a follower pulling from its leader,
+/// Kafka-style — returning the encoded [`FrameType::ReplicationFetchResponse`].
+fn handle_replication_fetch(
     engine: &StorageEngine,
-    src: &[u8],
-) -> Result<(usize, Vec<u8>), PacketError> {
-    if src.len() < 4 {
-        return Err(PacketError::NeedMoreData);
-    }
-    let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
-    if src.len() < 4 + payload_len {
-        return Err(PacketError::NeedMoreData);
-    }
-
-    let (req, _) = crate::replication::ReplicationFetchRequest::decode(&src[4..4 + payload_len])
-        .map_err(|_| PacketError::Fatal("Invalid gRPC replication fetch request".to_string()))?;
-    let bytes_consumed = 4 + payload_len;
+    payload: &[u8],
+) -> Result<Vec<u8>, PacketError> {
+    let (req, _) = crate::replication::ReplicationFetchRequest::decode(payload)
+        .map_err(|_| PacketError::new("Invalid replication fetch request".to_string()))?;
 
     let response = if !engine.is_partition_leader(&req.topic, req.partition) {
         // Not this node's partition to serve — respond empty rather than erroring; the
@@ -992,57 +989,27 @@ fn decode_grpc_replication_fetch_packet(
         }
     };
 
-    let encoded = response.encode();
-    let mut framed = Vec::with_capacity(4 + encoded.len());
-    framed.put_u32(encoded.len() as u32);
-    framed.extend_from_slice(&encoded);
-
-    Ok((bytes_consumed, framed))
+    Ok(response.encode_frame())
 }
 
-/// Decodes and processes an inter-node replication packet (0xAA).
+/// Serves a [`FrameType::ReplicationPush`] from a leader, returning the encoded
+/// [`FrameType::ReplicationPushAck`].
 ///
-/// CRIT-01: Verifies cluster_id and epoch before accepting any replicated data.
-/// SEC-MED-05: Caps record count to prevent CPU-exhaustion loops.
-fn decode_replication_packet(
-    engine: &StorageEngine,
-    mut src: &[u8],
-) -> Result<(usize, Vec<u8>), PacketError> {
-    let original_len = src.len();
-
-    // Minimum header: magic(1) + cluster_id_len(2)
-    if src.len() < 3 {
-        return Err(PacketError::NeedMoreData);
-    }
-
-    src.get_u8(); // 0xAA
-
-    // CRIT-01: Read cluster_id prefix for authentication before touching any partition state.
-    let cid_len = src.get_u16() as usize;
-    if cid_len > MAX_CLUSTER_ID_LEN {
-        tracing::warn!(
-            "HA Replication: Rejected — cluster_id length {} exceeds maximum",
-            cid_len
-        );
-        return Err(PacketError::Fatal(
-            "cluster_id too long in replication packet".to_string(),
-        ));
-    }
-    if src.len() < cid_len {
-        return Err(PacketError::NeedMoreData);
-    }
-    // CRIT-01: Use from_utf8 (strict) so invalid UTF-8 cannot spoof a cluster_id.
-    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(PacketError::Fatal(
-                "Invalid UTF-8 in replication cluster_id".to_string(),
-            ))
-        }
-    };
-    src = &src[cid_len..];
-
-    // CRIT-01: Reject replication from any node whose cluster_id does not match ours.
+/// CRIT-01: verifies cluster_id and epoch before accepting any replicated data.
+///
+/// The envelope having already delimited the frame removes an entire class of hazard this
+/// decoder used to carry. It previously parsed straight off the connection buffer and
+/// could run out of bytes mid-batch, which meant it had to be careful never to write
+/// anything before the last entry had parsed — otherwise a batch split across TCP segments
+/// was replayed from the start on the next call and permanently duplicated in the log.
+/// Here the whole frame is present by construction, so short data is malformed, never
+/// partial. The parse-everything-then-write ordering is kept regardless: it is also what
+/// makes a batch all-or-nothing against a decode error partway through.
+fn handle_replication_push(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>, PacketError> {
+    let mut reader = PayloadReader::new(payload, "ReplicationPush");
+    // CRIT-01: cluster_id is the first field, so an unknown sender is rejected before any
+    // partition state is touched.
+    let incoming_cluster_id = reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster_id")?;
     let local_cluster = &engine.config().cluster_id;
     if &incoming_cluster_id != local_cluster {
         tracing::warn!(
@@ -1050,53 +1017,24 @@ fn decode_replication_packet(
             incoming_cluster_id,
             local_cluster
         );
-        return Err(PacketError::Fatal(
+        return Err(PacketError::new(
             "Replication cluster_id mismatch".to_string(),
         ));
     }
 
-    // Topic length and name
-    if src.len() < 2 {
-        return Err(PacketError::NeedMoreData);
-    }
-    let topic_len = src.get_u16() as usize;
-    if src.len() < topic_len + 4 + 8 + 4 {
-        // topic + partition(4) + epoch(8) + count(4)
-        return Err(PacketError::NeedMoreData);
-    }
-    // CRIT-01: Use strict UTF-8 for topic name too.
-    let topic = match String::from_utf8(src[..topic_len].to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(PacketError::Fatal(
-                "Invalid UTF-8 in replicated topic name".to_string(),
-            ))
-        }
+    let topic = reader.pascal_string(MAX_TOPIC_NAME_LEN, "topic")?;
+    let partition = reader.u32("partition")?;
+    let incoming_epoch = reader.u64("epoch")?;
+    // The leader's committed high watermark at push time (see `encode_replication_push`).
+    let leader_hw = reader.u64("leader_hw")?;
+    let entries_len = reader.u32("entries_len")? as usize;
+    let mut entry_bytes = reader.take(entries_len, "entry bytes")?;
+
+    let nack = || {
+        Ok(crate::replication::encode_replication_push_ack(
+            crate::replication::push_ack::NACK,
+        ))
     };
-    src = &src[topic_len..];
-
-    // Partition ID
-    let partition = src.get_u32();
-    // Epoch (term) from leader
-    let incoming_epoch = src.get_u64();
-    // Leader's committed high watermark at the time of this push (see
-    // `send_replication_push_pooled`).
-    let leader_hw = src.get_u64();
-    // Record count
-    let count = src.get_u32() as usize;
-
-    // SEC-MED-05: Cap count to prevent CPU-exhaustion via malicious large count with NeedMoreData drip.
-    if count > MAX_REPLICATION_BATCH_COUNT {
-        tracing::warn!(
-            "HA Replication: Rejected — record count {} exceeds maximum {}",
-            count,
-            MAX_REPLICATION_BATCH_COUNT
-        );
-        return Err(PacketError::Fatal(format!(
-            "Replication batch count {} too large",
-            count
-        )));
-    }
 
     // Epoch fencing. Which epoch is authoritative depends on what is being replicated
     // (see `ReplicationManager::replicate_batch`): the metadata log is fenced by the
@@ -1118,12 +1056,11 @@ fn decode_replication_packet(
             "HA Replication: Stale epoch {} (current {}) from leader for topic '{}' partition {} – rejecting",
             incoming_epoch, current_epoch, topic, partition
         );
-        // H5: Return a single-byte STALE_EPOCH sentinel (0x02) so the leader reads
-        // exactly 1 byte (matching its read_exact(&mut [0u8;1])) and can distinguish
-        // this from a generic NACK (0x01).  Previously returned 11-byte "STALE_EPOCH"
-        // literal which the leader read as 0x53 ('S') — a plain error, never triggering
-        // step-down.
-        return Ok((original_len - src.len(), vec![0x02]));
+        // A distinct status, not a generic NACK: it tells the sender it is no longer the
+        // leader and must step down, rather than to retry.
+        return Ok(crate::replication::encode_replication_push_ack(
+            crate::replication::push_ack::STALE_EPOCH,
+        ));
     }
     if incoming_epoch > current_epoch && is_cluster_meta_topic {
         // Only the controller term is adopted from the data path. A data partition's
@@ -1141,50 +1078,40 @@ fn decode_replication_packet(
         );
     }
 
-    let pm = engine
-        .get_or_create_partition(&topic, partition)
-        .map_err(|e| PacketError::Fatal(format!("Partition create error: {}", e)))?;
-
-    // C3: Two-pass replication decode — parse ALL frames before writing any.
-    // Previously, frames were written inside the parse loop.  If the TCP stream
-    // delivered the packet in multiple segments, NeedMoreData was returned mid-batch
-    // without advancing `consumed`, causing already-written frames to be replayed on
-    // the next call and permanently duplicated in the partition log.
+    // Parse every entry before writing any, so a decode failure partway through leaves the
+    // log untouched rather than half-applied.
     //
-    // Now: first pass collects frames (no writes); only after the entire batch is
-    // confirmed present do we commit writes.  NeedMoreData can therefore only be
-    // returned when zero bytes have been written.
-    //
-    // Frames are kept whole (not narrowed to just `.payload`) so the write pass can
-    // append them verbatim — preserving the leader's original offset/timestamp/magic/CRC
-    // instead of reassigning them locally, which is what previously let a replica's log
-    // diverge from its leader's.
-    let is_cluster_meta = topic == "__cluster_metadata";
-    // Entries, not frames: the log has one record format and a push carries whatever the
-    // leader stored, which for everything the broker writes itself is now a single-record
-    // batch.
-    let mut parsed_entries: Vec<crate::segment::LogEntry> = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        if src.len() < HEADER_SIZE {
-            return Err(PacketError::NeedMoreData);
+    // Entries are kept whole (not narrowed to their records) so the write pass can append
+    // them verbatim — preserving the leader's original offsets, timestamps and CRC instead
+    // of re-encoding them locally, which is what keeps a replica's log byte-identical to
+    // its leader's.
+    let mut parsed_entries: Vec<crate::segment::LogEntry> = Vec::new();
+    while !entry_bytes.is_empty() {
+        if parsed_entries.len() >= MAX_REPLICATION_BATCH_COUNT {
+            tracing::warn!(
+                "HA Replication: Rejected — entry count exceeds maximum {}",
+                MAX_REPLICATION_BATCH_COUNT
+            );
+            return Err(PacketError::new(
+                "Replication batch entry count too large".to_string(),
+            ));
         }
-        match crate::segment::decode_entry(src) {
-            Ok((entry, entry_bytes)) => {
-                src = &src[entry_bytes..];
+        match crate::segment::decode_entry(entry_bytes) {
+            Ok((entry, consumed)) => {
+                entry_bytes = &entry_bytes[consumed..];
                 parsed_entries.push(entry);
             }
-            Err(e) if e.is_buffer_too_short() => {
-                return Err(PacketError::NeedMoreData);
-            }
             Err(e) => {
-                return Err(PacketError::Fatal(format!("Entry decode error: {}", e)));
+                return Err(PacketError::new(format!("Entry decode error: {}", e)));
             }
         }
     }
+    let count = parsed_entries.len();
 
-    // All frames parsed — compute consumed bytes before the write pass.
-    let bytes_consumed = original_len - src.len();
+    let is_cluster_meta = is_cluster_meta_topic;
+    let pm = engine
+        .get_or_create_partition(&topic, partition)
+        .map_err(|e| PacketError::new(format!("Partition create error: {}", e)))?;
 
     // C1: Track write failures and NACK the leader so it can remove this node from ISR.
     // Previously, disk errors were logged and silently swallowed; the function returned
@@ -1318,14 +1245,15 @@ fn decode_replication_packet(
 
     if write_failed {
         // Signal NACK so the leader retries or removes this follower from ISR.
-        return Ok((bytes_consumed, vec![1u8]));
+        return nack();
     }
-    Ok((bytes_consumed, vec![0u8]))
+    Ok(crate::replication::encode_replication_push_ack(
+        crate::replication::push_ack::OK,
+    ))
 }
 
-/// Decodes and validates an inter-node heartbeat PING packet (0xAC).
-///
-/// P4 Wire format: `[0xAC] [cluster_id: pascal] [node_id: 4b] [term: 8b] [leader_bind_addr: pascal]`
+/// Serves a [`FrameType::Heartbeat`] from a peer, returning the encoded
+/// [`FrameType::HeartbeatAck`]. See `replication::encode_heartbeat` for the payload.
 ///
 /// Followers only reset the election timer if the heartbeat's term >= our current epoch.
 ///
@@ -1334,69 +1262,17 @@ fn decode_replication_packet(
 /// still requires leader_bind_addr to be one of those peers; an *empty* peer_addrs means
 /// no static allowlist was configured, so it's accepted (subject to the cluster_id and
 /// CRIT-03 checks) rather than rejecting every sender — see the inline comments below.
-fn decode_heartbeat_packet(
-    engine: &StorageEngine,
-    mut src: &[u8],
-) -> Result<(usize, Vec<u8>), PacketError> {
-    let original_len = src.len();
-
-    if src.len() < 3 {
-        return Err(PacketError::NeedMoreData);
-    }
-
-    src.get_u8(); // 0xAC
-
-    let cid_len = src.get_u16() as usize;
-
-    // CRIT-02/03: Cap cluster_id length.
-    if cid_len > MAX_CLUSTER_ID_LEN {
-        return Err(PacketError::Fatal(
-            "cluster_id too long in heartbeat".to_string(),
-        ));
-    }
-    if src.len() < cid_len + 4 + 8 {
-        // node_id(4) + term(8)
-        return Err(PacketError::NeedMoreData);
-    }
-
-    // CRIT-03: Use from_utf8 (strict) so crafted invalid-UTF-8 cannot spoof a cluster_id.
-    let incoming_cluster_id = match String::from_utf8(src[..cid_len].to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(PacketError::Fatal(
-                "Invalid UTF-8 in heartbeat cluster_id".to_string(),
-            ))
-        }
-    };
-    src = &src[cid_len..];
-    let peer_node_id = src.get_u32();
-    let incoming_term = src.get_u64();
-
-    // Parse leader bind address
-    if src.len() < 2 {
-        return Err(PacketError::NeedMoreData);
-    }
-    let addr_len = src.get_u16() as usize;
-    if addr_len > 256 {
-        return Err(PacketError::Fatal(
-            "leader_bind_addr too long in heartbeat".to_string(),
-        ));
-    }
-    if src.len() < addr_len {
-        return Err(PacketError::NeedMoreData);
-    }
-    let leader_bind_addr = match String::from_utf8(src[..addr_len].to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(PacketError::Fatal(
-                "Invalid UTF-8 in leader_bind_addr".to_string(),
-            ))
-        }
-    };
-    src = &src[addr_len..];
+fn handle_heartbeat(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>, PacketError> {
+    let mut reader = PayloadReader::new(payload, "Heartbeat");
+    let incoming_cluster_id = reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster_id")?;
+    let peer_node_id = reader.u32("node_id")?;
+    let incoming_term = reader.u64("term")?;
+    let leader_bind_addr = reader.pascal_string(MAX_BIND_ADDR_LEN, "leader_bind_addr")?;
 
     let local_cluster_id = &engine.config().cluster_id;
-    let bytes_consumed = original_len - src.len();
+    // A rejection carries no identity of ours — a peer we refuse learns nothing about this
+    // node beyond the refusal itself.
+    let reject = || Ok(crate::replication::encode_heartbeat_ack(1, 0, "", &[]));
 
     if incoming_cluster_id != *local_cluster_id {
         tracing::warn!(
@@ -1405,7 +1281,7 @@ fn decode_heartbeat_packet(
             local_cluster_id,
             incoming_cluster_id
         );
-        return Ok((bytes_consumed, vec![1u8]));
+        return reject();
     }
 
     // CRIT-03 / H6: leader_bind_addr must never equal this node's own advertised
@@ -1424,7 +1300,7 @@ fn decode_heartbeat_packet(
             leader_bind_addr,
             peer_node_id
         );
-        return Ok((bytes_consumed, vec![1u8]));
+        return reject();
     }
 
     // Issue #62: an empty `peer_addrs` means "no static peer allowlist configured", not
@@ -1444,7 +1320,7 @@ fn decode_heartbeat_packet(
             "HA Heartbeat: REJECTED — leader_bind_addr '{}' not in configured peer whitelist (Node {})",
             leader_bind_addr, peer_node_id
         );
-        return Ok((bytes_consumed, vec![1u8]));
+        return reject();
     }
 
     let our_epoch = engine.replication().get_epoch();
@@ -1486,14 +1362,12 @@ fn decode_heartbeat_packet(
     // latter is whatever was configured before the listener bound (often a wildcard host
     // or an ephemeral `:0` port), neither of which the Leader could ever dial back.
     let self_advertised_addr = engine.replication().advertised_addr();
-    let role_bytes = crate::config::roles_to_bytes(&engine.config().roles);
-    let mut ack = Vec::with_capacity(1 + 4 + 2 + self_advertised_addr.len() + 1 + role_bytes.len());
-    ack.put_u8(0u8);
-    ack.put_u32(engine.config().node_id);
-    crate::protocol::wire::write_pascal_string(&mut ack, &self_advertised_addr);
-    ack.put_u8(role_bytes.len() as u8);
-    ack.extend_from_slice(&role_bytes);
-    Ok((bytes_consumed, ack))
+    Ok(crate::replication::encode_heartbeat_ack(
+        0,
+        engine.config().node_id,
+        &self_advertised_addr,
+        &engine.config().roles,
+    ))
 }
 
 /// Attempts to serve a `Fetch` straight from the segment file to `socket` via the kernel
@@ -3250,13 +3124,17 @@ mod grpc_replication_fetch_tests {
     }
 
     /// Encodes a `ReplicationFetchRequest` the exact way `send_grpc_replication_fetch`
-    /// frames it on the wire: `[u32 total_len][0xBB ...]`.
+    /// puts it on the wire.
     fn frame_request(req: &ReplicationFetchRequest) -> Vec<u8> {
-        let payload = req.encode();
-        let mut framed = Vec::with_capacity(4 + payload.len());
-        framed.put_u32(payload.len() as u32);
-        framed.extend_from_slice(&payload);
-        framed
+        req.encode_frame()
+    }
+
+    /// Runs a framed request through the same dispatch a real connection would, so these
+    /// tests exercise the envelope decode too rather than reaching past it.
+    fn serve(engine: &StorageEngine, framed: &[u8]) -> (usize, Vec<u8>) {
+        let frame = crate::replication::decode_frame(framed).expect("a well-formed frame");
+        let response = handle_inter_node_frame(engine, &frame).expect("a servable frame");
+        (frame.total_len, response)
     }
 
     /// Walks the raw entry bytes a replication fetch returns, flattening them into records
@@ -3275,10 +3153,13 @@ mod grpc_replication_fetch_tests {
     }
 
     fn decode_response(bytes: &[u8]) -> ReplicationFetchResponse {
-        assert!(bytes.len() >= 4);
-        let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        assert_eq!(bytes.len(), 4 + len);
-        ReplicationFetchResponse::decode(&bytes[4..]).unwrap()
+        let frame = crate::replication::decode_frame(bytes).unwrap();
+        assert_eq!(
+            frame.frame_type,
+            crate::replication::FrameType::ReplicationFetchResponse
+        );
+        assert_eq!(frame.total_len, bytes.len(), "no trailing bytes");
+        ReplicationFetchResponse::decode(frame.payload).unwrap()
     }
 
     #[tokio::test]
@@ -3305,8 +3186,7 @@ mod grpc_replication_fetch_tests {
         };
         let framed = frame_request(&req);
 
-        let (bytes_consumed, response_bytes) =
-            decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+        let (bytes_consumed, response_bytes) = serve(&engine, &framed);
         assert_eq!(bytes_consumed, framed.len());
 
         let resp = decode_response(&response_bytes);
@@ -3342,7 +3222,7 @@ mod grpc_replication_fetch_tests {
             max_bytes: 4096,
         };
         let framed = frame_request(&req);
-        decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+        serve(&engine, &framed);
 
         assert!(
             engine
@@ -3375,16 +3255,16 @@ mod grpc_replication_fetch_tests {
         };
         let framed = frame_request(&req);
 
-        let (_, response_bytes) = decode_grpc_replication_fetch_packet(&engine, &framed).unwrap();
+        let (_, response_bytes) = serve(&engine, &framed);
         let resp = decode_response(&response_bytes);
         assert!(resp.entries.is_empty());
     }
 
+    /// A frame split across TCP segments must be recognised as *incomplete* and waited
+    /// for, never mistaken for a malformed one — the connection loop closes on malformed,
+    /// so confusing the two drops healthy peers under ordinary segmentation.
     #[tokio::test]
-    async fn reports_need_more_data_for_a_truncated_frame() {
-        let dir = TempDir::new("need_more_data");
-        let engine = open_engine(&dir);
-
+    async fn a_truncated_frame_is_reported_as_incomplete_at_every_prefix() {
         let req = ReplicationFetchRequest {
             follower_node_id: 2,
             topic: "t".to_string(),
@@ -3394,21 +3274,29 @@ mod grpc_replication_fetch_tests {
         };
         let framed = frame_request(&req);
 
-        // Only the length prefix plus a few bytes of the payload have arrived so far.
-        let partial = &framed[..6];
-        match decode_grpc_replication_fetch_packet(&engine, partial) {
-            Err(PacketError::NeedMoreData) => {}
-            other => panic!("expected NeedMoreData, got {:?}", other),
+        for prefix in 0..framed.len() {
+            match crate::replication::decode_frame(&framed[..prefix]) {
+                Err(crate::replication::EnvelopeError::Incomplete { needed }) => {
+                    assert_eq!(needed.min(framed.len()), needed.min(framed.len()));
+                    assert!(needed > prefix);
+                }
+                other => panic!("expected Incomplete at prefix {}, got {:?}", prefix, other),
+            }
         }
+        // ...and the whole thing decodes.
+        assert_eq!(
+            crate::replication::decode_frame(&framed).unwrap().total_len,
+            framed.len()
+        );
     }
 }
 
 /// Issue #24's remaining item: a follower's ACK on the `__cluster_metadata` replication
-/// path (`decode_replication_packet`, the `0xAA` handler) must mean the record is actually
+/// path (`handle_replication_push`) must mean the record is actually
 /// durable, not merely written to the page cache. `FlushPolicy::AsyncPeriodic` (the
 /// default) makes `flush_if_sync_policy` a no-op until its interval/byte threshold trips,
 /// so before this fix the ACK was issued regardless. These tests exercise the fix directly
-/// against the `0xAA` decoder, the same way `grpc_replication_fetch_tests` above exercises
+/// against the push handler, the same way `grpc_replication_fetch_tests` above exercises
 /// the fetch-side decoder.
 #[cfg(test)]
 mod cluster_metadata_durability_tests {
@@ -3453,8 +3341,9 @@ mod cluster_metadata_durability_tests {
         .unwrap()
     }
 
-    /// Builds a `0xAA` replication-push packet exactly the way
-    /// `send_replication_push_pooled` (`src/replication/mod.rs`) frames it on the wire.
+    /// Builds a replication-push frame exactly the way `send_replication_push_pooled`
+    /// (`src/replication/mod.rs`) puts it on the wire — through the same encoder, so these
+    /// tests cannot drift from what a real leader sends.
     fn build_push_packet(
         engine: &StorageEngine,
         topic: &str,
@@ -3463,18 +3352,79 @@ mod cluster_metadata_durability_tests {
         leader_hw: u64,
         batches: &[crate::protocol::RecordBatch],
     ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.put_u8(0xAA);
-        crate::protocol::wire::write_pascal_string(&mut buf, &engine.config().cluster_id);
-        crate::protocol::wire::write_pascal_string(&mut buf, topic);
-        buf.put_u32(partition);
-        buf.put_u64(epoch);
-        buf.put_u64(leader_hw);
-        buf.put_u32(batches.len() as u32);
-        for batch in batches {
-            batch.encode_into(&mut buf);
-        }
-        buf
+        let entries: Vec<crate::replication::EncodedEntry> = batches
+            .iter()
+            .map(crate::replication::EncodedEntry::from_batch)
+            .collect();
+        crate::replication::encode_replication_push(
+            &engine.config().cluster_id,
+            topic,
+            partition,
+            epoch,
+            leader_hw,
+            &entries,
+        )
+    }
+
+    /// The additive path, end to end: a push from a build that carries a field this one
+    /// has never heard of must still be served, and its entries must still land.
+    ///
+    /// This is what the extension section buys. Without it the only way to add a field is
+    /// to widen the fixed header, which means every broker in the cluster has to be
+    /// upgraded in the same moment or they stop understanding each other's pushes — the
+    /// lockstep upgrade this whole change exists to end.
+    #[tokio::test]
+    async fn a_push_carrying_an_unknown_extension_is_still_applied() {
+        let dir = TempDir::new("future_extension");
+        let engine = open_engine(&dir);
+
+        let batch = broker_record(0, b"from a newer broker".to_vec());
+        let entry = crate::replication::EncodedEntry::from_batch(&batch);
+
+        // Rebuild the payload by hand so an extension can be planted in it — the encoder
+        // has no field to put there yet, which is exactly the situation being modelled.
+        let mut payload = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut payload, &engine.config().cluster_id);
+        crate::protocol::wire::write_pascal_string(&mut payload, "orders");
+        payload.put_u32(0);
+        payload.put_u64(0);
+        payload.put_u64(1);
+        payload.put_u32(entry.bytes.len() as u32);
+        payload.extend_from_slice(&entry.bytes);
+        crate::replication::write_extensions(
+            &mut payload,
+            &[(0x9001, b"a field this build has never heard of".to_vec())],
+        );
+        let packet = crate::replication::encode_frame(
+            crate::replication::FrameType::ReplicationPush,
+            &payload,
+        );
+
+        assert_eq!(
+            serve_push(&engine, &packet),
+            crate::replication::push_ack::OK,
+            "an unknown extension must not make a push unservable"
+        );
+
+        let pm = engine.get_or_create_partition("orders", 0).unwrap();
+        let records = pm.fetch(0, 4096).unwrap();
+        assert_eq!(records.len(), 1, "the entry must have been appended");
+        assert_eq!(
+            records[0].value.as_deref(),
+            Some(b"from a newer broker".as_slice())
+        );
+    }
+
+    /// Serves a push frame through the real dispatch and returns the ACK's status byte.
+    fn serve_push(engine: &StorageEngine, packet: &[u8]) -> u8 {
+        let frame = crate::replication::decode_frame(packet).expect("a well-formed frame");
+        let ack = handle_inter_node_frame(engine, &frame).expect("a servable frame");
+        let ack_frame = crate::replication::decode_frame(&ack).expect("a well-formed ACK");
+        assert_eq!(
+            ack_frame.frame_type,
+            crate::replication::FrameType::ReplicationPushAck
+        );
+        ack_frame.payload[0]
     }
 
     /// A single-record batch at `offset`, the shape everything the broker authors now takes.
@@ -3508,8 +3458,11 @@ mod cluster_metadata_durability_tests {
         let epoch = engine.replication().get_epoch();
         let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 1, &[frame]);
 
-        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
-        assert_eq!(ack, vec![0u8], "expected an ACK for a clean push");
+        assert_eq!(
+            serve_push(&engine, &packet),
+            crate::replication::push_ack::OK,
+            "expected an ACK for a clean push"
+        );
         assert!(
             engine.topic_is_registered("sync_proof_topic"),
             "the durable record must have been applied"
@@ -3544,8 +3497,11 @@ mod cluster_metadata_durability_tests {
         let frame = broker_record(0, b"data record".to_vec());
         let packet = build_push_packet(&engine, "orders", 0, 0, 1, &[frame]);
 
-        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
-        assert_eq!(ack, vec![0u8], "expected an ACK for a clean push");
+        assert_eq!(
+            serve_push(&engine, &packet),
+            crate::replication::push_ack::OK,
+            "expected an ACK for a clean push"
+        );
 
         let pm = engine.get_or_create_partition("orders", 0).unwrap();
         assert!(
@@ -3655,10 +3611,9 @@ mod cluster_metadata_durability_tests {
         let epoch = engine.replication().get_epoch();
         let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 2, &[frame]);
 
-        let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
         assert_eq!(
-            ack,
-            vec![1u8],
+            serve_push(&engine, &packet),
+            crate::replication::push_ack::NACK,
             "a sync failure must still produce a NACK, not a silent ACK"
         );
         assert!(
