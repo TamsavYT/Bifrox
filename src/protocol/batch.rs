@@ -228,6 +228,91 @@ impl RecordBatch {
         self.attributes & ATTR_TRANSACTIONAL_FLAG != 0
     }
 
+    /// Builds a batch whose records carry **explicit, possibly non-contiguous** offsets.
+    ///
+    /// [`Self::create`] assigns offsets sequentially from the base, which is right for a
+    /// produce — a produced batch never has gaps. Compaction does: it drops superseded
+    /// records from the middle of a batch and keeps the survivors at their original
+    /// offsets, so what remains is 5, 9, 12 rather than 0, 1, 2.
+    ///
+    /// The stored format has always supported this — every record carries its own
+    /// `offset_delta`, and `decode_records` reads it back — only `create` could not express
+    /// it. `last_offset_delta` is taken from the highest offset present, matching Kafka,
+    /// whose compacted batches likewise keep gaps.
+    ///
+    /// `records` must be sorted ascending by offset and every offset must be at or after
+    /// `base_offset`; a record before the base is skipped rather than encoded as a
+    /// wrapped-around delta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_offsets(
+        base_offset: u64,
+        base_timestamp: u64,
+        leader_epoch: u32,
+        producer_id: u64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        transactional: bool,
+        codec: BatchCompression,
+        records: &[(u64, u64, Option<Bytes>, Option<Bytes>)],
+    ) -> Self {
+        let mut raw = Vec::new();
+        let mut record_count = 0u32;
+        let mut last_offset_delta = 0u32;
+        for (offset, timestamp, key, value) in records {
+            let Some(delta) = offset.checked_sub(base_offset) else {
+                continue;
+            };
+            let delta = delta as u32;
+            raw.put_u32(delta);
+            raw.put_i64(*timestamp as i64 - base_timestamp as i64);
+            encode_opt_bytes(&mut raw, key);
+            encode_opt_bytes(&mut raw, value);
+            record_count += 1;
+            last_offset_delta = last_offset_delta.max(delta);
+        }
+
+        let record_data: Bytes = match codec {
+            BatchCompression::None => raw.into(),
+            BatchCompression::Lz4 => lz4_flex::compress_prepend_size(&raw).into(),
+            BatchCompression::Zstd => zstd::stream::encode_all(raw.as_slice(), 3)
+                .expect("in-memory zstd compression is infallible")
+                .into(),
+        };
+
+        let mut attributes = codec.to_bits() & ATTR_COMPRESSION_MASK;
+        if transactional {
+            attributes |= ATTR_TRANSACTIONAL_FLAG;
+        }
+
+        let crc = Self::calculate_crc(
+            base_offset,
+            last_offset_delta,
+            base_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            leader_epoch,
+            attributes,
+            record_count,
+            &record_data,
+        );
+
+        Self {
+            magic: BATCH_MAGIC_BYTE,
+            crc,
+            base_offset,
+            last_offset_delta,
+            base_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            leader_epoch,
+            attributes,
+            record_count,
+            record_data,
+        }
+    }
+
     /// Stamps this batch with the offset and leader epoch the broker assigns it, then
     /// recomputes the CRC to match.
     ///
@@ -1119,7 +1204,7 @@ mod tests {
     }
 
     /// The value is opaque bytes too — never split, parsed, or otherwise interpreted. A JSON
-    /// payload containing a `:` (the very character `extract_key_value`'s payload-sniffing
+    /// payload containing a `:` (the very character the broker's old payload-sniffing
     /// used to split on) must round-trip byte-identical, proving the broker isn't peeking
     /// inside it.
     #[test]
@@ -1235,6 +1320,102 @@ mod tests {
         batch
             .verify_crc()
             .expect("CRC must cover the stored bytes, decompressable or not");
+    }
+
+    /// Compaction keeps survivors at their original offsets, so a compacted batch has gaps.
+    /// The stored format supports that — each record carries its own delta — and this
+    /// asserts a batch built that way round-trips with those exact offsets and reports a
+    /// `last_offset_delta` taken from the highest offset present, not from the count.
+    #[test]
+    fn create_with_offsets_preserves_gaps() {
+        let records = vec![
+            (
+                105u64,
+                1_700_000_000_000u64,
+                Some(Bytes::from_static(b"k1")),
+                Some(Bytes::from_static(b"v1")),
+            ),
+            (
+                109,
+                1_700_000_000_040,
+                Some(Bytes::from_static(b"k2")),
+                None,
+            ),
+            (
+                112,
+                1_700_000_000_070,
+                None,
+                Some(Bytes::from_static(b"v3")),
+            ),
+        ];
+        let batch = RecordBatch::create_with_offsets(
+            100,
+            1_700_000_000_000,
+            3,
+            42,
+            7,
+            11,
+            false,
+            BatchCompression::Zstd,
+            &records,
+        );
+        assert_eq!(batch.record_count, 3);
+        assert_eq!(
+            batch.last_offset_delta, 12,
+            "must come from the highest offset present (112 - 100), not from the count"
+        );
+
+        let mut encoded = Vec::new();
+        batch.encode_into(&mut encoded);
+        let (decoded, _) = RecordBatch::decode(&encoded).unwrap();
+        let out = decoded.records().unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![105, 109, 112],
+            "gaps must survive the round trip"
+        );
+        for (i, (_, ts, key, value)) in records.iter().enumerate() {
+            assert_eq!(out[i].timestamp, *ts);
+            assert_eq!(&out[i].key, key);
+            assert_eq!(&out[i].value, value);
+        }
+    }
+
+    /// A record before the base offset cannot be expressed as an unsigned delta; it must be
+    /// skipped rather than wrapping around into a nonsensical offset.
+    #[test]
+    fn create_with_offsets_skips_records_before_the_base() {
+        let records = vec![
+            (
+                5u64,
+                1_700_000_000_000u64,
+                None,
+                Some(Bytes::from_static(b"before")),
+            ),
+            (
+                11,
+                1_700_000_000_000,
+                None,
+                Some(Bytes::from_static(b"after")),
+            ),
+        ];
+        let batch = RecordBatch::create_with_offsets(
+            10,
+            1_700_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &records,
+        );
+        assert_eq!(batch.record_count, 1);
+        let out = batch.records().unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].offset, 11);
+        assert_eq!(out[0].value.as_deref(), Some(b"after".as_ref()));
     }
 
     /// A batch that has been stamped and encoded must survive a full round trip through

@@ -2189,7 +2189,14 @@ async fn process_request(
             // is exactly what `Fetch` has always done.
             let isolation = framing.isolation_level();
             match engine
-                .fetch_entries(&topic, partition, offset, max_bytes)
+                .fetch_entries_waiting(
+                    &topic,
+                    partition,
+                    offset,
+                    max_bytes,
+                    framing.max_wait_ms(),
+                    framing.min_bytes(),
+                )
                 .await
             {
                 Ok(entries) => {

@@ -1,5 +1,5 @@
 use crate::config::EngineConfig;
-use crate::protocol::{RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
+use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
 use crate::segment::entry::{decode_entry, LogEntry};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
@@ -10,43 +10,6 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 
 use crate::segment::txnindex::TxnIndexSegment;
-
-/// Helper to extract record key from payload for log compaction deduplication
-pub fn extract_key(payload: &[u8]) -> &[u8] {
-    extract_key_value(payload).0
-}
-
-/// Extracts a record's key and, when unambiguous, its value — used by log compaction both
-/// for dedup-by-key (`extract_key`) and for detecting tombstones (a compacted-topic record
-/// whose value is empty, Hermes's convention for a Kafka-style delete marker: see
-/// `SegmentManager::compact_segments`).
-///
-/// The value half is `None` — never `Some(&[])` — whenever the payload doesn't match one of
-/// the two unambiguous key/value encodings below and falls back to "treat the whole payload
-/// as its own key". That fallback has no reliable value boundary at all, so it must never be
-/// mistaken for an empty (tombstone) value: doing so would misclassify every plain,
-/// non-keyed record in a compacted topic as a delete marker and eventually erase it.
-pub fn extract_key_value(payload: &[u8]) -> (&[u8], Option<&[u8]>) {
-    if payload.len() >= 2 {
-        let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if key_len > 0 && 2 + key_len <= payload.len() {
-            return (&payload[2..2 + key_len], Some(&payload[2 + key_len..]));
-        }
-    }
-    if let Ok(s) = std::str::from_utf8(payload) {
-        if let Some((k, v)) = s.split_once(':') {
-            if !k.is_empty() {
-                return (k.as_bytes(), Some(v.as_bytes()));
-            }
-        }
-        if let Some((k, v)) = s.split_once('=') {
-            if !k.is_empty() {
-                return (k.as_bytes(), Some(v.as_bytes()));
-            }
-        }
-    }
-    (payload, None)
-}
 
 /// Outcome of `SegmentManager::append_verbatim`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,20 +139,95 @@ impl SegmentPair {
 /// the rest of the read is unusable; here `entries` was already fully parsed into discrete
 /// entries by `read_all_entries` before this function ever runs, so a bad batch's neighbors
 /// are known-good and there's no reason they should be lost too.
-fn expand_entries_for_compaction(entries: Vec<LogEntry>) -> Vec<RecordFrame> {
+/// Encoded size of a log entry on disk, whichever kind it is.
+fn entry_encoded_size(entry: &LogEntry) -> usize {
+    match entry {
+        LogEntry::Frame(frame) => frame.encoded_size(),
+        LogEntry::Batch(batch) => batch.encoded_size(),
+    }
+}
+
+/// Encodes a log entry exactly as it is stored.
+fn encode_entry_into(entry: &LogEntry, buf: &mut Vec<u8>) {
+    match entry {
+        LogEntry::Frame(frame) => frame.encode_into(buf),
+        LogEntry::Batch(batch) => batch.encode_into(buf),
+    }
+}
+
+/// The offset an entry is indexed by: a frame's own offset, a batch's base offset.
+fn entry_index_offset(entry: &LogEntry) -> u64 {
+    match entry {
+        LogEntry::Frame(frame) => frame.offset,
+        LogEntry::Batch(batch) => batch.base_offset,
+    }
+}
+
+/// The timestamp an entry is time-indexed by.
+fn entry_index_timestamp(entry: &LogEntry) -> u64 {
+    match entry {
+        LogEntry::Frame(frame) => frame.timestamp,
+        LogEntry::Batch(batch) => batch.base_timestamp,
+    }
+}
+
+/// One record as compaction sees it, whichever entry kind it came from.
+///
+/// Compaction is the one place the broker legitimately decodes records — it cannot dedupe
+/// by key without reading keys — so this is where a batch is decompressed and a frame is
+/// decompressed, and nowhere else on any serving path.
+#[derive(Debug, Clone)]
+struct CompactionRecord {
+    offset: u64,
+    timestamp: u64,
+    /// The key the producer wrote. `None` means the record carries no key at all — it
+    /// cannot participate in dedup and is always kept. Produce rejects keyless records on
+    /// a compacted topic, so this only arises for records written before the topic became
+    /// compacted, or for a plain frame, which has no key field.
+    key: Option<Bytes>,
+    /// `None` is a tombstone: it marks the key deleted. Distinct from `Some(empty)`, an
+    /// ordinary record whose value happens to be empty.
+    value: Option<Bytes>,
+    is_control: bool,
+}
+
+/// Decodes every record out of a segment's entries for compaction's key scan.
+///
+/// A batch whose record data fails to decode has its records skipped rather than aborting
+/// the whole scan: `entries` was already fully parsed into discrete entries by
+/// `read_all_entries`, so a bad batch's neighbours are known-good and there is no reason
+/// to lose them too.
+fn records_for_compaction(entries: &[LogEntry]) -> Vec<CompactionRecord> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         match entry {
-            LogEntry::Frame(frame) => out.push(frame),
+            LogEntry::Frame(frame) => {
+                // A frame's payload is compressed per-record, unlike a batch's, so it must
+                // be decompressed before its bytes mean anything. A frame has no key field
+                // at all, so it can never be deduped by key.
+                let payload = frame
+                    .decompress_payload()
+                    .unwrap_or_else(|_| frame.payload.clone());
+                out.push(CompactionRecord {
+                    offset: frame.offset,
+                    timestamp: frame.timestamp,
+                    key: None,
+                    value: Some(payload),
+                    is_control: frame.is_control_marker(),
+                });
+            }
             LogEntry::Batch(batch) => {
-                if let Ok(records) = batch.records() {
-                    out.extend(records.into_iter().map(|r| {
-                        // Batch records now carry an explicit, nullable value; nothing on
-                        // the produce path writes a null value today (append_batch always
-                        // supplies the payload as the value), so this unwrap mirrors that
-                        // invariant rather than introducing a new one.
-                        RecordFrame::create(r.offset, r.timestamp, r.value.unwrap_or_default())
-                    }));
+                let Ok(records) = batch.records() else {
+                    continue;
+                };
+                for r in records {
+                    out.push(CompactionRecord {
+                        offset: r.offset,
+                        timestamp: r.timestamp,
+                        key: r.key,
+                        value: r.value,
+                        is_control: false,
+                    });
                 }
             }
         }
@@ -1400,38 +1438,34 @@ impl SegmentManager {
                 });
         };
 
+        // Dedup is by the key the producer wrote, compared byte-for-byte — the broker never
+        // parses a payload looking for one. A record with no key cannot be deduped and is
+        // skipped here entirely, so it survives Phase 2 untouched.
+        //
+        // A tombstone is a record with a *null* value, matching Kafka. An empty-but-present
+        // value is an ordinary record, not a delete.
         for pair in &mut self.historical {
-            let frames = expand_entries_for_compaction(pair.read_all_entries()?);
-            for frame in frames {
-                if frame.is_control_marker() {
+            let entries = pair.read_all_entries()?;
+            for record in records_for_compaction(&entries) {
+                if record.is_control {
                     continue;
                 }
-                // Compaction dedups by key, and the key lives inside the record payload —
-                // for a compressed frame that payload is the compressed blob, not the
-                // actual key/value bytes, so it must be decompressed first or every
-                // compressed record looks like a unique, never-matching "key". Falls back
-                // to the raw (compressed) bytes on decompress failure, same as this
-                // function's pre-existing error tolerance elsewhere.
-                let decoded = frame
-                    .decompress_payload()
-                    .unwrap_or_else(|_| frame.payload.clone());
-                let (key, value) = extract_key_value(&decoded);
-                let is_tombstone = value.is_some_and(|v| v.is_empty());
-                observe(key, frame.offset, frame.timestamp, is_tombstone);
+                let Some(key) = record.key.as_deref() else {
+                    continue;
+                };
+                observe(key, record.offset, record.timestamp, record.value.is_none());
             }
         }
 
-        let active_frames = expand_entries_for_compaction(self.active.read_all_entries()?);
-        for frame in active_frames {
-            if frame.is_control_marker() {
+        let active_entries = self.active.read_all_entries()?;
+        for record in records_for_compaction(&active_entries) {
+            if record.is_control {
                 continue;
             }
-            let decoded = frame
-                .decompress_payload()
-                .unwrap_or_else(|_| frame.payload.clone());
-            let (key, value) = extract_key_value(&decoded);
-            let is_tombstone = value.is_some_and(|v| v.is_empty());
-            observe(key, frame.offset, frame.timestamp, is_tombstone);
+            let Some(key) = record.key.as_deref() else {
+                continue;
+            };
+            observe(key, record.offset, record.timestamp, record.value.is_none());
         }
         // Load-bearing despite the closure having no `Drop` impl: `observe` holds a mutable
         // borrow of `latest`, and moving it here is what releases that borrow so `latest`
@@ -1474,38 +1508,119 @@ impl SegmentManager {
         let mut i = 0;
 
         while i < self.historical.len() && segments_compacted < MAX_SEGMENTS_COMPACTED_PER_CALL {
-            let all_frames = expand_entries_for_compaction(self.historical[i].read_all_entries()?);
-            if all_frames.is_empty() {
+            let all_entries = self.historical[i].read_all_entries()?;
+            if all_entries.is_empty() {
                 i += 1;
                 continue;
             }
 
-            let segment_total_bytes: u64 = all_frames.iter().map(|f| f.encoded_size() as u64).sum();
-            let mut kept_frames = Vec::with_capacity(all_frames.len());
-            let mut discarded_count = 0;
+            let segment_total_bytes: u64 = all_entries
+                .iter()
+                .map(|e| entry_encoded_size(e) as u64)
+                .sum();
+
+            // Whether a single record survives. A keyless record is always kept: with no
+            // key it cannot be deduped, and it is not a candidate for tombstone purging
+            // either.
+            let survives = |record: &CompactionRecord| -> bool {
+                if record.is_control {
+                    return true;
+                }
+                let Some(key) = record.key.as_deref() else {
+                    return true;
+                };
+                match latest_offsets.get(key) {
+                    Some(&latest_off) => record.offset == latest_off,
+                    // The key was purged as an expired tombstone, so every record for it
+                    // goes — including this one.
+                    None => !purged_keys.contains(key),
+                }
+            };
+
+            let mut kept_entries: Vec<LogEntry> = Vec::with_capacity(all_entries.len());
+            let mut discarded_count = 0usize;
             let mut discarded_bytes = 0u64;
 
-            for frame in all_frames {
-                if frame.is_control_marker() {
-                    kept_frames.push(frame);
-                    continue;
-                }
-                let decoded = frame
-                    .decompress_payload()
-                    .unwrap_or_else(|_| frame.payload.clone());
-                let key = extract_key(&decoded);
-                let keep = match latest_offsets.get(key) {
-                    Some(&latest_off) => frame.offset == latest_off,
-                    // Either the key was never ambiguous-fallback-eligible for dedup (kept,
-                    // matching pre-existing behavior), or it was purged as an expired
-                    // tombstone (discarded, including this frame).
-                    None => !purged_keys.contains(key),
-                };
-                if keep {
-                    kept_frames.push(frame);
-                } else {
-                    discarded_bytes += frame.encoded_size() as u64;
-                    discarded_count += 1;
+            for entry in all_entries {
+                let entry_size = entry_encoded_size(&entry) as u64;
+                match entry {
+                    LogEntry::Frame(frame) => {
+                        // A frame carries no key, so the only thing that can drop it is
+                        // being a non-control record whose payload-derived key was purged —
+                        // which cannot happen now that keys come from the record itself.
+                        // Kept as-is.
+                        let record = CompactionRecord {
+                            offset: frame.offset,
+                            timestamp: frame.timestamp,
+                            key: None,
+                            value: Some(frame.payload.clone()),
+                            is_control: frame.is_control_marker(),
+                        };
+                        if survives(&record) {
+                            kept_entries.push(LogEntry::Frame(frame));
+                        } else {
+                            discarded_bytes += entry_size;
+                            discarded_count += 1;
+                        }
+                    }
+                    LogEntry::Batch(batch) => {
+                        let Ok(records) = batch.records() else {
+                            // Undecodable payload — keep the batch rather than silently
+                            // dropping records we cannot inspect.
+                            kept_entries.push(LogEntry::Batch(batch));
+                            continue;
+                        };
+                        let total = records.len();
+                        let survivors: Vec<(u64, u64, Option<Bytes>, Option<Bytes>)> = records
+                            .into_iter()
+                            .filter(|r| {
+                                survives(&CompactionRecord {
+                                    offset: r.offset,
+                                    timestamp: r.timestamp,
+                                    key: r.key.clone(),
+                                    value: r.value.clone(),
+                                    is_control: false,
+                                })
+                            })
+                            .map(|r| (r.offset, r.timestamp, r.key, r.value))
+                            .collect();
+
+                        discarded_count += total - survivors.len();
+                        if survivors.is_empty() {
+                            discarded_bytes += entry_size;
+                            continue;
+                        }
+                        if survivors.len() == total {
+                            kept_entries.push(LogEntry::Batch(batch));
+                            continue;
+                        }
+
+                        // Rebuilt as a batch, not flattened into frames: a compacted
+                        // segment stays batched and stays compressed in the producer's
+                        // codec, which is what Kafka's cleaner does too. Survivors keep
+                        // their original offsets, so the rebuilt batch has gaps — the
+                        // format expresses that, `create_with_offsets` builds it.
+                        //
+                        // `base_sequence`/`producer_id` are carried over even though they
+                        // no longer describe the batch's exact contents. Nothing in Hermes
+                        // reconstructs idempotent-producer dedup state by reading them back
+                        // off disk — that state lives in memory, written at produce time by
+                        // `ProducerStateManager` — so preserving them costs nothing and
+                        // keeps the batch self-describing.
+                        let rebuilt = RecordBatch::create_with_offsets(
+                            batch.base_offset,
+                            batch.base_timestamp,
+                            batch.leader_epoch,
+                            batch.producer_id,
+                            batch.producer_epoch,
+                            batch.base_sequence,
+                            batch.is_transactional(),
+                            batch.compression().unwrap_or(BatchCompression::None),
+                            &survivors,
+                        );
+                        discarded_bytes += entry_size.saturating_sub(rebuilt.encoded_size() as u64);
+                        kept_entries.push(LogEntry::Batch(rebuilt));
+                    }
                 }
             }
 
@@ -1524,7 +1639,7 @@ impl SegmentManager {
             segments_compacted += 1;
             let base_offset = self.historical[i].base_offset;
 
-            if kept_frames.is_empty() {
+            if kept_entries.is_empty() {
                 let pair_to_remove = self.historical.remove(i);
                 let log_path = pair_to_remove.log.path.clone();
                 let index_path = pair_to_remove.index.path().to_path_buf();
@@ -1577,14 +1692,15 @@ impl SegmentManager {
 
                 let mut bytes_since_last_index = 0u64;
 
-                for (idx, frame) in kept_frames.iter().enumerate() {
-                    let mut encoded = Vec::with_capacity(frame.encoded_size());
-                    frame.encode_into(&mut encoded);
+                for (idx, entry) in kept_entries.iter().enumerate() {
+                    let mut encoded = Vec::with_capacity(entry_encoded_size(entry));
+                    encode_entry_into(entry, &mut encoded);
                     let phys_pos = tmp_log.append_bytes(&encoded)?;
 
                     if idx == 0 || bytes_since_last_index >= self.config.index_interval_bytes {
-                        tmp_index.append(frame.offset, phys_pos)?;
-                        tmp_timeindex.append(frame.timestamp, frame.offset)?;
+                        let index_offset = entry_index_offset(entry);
+                        tmp_index.append(index_offset, phys_pos)?;
+                        tmp_timeindex.append(entry_index_timestamp(entry), index_offset)?;
                         bytes_since_last_index = 0;
                     }
                     bytes_since_last_index += encoded.len() as u64;
@@ -2397,6 +2513,54 @@ mod tests {
         }
     }
 
+    /// Appends one batch of explicitly keyed records — how a producer writes to a
+    /// compacted topic now that keys are on the record rather than guessed from a payload.
+    /// A `None` value is a tombstone.
+    fn append_keyed(
+        mgr: &mut SegmentManager,
+        records: &[(&[u8], Option<&[u8]>)],
+        timestamp: u64,
+        codec: BatchCompression,
+    ) -> RecordBatch {
+        let triples: Vec<(u64, Option<Bytes>, Option<Bytes>)> = records
+            .iter()
+            .map(|(k, v)| {
+                (
+                    timestamp,
+                    Some(Bytes::copy_from_slice(k)),
+                    v.map(Bytes::copy_from_slice),
+                )
+            })
+            .collect();
+        let batch = RecordBatch::create(0, timestamp, 0, 0, 0, 0, false, codec, &triples);
+        mgr.append_batch(batch, 0).unwrap()
+    }
+
+    /// Every record still in the log, as `(offset, key, value)`, across historical and
+    /// active segments. Unlike `fetch`, this preserves keys and distinguishes a null value
+    /// (tombstone) from an empty one.
+    #[allow(clippy::type_complexity)]
+    fn all_keyed_records(mgr: &mut SegmentManager) -> Vec<(u64, Option<Vec<u8>>, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        for pair in &mut mgr.historical {
+            for r in records_for_compaction(&pair.read_all_entries().unwrap()) {
+                out.push((
+                    r.offset,
+                    r.key.map(|k| k.to_vec()),
+                    r.value.map(|v| v.to_vec()),
+                ));
+            }
+        }
+        for r in records_for_compaction(&mgr.active.read_all_entries().unwrap()) {
+            out.push((
+                r.offset,
+                r.key.map(|k| k.to_vec()),
+                r.value.map(|v| v.to_vec()),
+            ));
+        }
+        out
+    }
+
     #[test]
     fn compact_segments_keeps_unexpired_tombstone_as_latest_record() {
         let dir = TempDir::new("tombstone_kept");
@@ -2410,17 +2574,106 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
 
-        mgr.append(b"user1:val_1", 1000).unwrap(); // offset 0, superseded below (timestamp irrelevant — not the latest)
-        mgr.append(b"user1:", now_ms).unwrap(); // offset 1 — empty value = tombstone, written "now" so it's well within the 24h grace period
+        append_keyed(
+            &mut mgr,
+            &[(b"user1", Some(b"val_1"))],
+            1000,
+            BatchCompression::None,
+        );
+        // Null value = tombstone, written "now" so it is well inside the 24h grace period.
+        append_keyed(
+            &mut mgr,
+            &[(b"user1", None)],
+            now_ms,
+            BatchCompression::None,
+        );
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
-        assert_eq!(n, 1, "the stale user1:val_1 record should be dropped");
+        assert_eq!(n, 1, "the stale user1 record should be dropped");
 
-        let remaining = mgr.fetch(0, 4096).unwrap();
+        let remaining = all_keyed_records(&mut mgr);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].offset, 1);
-        assert_eq!(remaining[0].payload.as_ref(), b"user1:");
+        assert_eq!(remaining[0].0, 1);
+        assert_eq!(remaining[0].1.as_deref(), Some(b"user1".as_ref()));
+        assert_eq!(
+            remaining[0].2, None,
+            "the survivor is the tombstone itself, still null-valued"
+        );
+    }
+
+    /// An empty-but-present value is an ordinary record, not a delete. Under the old
+    /// payload-sniffing convention these were the same thing; the null sentinel is what
+    /// makes them distinguishable, and compaction must honour the distinction.
+    #[test]
+    fn compact_segments_treats_empty_value_as_a_record_not_a_tombstone() {
+        let dir = TempDir::new("empty_value_not_tombstone");
+        // A 1ms grace period: were this treated as a tombstone it would be expired
+        // immediately and the key purged outright.
+        let mut mgr = SegmentManager::open(&dir.0, compact_config(Some(1), 0.0)).unwrap();
+
+        append_keyed(
+            &mut mgr,
+            &[(b"keyA", Some(b"first"))],
+            1,
+            BatchCompression::None,
+        );
+        append_keyed(&mut mgr, &[(b"keyA", Some(b""))], 1, BatchCompression::None);
+        mgr.rotate_segment().unwrap();
+
+        let n = mgr.apply_retention().unwrap();
+        assert_eq!(n, 1, "only the superseded first value should be dropped");
+
+        let remaining = all_keyed_records(&mut mgr);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "an empty value is a normal record — the key must not be purged"
+        );
+        assert_eq!(remaining[0].0, 1);
+        assert_eq!(remaining[0].2.as_deref(), Some(b"".as_ref()));
+    }
+
+    /// A record with no key at all cannot be deduped by key, so compaction must leave it
+    /// alone rather than guessing one out of its payload.
+    #[test]
+    fn compact_segments_keeps_keyless_records_untouched() {
+        let dir = TempDir::new("keyless_kept");
+        let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
+
+        // Two keyless records whose payloads are identical — under the old sniffing these
+        // hashed to the same "key" and one would have been discarded as stale.
+        append_built_batch(
+            &mut mgr,
+            1,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &[
+                (1, Bytes::from_static(b"same:payload")),
+                (1, Bytes::from_static(b"same:payload")),
+            ],
+        )
+        .unwrap();
+        // Plus a keyed pair where the first really is superseded, so the segment is dirty
+        // enough to be rewritten and the keyless records genuinely pass through a rewrite.
+        append_keyed(&mut mgr, &[(b"k", Some(b"v1"))], 1, BatchCompression::None);
+        append_keyed(&mut mgr, &[(b"k", Some(b"v2"))], 1, BatchCompression::None);
+        mgr.rotate_segment().unwrap();
+
+        let n = mgr.apply_retention().unwrap();
+        assert_eq!(n, 1, "only the superseded keyed record should be dropped");
+
+        let remaining = all_keyed_records(&mut mgr);
+        let keyless: Vec<_> = remaining.iter().filter(|(_, k, _)| k.is_none()).collect();
+        assert_eq!(
+            keyless.len(),
+            2,
+            "both keyless records must survive — identical payloads are not a shared key"
+        );
     }
 
     #[test]
@@ -2431,9 +2684,19 @@ mod tests {
         // test itself runs.
         let mut mgr = SegmentManager::open(&dir.0, compact_config(Some(1000), 0.0)).unwrap();
 
-        mgr.append(b"keyA:val1", 1).unwrap(); // offset 0 — stale, superseded by offset 1
-        mgr.append(b"keyA:val2", 1).unwrap(); // offset 1 — current value for keyA, kept
-        mgr.append(b"keyB:", 1).unwrap(); // offset 2 — expired tombstone, keyB fully purged
+        append_keyed(
+            &mut mgr,
+            &[(b"keyA", Some(b"val1"))],
+            1,
+            BatchCompression::None,
+        );
+        append_keyed(
+            &mut mgr,
+            &[(b"keyA", Some(b"val2"))],
+            1,
+            BatchCompression::None,
+        );
+        append_keyed(&mut mgr, &[(b"keyB", None)], 1, BatchCompression::None);
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
@@ -2442,10 +2705,10 @@ mod tests {
             "offset 0 (stale) and offset 2 (expired tombstone) should be dropped"
         );
 
-        let remaining = mgr.fetch(0, 4096).unwrap();
+        let remaining = all_keyed_records(&mut mgr);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].offset, 1);
-        assert_eq!(remaining[0].payload.as_ref(), b"keyA:val2");
+        assert_eq!(remaining[0].0, 1);
+        assert_eq!(remaining[0].2.as_deref(), Some(b"val2".as_ref()));
     }
 
     #[test]
@@ -2455,268 +2718,267 @@ mod tests {
 
         // 10 same-size records (offsets 0..9) in one historical segment.
         for i in 0..10u64 {
-            mgr.append(format!("k{}:v0", i).as_bytes(), i).unwrap();
+            append_keyed(
+                &mut mgr,
+                &[(format!("k{i}").as_bytes(), Some(b"v0"))],
+                i,
+                BatchCompression::None,
+            );
         }
         mgr.rotate_segment().unwrap();
-        // Supersede k0 from the active segment — exactly 1 of the 10 historical frames
+        // Supersede k0 from the active segment — exactly 1 of the 10 historical entries
         // (10%) becomes stale, well below the 50% gate.
-        mgr.append(b"k0:v1", 100).unwrap();
+        append_keyed(
+            &mut mgr,
+            &[(b"k0", Some(b"v1"))],
+            100,
+            BatchCompression::None,
+        );
 
         let n = mgr.apply_retention().unwrap();
         assert_eq!(
             n, 0,
             "10% dirty is below the 50% min_cleanable_dirty_ratio gate"
         );
-        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 10);
+        assert_eq!(
+            records_for_compaction(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            10
+        );
 
         // Lowering the gate below the segment's actual dirty ratio lets it compact.
         mgr.set_min_cleanable_dirty_ratio(0.05);
         let n = mgr.apply_retention().unwrap();
         assert_eq!(n, 1, "10% dirty now clears the lowered 5% gate");
-        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 9);
+        assert_eq!(
+            records_for_compaction(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            9
+        );
     }
 
+    /// Keys live inside a batch's compressed record data, so compaction must decompress to
+    /// read them — this is the one place the broker legitimately does that.
     #[test]
-    fn compact_segments_dedups_compressed_records_by_decompressed_key() {
+    fn compact_segments_dedups_records_inside_compressed_batches() {
         let dir = TempDir::new("compact_compressed");
         let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
 
-        // Both records use the same logical key ("user1:...") but only exist on disk in
-        // compressed form — compaction must decompress before extracting the key, or it
-        // will treat each compressed blob as its own unique "key" and never dedup them.
-        mgr.append_with_codec(
-            Bytes::from_static(b"user1:val_1"),
+        append_keyed(
+            &mut mgr,
+            &[(b"user1", Some(b"val_1"))],
             1,
-            crate::config::CompressionCodec::Lz4,
-        )
-        .unwrap(); // offset 0, stale
-        mgr.append_with_codec(
-            Bytes::from_static(b"user1:val_2"),
+            BatchCompression::Lz4,
+        );
+        append_keyed(
+            &mut mgr,
+            &[(b"user1", Some(b"val_2"))],
             2,
-            crate::config::CompressionCodec::Zstd,
-        )
-        .unwrap(); // offset 1, current
+            BatchCompression::Zstd,
+        );
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
-        assert_eq!(
-            n, 1,
-            "the stale compressed user1:val_1 record should be dropped"
-        );
+        assert_eq!(n, 1, "the stale compressed user1 record should be dropped");
 
-        let remaining = mgr.fetch(0, 4096).unwrap();
+        let remaining = all_keyed_records(&mut mgr);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].offset, 1);
-        assert_eq!(
-            remaining[0].decompress_payload().unwrap().as_ref(),
-            b"user1:val_2"
-        );
+        assert_eq!(remaining[0].0, 1);
+        assert_eq!(remaining[0].2.as_deref(), Some(b"val_2".as_ref()));
     }
 
-    /// The headline regression this stage fixes: before it, `compact_segments` read
-    /// entries via `read_all_frames`, which silently skips `RecordBatch` entries. Once a
-    /// segment contained a mix of frames and a batch, and *any* frame in it needed
-    /// discarding (triggering the dirty-ratio rewrite), the rewrite would carry forward
-    /// only the frames `read_all_frames` saw — the entire batch, including records that
-    /// were never even stale, vanished when the rewritten segment replaced the original.
+    /// A batch that is only *partially* compacted must come back out as a batch, still
+    /// compressed in the producer's codec, with its survivors at their original offsets.
     ///
-    /// This test's historical segment mixes a never-stale frame (`zzz`), a 3-record batch
-    /// (only one of whose keys, `k1`, gets superseded), and a stale frame (`www`) — so the
-    /// segment does get rewritten (discarding `www`), and the fix is what keeps the
-    /// batch's untouched `k2`/`k3` records alive through that rewrite.
-    ///
-    /// Confirmed this fails without the fix: temporarily reverting the three call sites in
-    /// `compact_segments` from `expand_entries_for_compaction(pair.read_all_entries()?)`
-    /// back to the pre-fix `pair.read_all_frames()?` makes this test fail at the very
-    /// first assertion — `n` (the "offset 1 and offset 4 dropped" assertion) comes back
-    /// `1` instead of `2`, because `read_all_frames` makes the whole batch (including
-    /// `k1`) invisible to phase 1's dedup scan, so only the plain frame `www` is ever
-    /// observed as discardable; `k1`'s stale batch record is never even recognized as
-    /// stale, let alone dropped from the rewrite.
+    /// Flattening survivors into plain uncompressed frames — what compaction used to do —
+    /// would keep a second record format alive forever and strip compression from exactly
+    /// the topics that retain data longest.
+    #[test]
+    fn compact_segments_rewrites_a_partially_compacted_batch_as_a_compressed_batch() {
+        let dir = TempDir::new("compact_rewrites_as_batch");
+        let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
+
+        append_keyed(
+            &mut mgr,
+            &[
+                (b"k1", Some(b"v1")),
+                (b"k2", Some(b"v2")),
+                (b"k3", Some(b"v3")),
+            ],
+            1,
+            BatchCompression::Zstd,
+        );
+        mgr.rotate_segment().unwrap();
+        // Supersedes only k2, so the historical batch keeps k1 and k3 and must be rebuilt
+        // with a gap where k2 was.
+        append_keyed(
+            &mut mgr,
+            &[(b"k2", Some(b"v2b"))],
+            2,
+            BatchCompression::None,
+        );
+
+        let n = mgr.apply_retention().unwrap();
+        assert_eq!(n, 1, "only k2's stale record should be dropped");
+
+        let entries = mgr.historical[0].read_all_entries().unwrap();
+        assert_eq!(entries.len(), 1, "the segment must still hold one batch");
+        let LogEntry::Batch(rebuilt) = &entries[0] else {
+            panic!("compaction must rewrite a batch as a batch, not flatten it into frames");
+        };
+        assert_eq!(
+            rebuilt.compression().unwrap(),
+            BatchCompression::Zstd,
+            "the rebuilt batch must keep the producer's codec"
+        );
+        assert_eq!(rebuilt.record_count, 2);
+        let records = rebuilt.records().unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![0, 2],
+            "survivors keep their original offsets, leaving a gap where k2 was"
+        );
+        assert_eq!(records[0].key.as_deref(), Some(b"k1".as_ref()));
+        assert_eq!(records[1].key.as_deref(), Some(b"k3".as_ref()));
+    }
+
+    /// The headline regression an earlier stage fixed: compaction once read entries via
+    /// `read_all_frames`, which silently skips `RecordBatch` entries, so a rewrite carried
+    /// forward only the frames it saw and the entire batch vanished. This keeps that
+    /// covered now that records carry explicit keys.
     #[test]
     fn compact_segments_keeps_surviving_batch_records() {
         let dir = TempDir::new("compact_keeps_batch_records");
         let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
 
-        mgr.append(b"zzz:keep", 1).unwrap(); // offset 0 — plain frame, never superseded
-        append_built_batch(
+        append_keyed(
             &mut mgr,
-            2,
-            0,
-            0,
-            0,
-            0,
-            false,
+            &[(b"zzz", Some(b"keep"))],
+            1,
             BatchCompression::None,
+        );
+        append_keyed(
+            &mut mgr,
             &[
-                (2, Bytes::from_static(b"k1:v1")),
-                (2, Bytes::from_static(b"k2:v2")),
-                (2, Bytes::from_static(b"k3:v3")),
+                (b"k1", Some(b"v1")),
+                (b"k2", Some(b"v2")),
+                (b"k3", Some(b"v3")),
             ],
-        )
-        .unwrap(); // offsets 1..=3
-        mgr.append(b"www:stale", 3).unwrap(); // offset 4 — plain frame, superseded below
+            2,
+            BatchCompression::None,
+        );
+        append_keyed(
+            &mut mgr,
+            &[(b"www", Some(b"stale"))],
+            3,
+            BatchCompression::None,
+        );
         mgr.rotate_segment().unwrap();
 
-        mgr.append(b"www:fresh", 4).unwrap(); // offset 5 — supersedes offset 4
-        mgr.append(b"k1:v2", 5).unwrap(); // offset 6 — supersedes the batch's k1 (offset 1)
+        append_keyed(
+            &mut mgr,
+            &[(b"www", Some(b"fresh"))],
+            4,
+            BatchCompression::None,
+        );
+        append_keyed(&mut mgr, &[(b"k1", Some(b"v2"))], 5, BatchCompression::None);
 
         let n = mgr.apply_retention().unwrap();
         assert_eq!(
             n, 2,
-            "offset 1 (stale batch record k1) and offset 4 (stale frame www) should be dropped"
+            "offset 1 (stale batch record k1) and offset 4 (stale www) should be dropped"
         );
 
-        // `fetch` reads from a single segment at a time (the one containing
-        // `start_offset`), so the rewritten historical segment and the active segment
-        // (untouched by this compaction pass) are fetched separately and concatenated.
-        let mut remaining = mgr.fetch(0, 65536).unwrap();
-        remaining.extend(mgr.fetch(5, 65536).unwrap());
-        let payloads: Vec<&[u8]> = remaining.iter().map(|f| f.payload.as_ref()).collect();
+        let remaining = all_keyed_records(&mut mgr);
+        let keys: Vec<&[u8]> = remaining
+            .iter()
+            .map(|(_, k, _)| k.as_deref().unwrap())
+            .collect();
         assert_eq!(
-            payloads,
+            keys,
             vec![
-                b"zzz:keep".as_ref(),
-                b"k2:v2".as_ref(),
-                b"k3:v3".as_ref(),
-                b"www:fresh".as_ref(),
-                b"k1:v2".as_ref(),
+                b"zzz".as_ref(),
+                b"k2".as_ref(),
+                b"k3".as_ref(),
+                b"www".as_ref(),
+                b"k1".as_ref(),
             ],
             "k2/k3 came from inside the batch and were never superseded — compaction must \
              not drop them just because they arrived batched"
         );
     }
 
-    /// Dedup-by-key must not care whether a record arrived as a lone `RecordFrame` or
-    /// packed inside a `RecordBatch` — both directions are exercised: `keyA`'s latest
-    /// value arrives in a batch after an earlier plain frame, and `keyB`'s latest value
-    /// arrives as a plain frame after an earlier batch record.
+    /// Dedup-by-key must not care how records were grouped into batches: a key superseded
+    /// from a later batch is dropped regardless of which batch it originally arrived in.
     #[test]
-    fn compact_segments_dedups_across_frame_and_batch_records() {
-        let dir = TempDir::new("compact_dedup_frame_batch_mix");
+    fn compact_segments_dedups_across_batch_boundaries() {
+        let dir = TempDir::new("compact_dedup_across_batches");
         let mut mgr = SegmentManager::open(&dir.0, compact_config(None, 0.0)).unwrap();
 
-        mgr.append(b"keyA:stale", 1).unwrap(); // offset 0 — frame, superseded by the batch below
-        append_built_batch(
+        append_keyed(
             &mut mgr,
-            2,
-            0,
-            0,
-            0,
-            0,
-            false,
+            &[(b"keyA", Some(b"stale"))],
+            1,
             BatchCompression::None,
-            &[
-                (2, Bytes::from_static(b"keyA:fresh")), // offset 1 — supersedes offset 0
-                (2, Bytes::from_static(b"keyB:stale")), // offset 2 — superseded by the frame below
-            ],
-        )
-        .unwrap();
-        mgr.append(b"keyB:fresh", 3).unwrap(); // offset 3 — supersedes offset 2
+        );
+        append_keyed(
+            &mut mgr,
+            &[(b"keyA", Some(b"fresh")), (b"keyB", Some(b"stale"))],
+            2,
+            BatchCompression::None,
+        );
+        append_keyed(
+            &mut mgr,
+            &[(b"keyB", Some(b"fresh"))],
+            3,
+            BatchCompression::None,
+        );
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
         assert_eq!(
             n, 2,
-            "offset 0 (keyA:stale) and offset 2 (keyB:stale) should be dropped"
+            "offset 0 (keyA stale) and offset 2 (keyB stale) should be dropped"
         );
 
-        let remaining = mgr.fetch(0, 65536).unwrap();
-        let payloads: Vec<&[u8]> = remaining.iter().map(|f| f.payload.as_ref()).collect();
-        assert_eq!(
-            payloads,
-            vec![b"keyA:fresh".as_ref(), b"keyB:fresh".as_ref()]
-        );
+        let remaining = all_keyed_records(&mut mgr);
+        let values: Vec<&[u8]> = remaining
+            .iter()
+            .map(|(_, _, v)| v.as_deref().unwrap())
+            .collect();
+        assert_eq!(values, vec![b"fresh".as_ref(), b"fresh".as_ref()]);
     }
 
-    /// A tombstone (empty value) carried inside a batch record must behave exactly like a
-    /// tombstone carried in a plain frame: kept as the latest record for its key until
-    /// `delete_retention_millis` elapses. Mirrors
-    /// `compact_segments_keeps_unexpired_tombstone_as_latest_record`, routing the
-    /// tombstone through `append_batch` instead of `append`.
-    #[test]
-    fn compact_segments_tombstone_inside_batch_matches_frame_tombstone_semantics() {
-        let dir = TempDir::new("compact_batch_tombstone");
-        let mut mgr =
-            SegmentManager::open(&dir.0, compact_config(Some(24 * 60 * 60 * 1000), 0.0)).unwrap();
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        mgr.append(b"user1:val_1", 1000).unwrap(); // offset 0 — stale, superseded below
-        append_built_batch(
-            &mut mgr,
-            now_ms,
-            0,
-            0,
-            0,
-            0,
-            false,
-            BatchCompression::None,
-            &[(now_ms, Bytes::from_static(b"user1:"))], // offset 1 — tombstone, well within the grace period
-        )
-        .unwrap();
-        mgr.rotate_segment().unwrap();
-
-        let n = mgr.apply_retention().unwrap();
-        assert_eq!(n, 1, "the stale user1:val_1 record should be dropped");
-
-        let remaining = mgr.fetch(0, 4096).unwrap();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "the unexpired tombstone must be kept as the latest record for its key"
-        );
-        assert_eq!(remaining[0].offset, 1);
-        assert_eq!(remaining[0].payload.as_ref(), b"user1:");
-    }
-
-    /// Mirrors `compact_segments_purges_key_once_tombstone_exceeds_delete_retention`,
-    /// with the expired tombstone carried inside a batch instead of a plain frame — the
-    /// key must be purged entirely (batch record and all), same as a frame tombstone.
+    /// An expired tombstone purges its key entirely, batch record and all.
     #[test]
     fn compact_segments_purges_expired_tombstone_carried_in_a_batch() {
         let dir = TempDir::new("compact_batch_tombstone_expired");
         let mut mgr = SegmentManager::open(&dir.0, compact_config(Some(1000), 0.0)).unwrap();
 
-        mgr.append(b"keyA:val1", 1).unwrap(); // offset 0 — stale
-        mgr.append(b"keyA:val2", 1).unwrap(); // offset 1 — current
-        append_built_batch(
+        append_keyed(
             &mut mgr,
+            &[(b"keyA", Some(b"val1")), (b"keyA", Some(b"val2"))],
             1,
-            0,
-            0,
-            0,
-            0,
-            false,
             BatchCompression::None,
-            &[(1, Bytes::from_static(b"keyB:"))], // offset 2 — expired tombstone, keyB fully purged
-        )
-        .unwrap();
+        );
+        append_keyed(&mut mgr, &[(b"keyB", None)], 1, BatchCompression::None);
         mgr.rotate_segment().unwrap();
 
         let n = mgr.apply_retention().unwrap();
         assert_eq!(
             n, 2,
-            "offset 0 (stale) and offset 2 (expired tombstone from the batch) should be dropped"
+            "offset 0 (stale) and offset 2 (expired tombstone) should be dropped"
         );
 
-        let remaining = mgr.fetch(0, 4096).unwrap();
+        let remaining = all_keyed_records(&mut mgr);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].offset, 1);
-        assert_eq!(remaining[0].payload.as_ref(), b"keyA:val2");
+        assert_eq!(remaining[0].0, 1);
+        assert_eq!(remaining[0].2.as_deref(), Some(b"val2".as_ref()));
     }
 
-    /// Frame-only compaction must be unaffected by this stage: when a segment holds no
-    /// batches at all, `expand_entries_for_compaction` (fed by `read_all_entries`) must
-    /// produce exactly the same `Vec<RecordFrame>`, in the same order, that
-    /// `read_all_frames` already did before this stage — a direct equivalence check
-    /// between the old and new code paths over the same on-disk data, rather than relying
-    /// solely on "the existing frame-only compaction tests above still pass".
+    /// `records_for_compaction` must see exactly the records `read_all_frames` sees when a
+    /// segment holds only frames — a direct equivalence check between the record scan
+    /// compaction uses and the plain frame reader, over the same on-disk data.
     #[test]
-    fn expand_entries_for_compaction_matches_read_all_frames_when_no_batches_present() {
+    fn records_for_compaction_matches_read_all_frames_when_no_batches_present() {
         let dir = TempDir::new("compact_frame_only_equivalence");
         let mut mgr = open_manager(&dir);
 
@@ -2728,15 +2990,27 @@ mod tests {
             mgr.append(format!("k{i}:v{i}").as_bytes(), i).unwrap();
         }
 
-        let via_read_all_frames = mgr.historical[0].read_all_frames().unwrap();
-        let via_expand =
-            expand_entries_for_compaction(mgr.historical[0].read_all_entries().unwrap());
-        assert_eq!(via_read_all_frames, via_expand);
-
-        let active_via_read_all_frames = mgr.active.read_all_frames().unwrap();
-        let active_via_expand =
-            expand_entries_for_compaction(mgr.active.read_all_entries().unwrap());
-        assert_eq!(active_via_read_all_frames, active_via_expand);
+        for pair_frames_and_entries in [
+            (
+                mgr.historical[0].read_all_frames().unwrap(),
+                mgr.historical[0].read_all_entries().unwrap(),
+            ),
+            (
+                mgr.active.read_all_frames().unwrap(),
+                mgr.active.read_all_entries().unwrap(),
+            ),
+        ] {
+            let (frames, entries) = pair_frames_and_entries;
+            let records = records_for_compaction(&entries);
+            assert_eq!(records.len(), frames.len());
+            for (record, frame) in records.iter().zip(frames.iter()) {
+                assert_eq!(record.offset, frame.offset);
+                assert_eq!(record.timestamp, frame.timestamp);
+                assert_eq!(record.value.as_deref(), Some(frame.payload.as_ref()));
+                // A frame has no key field, so compaction can never dedupe one by key.
+                assert_eq!(record.key, None);
+            }
+        }
     }
 
     #[test]

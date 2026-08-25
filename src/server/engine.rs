@@ -2171,6 +2171,35 @@ impl StorageEngine {
         // `get_or_create_partition_for_client`).
         let pm = self.get_or_create_partition_for_client(topic, partition_id)?;
 
+        // A compacted topic dedupes by key, so a record without one has no meaning there:
+        // it can never be superseded and can never be compacted away, so it would sit in
+        // the log forever and surface much later as unexplained growth. Kafka rejects such
+        // a produce outright (`InvalidRecordException`, "Compacted topic cannot accept
+        // message without key"); this does the same.
+        //
+        // Checked against the batch's decoded records, which means decompressing it — the
+        // one produce-path decompression, and only on compacted topics.
+        if pm.cleanup_policy().is_compact() {
+            let records = batch.records().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Malformed record batch: {}", e),
+                )
+            })?;
+            if let Some(bad) = records.iter().position(|r| r.key.is_none()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Compacted topic '{}' cannot accept a record without a key \
+                         (record {} of {} in this batch)",
+                        topic,
+                        bad,
+                        records.len()
+                    ),
+                ));
+            }
+        }
+
         // The actual disk work (segment append per record, plus the batch's group-commit
         // fsync) is synchronous, lock-and-syscall-heavy I/O. Running it inline in this
         // `async fn` would block whichever Tokio worker thread picked up this task for the
@@ -2266,6 +2295,65 @@ impl StorageEngine {
     /// Entries are clamped to the committed high watermark, and an entry containing
     /// `offset` is returned whole — a batch is atomic on disk, so a consumer asking from
     /// the middle of one gets the whole batch and filters it itself, as in Kafka.
+    /// A fetch that waits for data rather than answering an idle partition with an empty
+    /// response.
+    ///
+    /// Returns as soon as at least `min_bytes` are available, or when `max_wait_ms`
+    /// elapses, whichever comes first — Kafka's `fetch.max.wait.ms` / `fetch.min.bytes`.
+    /// With `max_wait_ms` of 0 (an untagged request) this is exactly
+    /// [`Self::fetch_entries`], so nothing changes for a client that does not ask to wait.
+    ///
+    /// The wait is driven by the partition's high-watermark notification, not by polling:
+    /// the request parks until data actually commits. That cuts request volume on an idle
+    /// partition and *lowers* delivery latency at the same time, since a parked consumer is
+    /// woken the moment a record commits instead of on its next poll tick.
+    pub async fn fetch_entries_waiting(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        max_wait_ms: u32,
+        min_bytes: u32,
+    ) -> IoResult<Bytes> {
+        let entries = self
+            .fetch_entries(topic, partition, offset, max_bytes)
+            .await?;
+        if max_wait_ms == 0 || entries.len() as u32 >= min_bytes {
+            return Ok(entries);
+        }
+        let Some(pm) = self.partition_for_read(topic, partition)? else {
+            return Ok(entries);
+        };
+
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(max_wait_ms as u64);
+        let mut best = entries;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // The watermark this fetch has already accounted for. Waiting for it to move
+            // past this point is what distinguishes "no new data yet" from "data arrived
+            // while we were reading", so a commit landing mid-read cannot be slept through.
+            let seen_hw = pm.high_watermark();
+            let woke = pm.await_hw_beyond(seen_hw, deadline - now).await;
+
+            // Re-read unconditionally, including on timeout. Returning the snapshot taken
+            // before the wait would hand back an empty response for data that arrived
+            // during it: the notification says *when* to look, it is never the authority
+            // on whether there is anything to find.
+            best = self
+                .fetch_entries(topic, partition, offset, max_bytes)
+                .await?;
+            if best.len() as u32 >= min_bytes || !woke {
+                break;
+            }
+        }
+        Ok(best)
+    }
+
     /// The transactional metadata a read-committed consumer needs to filter for itself:
     /// the last stable offset and the aborted offset ranges.
     ///

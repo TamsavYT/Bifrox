@@ -790,6 +790,55 @@ impl TestClient {
         }
     }
 
+    /// A long-polling fetch: asks the broker to hold the request until at least
+    /// `min_bytes` are available or `max_wait` elapses, instead of answering an idle
+    /// partition immediately with nothing.
+    ///
+    /// This is the consumer half of Kafka's `fetch.max.wait.ms` / `fetch.min.bytes`. It
+    /// cuts request volume on an idle partition and lowers delivery latency at the same
+    /// time — a plain polling loop waits on average half its poll interval for a record
+    /// that has already landed, whereas a parked fetch returns as soon as one commits.
+    ///
+    /// `max_wait` of zero behaves exactly like [`Self::fetch_records`].
+    pub async fn fetch_records_waiting(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        max_wait: std::time::Duration,
+        min_bytes: u32,
+    ) -> IoResult<Vec<ConsumerRecord>> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u64(offset);
+        inner.put_u32(max_bytes);
+
+        let tags = vec![
+            (
+                crate::protocol::wire::tags::MAX_WAIT_MS,
+                (max_wait.as_millis().min(u32::MAX as u128) as u32)
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+            (
+                crate::protocol::wire::tags::MIN_BYTES,
+                min_bytes.to_be_bytes().to_vec(),
+            ),
+        ];
+
+        let resp = self
+            .send_versioned(CommandCode::Fetch, &tags, inner)
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_fetch_entries_records(&resp.payload, offset, false)
+    }
+
     /// Fetches records including their per-record keys.
     ///
     /// [`Self::fetch`] returns [`RecordFrame`]s, which have no key field, so keys are
