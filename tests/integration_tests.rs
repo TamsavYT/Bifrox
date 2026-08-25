@@ -1680,19 +1680,28 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
 /// "process the request, delay the response") instead of rejecting them outright.
 #[tokio::test]
 async fn test_scenario_22_per_client_quota_throttling() {
-    // 1. Baseline: with no quota configured, produce/fetch complete quickly.
+    // 1. Baseline: with no quota configured, a produce is not delayed.
+    //
+    // Measured rather than bounded by a fixed millisecond figure. Every "must be fast"
+    // assertion in a timing test is unfixable by tuning, because host slowness has no
+    // upper bound — this one used to assert < 500ms and hit 1.26s on a loaded Windows
+    // runner, for reasons that had nothing to do with quota. The comparison against a
+    // genuinely throttled produce below is what carries the meaning; both run on the same
+    // machine in the same test, so host speed cancels out.
     let env_unlimited = start_test_server().await;
     let mut client_unlimited = TestClient::connect(env_unlimited.addr).await.unwrap();
+    // Warm-up: the first produce to a topic also creates it, dragging a controller
+    // metadata proposal and its commit into anything that times it.
+    client_unlimited
+        .produce_single("quota_baseline_topic", "k1", None, 1, vec![0u8; 4096])
+        .await
+        .expect("Baseline produce should succeed");
     let start = std::time::Instant::now();
     client_unlimited
         .produce_single("quota_baseline_topic", "k1", None, 1, vec![0u8; 4096])
         .await
         .expect("Baseline produce should succeed");
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "Unthrottled produce should be fast, took {:?}",
-        start.elapsed()
-    );
+    let unthrottled_elapsed = start.elapsed();
 
     // 2. Configure a deliberately low produce quota (100 bytes/sec) and verify a
     // single request exceeding the burst capacity is measurably delayed rather than
@@ -1718,9 +1727,16 @@ async fn test_scenario_22_per_client_quota_throttling() {
         elapsed
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "Throttle delay should be bounded, took {:?}",
+        elapsed < Duration::from_secs(20),
+        "Throttle delay should be bounded well below the 60s cap, took {:?}",
         elapsed
+    );
+    // The baseline's actual claim: an unquotaed produce is not subject to that delay.
+    // Relative, so it holds on any machine.
+    assert!(
+        unthrottled_elapsed * 2 < elapsed,
+        "an unquotaed produce must not be delayed like a throttled one: baseline took \
+         {unthrottled_elapsed:?} against a throttled {elapsed:?}"
     );
 
     // 3. Configure a deliberately low fetch quota and verify a large fetch response
@@ -3725,6 +3741,11 @@ async fn test_scenario_39_acks_all_waits_for_every_isr_member() {
 
     let target_offset = 42u64;
     let short = std::time::Duration::from_millis(150);
+    // A deliberately long timeout for the fail-fast check below. Asserting "returned in
+    // under 150ms" leaves no room for host slowness and would fail on a loaded runner for
+    // reasons unrelated to ISR logic; asserting "returned in a small fraction of a 3s
+    // timeout it never should have waited on" says the same thing with room to breathe.
+    let fail_fast_timeout = std::time::Duration::from_secs(3);
 
     // Only follower A has acknowledged: 2 of 3 ISR members hold the record, which
     // satisfies min.insync.replicas=2 but is NOT the full ISR.
@@ -3770,15 +3791,17 @@ async fn test_scenario_39_acks_all_waits_for_every_isr_member() {
     );
     let started = std::time::Instant::now();
     let below_floor = engine
-        .await_full_isr_ack(&pm, "isr_topic", 0, target_offset + 1, short)
+        .await_full_isr_ack(&pm, "isr_topic", 0, target_offset + 1, fail_fast_timeout)
         .await;
     assert!(
         below_floor.is_err(),
         "ISR below min.insync.replicas must be rejected"
     );
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < short,
-        "an under-replicated ISR should fail fast, not block for the timeout"
+        elapsed * 3 < fail_fast_timeout,
+        "an under-replicated ISR should fail fast, not block for the timeout: took \
+         {elapsed:?} of a {fail_fast_timeout:?} budget"
     );
 }
 
@@ -4708,8 +4731,11 @@ async fn test_scenario_50_sole_controller_commits_immediately() {
         engine.topic_is_registered("solo_quorum"),
         "the record must take effect immediately"
     );
+    // Generous, because this is a "must be fast" bound and host slowness has no upper
+    // limit. It still catches the regression it exists for: a controller that waited on a
+    // quorum it does not have would block for the full metadata commit timeout (5s).
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
+        started.elapsed() < std::time::Duration::from_secs(4),
         "a sole controller must not wait on anyone, took {:?}",
         started.elapsed()
     );
@@ -8226,14 +8252,20 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
     );
 
     // 3. A fetch that does not ask to wait still answers immediately.
+    //
+    // Compared against the hold measured in step 1 rather than a fixed millisecond bound:
+    // host slowness has no upper bound, so an absolute "must be fast" check fails on a
+    // loaded runner for reasons unrelated to long polling. Both measurements come from the
+    // same machine in the same test, so its speed cancels out.
     let mut plain = hermes::client::TestClient::connect(env.addr).await.unwrap();
     let started = std::time::Instant::now();
     let empty = plain.fetch_records(topic, 0, 99, 64 * 1024).await.unwrap();
+    let no_wait_elapsed = started.elapsed();
     assert!(empty.is_empty());
     assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "a fetch with no wait tag must not be held (took {:?})",
-        started.elapsed()
+        no_wait_elapsed * 2 < idle_elapsed,
+        "a fetch with no wait tag must not be held: it took {no_wait_elapsed:?}, which is \
+         not decisively faster than the {idle_elapsed:?} an opted-in fetch was held for"
     );
 }
 
