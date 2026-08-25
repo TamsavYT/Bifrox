@@ -170,6 +170,55 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
     }
 }
 
+/// Builds a batch of explicitly keyed `(key, value)` records, placeholder base offset 0.
+/// `None` value is a tombstone.
+fn producer_keyed_batch(
+    records: &[(&[u8], Option<&[u8]>)],
+    codec: hermes::protocol::BatchCompression,
+) -> hermes::protocol::RecordBatch {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let triples: Vec<(u64, Option<bytes::Bytes>, Option<bytes::Bytes>)> = records
+        .iter()
+        .map(|(k, v)| {
+            (
+                timestamp,
+                Some(bytes::Bytes::copy_from_slice(k)),
+                v.map(bytes::Bytes::copy_from_slice),
+            )
+        })
+        .collect();
+    hermes::protocol::RecordBatch::create(0, timestamp, 0, 0, 0, 0, false, codec, &triples)
+}
+
+/// Appends one explicitly keyed record as a single-record batch, the way a producer writes
+/// to a compacted topic. `None` value is a tombstone.
+fn append_keyed_record(
+    seg_mgr: &mut hermes::segment::SegmentManager,
+    key: &[u8],
+    value: Option<&[u8]>,
+    timestamp: u64,
+) -> hermes::protocol::RecordBatch {
+    let batch = hermes::protocol::RecordBatch::create(
+        0,
+        timestamp,
+        0,
+        0,
+        0,
+        0,
+        false,
+        hermes::protocol::BatchCompression::None,
+        &[(
+            timestamp,
+            Some(bytes::Bytes::copy_from_slice(key)),
+            value.map(bytes::Bytes::copy_from_slice),
+        )],
+    );
+    seg_mgr.append_batch(batch, 0).unwrap()
+}
+
 /// Builds the batch a producer would send: null keys, payloads as values, a placeholder
 /// base offset of 0 for the broker to stamp, and no compression unless a test asks for it.
 /// Mirrors what `TestClient::produce_batch_eos` does over the wire.
@@ -1779,27 +1828,27 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
 
     // Append records with duplicate keys across multiple segment rotations
     // Format: "key:value" payload
-    let r0 = seg_mgr.append(b"user1:val_1", 1000).unwrap(); // offset 0
-    let r1 = seg_mgr.append(b"user2:val_1", 1001).unwrap(); // offset 1
-    let r2 = seg_mgr.append(b"user1:val_2", 1002).unwrap(); // offset 2 (should override offset 0)
+    let r0 = append_keyed_record(&mut seg_mgr, b"user1", Some(b"val_1"), 1000); // offset 0
+    let r1 = append_keyed_record(&mut seg_mgr, b"user2", Some(b"val_1"), 1001); // offset 1
+    let r2 = append_keyed_record(&mut seg_mgr, b"user1", Some(b"val_2"), 1002); // offset 2 (overrides offset 0)
 
     // Force rotation into historical segment
     seg_mgr.rotate_segment().unwrap();
 
-    let r3 = seg_mgr.append(b"user2:val_2", 1003).unwrap(); // offset 3 (should override offset 1)
-    let r4 = seg_mgr.append(b"user1:val_3", 1004).unwrap(); // offset 4 (should override offset 2)
+    let r3 = append_keyed_record(&mut seg_mgr, b"user2", Some(b"val_2"), 1003); // offset 3 (overrides offset 1)
+    let r4 = append_keyed_record(&mut seg_mgr, b"user1", Some(b"val_3"), 1004); // offset 4 (overrides offset 2)
 
     // Force another rotation
     seg_mgr.rotate_segment().unwrap();
 
-    let r5 = seg_mgr.append(b"user3:val_1", 1005).unwrap(); // offset 5 in active segment
+    let r5 = append_keyed_record(&mut seg_mgr, b"user3", Some(b"val_1"), 1005); // offset 5 in active segment
 
-    assert_eq!(r0.offset, 0);
-    assert_eq!(r1.offset, 1);
-    assert_eq!(r2.offset, 2);
-    assert_eq!(r3.offset, 3);
-    assert_eq!(r4.offset, 4);
-    assert_eq!(r5.offset, 5);
+    assert_eq!(r0.base_offset, 0);
+    assert_eq!(r1.base_offset, 1);
+    assert_eq!(r2.base_offset, 2);
+    assert_eq!(r3.base_offset, 3);
+    assert_eq!(r4.base_offset, 4);
+    assert_eq!(r5.base_offset, 5);
 
     // Trigger the log compaction garbage collector. Compaction is intentionally
     // incremental — one call rewrites at most a handful of segments (bounding how long
@@ -1824,12 +1873,12 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
     let fetched_3 = seg_mgr.fetch(3, 1024).unwrap();
     assert!(!fetched_3.is_empty());
     assert_eq!(fetched_3[0].offset, 3);
-    assert_eq!(fetched_3[0].payload.as_ref(), b"user2:val_2");
+    assert_eq!(fetched_3[0].payload.as_ref(), b"val_2");
 
     let fetched_4 = seg_mgr.fetch(4, 1024).unwrap();
     assert!(!fetched_4.is_empty());
     assert_eq!(fetched_4[0].offset, 4);
-    assert_eq!(fetched_4[0].payload.as_ref(), b"user1:val_3");
+    assert_eq!(fetched_4[0].payload.as_ref(), b"val_3");
 }
 
 #[tokio::test]
@@ -3446,22 +3495,19 @@ async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
         .await
         .expect("AlterConfigs should succeed");
 
-    client
-        .produce_single(topic, "", None, 1, "userA:v1")
-        .await
-        .unwrap(); // offset 0 — stale
-    client
-        .produce_single(topic, "", None, 1, "userA:v2")
-        .await
-        .unwrap(); // offset 1 — current value for userA
-    client
-        .produce_single(topic, "", None, 1, "userB:")
-        .await
-        .unwrap(); // offset 2 — tombstone for userB
-    client
-        .produce_single(topic, "", None, 1, "zzz:filler")
-        .await
-        .unwrap(); // offset 3 — pushes offset 2's segment into history
+    // Keys are explicit on the record now, and a tombstone is a *null* value — not an
+    // empty one, which is an ordinary record.
+    for record in [
+        (Some(b"userA".as_ref()), Some(b"v1".as_ref())), // offset 0 — stale
+        (Some(b"userA".as_ref()), Some(b"v2".as_ref())), // offset 1 — current value for userA
+        (Some(b"userB".as_ref()), None),                 // offset 2 — tombstone for userB
+        (Some(b"zzz".as_ref()), Some(b"filler".as_ref())), // offset 3 — rolls the segment
+    ] {
+        client
+            .produce_keyed_batch_eos(topic, "", None, 1, 0, 0, 0, &[record])
+            .await
+            .unwrap();
+    }
 
     // delete.retention.ms=1 means the tombstone is expired almost as soon as it's
     // written; this sleep just makes that unambiguous regardless of scheduling jitter.
@@ -3476,10 +3522,11 @@ async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
     );
 
     // The surviving current value for userA must still be exactly as produced.
-    let remaining = client.fetch(topic, 0, 1, 4096).await.unwrap();
+    let remaining = client.fetch_records(topic, 0, 1, 4096).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].offset, 1);
-    assert_eq!(remaining[0].payload.as_ref(), b"userA:v2");
+    assert_eq!(remaining[0].key.as_deref(), Some(b"userA".as_ref()));
+    assert_eq!(remaining[0].value.as_deref(), Some(b"v2".as_ref()));
 
     server_task.abort();
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -7904,6 +7951,81 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// A compacted topic dedupes by key, so a record without one can never be superseded and
+/// can never be compacted away — it would sit in the log forever. Kafka rejects such a
+/// produce outright and so does this.
+///
+/// The same produce must still succeed on an ordinary (delete-policy) topic, otherwise the
+/// rule is not a compaction rule but a global one.
+#[tokio::test]
+async fn test_scenario_96_compacted_topic_rejects_records_without_a_key() {
+    let env = start_test_server().await;
+    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+
+    let compacted = "compacted_needs_keys_topic";
+    client.create_topic(compacted, 1).await.unwrap();
+    client
+        .alter_configs(
+            compacted,
+            &[("cleanup.policy".to_string(), "compact".to_string())],
+        )
+        .await
+        .expect("AlterConfigs should succeed");
+
+    // A keyed record is fine.
+    client
+        .produce_keyed_batch_eos(compacted, "", None, 1, 0, 0, 0, &[(Some(b"k"), Some(b"v"))])
+        .await
+        .expect("a keyed record must be accepted on a compacted topic");
+
+    // A keyless one is not.
+    let err = client
+        .produce_keyed_batch_eos(compacted, "", None, 1, 0, 0, 0, &[(None, Some(b"v"))])
+        .await
+        .expect_err("a keyless record must be rejected on a compacted topic");
+    let message = err.to_string();
+    assert!(
+        message.contains("without a key"),
+        "the error must say why it was rejected, got: {message}"
+    );
+
+    // One keyless record anywhere in the batch rejects the whole batch — offsets stay
+    // contiguous rather than half the batch landing.
+    let err = client
+        .produce_keyed_batch_eos(
+            compacted,
+            "",
+            None,
+            1,
+            0,
+            0,
+            0,
+            &[(Some(b"a"), Some(b"1")), (None, Some(b"2"))],
+        )
+        .await
+        .expect_err("a batch containing any keyless record must be rejected whole");
+    assert!(err.to_string().contains("without a key"));
+
+    // Only the first record survived, from the accepted produce above.
+    let records = client
+        .fetch_records(compacted, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "no part of a rejected batch may reach the log"
+    );
+    assert_eq!(records[0].key.as_deref(), Some(b"k".as_ref()));
+
+    // The same keyless produce is perfectly valid on an ordinary topic.
+    let plain = "plain_topic_allows_keyless";
+    client
+        .produce_keyed_batch_eos(plain, "", None, 1, 0, 0, 0, &[(None, Some(b"v"))])
+        .await
+        .expect("a keyless record must still be accepted on a delete-policy topic");
+}
+
 /// A long-polling fetch must actually park, and must be woken by data arriving rather
 /// than by its own timeout — that is what makes it cheaper *and* faster than polling.
 ///
@@ -8482,21 +8604,22 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     // up a mix of frame + batch entries (not a batch-only segment), so it's genuinely
     // rewritten by compaction rather than skipped outright for having no discardable
     // record at all.
-    pm.produce(b"zzz:keep").unwrap(); // offset 0
+    pm.produce_batch_eos(producer_keyed_batch(
+        &[(b"zzz", Some(b"keep"))],
+        hermes::protocol::BatchCompression::None,
+    ))
+    .unwrap()
+    .unwrap(); // offset 0
 
     // A batch of 3 records, written through the batch path directly
     // (`produce_batch_eos`), which is now the only client produce write path.
     let batch = pm
-        .produce_batch_eos(producer_batch(
+        .produce_batch_eos(producer_keyed_batch(
             &[
-                bytes::Bytes::from_static(b"k1:v1"),
-                bytes::Bytes::from_static(b"k2:v2"),
-                bytes::Bytes::from_static(b"k3:v3"),
+                (b"k1", Some(b"v1")),
+                (b"k2", Some(b"v2")),
+                (b"k3", Some(b"v3")),
             ],
-            0,
-            0,
-            0,
-            false,
             hermes::protocol::BatchCompression::None,
         ))
         .unwrap()
@@ -8507,8 +8630,14 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
         "offsets 1..=3"
     );
 
-    let plain_frame = pm.produce_frame(b"www:stale").unwrap(); // offset 4 — superseded below
-    assert_eq!(plain_frame.offset, 4);
+    let stale_www = pm
+        .produce_batch_eos(producer_keyed_batch(
+            &[(b"www", Some(b"stale"))],
+            hermes::protocol::BatchCompression::None,
+        ))
+        .unwrap()
+        .unwrap(); // offset 4 — superseded below
+    assert_eq!(stale_www.base_offset, 4);
 
     // `max_segment_bytes: 200` (set below on the engine config) is sized so that the
     // three writes above (33 + 116 + 34 = 183 bytes) fit in one segment, but the next
@@ -8517,10 +8646,22 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     // and `www:fresh`/`k1:v2` below into a fresh active segment, without needing direct
     // access to `SegmentManager::rotate_segment` (private, and rightly so, to this
     // black-box `PartitionManager`-level test).
-    let fresh_www = pm.produce_frame(b"www:fresh").unwrap(); // offset 5
-    assert_eq!(fresh_www.offset, 5);
-    let fresh_k1 = pm.produce_frame(b"k1:v2").unwrap(); // offset 6 — supersedes the batch's k1
-    assert_eq!(fresh_k1.offset, 6);
+    let fresh_www = pm
+        .produce_batch_eos(producer_keyed_batch(
+            &[(b"www", Some(b"fresh"))],
+            hermes::protocol::BatchCompression::None,
+        ))
+        .unwrap()
+        .unwrap(); // offset 5
+    assert_eq!(fresh_www.base_offset, 5);
+    let fresh_k1 = pm
+        .produce_batch_eos(producer_keyed_batch(
+            &[(b"k1", Some(b"v2"))],
+            hermes::protocol::BatchCompression::None,
+        ))
+        .unwrap()
+        .unwrap(); // offset 6 — supersedes the batch's k1
+    assert_eq!(fresh_k1.base_offset, 6);
 
     let mut compacted = 0usize;
     for _ in 0..10 {
@@ -8532,23 +8673,32 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     }
     assert_eq!(
         compacted, 2,
-        "offset 1 (stale batch record k1) and offset 4 (stale frame www) should be dropped"
+        "offset 1 (stale batch record k1) and offset 4 (stale www) should be dropped"
     );
 
-    // The rewritten historical segment and the untouched active segment are fetched
-    // separately and concatenated, same as `SegmentManager::fetch`'s single-segment
-    // contract requires at the unit level.
-    let mut remaining = pm.fetch(0, 65536).unwrap();
-    remaining.extend(pm.fetch(5, 65536).unwrap());
+    // `fetch` serves one segment at a time, so walk forward from offset 0 until nothing
+    // new comes back. Segment boundaries depend on entry sizes and are not what this test
+    // is about; hard-coding which offsets live in which segment would make it brittle.
+    let mut remaining = Vec::new();
+    let mut next = 0u64;
+    loop {
+        let page = pm.fetch(next, 65536).unwrap();
+        let Some(last) = page.last() else { break };
+        next = last.offset + 1;
+        remaining.extend(page);
+        if next > 6 {
+            break;
+        }
+    }
     let payloads: Vec<&[u8]> = remaining.iter().map(|f| f.payload.as_ref()).collect();
     assert_eq!(
         payloads,
         vec![
-            b"zzz:keep".as_ref(),
-            b"k2:v2".as_ref(),
-            b"k3:v3".as_ref(),
-            b"www:fresh".as_ref(),
-            b"k1:v2".as_ref(),
+            b"keep".as_ref(),
+            b"v2".as_ref(),
+            b"v3".as_ref(),
+            b"fresh".as_ref(),
+            b"v2".as_ref(),
         ],
         "k2/k3 came from inside the batch and were never superseded — compaction must not \
          drop them just because they arrived batched"

@@ -2171,6 +2171,35 @@ impl StorageEngine {
         // `get_or_create_partition_for_client`).
         let pm = self.get_or_create_partition_for_client(topic, partition_id)?;
 
+        // A compacted topic dedupes by key, so a record without one has no meaning there:
+        // it can never be superseded and can never be compacted away, so it would sit in
+        // the log forever and surface much later as unexplained growth. Kafka rejects such
+        // a produce outright (`InvalidRecordException`, "Compacted topic cannot accept
+        // message without key"); this does the same.
+        //
+        // Checked against the batch's decoded records, which means decompressing it — the
+        // one produce-path decompression, and only on compacted topics.
+        if pm.cleanup_policy().is_compact() {
+            let records = batch.records().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Malformed record batch: {}", e),
+                )
+            })?;
+            if let Some(bad) = records.iter().position(|r| r.key.is_none()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Compacted topic '{}' cannot accept a record without a key \
+                         (record {} of {} in this batch)",
+                        topic,
+                        bad,
+                        records.len()
+                    ),
+                ));
+            }
+        }
+
         // The actual disk work (segment append per record, plus the batch's group-commit
         // fsync) is synchronous, lock-and-syscall-heavy I/O. Running it inline in this
         // `async fn` would block whichever Tokio worker thread picked up this task for the
