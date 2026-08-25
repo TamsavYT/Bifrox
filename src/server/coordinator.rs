@@ -442,6 +442,7 @@ impl GroupCoordinator {
         group_instance_id: Option<&str>,
         protocols: Vec<String>,
         session_timeout_ms: Option<u32>,
+        cooperative_round_two: bool,
     ) -> Result<(String, u32, bool, String), String> {
         let mut groups = self.groups.lock().unwrap();
         let group = groups
@@ -453,19 +454,41 @@ impl GroupCoordinator {
             Self::resolve_session_timeout(session_timeout_ms, group_id, member_id);
 
         // A known instance id short-circuits everything below: the caller is a member the
-        // group already has, so it takes its slot back without the group rebalancing.
+        // group already has, so it takes its slot back without the group rebalancing
+        // (issue #55 — a static member restarting must not disturb the group).
+        //
+        // A stated cooperative round-two request is the one exception. Without it, a
+        // cooperative group whose leader is static could never get its second round: this
+        // returns before `rebalance_needed` is ever computed, so the generation never
+        // bumped, no follower's heartbeat was rejected, and the moved partitions sat
+        // assigned but unconsumed until some unrelated event caused a rejoin (issue #69).
+        // This does not weaken #55: a restarting static member is reclaiming a slot, not
+        // asking for a round, so it never sets the tag.
         if let Some(instance_id) = group_instance_id {
-            if let Some(result) = Self::rejoin_static(group, instance_id, session_timeout) {
-                return Ok(result);
+            if !cooperative_round_two {
+                if let Some(result) = Self::rejoin_static(group, instance_id, session_timeout) {
+                    return Ok(result);
+                }
             }
         }
 
         let m_id = if let Some(instance_id) = group_instance_id {
-            // First sighting of this instance. Name its member id after the instance so a
-            // static member is identifiable in `describe_group` output, and so the
-            // sequence below can hand out a fresh one on every rejoin.
-            group.member_id_seq = group.member_id_seq.saturating_add(1);
-            format!("{}-{}", instance_id, group.member_id_seq)
+            match group.static_members.get(instance_id) {
+                // A known instance only reaches here on a stated round-two request — every
+                // other static rejoin returned above. That caller is the member already
+                // here, mid-round, not a restarting process, so it keeps its existing
+                // member id: minting a fresh one would make the group's own leader look
+                // like a brand-new member and hand leadership to someone else, which is
+                // the opposite of what a leader driving its second round needs.
+                Some(existing) => existing.clone(),
+                // First sighting of this instance. Name its member id after the instance so
+                // a static member is identifiable in `describe_group` output, and so the
+                // sequence below can hand out a fresh one on every rejoin.
+                None => {
+                    group.member_id_seq = group.member_id_seq.saturating_add(1);
+                    format!("{}-{}", instance_id, group.member_id_seq)
+                }
+            }
         } else if member_id.is_empty() {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -515,38 +538,23 @@ impl GroupCoordinator {
             // cooperative group's leader only the intersection of each member's current
             // and target partitions, and the partitions withheld from that intersection
             // only reach their new owner once a second round hands out the (now
-            // ownerless) remainder. Nothing else in this protocol lets an established,
-            // still-healthy member request a fresh round — every other path to
-            // `rebalance_needed = true` is a membership change (a new member above, or
-            // the group re-forming from Empty below) — so the group's own leader calling
-            // JoinGroup again while the group is genuinely Stable is treated as exactly
-            // that request.
+            // ownerless) remainder.
             //
-            // Deliberately scoped to the *leader specifically*, not "any known member":
-            // an ordinary follower's routine catch-up call — heartbeat-triggered,
-            // `GroupConsumer`'s only path to `rejoin()` — always lands on a group that
-            // has *already* stabilized on a newer generation by the time it arrives
-            // (that's what made its own heartbeat fail in the first place), which means
-            // `state == Stable` is true for that call too. Treating that as a fresh
-            // request would misfire on every ordinary follower catch-up after any real
-            // rebalance, cooperative or not, and — worse — would never stop: each
-            // follower's catch-up would itself open a new round for the *next* follower
-            // to stumble into. Restricting this to the leader closes that: a leader only
-            // ever reaches this call site once, deliberately, right after submitting a
-            // round that needed a follow-up (`GroupConsumer::rejoin`'s cooperative
-            // branch) — never as a reaction to its own generation going stale, since the
-            // leader is the one *causing* the generation to advance, not discovering it
-            // secondhand.
+            // The client states that intent with a tagged field rather than the
+            // coordinator inferring it. The inference this replaces was
+            // `is_cooperative() && state == Stable && caller is the leader`, which could
+            // not tell a deliberate round-two request from a leader that called JoinGroup
+            // for some other reason — a reconnect, say — while the group happened to be
+            // Stable, and so caused a spurious extra round (issue #70).
             //
-            // Also scoped to `is_cooperative()` groups only: an eager group has no
-            // second round to ask for, so this never fires for one regardless of who
-            // calls it. The `state == Stable` guard is what keeps a single legitimate
-            // request from cascading: the moment it fires, the group leaves Stable
-            // (below) atomically under this same lock, so it cannot re-fire for the
-            // very generation it just opened.
-            if group.is_cooperative()
-                && group.state == GroupState::Stable
-                && group.leader.as_deref() == Some(m_id.as_str())
+            // Still scoped to `is_cooperative()`: an eager group has no second round to
+            // ask for, so a stray tag on one is ignored rather than opening a round that
+            // means nothing. The `state == Stable` guard stays too, so a request arriving
+            // mid-rebalance does not open a second round on top of the one already
+            // running — the moment this fires the group leaves Stable below, atomically
+            // under this same lock, so it cannot re-fire for the generation it just
+            // opened.
+            if cooperative_round_two && group.is_cooperative() && group.state == GroupState::Stable
             {
                 rebalance_needed = true;
             }
@@ -886,7 +894,14 @@ mod tests {
     fn join_group_honors_an_in_range_requested_session_timeout() {
         let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
         let (member_id, ..) = coordinator
-            .join_group("g", "m1", None, vec!["range".to_string()], Some(2_000))
+            .join_group(
+                "g",
+                "m1",
+                None,
+                vec!["range".to_string()],
+                Some(2_000),
+                false,
+            )
             .unwrap();
         assert_eq!(
             member_session_timeout(&coordinator, "g", &member_id),
@@ -898,7 +913,7 @@ mod tests {
     fn join_group_clamps_a_too_low_requested_session_timeout() {
         let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
         let (member_id, ..) = coordinator
-            .join_group("g", "m1", None, vec!["range".to_string()], Some(1))
+            .join_group("g", "m1", None, vec!["range".to_string()], Some(1), false)
             .unwrap();
         assert_eq!(
             member_session_timeout(&coordinator, "g", &member_id),
@@ -912,7 +927,14 @@ mod tests {
     fn join_group_clamps_a_too_high_requested_session_timeout() {
         let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
         let (member_id, ..) = coordinator
-            .join_group("g", "m1", None, vec!["range".to_string()], Some(3_600_000))
+            .join_group(
+                "g",
+                "m1",
+                None,
+                vec!["range".to_string()],
+                Some(3_600_000),
+                false,
+            )
             .unwrap();
         assert_eq!(
             member_session_timeout(&coordinator, "g", &member_id),
@@ -926,7 +948,7 @@ mod tests {
     fn join_group_without_the_tag_keeps_the_default_session_timeout() {
         let coordinator = GroupCoordinator::with_rebalance_delay(Duration::ZERO);
         let (member_id, ..) = coordinator
-            .join_group("g", "m1", None, vec!["range".to_string()], None)
+            .join_group("g", "m1", None, vec!["range".to_string()], None, false)
             .unwrap();
         assert_eq!(
             member_session_timeout(&coordinator, "g", &member_id),
@@ -945,6 +967,7 @@ mod tests {
                 Some("instance-a"),
                 vec!["range".to_string()],
                 Some(1_000),
+                false,
             )
             .unwrap();
         // Same instance rejoins with a different requested timeout — simulating a
@@ -956,6 +979,7 @@ mod tests {
                 Some("instance-a"),
                 vec!["range".to_string()],
                 Some(9_000),
+                false,
             )
             .unwrap();
         assert_eq!(
@@ -991,7 +1015,14 @@ mod tests {
     fn a_dead_member_is_evicted_for_session_timeout_not_stalled_consumption() {
         let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_secs(600));
         let (member_id, ..) = coordinator
-            .join_group("g", "dead", None, vec!["range".to_string()], Some(1_000))
+            .join_group(
+                "g",
+                "dead",
+                None,
+                vec!["range".to_string()],
+                Some(1_000),
+                false,
+            )
             .unwrap();
         // Neither heartbeat nor fetch for well past the 1s session timeout, but nowhere
         // near the group's very generous 600s max_poll_interval — only the session-timeout
@@ -1022,6 +1053,7 @@ mod tests {
                 None,
                 vec!["range".to_string()],
                 Some(60_000),
+                false,
             )
             .unwrap();
         // Heartbeat is fresh — session timeout cannot be why this gets pruned — but fetch
@@ -1046,7 +1078,14 @@ mod tests {
     fn record_progress_prevents_a_heartbeating_members_stalled_eviction() {
         let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_millis(500));
         let (member_id, ..) = coordinator
-            .join_group("g", "active", None, vec!["range".to_string()], Some(60_000))
+            .join_group(
+                "g",
+                "active",
+                None,
+                vec!["range".to_string()],
+                Some(60_000),
+                false,
+            )
             .unwrap();
         backdate(
             &coordinator,
@@ -1071,7 +1110,14 @@ mod tests {
     fn both_eviction_causes_are_recorded_distinctly_in_the_same_group() {
         let coordinator = GroupCoordinator::with_config(Duration::ZERO, Duration::from_millis(500));
         let (dead, ..) = coordinator
-            .join_group("g", "dead", None, vec!["range".to_string()], Some(200))
+            .join_group(
+                "g",
+                "dead",
+                None,
+                vec!["range".to_string()],
+                Some(200),
+                false,
+            )
             .unwrap();
         let (stalled, ..) = coordinator
             .join_group(
@@ -1080,6 +1126,7 @@ mod tests {
                 None,
                 vec!["range".to_string()],
                 Some(60_000),
+                false,
             )
             .unwrap();
         let (healthy, ..) = coordinator
@@ -1089,6 +1136,7 @@ mod tests {
                 None,
                 vec!["range".to_string()],
                 Some(60_000),
+                false,
             )
             .unwrap();
 

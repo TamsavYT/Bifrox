@@ -773,16 +773,18 @@ impl GroupConsumer {
                 // Round one's SyncGroup above just made every withheld partition
                 // ownerless — no member's `assigned_partitions` includes them any more
                 // (each kept only its share of `round_one`). Getting them to their new
-                // owners needs a second generation, and the only lever this member has
-                // to request one — without a wire change — is calling JoinGroup again
-                // itself: for a cooperative group, the coordinator treats an already-known
-                // member calling JoinGroup while the group is Stable as a request for a
-                // fresh rebalance round (see `GroupCoordinator::join_group`), bumping the
-                // generation and reopening the join barrier so every other member gets a
-                // chance to notice — via its own heartbeat rejection — and rejoin before
-                // this round closes. Eager groups never reach this branch at all
-                // (`needs_second_round` is always false for them), so this never runs for
-                // them regardless.
+                // owners needs a second generation, which this asks for explicitly with
+                // the `COOPERATIVE_ROUND_TWO` tagged field: the coordinator bumps the
+                // generation and reopens the join barrier so every other member notices
+                // — via its own heartbeat rejection — and rejoins before this round
+                // closes.
+                //
+                // Stated rather than inferred. The coordinator used to read "a known
+                // member called JoinGroup while the group was Stable" as this request,
+                // which fired on an unrelated leader reconnect too (#70) and never fired
+                // at all for a static leader, whose rejoin short-circuits earlier (#69).
+                // Eager groups never reach this branch (`needs_second_round` is always
+                // false for them), so it never runs for one regardless.
                 // Recomputed rather than reusing the outer `protocol_refs` — that borrow
                 // of `self.config.protocols` would otherwise have to stay alive across
                 // the mutable `self.submit_assignment` call above, which the borrow
@@ -791,7 +793,7 @@ impl GroupConsumer {
                     self.config.protocols.iter().map(String::as_str).collect();
                 let round_two_join = self
                     .client
-                    .join_group_with_session_timeout(
+                    .join_group_round_two(
                         &self.config.group_id,
                         &self.member_id,
                         self.config.instance_id.as_deref(),

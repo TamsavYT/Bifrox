@@ -2329,6 +2329,18 @@ impl TestClient {
             .await
     }
 
+    /// A cooperative rebalance leader's second-round request — [`Self::join_group`] with
+    /// the `COOPERATIVE_ROUND_TWO` tag set.
+    pub async fn join_group_requesting_round_two(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        protocols: &[&str],
+    ) -> IoResult<JoinGroupResult> {
+        self.join_group_round_two(group_id, member_id, None, protocols, None)
+            .await
+    }
+
     /// Joins with a `group.instance.id` — a name for *this consumer's slot in the group*
     /// that outlives the process holding it.
     ///
@@ -2373,6 +2385,52 @@ impl TestClient {
         protocols: &[&str],
         session_timeout: Option<std::time::Duration>,
     ) -> IoResult<JoinGroupResult> {
+        self.join_group_full(
+            group_id,
+            member_id,
+            instance_id,
+            protocols,
+            session_timeout,
+            false,
+        )
+        .await
+    }
+
+    /// `join_group_with_session_timeout` plus the cooperative round-two flag.
+    ///
+    /// A cooperative rebalance's leader calls this after round one to ask for the second
+    /// generation that delivers the withheld partitions. Stating it explicitly is what
+    /// keeps it distinguishable from an ordinary rejoin — including a static member
+    /// reclaiming its slot, which must not open a round.
+    pub async fn join_group_round_two(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        instance_id: Option<&str>,
+        protocols: &[&str],
+        session_timeout: Option<std::time::Duration>,
+    ) -> IoResult<JoinGroupResult> {
+        self.join_group_full(
+            group_id,
+            member_id,
+            instance_id,
+            protocols,
+            session_timeout,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn join_group_full(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        instance_id: Option<&str>,
+        protocols: &[&str],
+        session_timeout: Option<std::time::Duration>,
+        cooperative_round_two: bool,
+    ) -> IoResult<JoinGroupResult> {
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, group_id);
         crate::protocol::wire::write_pascal_string(&mut inner, member_id);
@@ -2386,26 +2444,32 @@ impl TestClient {
             crate::protocol::wire::write_pascal_string(&mut inner, instance_id);
         }
 
-        let resp = match session_timeout {
-            None => {
-                let mut req_buf = Vec::new();
-                req_buf.put_u8(CommandCode::JoinGroup as u8);
-                req_buf.put_u32(inner.len() as u32);
-                req_buf.extend_from_slice(&inner);
-                self.send_raw_bytes(&req_buf).await?
-            }
-            Some(timeout) => {
-                let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-                self.send_versioned(
-                    CommandCode::JoinGroup,
-                    &[(
-                        crate::protocol::wire::tags::SESSION_TIMEOUT_MS,
-                        ms.to_be_bytes().to_vec(),
-                    )],
-                    inner,
-                )
+        let mut tags: Vec<(u8, Vec<u8>)> = Vec::new();
+        if let Some(timeout) = session_timeout {
+            let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            tags.push((
+                crate::protocol::wire::tags::SESSION_TIMEOUT_MS,
+                ms.to_be_bytes().to_vec(),
+            ));
+        }
+        if cooperative_round_two {
+            // The tag's presence is the signal; the payload is empty.
+            tags.push((
+                crate::protocol::wire::tags::COOPERATIVE_ROUND_TWO,
+                Vec::new(),
+            ));
+        }
+
+        let resp = if tags.is_empty() {
+            // Nothing to state: send the exact bytes a legacy join always did.
+            let mut req_buf = Vec::new();
+            req_buf.put_u8(CommandCode::JoinGroup as u8);
+            req_buf.put_u32(inner.len() as u32);
+            req_buf.extend_from_slice(&inner);
+            self.send_raw_bytes(&req_buf).await?
+        } else {
+            self.send_versioned(CommandCode::JoinGroup, &tags, inner)
                 .await?
-            }
         };
 
         if resp.status == 0 {

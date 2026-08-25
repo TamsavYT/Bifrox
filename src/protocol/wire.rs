@@ -196,6 +196,21 @@ pub mod tags {
     /// Only meaningful alongside [`MAX_WAIT_MS`], which bounds the wait. An absent tag
     /// means 1: any data at all completes the fetch.
     pub const MIN_BYTES: u8 = 0x06;
+
+    /// Marks a `JoinGroup` as a cooperative rebalance's **second-round request**. The
+    /// payload is empty; the tag's presence is the signal.
+    ///
+    /// The coordinator used to infer this from "the caller is the leader and the group is
+    /// Stable", which cannot tell a deliberate round-two request from a leader that called
+    /// `JoinGroup` for some other reason while the group happened to be Stable — a
+    /// reconnect, say. That inference caused a spurious extra rebalance round, and it also
+    /// never fired at all when the leader was a *static* member, because the static-rejoin
+    /// short-circuit returns before the inference is reached.
+    ///
+    /// Stating the intent fixes both: the coordinator acts on what the client said rather
+    /// than on a guess, and a static member's ordinary slot reclaim stays distinguishable
+    /// from its leader deliberately opening a round.
+    pub const COOPERATIVE_ROUND_TWO: u8 = 0x07;
 }
 
 /// Read isolation requested by a fetch.
@@ -260,6 +275,9 @@ pub struct RequestTags {
     pub max_wait_ms: Option<u32>,
     /// `fetch.min.bytes` — see [`tags::MIN_BYTES`]. `None` means 1.
     pub min_bytes: Option<u32>,
+    /// True when this `JoinGroup` is a cooperative rebalance's second-round request — see
+    /// [`tags::COOPERATIVE_ROUND_TWO`].
+    pub cooperative_round_two: bool,
 }
 
 /// How a request arrived, which determines how its response must be framed.
@@ -336,6 +354,13 @@ impl RequestFraming {
         self.tags().min_bytes.unwrap_or(1).max(1)
     }
 
+    /// Whether this `JoinGroup` states it is a cooperative second-round request — see
+    /// [`tags::COOPERATIVE_ROUND_TWO`]. False when untagged, which is what every request
+    /// that is not deliberately opening a round looks like.
+    pub fn is_cooperative_round_two(&self) -> bool {
+        self.tags().cooperative_round_two
+    }
+
     /// `(group_id, member_id)` this request is attributed to via
     /// [`tags::GROUP_MEMBER`], or `None` if untagged.
     pub fn group_member(&self) -> Option<(String, String)> {
@@ -389,6 +414,11 @@ pub fn wrap_forwarded_request(raw_request: &[u8]) -> Result<Vec<u8>, WireError> 
         tag_section.put_u8(tags::MIN_BYTES);
         tag_section.put_u16(4);
         tag_section.put_u32(min_bytes);
+        tag_count += 1;
+    }
+    if tags.cooperative_round_two {
+        tag_section.put_u8(tags::COOPERATIVE_ROUND_TWO);
+        tag_section.put_u16(0);
         tag_count += 1;
     }
     if let Some((group_id, member_id)) = &tags.group_member {
@@ -874,6 +904,7 @@ impl WireRequest {
                         tags.session_timeout_ms =
                             Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));
                     }
+                    tags::COOPERATIVE_ROUND_TWO => tags.cooperative_round_two = true,
                     tags::MAX_WAIT_MS if len >= 4 => {
                         tags.max_wait_ms =
                             Some(u32::from_be_bytes(value[0..4].try_into().unwrap()));

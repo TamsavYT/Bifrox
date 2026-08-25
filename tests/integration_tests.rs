@@ -7477,12 +7477,12 @@ async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds(
         .unwrap();
     // The group is Stable again at generation 2 — round one is done.
 
-    // Round two: A (the leader), already a known member, requests a fresh round by
-    // calling JoinGroup again while the group is Stable — the coordinator change this
-    // feature needed (`GroupCoordinator::join_group`'s cooperative branch) bumps the
-    // generation for exactly this call.
+    // Round two: A (the leader) asks for a fresh round explicitly, via the
+    // `COOPERATIVE_ROUND_TWO` tagged field. The coordinator acts on that stated intent
+    // rather than inferring it from "a known member joined while the group was Stable",
+    // which could not tell this from an unrelated leader reconnect.
     let round_two_join = client_a
-        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .join_group_requesting_round_two(group_id, "member-a", &["cooperative-sticky"])
         .await
         .expect("A must be able to request a second round");
     assert_eq!(
@@ -7715,7 +7715,7 @@ async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two
 
     // Round two: A requests and drives a fresh round, advancing the generation again.
     let round_two_join = client_a
-        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .join_group_requesting_round_two(group_id, "member-a", &["cooperative-sticky"])
         .await
         .unwrap();
     let round_two_generation = round_two_join.generation_id;
@@ -8261,6 +8261,163 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
         no_wait_elapsed * 2 < idle_elapsed,
         "a fetch with no wait tag must not be held: it took {no_wait_elapsed:?}, which is \
          not decisively faster than the {idle_elapsed:?} an opted-in fetch was held for"
+    );
+}
+
+/// Issue #70: a cooperative leader reconnecting must not be mistaken for a round-two
+/// request.
+///
+/// The coordinator used to infer round two from "the caller is the leader and the group is
+/// Stable", which is also exactly what an ordinary leader rejoin looks like — a heartbeat
+/// connection blipping and re-establishing, say. That cost a spurious rebalance round every
+/// time. The request is stated now, so a join that does not state it changes nothing.
+#[tokio::test]
+async fn test_scenario_101_cooperative_leader_rejoin_does_not_open_a_round() {
+    let env = start_test_server().await;
+    let group_id = "coop_leader_rejoin_group";
+    let mut client_a = TestClient::connect(env.addr).await.unwrap();
+    let mut client_b = TestClient::connect(env.addr).await.unwrap();
+
+    let join_a = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert!(join_a.is_leader);
+    let join_b = client_b
+        .join_group(group_id, "member-b", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    let stable_generation = join_b.generation_id;
+
+    // Close the round so the group is Stable — the state the old inference keyed on.
+    let assignments: Vec<hermes::protocol::wire::MemberAssignment> =
+        [("member-a", vec![0u32]), ("member-b", vec![1u32])]
+            .into_iter()
+            .map(
+                |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                    member_id: member_id.to_string(),
+                    topic: "coop_leader_rejoin_topic".to_string(),
+                    partitions,
+                },
+            )
+            .collect();
+    client_a
+        .sync_group(group_id, stable_generation, "member-a", &assignments)
+        .await
+        .unwrap();
+
+    // The leader rejoins for an unrelated reason. Same call the old inference could not
+    // distinguish from a deliberate round-two request.
+    let reconnect = client_a
+        .join_group(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(
+        reconnect.generation_id, stable_generation,
+        "an ordinary leader rejoin must not open a new rebalance round"
+    );
+
+    // And the explicit request still does open one, so the capability is intact.
+    let round_two = client_a
+        .join_group_requesting_round_two(group_id, "member-a", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    assert_eq!(
+        round_two.generation_id,
+        stable_generation + 1,
+        "a stated round-two request must still advance the generation"
+    );
+}
+
+/// Issue #69: a cooperative group whose leader is a *static* member could never get its
+/// second round.
+///
+/// `join_group`'s static-rejoin short-circuit returns before the round-two path is reached
+/// — correct for its own purpose (#55: a static member restarting must not disturb the
+/// group), but it also swallowed the leader's deliberate request. The generation never
+/// bumped, so no follower's heartbeat was rejected and the moved partitions sat assigned
+/// but unconsumed.
+///
+/// Both halves are asserted, because fixing this by simply letting static members through
+/// would undo #55: a static member reclaiming its slot must still change nothing.
+#[tokio::test]
+async fn test_scenario_102_static_cooperative_leader_can_request_round_two() {
+    let env = start_test_server().await;
+    let group_id = "static_coop_leader_group";
+    let mut leader = TestClient::connect(env.addr).await.unwrap();
+    let mut follower = TestClient::connect(env.addr).await.unwrap();
+
+    // A static leader — the combination that used to be stuck.
+    let join_leader = leader
+        .join_group_static(
+            group_id,
+            "",
+            Some("leader-instance"),
+            &["cooperative-sticky"],
+        )
+        .await
+        .unwrap();
+    assert!(join_leader.is_leader);
+    let leader_member_id = join_leader.member_id.clone();
+
+    let join_follower = follower
+        .join_group(group_id, "member-follower", &["cooperative-sticky"])
+        .await
+        .unwrap();
+    let stable_generation = join_follower.generation_id;
+
+    let assignments: Vec<hermes::protocol::wire::MemberAssignment> = [
+        (leader_member_id.clone(), vec![0u32]),
+        ("member-follower".to_string(), vec![1u32]),
+    ]
+    .into_iter()
+    .map(
+        |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            member_id,
+            topic: "static_coop_leader_topic".to_string(),
+            partitions,
+        },
+    )
+    .collect();
+    leader
+        .sync_group(group_id, stable_generation, &leader_member_id, &assignments)
+        .await
+        .unwrap();
+
+    // #55 still holds: the static member reclaiming its slot changes nothing.
+    let reclaim = leader
+        .join_group_static(
+            group_id,
+            "",
+            Some("leader-instance"),
+            &["cooperative-sticky"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaim.generation_id, stable_generation,
+        "a static member reclaiming its slot must not rebalance the group (#55)"
+    );
+
+    // #69: the same static member, stating a round-two request, must get a new generation.
+    let round_two = leader
+        .join_group_round_two(
+            group_id,
+            &leader_member_id,
+            Some("leader-instance"),
+            &["cooperative-sticky"],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        round_two.generation_id,
+        stable_generation + 1,
+        "a static cooperative leader must be able to open its second round"
+    );
+    assert!(
+        round_two.is_leader,
+        "it is still the leader driving the round"
     );
 }
 
