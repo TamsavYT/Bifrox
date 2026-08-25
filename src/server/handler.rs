@@ -2448,12 +2448,15 @@ async fn process_request(
             // hardcoded default, clamped to a sane range (see
             // `GroupCoordinator::resolve_session_timeout`).
             match engine
-                .join_group_awaited_with_session_timeout(
+                .join_group_awaited_with_options(
                     &group_id,
                     &member_id,
                     group_instance_id.as_deref(),
                     protocols,
-                    framing.session_timeout_ms(),
+                    crate::server::engine::JoinGroupOptions {
+                        session_timeout_ms: framing.session_timeout_ms(),
+                        cooperative_round_two: framing.is_cooperative_round_two(),
+                    },
                 )
                 .await
             {

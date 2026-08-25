@@ -202,6 +202,17 @@ pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     Ok(())
 }
 
+/// What a `JoinGroup` request's tagged fields asked for. Every field defaults to "the tag
+/// was absent", which is what a request that states nothing looks like.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JoinGroupOptions {
+    /// `session.timeout.ms` the member asked for, or `None` when untagged — the
+    /// coordinator keeps its own default rather than clamping "nothing" into a value.
+    pub session_timeout_ms: Option<u32>,
+    /// Whether this join states it is a cooperative rebalance's second-round request.
+    pub cooperative_round_two: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProduceBatchParams<'a> {
     pub topic: &'a str,
@@ -1756,30 +1767,27 @@ impl StorageEngine {
         group_instance_id: Option<&str>,
         protocols: Vec<String>,
     ) -> Result<(String, u32, bool, String), String> {
-        self.join_group_awaited_with_session_timeout(
+        self.join_group_awaited_with_options(
             group_id,
             member_id,
             group_instance_id,
             protocols,
-            None,
+            JoinGroupOptions::default(),
         )
         .await
     }
 
-    /// Same as [`Self::join_group_awaited`], but also carries the client's requested
-    /// `session.timeout.ms` — the `SESSION_TIMEOUT_MS` tagged field off the request
-    /// envelope, or `None` if the request carried no such tag — through to
-    /// `GroupCoordinator::join_group`, which resolves (and clamps) it into the member's
-    /// actual eviction threshold. Split out from `join_group_awaited` rather than adding a
-    /// parameter there so the many existing callers that don't care about this are
-    /// unaffected.
-    pub async fn join_group_awaited_with_session_timeout(
+    /// Same as [`Self::join_group_awaited`], but also carries what the request's tagged
+    /// fields asked for. Kept separate from `join_group_awaited` so the many callers that
+    /// want none of it stay unaffected, and taking a struct rather than more positional
+    /// parameters so adding the next tag does not grow another argument.
+    pub async fn join_group_awaited_with_options(
         &self,
         group_id: &str,
         member_id: &str,
         group_instance_id: Option<&str>,
         protocols: Vec<String>,
-        session_timeout_ms: Option<u32>,
+        options: JoinGroupOptions,
     ) -> Result<(String, u32, bool, String), String> {
         let coordinator = self.group_coordinator();
         let (m_id, generation_id, is_leader, protocol_name) = coordinator.join_group(
@@ -1787,7 +1795,8 @@ impl StorageEngine {
             member_id,
             group_instance_id,
             protocols,
-            session_timeout_ms,
+            options.session_timeout_ms,
+            options.cooperative_round_two,
         )?;
 
         // Bound the total wait so a pathological extension chain can't pin a connection.
