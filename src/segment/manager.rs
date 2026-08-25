@@ -1,6 +1,6 @@
 use crate::config::EngineConfig;
 use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
-use crate::segment::entry::{decode_entry, LogEntry};
+use crate::segment::entry::{decode_entry, records_from_entries, LogEntry, Record};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
 use crate::segment::timeindex::TimeIndexSegment;
@@ -169,70 +169,6 @@ fn entry_index_timestamp(entry: &LogEntry) -> u64 {
         LogEntry::Frame(frame) => frame.timestamp,
         LogEntry::Batch(batch) => batch.base_timestamp,
     }
-}
-
-/// One record as compaction sees it, whichever entry kind it came from.
-///
-/// Compaction is the one place the broker legitimately decodes records — it cannot dedupe
-/// by key without reading keys — so this is where a batch is decompressed and a frame is
-/// decompressed, and nowhere else on any serving path.
-#[derive(Debug, Clone)]
-struct CompactionRecord {
-    offset: u64,
-    timestamp: u64,
-    /// The key the producer wrote. `None` means the record carries no key at all — it
-    /// cannot participate in dedup and is always kept. Produce rejects keyless records on
-    /// a compacted topic, so this only arises for records written before the topic became
-    /// compacted, or for a plain frame, which has no key field.
-    key: Option<Bytes>,
-    /// `None` is a tombstone: it marks the key deleted. Distinct from `Some(empty)`, an
-    /// ordinary record whose value happens to be empty.
-    value: Option<Bytes>,
-    is_control: bool,
-}
-
-/// Decodes every record out of a segment's entries for compaction's key scan.
-///
-/// A batch whose record data fails to decode has its records skipped rather than aborting
-/// the whole scan: `entries` was already fully parsed into discrete entries by
-/// `read_all_entries`, so a bad batch's neighbours are known-good and there is no reason
-/// to lose them too.
-fn records_for_compaction(entries: &[LogEntry]) -> Vec<CompactionRecord> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match entry {
-            LogEntry::Frame(frame) => {
-                // A frame's payload is compressed per-record, unlike a batch's, so it must
-                // be decompressed before its bytes mean anything. A frame has no key field
-                // at all, so it can never be deduped by key.
-                let payload = frame
-                    .decompress_payload()
-                    .unwrap_or_else(|_| frame.payload.clone());
-                out.push(CompactionRecord {
-                    offset: frame.offset,
-                    timestamp: frame.timestamp,
-                    key: None,
-                    value: Some(payload),
-                    is_control: frame.is_control_marker(),
-                });
-            }
-            LogEntry::Batch(batch) => {
-                let Ok(records) = batch.records() else {
-                    continue;
-                };
-                for r in records {
-                    out.push(CompactionRecord {
-                        offset: r.offset,
-                        timestamp: r.timestamp,
-                        key: r.key,
-                        value: r.value,
-                        is_control: false,
-                    });
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Rotates log and index segments, manages historical segments, and performs index-accelerated seeks
@@ -1011,58 +947,37 @@ impl SegmentManager {
     /// caller that only wants `start_offset` from the middle of a batch still gets it,
     /// because a batch is atomic on disk and must be decoded whole (see
     /// `physical_pos_for_offset`) before its later records can be filtered out.
-    pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<RecordFrame>> {
+    pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<Record>> {
         let segment_pair = self.find_segment_pair_mut(start_offset);
         let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
         let start_pos = seek_entry.map_or(0, |e| e.physical_position as u64);
 
-        if let Some(ref mmap) = segment_pair.mmap {
-            return Ok(mmap.fetch_zero_copy(start_pos, start_offset, max_bytes));
-        }
+        // The mmap path borrows the mapping directly (zero-copy); the file path reads into
+        // a buffer. Owned either way so the two arms have one type.
+        let raw_bytes: Vec<u8> = if let Some(ref mmap) = segment_pair.mmap {
+            mmap.raw_from(start_pos, max_bytes).to_vec()
+        } else {
+            let raw = segment_pair.log.read_at(start_pos, max_bytes)?;
+            Self::ensure_first_batch_fits(segment_pair, start_pos, raw)?
+        };
 
-        let raw_bytes = segment_pair.log.read_at(start_pos, max_bytes)?;
-        let raw_bytes = Self::ensure_first_batch_fits(segment_pair, start_pos, raw_bytes)?;
-
-        let mut frames = Vec::new();
+        let mut entries = Vec::new();
         let mut cursor = 0usize;
-
         while cursor < raw_bytes.len() {
             if cursor + HEADER_SIZE > raw_bytes.len() {
                 break;
             }
-            match decode_entry(&raw_bytes[cursor..]) {
-                Ok((LogEntry::Frame(frame), consumed)) => {
-                    cursor += consumed;
-                    if frame.offset >= start_offset {
-                        frames.push(frame);
-                    }
-                }
-                Ok((LogEntry::Batch(batch), consumed)) => {
-                    let Ok(records) = batch.records() else {
-                        // Corrupt batch payload — treat exactly like a corrupt frame
-                        // would be treated below: stop the scan rather than propagate a
-                        // partial/garbage record into the response.
-                        break;
-                    };
-                    for record in records {
-                        if record.offset >= start_offset {
-                            // See `expand_entries_for_compaction`: batch records now carry
-                            // an explicit, nullable value; append_batch never writes a null
-                            // one, so this unwrap preserves existing behavior.
-                            frames.push(RecordFrame::create(
-                                record.offset,
-                                record.timestamp,
-                                record.value.unwrap_or_default(),
-                            ));
-                        }
-                    }
-                    cursor += consumed;
-                }
-                Err(_) => break,
-            }
+            let Ok((entry, consumed)) = decode_entry(&raw_bytes[cursor..]) else {
+                break;
+            };
+            entries.push(entry);
+            cursor += consumed;
         }
 
-        Ok(frames)
+        Ok(records_from_entries(&entries)
+            .into_iter()
+            .filter(|r| r.offset >= start_offset)
+            .collect())
     }
 
     /// Reads the stored bytes covering `start_offset` onward, **exactly as they sit on
@@ -1449,7 +1364,7 @@ impl SegmentManager {
         // value is an ordinary record, not a delete.
         for pair in &mut self.historical {
             let entries = pair.read_all_entries()?;
-            for record in records_for_compaction(&entries) {
+            for record in records_from_entries(&entries) {
                 if record.is_control {
                     continue;
                 }
@@ -1461,7 +1376,7 @@ impl SegmentManager {
         }
 
         let active_entries = self.active.read_all_entries()?;
-        for record in records_for_compaction(&active_entries) {
+        for record in records_from_entries(&active_entries) {
             if record.is_control {
                 continue;
             }
@@ -1525,7 +1440,7 @@ impl SegmentManager {
             // Whether a single record survives. A keyless record is always kept: with no
             // key it cannot be deduped, and it is not a candidate for tombstone purging
             // either.
-            let survives = |record: &CompactionRecord| -> bool {
+            let survives = |record: &Record| -> bool {
                 if record.is_control {
                     return true;
                 }
@@ -1552,7 +1467,7 @@ impl SegmentManager {
                         // being a non-control record whose payload-derived key was purged —
                         // which cannot happen now that keys come from the record itself.
                         // Kept as-is.
-                        let record = CompactionRecord {
+                        let record = Record {
                             offset: frame.offset,
                             timestamp: frame.timestamp,
                             key: None,
@@ -1577,7 +1492,7 @@ impl SegmentManager {
                         let survivors: Vec<(u64, u64, Option<Bytes>, Option<Bytes>)> = records
                             .into_iter()
                             .filter(|r| {
-                                survives(&CompactionRecord {
+                                survives(&Record {
                                     offset: r.offset,
                                     timestamp: r.timestamp,
                                     key: r.key.clone(),
@@ -1954,7 +1869,7 @@ impl SegmentManager {
         &mut self,
         target_timestamp: u64,
         max_bytes: usize,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<Record>> {
         let start_offset = self.find_offset_for_timestamp(target_timestamp);
         let frames = self.fetch(start_offset, max_bytes)?;
         Ok(frames
@@ -2053,7 +1968,6 @@ impl SegmentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::frame::MAGIC_BYTE;
     use crate::protocol::BatchCompression;
 
     struct TempDir(PathBuf);
@@ -2098,8 +2012,8 @@ mod tests {
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].offset, 0);
         assert_eq!(fetched[0].timestamp, 123_456_789);
-        assert_eq!(fetched[0].magic, MAGIC_BYTE);
-        assert_eq!(fetched[0].payload.as_ref(), b"hello");
+        assert_eq!(fetched[0].value.as_deref().unwrap_or_default(), b"hello");
+        assert_eq!(fetched[0].key, None, "a frame carries no key");
         assert_eq!(mgr.high_watermark(), 1);
     }
 
@@ -2162,7 +2076,7 @@ mod tests {
 
         let all = mgr.fetch(0, 4096).unwrap();
         assert_eq!(all.len(), 4);
-        assert_eq!(all[3].payload.as_ref(), b"replacement");
+        assert_eq!(all[3].value.as_deref().unwrap_or_default(), b"replacement");
         assert_eq!(all[3].timestamp, 999);
     }
 
@@ -2247,9 +2161,16 @@ mod tests {
         let hw = mgr.high_watermark();
         assert_eq!(hw, 5);
 
+        // Re-encode the frames from the same offsets the buffered read covers: the plan
+        // is a byte range, so it is compared against bytes, not against decoded records.
         let buffered = mgr.fetch(1, 4096).unwrap();
         let mut expected_bytes = Vec::new();
-        for frame in &buffered {
+        for record in &buffered {
+            let frame = RecordFrame::create(
+                record.offset,
+                record.timestamp,
+                record.value.clone().unwrap_or_default(),
+            );
             frame.encode_into(&mut expected_bytes);
         }
 
@@ -2369,7 +2290,10 @@ mod tests {
             mid.iter().map(|f| f.offset).collect::<Vec<_>>(),
             vec![3, 4, 5, 6]
         );
-        assert_eq!(mid[0].payload.as_ref(), records[2].1.as_ref());
+        assert_eq!(
+            mid[0].value.as_deref().unwrap_or_default(),
+            records[2].1.as_ref()
+        );
         assert_eq!(mid[0].timestamp, records[2].0);
 
         // Starting at the batch's last offset returns just that one record plus what
@@ -2409,14 +2333,12 @@ mod tests {
         assert_eq!(fetched.len(), 4);
         for (i, frame) in fetched.iter().enumerate() {
             assert_eq!(frame.offset, i as u64);
-            assert_eq!(frame.payload.as_ref(), records[i].1.as_ref());
-            // Synthesized frames are always plain/uncompressed magic — decompressing
-            // them is a safe no-op, exactly matching a client's existing
-            // `decompress_payload()` call on any already-uncompressed frame.
             assert_eq!(
-                frame.decompress_payload().unwrap().as_ref(),
+                frame.value.as_deref().unwrap_or_default(),
                 records[i].1.as_ref()
             );
+            // Decompression now happens on the read path itself, so a caller never sees
+            // compressed bytes and has nothing left to decompress.
         }
     }
 
@@ -2495,7 +2417,13 @@ mod tests {
         assert_eq!(plan.frame_count, 1);
         assert_eq!(read_plan_bytes(&plan), {
             let mut expected = Vec::new();
-            mgr.fetch(0, 65536).unwrap()[0].encode_into(&mut expected);
+            let record = mgr.fetch(0, 65536).unwrap().remove(0);
+            RecordFrame::create(
+                record.offset,
+                record.timestamp,
+                record.value.unwrap_or_default(),
+            )
+            .encode_into(&mut expected);
             expected
         });
 
@@ -2546,7 +2474,7 @@ mod tests {
     fn all_keyed_records(mgr: &mut SegmentManager) -> Vec<(u64, Option<Vec<u8>>, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         for pair in &mut mgr.historical {
-            for r in records_for_compaction(&pair.read_all_entries().unwrap()) {
+            for r in records_from_entries(&pair.read_all_entries().unwrap()) {
                 out.push((
                     r.offset,
                     r.key.map(|k| k.to_vec()),
@@ -2554,7 +2482,7 @@ mod tests {
                 ));
             }
         }
-        for r in records_for_compaction(&mgr.active.read_all_entries().unwrap()) {
+        for r in records_from_entries(&mgr.active.read_all_entries().unwrap()) {
             out.push((
                 r.offset,
                 r.key.map(|k| k.to_vec()),
@@ -2744,7 +2672,7 @@ mod tests {
             "10% dirty is below the 50% min_cleanable_dirty_ratio gate"
         );
         assert_eq!(
-            records_for_compaction(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            records_from_entries(&mgr.historical[0].read_all_entries().unwrap()).len(),
             10
         );
 
@@ -2753,7 +2681,7 @@ mod tests {
         let n = mgr.apply_retention().unwrap();
         assert_eq!(n, 1, "10% dirty now clears the lowered 5% gate");
         assert_eq!(
-            records_for_compaction(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            records_from_entries(&mgr.historical[0].read_all_entries().unwrap()).len(),
             9
         );
     }
@@ -3004,7 +2932,7 @@ mod tests {
             ),
         ] {
             let (frames, entries) = pair_frames_and_entries;
-            let records = records_for_compaction(&entries);
+            let records = records_from_entries(&entries);
             assert_eq!(records.len(), frames.len());
             for (record, frame) in records.iter().zip(frames.iter()) {
                 assert_eq!(record.offset, frame.offset);

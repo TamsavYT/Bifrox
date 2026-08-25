@@ -697,7 +697,11 @@ impl PartitionManager {
     }
 
     /// Reads event records starting from target logical offset
-    pub fn fetch(&self, start_offset: u64, max_bytes: u32) -> IoResult<Vec<RecordFrame>> {
+    pub fn fetch(
+        &self,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch(start_offset, max_bytes as usize)
     }
@@ -761,7 +765,7 @@ impl PartitionManager {
         &self,
         target_timestamp: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch_by_timestamp(target_timestamp, max_bytes as usize)
     }

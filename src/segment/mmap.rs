@@ -1,5 +1,4 @@
-use crate::protocol::{RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
-use crate::segment::entry::{decode_entry, LogEntry};
+use crate::protocol::BATCH_MAGIC_BYTE;
 use memmap2::Mmap;
 use std::fs::OpenOptions;
 use std::io::Result as IoResult;
@@ -55,65 +54,23 @@ impl MmapLogSegment {
         Some(&self.mmap[pos..pos + read_len])
     }
 
-    /// Fast zero-copy decode of record frames directly from mmap memory slice.
+    /// Returns the mapped bytes for `max_bytes` starting at `start_pos`, widening to the
+    /// rest of the mapping when the first entry is a batch that would otherwise be cut
+    /// short.
     ///
-    /// A `RecordBatch` (magic [`BATCH_MAGIC_BYTE`]) found along the way is decoded and
-    /// its records surfaced as synthetic uncompressed `RecordFrame`s, filtered to
-    /// `offset >= start_offset` — same contract as `SegmentManager::fetch`, which this
-    /// mirrors. Unlike the file-backed path, no extra read is ever needed to cover a
-    /// batch cut short by `max_bytes`: the whole segment is already resident in `mmap`,
-    /// so when the very first entry is a batch this simply widens the slice to the rest
-    /// of the mapped region (free — it's already in memory) instead of re-reading.
-    pub fn fetch_zero_copy(
-        &self,
-        start_pos: u64,
-        start_offset: u64,
-        max_bytes: usize,
-    ) -> Vec<RecordFrame> {
-        let mut frames = Vec::new();
+    /// Handing back raw bytes rather than decoded records is what keeps this path
+    /// zero-copy: the whole segment is already resident, so widening costs nothing, and
+    /// the caller decodes once instead of this doing it a second time.
+    pub fn raw_from(&self, start_pos: u64, max_bytes: usize) -> &[u8] {
         let Some(mut slice) = self.get_slice(start_pos, max_bytes) else {
-            return frames;
+            return &[];
         };
         if slice.first() == Some(&BATCH_MAGIC_BYTE) {
             if let Some(whole) = self.get_slice(start_pos, self.len) {
                 slice = whole;
             }
         }
-
-        let mut cursor = 0usize;
-        while cursor < slice.len() {
-            if cursor + HEADER_SIZE > slice.len() {
-                break;
-            }
-            match decode_entry(&slice[cursor..]) {
-                Ok((LogEntry::Frame(frame), consumed)) => {
-                    cursor += consumed;
-                    if frame.offset >= start_offset {
-                        frames.push(frame);
-                    }
-                }
-                Ok((LogEntry::Batch(batch), consumed)) => {
-                    let Ok(records) = batch.records() else {
-                        break;
-                    };
-                    for record in records {
-                        if record.offset >= start_offset {
-                            // Batch records now carry an explicit, nullable value;
-                            // append_batch never writes a null one, so this unwrap
-                            // preserves existing behavior (see `SegmentManager::fetch`).
-                            frames.push(RecordFrame::create(
-                                record.offset,
-                                record.timestamp,
-                                record.value.unwrap_or_default(),
-                            ));
-                        }
-                    }
-                    cursor += consumed;
-                }
-                Err(_) => break,
-            }
-        }
-        frames
+        slice
     }
 
     pub fn len(&self) -> usize {

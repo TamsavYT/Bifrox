@@ -1,6 +1,6 @@
 use crate::client::TestClient;
 use crate::protocol::wire::MemberAssignment;
-use crate::protocol::RecordFrame;
+use crate::segment::Record;
 use std::collections::HashMap;
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
@@ -929,7 +929,7 @@ impl GroupConsumer {
     /// this member was fenced — it set `needs_rejoin`, and this calls `rejoin()` and
     /// returns an empty result for the round rather than fetching under a stale generation;
     /// the caller is expected to call `poll()` again.
-    pub async fn poll(&mut self) -> IoResult<Vec<(u32, RecordFrame)>> {
+    pub async fn poll(&mut self) -> IoResult<Vec<(u32, Record)>> {
         if self.needs_rejoin.swap(false, Ordering::AcqRel) {
             self.rejoin().await?;
             return Ok(Vec::new());
@@ -960,7 +960,7 @@ impl GroupConsumer {
                         // offsets too — but only non-control frames are handed back.
                         self.next_offsets.insert(partition, frame.offset + 1);
                         self.pending_commits.insert(partition, frame.offset);
-                        if !frame.is_control_marker() {
+                        if !frame.is_control {
                             records.push((partition, frame));
                         }
                     }

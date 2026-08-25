@@ -6,7 +6,7 @@ pub mod mmap;
 pub mod timeindex;
 pub mod txnindex;
 
-pub use entry::{decode_entry, EntryError, LogEntry};
+pub use entry::{decode_entry, records_from_entries, EntryError, LogEntry, Record};
 pub use index::{IndexEntry, IndexSegment};
 pub use log::LogSegment;
 pub use manager::{SegmentManager, VerbatimAppendResult, ZeroCopyFetchPlan};

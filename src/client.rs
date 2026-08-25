@@ -1,4 +1,4 @@
-use crate::protocol::{BatchCompression, CommandCode, RecordBatch, RecordFrame, WireResponse};
+use crate::protocol::{BatchCompression, CommandCode, RecordBatch, WireResponse};
 use crate::scram;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::{Buf, BufMut, Bytes};
@@ -113,21 +113,14 @@ fn next_correlation_id() -> u32 {
 /// ordinary record whose value happens to be empty.
 pub type KeyedRecord<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
 
-/// A record as a consumer sees it: its offset and timestamp, and the key and value the
-/// producer wrote, both nullable opaque bytes.
+/// A record as a consumer sees it: offset, timestamp, and the key and value the producer
+/// wrote, both nullable opaque bytes.
 ///
-/// [`TestClient::fetch`] and friends return [`RecordFrame`]s, which have no key field and
-/// so cannot represent one. Anything that cares about keys — a compacted topic, or routing
-/// by key — needs this instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsumerRecord {
-    pub offset: u64,
-    pub timestamp: u64,
-    pub key: Option<Bytes>,
-    /// `None` is a tombstone on a compacted topic: it marks the key deleted. That is
-    /// distinct from `Some(Bytes::new())`, an ordinary record with an empty value.
-    pub value: Option<Bytes>,
-}
+/// The same [`crate::segment::Record`] the broker reads out of the log. A `RecordFrame`
+/// cannot stand in for it: with only `payload: Bytes` it has no key field, and it cannot
+/// tell a tombstone (null value) from an ordinary record whose value happens to be empty —
+/// a distinction compaction acts on.
+pub type ConsumerRecord = crate::segment::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProduceResult {
@@ -876,7 +869,7 @@ impl TestClient {
         Self::decode_fetch_entries_records(&resp.payload, offset, false)
     }
 
-    /// Like [`Self::decode_fetch_entries_response`] but keeps each record's key.
+    /// Decodes a fetch response into records, keys and null values intact.
     ///
     /// A `RecordFrame` has no key, so one decoded out of the log surfaces with `key: None`
     /// and its payload as the value.
@@ -912,147 +905,29 @@ impl TestClient {
             drop_control_and_aborted && (offset >= last_stable_offset || is_aborted(offset))
         };
 
-        let mut out = Vec::new();
+        // Decoded by the same `records_from_entries` the broker reads its own log with,
+        // rather than a second copy of that logic here. Two implementations of "turn
+        // entries into records" is how a null value came to be flattened into an empty one
+        // on this side while the broker kept them distinct.
+        let mut decoded = Vec::new();
         let mut pos = 0usize;
         while pos < entries.len() {
             let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[pos..]) else {
                 break;
             };
             pos += consumed;
-            match entry {
-                crate::segment::LogEntry::Frame(mut frame) => {
-                    if let Ok(decompressed) = frame.decompress_payload() {
-                        frame.payload = decompressed;
-                    }
-                    if frame.offset < start_offset
-                        || excluded(frame.offset)
-                        || (drop_control_and_aborted && frame.is_control_marker())
-                    {
-                        continue;
-                    }
-                    out.push(ConsumerRecord {
-                        offset: frame.offset,
-                        timestamp: frame.timestamp,
-                        key: None,
-                        value: Some(frame.payload),
-                    });
-                }
-                crate::segment::LogEntry::Batch(batch) => {
-                    let Ok(records) = batch.records() else {
-                        break;
-                    };
-                    for record in records {
-                        if record.offset < start_offset || excluded(record.offset) {
-                            continue;
-                        }
-                        out.push(ConsumerRecord {
-                            offset: record.offset,
-                            timestamp: record.timestamp,
-                            key: record.key,
-                            value: record.value,
-                        });
-                    }
-                }
-            }
+            decoded.push(entry);
         }
-        Ok(out)
-    }
 
-    /// Decodes a fetch response into records.
-    ///
-    /// The response carries the broker's stored bytes — whole log entries, exactly as
-    /// written. Everything that turns them into records happens here, on the client:
-    /// decoding entries, decompressing batches, and dropping what a read-committed
-    /// consumer must not see. The broker does none of it.
-    ///
-    /// Filtering is applied in this order, matching Kafka's consumer:
-    /// - records below `start_offset` (a batch containing it is returned whole, so its
-    ///   earlier records arrive too and are dropped here)
-    /// - control markers, which are transaction bookkeeping rather than data
-    /// - records at or beyond the last stable offset
-    /// - records inside an aborted transaction's offset range
-    ///
-    /// Under read-uncommitted the broker sends `u64::MAX` and no ranges, so only the
-    /// start-offset trim applies.
-    fn decode_fetch_entries_response(
-        payload: &[u8],
-        start_offset: u64,
-        drop_control_and_aborted: bool,
-    ) -> IoResult<Vec<RecordFrame>> {
-        let short =
-            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Fetch response too short");
-        if payload.len() < 12 {
-            return Err(short());
-        }
-        let mut cursor = payload;
-        let last_stable_offset = cursor.get_u64();
-        let aborted_count = cursor.get_u32() as usize;
-        if cursor.len() < aborted_count * 16 + 4 {
-            return Err(short());
-        }
-        let mut aborted = Vec::with_capacity(aborted_count);
-        for _ in 0..aborted_count {
-            let start = cursor.get_u64();
-            let end = cursor.get_u64();
-            aborted.push((start, end));
-        }
-        let entries_len = cursor.get_u32() as usize;
-        if cursor.len() < entries_len {
-            return Err(short());
-        }
-        let entries = &cursor[..entries_len];
-
-        let is_aborted = |offset: u64| aborted.iter().any(|(s, e)| offset >= *s && offset <= *e);
-
-        let mut out = Vec::new();
-        let mut pos = 0usize;
-        while pos < entries.len() {
-            let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[pos..]) else {
-                break;
-            };
-            pos += consumed;
-            match entry {
-                crate::segment::LogEntry::Frame(mut frame) => {
-                    if let Ok(decompressed) = frame.decompress_payload() {
-                        frame.payload = decompressed;
-                    }
-                    if frame.offset < start_offset {
-                        continue;
-                    }
-                    if drop_control_and_aborted
-                        && (frame.is_control_marker()
-                            || frame.offset >= last_stable_offset
-                            || is_aborted(frame.offset))
-                    {
-                        continue;
-                    }
-                    out.push(frame);
-                }
-                crate::segment::LogEntry::Batch(batch) => {
-                    // Decompressing the batch is this side's job; a corrupt one ends the
-                    // scan rather than yielding partial records.
-                    let Ok(records) = batch.records() else {
-                        break;
-                    };
-                    for record in records {
-                        if record.offset < start_offset {
-                            continue;
-                        }
-                        if drop_control_and_aborted
-                            && (record.offset >= last_stable_offset || is_aborted(record.offset))
-                        {
-                            continue;
-                        }
-                        out.push(RecordFrame::create(
-                            record.offset,
-                            record.timestamp,
-                            record.value.unwrap_or_default(),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(out)
+        Ok(crate::segment::records_from_entries(&decoded)
+            .into_iter()
+            .filter(|r| {
+                // A batch containing `start_offset` arrives whole, so its earlier records
+                // are trimmed here.
+                r.offset >= start_offset
+                    && !(drop_control_and_aborted && (r.is_control || excluded(r.offset)))
+            })
+            .collect())
     }
 
     pub async fn fetch(
@@ -1061,7 +936,7 @@ impl TestClient {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::Fetch as u8);
 
@@ -1084,7 +959,7 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            Self::decode_fetch_entries_response(&resp_payload, offset, false)
+            Self::decode_fetch_entries_records(&resp_payload, offset, false)
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
@@ -1108,7 +983,7 @@ impl TestClient {
         offset: u64,
         max_bytes: u32,
         isolation: crate::protocol::wire::IsolationLevel,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         use crate::protocol::wire::{tags, PROTOCOL_VERSION_MAX, VERSIONED_ENVELOPE_MAGIC};
 
         // A process-wide counter rather than per-connection state: the id only has to be
@@ -1168,7 +1043,7 @@ impl TestClient {
                 String::from_utf8_lossy(&resp.payload).to_string(),
             ));
         }
-        Self::decode_fetch_entries_response(
+        Self::decode_fetch_entries_records(
             &resp.payload,
             offset,
             isolation == crate::protocol::wire::IsolationLevel::ReadCommitted,
@@ -1195,7 +1070,7 @@ impl TestClient {
         max_bytes: u32,
         group_id: &str,
         member_id: &str,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         let mut inner = Vec::new();
         crate::protocol::wire::write_pascal_string(&mut inner, topic);
         inner.put_u32(partition);
@@ -1219,7 +1094,7 @@ impl TestClient {
             ));
         }
         // No isolation tag on this request, so the broker answers read-uncommitted.
-        Self::decode_fetch_entries_response(&resp.payload, offset, false)
+        Self::decode_fetch_entries_records(&resp.payload, offset, false)
     }
 
     /// Asks the broker which protocol versions and commands it supports.
@@ -2165,7 +2040,7 @@ impl TestClient {
         partition: u32,
         target_timestamp: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::FetchByTimestamp as u8);
 
@@ -2188,7 +2063,7 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            let frames = Self::decode_fetch_entries_response(&resp_payload, 0, false)?;
+            let frames = Self::decode_fetch_entries_records(&resp_payload, 0, false)?;
             // The broker resolves a starting offset through its (sparse) time index and
             // hands over stored bytes from there; it cannot apply the timestamp predicate
             // without decoding every batch, so the filter belongs here.
@@ -2211,7 +2086,7 @@ impl TestClient {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         let mut req_buf = Vec::new();
         req_buf.put_u8(CommandCode::FetchCommitted as u8);
 
@@ -2234,7 +2109,7 @@ impl TestClient {
         let resp_payload = resp.payload;
 
         if status == 0 {
-            Self::decode_fetch_entries_response(&resp_payload, offset, true)
+            Self::decode_fetch_entries_records(&resp_payload, offset, true)
         } else {
             Err(std::io::Error::other(
                 String::from_utf8_lossy(&resp_payload).to_string(),
@@ -2960,7 +2835,7 @@ impl RoutedClient {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<ConsumerRecord>> {
         if !self.topic_metadata.contains_key(topic) {
             let _ = self.refresh_metadata(topic).await;
         }

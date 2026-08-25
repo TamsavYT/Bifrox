@@ -1,6 +1,6 @@
 use hermes::{
-    hash_key, EngineConfig, FlushPolicy, GroupConsumer, GroupConsumerConfig, RecordFrame, Server,
-    StorageEngine, TestClient,
+    hash_key, EngineConfig, FlushPolicy, GroupConsumer, GroupConsumerConfig, Server, StorageEngine,
+    TestClient,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -168,6 +168,15 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
         data_dir,
         engine,
     }
+}
+
+/// The value bytes of a record, for assertions written before values became nullable.
+///
+/// A null value (tombstone) reads as empty here — which is exactly the conflation that made
+/// `RecordFrame` unfit for the read path, so tests that care about the difference assert on
+/// `record.value` directly instead of using this.
+fn value_of(record: &hermes::segment::Record) -> &[u8] {
+    record.value.as_deref().unwrap_or_default()
 }
 
 /// Builds a batch of explicitly keyed `(key, value)` records, placeholder base offset 0.
@@ -346,21 +355,19 @@ async fn test_scenario_3_consume_fetch_flow() {
     for (i, frame) in frames.iter().enumerate() {
         assert_eq!(frame.offset, i as u64, "Logical offset sequence mismatch");
         assert_eq!(
-            frame.payload,
+            value_of(frame),
             records[i].as_bytes(),
             "Payload content mismatch"
         );
-        // Verify CRC32 checksum calculation matches expected
-        let calculated_crc =
-            RecordFrame::calculate_crc(frame.offset, frame.timestamp, &frame.payload);
-        assert_eq!(frame.crc, calculated_crc, "Frame CRC32 checksum mismatch");
+        // The CRC is a property of the entry on disk, not of a record decoded out of one,
+        // and `decode_entry` already verified it — a corrupt entry never reaches here.
     }
 
     // Fetch starting from offset 2
     let sliced_frames = client.fetch(topic, partition, 2, 64 * 1024).await.unwrap();
     assert_eq!(sliced_frames.len(), 3);
     assert_eq!(sliced_frames[0].offset, 2);
-    assert_eq!(sliced_frames[0].payload, "record_2".as_bytes());
+    assert_eq!(value_of(&sliced_frames[0]), "record_2".as_bytes());
 
     // Fetch from out-of-bounds offset
     let oob_frames = client
@@ -536,7 +543,7 @@ async fn test_scenario_6_fault_tolerance_and_edge_cases() {
 
     let fetched = client.fetch("reconnect_topic", 0, 0, 1024).await.unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].payload, "post_reconnect_msg".as_bytes());
+    assert_eq!(value_of(&fetched[0]), "post_reconnect_msg".as_bytes());
 }
 
 #[tokio::test]
@@ -700,7 +707,7 @@ async fn test_scenario_9_network_transactions_and_timestamp_fetch() {
         .await
         .unwrap();
     assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].payload, "Timestamp Payload".as_bytes());
+    assert_eq!(value_of(&frames[0]), "Timestamp Payload".as_bytes());
 }
 
 #[tokio::test]
@@ -774,7 +781,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
 
     assert_eq!(fetched.len(), 1);
     assert_eq!(
-        fetched[0].payload,
+        value_of(&fetched[0]),
         "Cluster Replication Event 101".as_bytes()
     );
 
@@ -887,7 +894,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
 
     assert_eq!(fetched.len(), 1);
     assert_eq!(
-        fetched[0].payload,
+        value_of(&fetched[0]),
         "Dynamic Metadata Replicated Event".as_bytes()
     );
 
@@ -974,8 +981,8 @@ async fn test_scenario_12_read_committed_isolation() {
         .await
         .unwrap();
     for frame in &frames_committed {
-        assert_ne!(
-            frame.magic, 0xAD,
+        assert!(
+            !frame.is_control,
             "fetch_committed must never return control markers"
         );
     }
@@ -996,8 +1003,8 @@ async fn test_scenario_12_read_committed_isolation() {
         .await
         .unwrap();
     for frame in &frames_after_commit {
-        assert_ne!(
-            frame.magic, 0xAD,
+        assert!(
+            !frame.is_control,
             "fetch_committed must not return control markers"
         );
     }
@@ -1006,8 +1013,8 @@ async fn test_scenario_12_read_committed_isolation() {
         3,
         "All 3 data records visible after commit"
     );
-    assert_eq!(frames_after_commit[0].payload, "msg_hidden_1".as_bytes());
-    assert_eq!(frames_after_commit[2].payload, "msg_hidden_3".as_bytes());
+    assert_eq!(value_of(&frames_after_commit[0]), "msg_hidden_1".as_bytes());
+    assert_eq!(value_of(&frames_after_commit[2]), "msg_hidden_3".as_bytes());
 }
 
 /// Scenario 13: After AbortTx, fetch_committed filters control markers.
@@ -1056,13 +1063,11 @@ async fn test_scenario_13_read_committed_abort_filtering() {
         .await
         .unwrap();
     for frame in &committed {
-        assert_ne!(frame.magic, 0xAD, "No control markers in fetch_committed");
+        assert!(!frame.is_control, "No control markers in fetch_committed");
     }
     // The pre-tx committed record must always be present
     assert!(
-        committed
-            .iter()
-            .any(|f| f.payload.as_ref() == b"committed_record"),
+        committed.iter().any(|f| value_of(f) == b"committed_record"),
         "Committed record must appear in read_committed"
     );
 }
@@ -1285,8 +1290,8 @@ async fn test_scenario_16_eos_idempotence() {
         2,
         "Should only have 2 committed records (duplicate dropped)"
     );
-    assert_eq!(committed[0].payload.as_ref(), b"record1");
-    assert_eq!(committed[1].payload.as_ref(), b"record2");
+    assert_eq!(value_of(&committed[0]), b"record1");
+    assert_eq!(value_of(&committed[1]), b"record2");
 }
 
 #[tokio::test]
@@ -1495,7 +1500,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
         1,
         "Should only contain good_msg (aborted batch filtered via .txnindex)"
     );
-    assert_eq!(frames[0].payload.as_ref(), b"good_msg");
+    assert_eq!(value_of(&frames[0]), b"good_msg");
 
     // 5. Verify .index file size mathematically matches 8 bytes per index entry
     let index_file = test_dir.join(format!("{}-0/00000000000000000000.index", topic));
@@ -1668,8 +1673,8 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
         .await
         .expect("fetch_smart failed");
     assert_eq!(fetched.len(), 2);
-    assert_eq!(fetched[0].payload.as_ref(), b"smart_payload_1");
-    assert_eq!(fetched[1].payload.as_ref(), b"smart_payload_2");
+    assert_eq!(value_of(&fetched[0]), b"smart_payload_1");
+    assert_eq!(value_of(&fetched[1]), b"smart_payload_2");
 
     server_node1_task.abort();
     server_node2_task.abort();
@@ -1920,12 +1925,12 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
     let fetched_3 = seg_mgr.fetch(3, 1024).unwrap();
     assert!(!fetched_3.is_empty());
     assert_eq!(fetched_3[0].offset, 3);
-    assert_eq!(fetched_3[0].payload.as_ref(), b"val_2");
+    assert_eq!(value_of(&fetched_3[0]), b"val_2");
 
     let fetched_4 = seg_mgr.fetch(4, 1024).unwrap();
     assert!(!fetched_4.is_empty());
     assert_eq!(fetched_4[0].offset, 4);
-    assert_eq!(fetched_4[0].payload.as_ref(), b"val_3");
+    assert_eq!(value_of(&fetched_4[0]), b"val_3");
 }
 
 #[tokio::test]
@@ -2196,7 +2201,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     // Fetch over TLS
     let fetched = tls_client.fetch("tls_topic", 0, 0, 1024).await.unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].payload.as_ref(), b"encrypted_payload_over_tls");
+    assert_eq!(value_of(&fetched[0]), b"encrypted_payload_over_tls");
 
     // 2. Test SASL_SSL mode (encrypted TLS transport + SASL authentication)
     let sasl_ssl_guard = TestDataDirGuard::new("sasl_ssl_transport_test");
@@ -2262,7 +2267,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
         .await
         .unwrap();
     assert_eq!(fetched2.len(), 1);
-    assert_eq!(fetched2[0].payload.as_ref(), b"encrypted_payload_over_tls");
+    assert_eq!(value_of(&fetched2[0]), b"encrypted_payload_over_tls");
 }
 
 #[tokio::test]
@@ -2370,7 +2375,7 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
         .await
         .unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].payload.as_ref(), b"verified_pem_mtls_payload");
+    assert_eq!(value_of(&fetched[0]), b"verified_pem_mtls_payload");
 }
 
 #[tokio::test]
@@ -2507,7 +2512,7 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     // Fetch over wire TCP: server returns 0xAC LZ4 compressed frame, client decompresses transparently
     let fetched = client.fetch("lz4_wire_topic", 0, 0, 1024).await.unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
+    assert_eq!(value_of(&fetched[0]), raw_payload_str.as_bytes());
 
     // Verify on-disk log segment file directly: confirm 0xAC magic byte stored on disk
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
@@ -2610,7 +2615,7 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
     // Fetch over wire TCP: server returns 0xAE Zstd compressed frame, client decompresses transparently
     let fetched = client.fetch("zstd_wire_topic", 0, 0, 1024).await.unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].payload.as_ref(), raw_payload_str.as_bytes());
+    assert_eq!(value_of(&fetched[0]), raw_payload_str.as_bytes());
 
     // Verify on-disk log segment file directly: confirm 0xAE magic byte stored on disk.
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
@@ -2790,7 +2795,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
     let committed = restarted.fetch_committed(topic, 0, 0, 1024).await.unwrap();
     assert_eq!(all_frames.len(), 4);
     assert_eq!(committed.len(), 1);
-    assert_eq!(committed[0].payload.as_ref(), b"txn-recovery-record-2");
+    assert_eq!(value_of(&committed[0]), b"txn-recovery-record-2");
 }
 
 #[tokio::test]
@@ -2962,7 +2967,7 @@ async fn test_scenario_31_share_consumer_and_queue_semantics() {
         .await
         .unwrap();
     assert_eq!(dlq_frames.len(), 1);
-    assert_eq!(dlq_frames[0].payload.as_ref(), b"share-msg-1");
+    assert_eq!(value_of(&dlq_frames[0]), b"share-msg-1");
 
     // 7. Test automatic lock lease timeout expiry & redelivery
     // Member 1 acquires offsets 4 and 5 with short 100ms lock timeout
@@ -3406,7 +3411,7 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
         .expect("fetch directly from the broker-only node should succeed");
     assert_eq!(fetched.len(), 1);
     assert_eq!(
-        fetched[0].payload,
+        value_of(&fetched[0]),
         "hello from a controller-only entrypoint".as_bytes()
     );
 
@@ -3445,14 +3450,10 @@ async fn test_scenario_35_zero_copy_fetch_end_to_end() {
     assert_eq!(all_frames.len(), total_records);
     for (i, frame) in all_frames.iter().enumerate() {
         assert_eq!(frame.offset, i as u64);
-        assert_eq!(frame.payload, records[i].as_bytes());
-        let calculated_crc =
-            RecordFrame::calculate_crc(frame.offset, frame.timestamp, &frame.payload);
-        assert_eq!(
-            frame.crc, calculated_crc,
-            "zero-copy frame CRC mismatch at offset {}",
-            i
-        );
+        // The CRC is a property of the stored entry, verified by `decode_entry` before a
+        // record is ever produced from it — a corrupt entry stops the scan rather than
+        // reaching here.
+        assert_eq!(value_of(frame), records[i].as_bytes());
     }
 
     // 2. Tight max_bytes budget forcing a multi-round consume loop — reconstructs the
@@ -3477,7 +3478,7 @@ async fn test_scenario_35_zero_copy_fetch_end_to_end() {
     assert_eq!(collected.len(), total_records);
     for (i, frame) in collected.iter().enumerate() {
         assert_eq!(frame.offset, i as u64);
-        assert_eq!(frame.payload, records[i].as_bytes());
+        assert_eq!(value_of(frame), records[i].as_bytes());
     }
 
     // 3. Fetching at/beyond the high watermark must return an empty (not erroring) result
@@ -4326,7 +4327,7 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
 
     let payloads: Vec<String> = pulled
         .iter()
-        .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+        .map(|f| String::from_utf8_lossy(value_of(f)).to_string())
         .collect();
     assert!(
         payloads.iter().any(|p| p.contains("after-assignment")),
@@ -4554,7 +4555,7 @@ async fn test_scenario_48_controller_assigns_new_topics_before_first_write() {
     // And the record itself landed.
     let fetched = client.fetch("born_assigned", 0, 0, 65536).await.unwrap();
     assert_eq!(fetched.len(), 1);
-    assert_eq!(&fetched[0].payload[..], b"first record");
+    assert_eq!(value_of(&fetched[0]), b"first record");
 
     // Idempotent: producing again must not re-create or re-assign the topic.
     let epoch_before = pm.leader_epoch();
@@ -4622,7 +4623,7 @@ async fn test_scenario_51_fetch_honours_requested_isolation_level() {
         .unwrap();
     let payloads: Vec<String> = committed
         .iter()
-        .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+        .map(|f| String::from_utf8_lossy(value_of(f)).to_string())
         .collect();
     assert!(
         !payloads.iter().any(|p| p.contains("aborted_record")),
@@ -4630,8 +4631,8 @@ async fn test_scenario_51_fetch_honours_requested_isolation_level() {
         payloads
     );
     for frame in &committed {
-        assert_ne!(
-            frame.magic, 0xAD,
+        assert!(
+            !frame.is_control,
             "read-committed must not return control markers"
         );
     }
@@ -5225,7 +5226,7 @@ async fn test_scenario_58_consumer_group_assignment_drives_what_is_consumed() {
     while seen.len() < expected_payloads.len() && std::time::Instant::now() < deadline {
         let records = consumer.poll().await.unwrap();
         for (_, frame) in records {
-            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+            seen.insert(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         if seen.len() < expected_payloads.len() {
             sleep(Duration::from_millis(20)).await;
@@ -5345,7 +5346,7 @@ async fn test_scenario_59_two_consumers_split_the_partitions_disjointly() {
                 partition,
                 a1
             );
-            seen1.insert(String::from_utf8_lossy(&frame.payload).to_string());
+            seen1.insert(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         for (partition, frame) in c2.poll().await.unwrap() {
             assert!(
@@ -5354,7 +5355,7 @@ async fn test_scenario_59_two_consumers_split_the_partitions_disjointly() {
                 partition,
                 a2
             );
-            seen2.insert(String::from_utf8_lossy(&frame.payload).to_string());
+            seen2.insert(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         if seen1.len() < expected1.len() || seen2.len() < expected2.len() {
             sleep(Duration::from_millis(20)).await;
@@ -5432,7 +5433,7 @@ async fn test_scenario_60_a_stale_generation_makes_a_consumer_rejoin() {
     while seen.len() < expected_payloads.len() && std::time::Instant::now() < deadline {
         let records = c1.poll().await.unwrap();
         for (_, frame) in records {
-            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+            seen.insert(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         if seen.len() < expected_payloads.len() {
             sleep(Duration::from_millis(20)).await;
@@ -5583,7 +5584,7 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
     while seen.len() < all_payloads.len() && std::time::Instant::now() < deadline {
         let records = c1.poll().await.unwrap();
         for (_, frame) in &records {
-            seen.insert(String::from_utf8_lossy(&frame.payload).to_string());
+            seen.insert(String::from_utf8_lossy(value_of(frame)).to_string());
         }
         if !records.is_empty() {
             c1.commit().await.unwrap();
@@ -5622,7 +5623,7 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
     for _ in 0..10 {
         let records = c2.poll().await.unwrap();
         for (_, frame) in records {
-            redelivered.push(String::from_utf8_lossy(&frame.payload).to_string());
+            redelivered.push(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -6992,7 +6993,7 @@ async fn test_scenario_79_cooperative_rebalance_revokes_before_reassigning_and_p
         for (partition, frame) in records {
             consumed_first
                 .entry(partition)
-                .or_insert_with(|| String::from_utf8_lossy(&frame.payload).to_string());
+                .or_insert_with(|| String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         if consumed_first.len() < num_partitions as usize {
             sleep(Duration::from_millis(20)).await;
@@ -7191,7 +7192,7 @@ async fn test_scenario_79_cooperative_rebalance_revokes_before_reassigning_and_p
             seen_on_kept
                 .entry(partition)
                 .or_default()
-                .push(String::from_utf8_lossy(&frame.payload).to_string());
+                .push(String::from_utf8_lossy(value_of(&frame)).to_string());
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -7234,8 +7235,8 @@ async fn test_scenario_79_cooperative_rebalance_revokes_before_reassigning_and_p
             .expect("B's fetch of its newly-owned partition must succeed");
         let payloads: Vec<String> = frames
             .iter()
-            .filter(|f| !f.is_control_marker())
-            .map(|f| String::from_utf8_lossy(&f.payload).to_string())
+            .filter(|f| !f.is_control)
+            .map(|f| String::from_utf8_lossy(value_of(f)).to_string())
             .collect();
         assert_eq!(
             payloads,
@@ -7929,10 +7930,7 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
              records from there onward"
         );
         for (i, frame) in fetched.iter().enumerate() {
-            assert_eq!(
-                frame.payload.as_ref(),
-                records[(start as usize) + i].as_ref()
-            );
+            assert_eq!(value_of(frame), records[(start as usize) + i].as_ref());
         }
     }
 }
@@ -8267,6 +8265,102 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
         "a fetch with no wait tag must not be held: it took {no_wait_elapsed:?}, which is \
          not decisively faster than the {idle_elapsed:?} an opted-in fetch was held for"
     );
+}
+
+/// A tombstone must stay distinguishable from an empty value all the way out to a
+/// consumer.
+///
+/// The read path used to hand back `RecordFrame`s, which carry only `payload: Bytes` and so
+/// cannot represent a null value at all — a delete and an empty record arrived as the same
+/// bytes. Compaction acts on that distinction (it purges a key on null and retains it on
+/// empty), so a consumer that could not see it built state that disagreed with the log.
+#[tokio::test]
+async fn test_scenario_98_tombstone_stays_distinct_from_empty_value_for_consumers() {
+    let env = start_test_server().await;
+    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let topic = "tombstone_vs_empty_topic";
+
+    client
+        .produce_keyed_batch_eos(
+            topic,
+            "",
+            None,
+            1,
+            0,
+            0,
+            0,
+            &[(Some(b"deleted"), None), (Some(b"empty"), Some(b""))],
+        )
+        .await
+        .unwrap();
+
+    for records in [
+        client.fetch(topic, 0, 0, 65536).await.unwrap(),
+        client.fetch_records(topic, 0, 0, 65536).await.unwrap(),
+    ] {
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].value, None, "a tombstone must read back as null");
+        assert_eq!(
+            records[1].value,
+            Some(bytes::Bytes::new()),
+            "an empty value must read back as present-but-empty"
+        );
+        assert_ne!(
+            records[0].value, records[1].value,
+            "a delete and an empty record must never arrive as the same thing"
+        );
+        assert_eq!(records[0].key.as_deref(), Some(b"deleted".as_ref()));
+        assert_eq!(records[1].key.as_deref(), Some(b"empty".as_ref()));
+    }
+}
+
+/// Records the broker writes itself must survive a non-default `compression.type`.
+///
+/// `produce_frame` compresses with the partition's codec, but the readers that replay
+/// cluster metadata and transaction state decode the payload directly. With the read path
+/// handing back raw frames, a broker configured with `compression.type=lz4` wrote
+/// compressed metadata and then failed to decode it on replay — silently, because the
+/// replay loop skips a record whose decode fails. Only the default codec hid it.
+#[tokio::test]
+async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() {
+    use hermes::config::{CompressionCodec, EngineConfig};
+
+    for codec in [
+        CompressionCodec::Lz4,
+        CompressionCodec::Zstd,
+        CompressionCodec::None,
+    ] {
+        let dir = TestDataDirGuard::new(&format!("broker_authored_codec_{codec}"));
+        let engine = StorageEngine::new(EngineConfig {
+            data_dir: dir.path.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            compression_codec: codec,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+
+        let pm = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap();
+        let original: &[u8] =
+            b"metadata-record-payload-that-is-quite-compressible-aaaaaaaaaaaaaaaaaaaa";
+        // The engine writes its own bootstrap records to this partition, so target the one
+        // written here by offset rather than assuming an empty log.
+        let written = pm.produce_frame(original).unwrap();
+        pm.advance_committed_hw(written.offset + 1);
+
+        let records = pm.fetch(written.offset, 65536).unwrap();
+        let mine = records
+            .iter()
+            .find(|r| r.offset == written.offset)
+            .unwrap_or_else(|| panic!("{codec}: the record just written must be readable"));
+        assert_eq!(
+            mine.value.as_deref(),
+            Some(original),
+            "{codec}: a broker-authored record must read back as written, not as the \
+             compressed bytes it happens to be stored as"
+        );
+    }
 }
 
 /// Per-record keys must survive the whole round trip — producer to disk to consumer —
@@ -8855,7 +8949,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
             break;
         }
     }
-    let payloads: Vec<&[u8]> = remaining.iter().map(|f| f.payload.as_ref()).collect();
+    let payloads: Vec<&[u8]> = remaining.iter().map(value_of).collect();
     assert_eq!(
         payloads,
         vec![

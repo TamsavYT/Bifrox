@@ -17,12 +17,81 @@
 //! derailing the scan.
 
 use crate::protocol::{BatchError, FrameError, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE};
+use bytes::Bytes;
 
 /// One decoded entry from a segment's log stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEntry {
     Frame(RecordFrame),
     Batch(RecordBatch),
+}
+
+/// One record read out of the log, whichever entry kind carried it.
+///
+/// This is what every read path hands back. It exists because [`RecordFrame`] cannot
+/// express two things the log now relies on:
+///
+/// - **A null value.** A frame has `payload: Bytes` and nothing else, so a tombstone (null
+///   value) and an ordinary record with an empty value are the same bytes. Compaction acts
+///   on that distinction — it purges a key on null and retains it on empty — so a reader
+///   that cannot see it builds wrong state.
+/// - **A key.** Frames predate explicit keys entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub offset: u64,
+    pub timestamp: u64,
+    /// `None` means the record carries no key. A frame never has one.
+    pub key: Option<Bytes>,
+    /// `None` is a tombstone on a compacted topic — distinct from `Some(empty)`.
+    pub value: Option<Bytes>,
+    /// A transaction control marker rather than data. Readers that surface records to
+    /// applications skip these.
+    pub is_control: bool,
+}
+
+/// Decodes every record out of `entries`.
+///
+/// A frame's payload is compressed per-record, so it is decompressed here — without this,
+/// a caller reading records written under a non-default `compression.type` gets compressed
+/// bytes and no indication that is what they are. A batch's records are decompressed by
+/// `RecordBatch::records` as a unit.
+///
+/// A batch whose record data fails to decode has its records skipped rather than aborting
+/// the scan: `entries` was already parsed into discrete entries, so a bad batch's
+/// neighbours are known-good and there is no reason to lose them too.
+pub fn records_from_entries(entries: &[LogEntry]) -> Vec<Record> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            LogEntry::Frame(frame) => {
+                let payload = frame
+                    .decompress_payload()
+                    .unwrap_or_else(|_| frame.payload.clone());
+                out.push(Record {
+                    offset: frame.offset,
+                    timestamp: frame.timestamp,
+                    key: None,
+                    value: Some(payload),
+                    is_control: frame.is_control_marker(),
+                });
+            }
+            LogEntry::Batch(batch) => {
+                let Ok(records) = batch.records() else {
+                    continue;
+                };
+                for r in records {
+                    out.push(Record {
+                        offset: r.offset,
+                        timestamp: r.timestamp,
+                        key: r.key,
+                        value: r.value,
+                        is_control: false,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Either a [`FrameError`] or a [`BatchError`], depending on which decoder

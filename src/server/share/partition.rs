@@ -76,6 +76,22 @@ pub struct SharePartition {
     timers: RwLock<BTreeSet<ExpiryTimer>>,
 }
 
+/// Share fetch has its own wire encoding built on [`RecordFrame`], so records are converted
+/// at this boundary.
+///
+/// A frame cannot carry a key or express a null value, so both are dropped here — acceptable
+/// for share groups, which are queue semantics rather than compacted-topic replay, and which
+/// have never surfaced keys. The payload is the *decoded* value, so a record written under a
+/// non-default `compression.type` now reaches a share consumer decompressed instead of as
+/// compressed bytes it had no way to recognise.
+fn record_to_frame(record: crate::segment::Record) -> RecordFrame {
+    RecordFrame::create(
+        record.offset,
+        record.timestamp,
+        record.value.unwrap_or_default(),
+    )
+}
+
 pub struct AcquiredRecordInfo {
     pub offset: u64,
     pub delivery_count: u16,
@@ -169,7 +185,7 @@ impl SharePartition {
                                 acquired_infos.push(AcquiredRecordInfo {
                                     offset: frame.offset,
                                     delivery_count: batch.delivery_count,
-                                    frame,
+                                    frame: record_to_frame(frame),
                                 });
                             }
                         }
@@ -211,7 +227,7 @@ impl SharePartition {
                                 acquired_infos.push(AcquiredRecordInfo {
                                     offset: frame.offset,
                                     delivery_count: acquired_batch.delivery_count,
-                                    frame,
+                                    frame: record_to_frame(frame),
                                 });
                             }
                         }
@@ -260,7 +276,7 @@ impl SharePartition {
                         acquired_infos.push(AcquiredRecordInfo {
                             offset: off,
                             delivery_count: 1,
-                            frame,
+                            frame: record_to_frame(frame),
                         });
                     }
 

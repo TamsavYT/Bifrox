@@ -1,8 +1,6 @@
 use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
-use crate::protocol::frame::CONTROL_MAGIC_BYTE;
 use crate::protocol::RecordBatch;
-use crate::protocol::RecordFrame;
 use crate::replication::{ClusterConfig, ReplicationManager};
 use crate::server::coordinator::GroupCoordinator;
 use crate::server::partition::PartitionManager;
@@ -893,7 +891,8 @@ impl StorageEngine {
                     break;
                 }
                 for frame in &frames {
-                    if let Ok(rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
+                    let payload = frame.value.clone().unwrap_or_default();
+                    if let Ok(rec) = crate::replication::MetadataRecord::decode(&payload) {
                         self.apply_metadata_record(frame.offset, rec);
                     }
                     offset = frame.offset + 1;
@@ -2042,7 +2041,7 @@ impl StorageEngine {
                 }
                 for frame in &frames {
                     if let Some((status, producer_id, tx_id, partitions)) =
-                        decode_tx_state_record(&frame.payload)
+                        decode_tx_state_record(&frame.value.clone().unwrap_or_default())
                     {
                         latest_states.insert(tx_id, (status, producer_id, partitions));
                     }
@@ -2402,7 +2401,7 @@ impl StorageEngine {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new()); // unknown topic — empty, without creating it
         };
@@ -2487,7 +2486,7 @@ impl StorageEngine {
         partition: u32,
         target_timestamp: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new());
         };
@@ -2502,7 +2501,7 @@ impl StorageEngine {
         partition: u32,
         offset: u64,
         max_bytes: u32,
-    ) -> IoResult<Vec<RecordFrame>> {
+    ) -> IoResult<Vec<crate::segment::Record>> {
         let Some(pm) = self.partition_for_read(topic, partition)? else {
             return Ok(Vec::new());
         };
@@ -2511,30 +2510,31 @@ impl StorageEngine {
         let all_frames = self.fetch(topic, partition, offset, max_bytes).await?;
 
         let pm_blocking = pm.clone();
-        let committed_frames: Vec<RecordFrame> = tokio::task::spawn_blocking(move || {
-            all_frames
-                .into_iter()
-                .filter(|frame| {
-                    if frame.magic == CONTROL_MAGIC_BYTE {
-                        return false;
-                    }
-                    if frame.offset >= lso {
-                        return false;
-                    }
-                    if pm_blocking.is_offset_aborted(frame.offset) {
-                        return false;
-                    }
-                    for (start, end) in &aborted {
-                        if frame.offset >= *start && frame.offset <= *end {
+        let committed_frames: Vec<crate::segment::Record> =
+            tokio::task::spawn_blocking(move || {
+                all_frames
+                    .into_iter()
+                    .filter(|frame| {
+                        if frame.is_control {
                             return false;
                         }
-                    }
-                    true
-                })
-                .collect()
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("fetch_committed join error: {}", e)))?;
+                        if frame.offset >= lso {
+                            return false;
+                        }
+                        if pm_blocking.is_offset_aborted(frame.offset) {
+                            return false;
+                        }
+                        for (start, end) in &aborted {
+                            if frame.offset >= *start && frame.offset <= *end {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("fetch_committed join error: {}", e)))?;
 
         Ok(committed_frames)
     }
@@ -3163,10 +3163,31 @@ impl StorageEngine {
                 continue; // already current
             }
 
-            let frames = match meta_pm.fetch(from, MAX_CATCHUP_BYTES) {
-                Ok(frames) if !frames.is_empty() => frames,
+            // Read as stored bytes and decode the frames back out, rather than going
+            // through `fetch`, which yields decoded records. The follower appends what
+            // arrives verbatim, so the frames pushed here must be the leader's own bytes —
+            // rebuilding them from decoded payloads would produce different bytes (an
+            // uncompressed frame where the leader stored a compressed one) and break the
+            // byte-identity the replica relies on.
+            let entry_bytes = match meta_pm.fetch_entries_for_replication(from, MAX_CATCHUP_BYTES) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
                 _ => continue,
             };
+            let mut frames = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < entry_bytes.len() {
+                let Ok((entry, consumed)) = crate::segment::decode_entry(&entry_bytes[cursor..])
+                else {
+                    break;
+                };
+                cursor += consumed;
+                if let crate::segment::LogEntry::Frame(frame) = entry {
+                    frames.push(frame);
+                }
+            }
+            if frames.is_empty() {
+                continue;
+            }
 
             match self
                 .replication
@@ -4140,7 +4161,7 @@ impl StorageEngine {
                     for &off in dlq_offsets {
                         if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
                             if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
-                                let _ = dlq_pm.produce_frame(&f.payload);
+                                let _ = dlq_pm.produce_frame(&f.value.unwrap_or_default());
                             }
                         }
                     }
@@ -4183,7 +4204,7 @@ impl StorageEngine {
                     for &off in dlq_offsets {
                         if let Ok(frames) = src_pm.fetch(off, 1024 * 1024) {
                             if let Some(f) = frames.into_iter().find(|fr| fr.offset == off) {
-                                let _ = dlq_pm.produce_frame(&f.payload);
+                                let _ = dlq_pm.produce_frame(&f.value.unwrap_or_default());
                             }
                         }
                     }
