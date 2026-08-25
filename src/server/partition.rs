@@ -706,6 +706,20 @@ impl PartitionManager {
         seg_guard.fetch_entries(start_offset, max_bytes as usize, hw)
     }
 
+    /// The zero-copy form of [`Self::fetch_entries`]: the same byte range, expressed as a
+    /// physical range plus its own file handle so the kernel can stream it straight to a
+    /// socket. Bounded by the committed high watermark, exactly as `fetch_entries` is.
+    /// See [`SegmentManager::plan_entries_fetch`].
+    pub fn plan_entries_fetch(
+        &self,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> IoResult<Option<crate::segment::EntriesFetchPlan>> {
+        let hw = self.high_watermark();
+        let mut seg_guard = self.segment_manager.lock();
+        seg_guard.plan_entries_fetch(start_offset, max_bytes as usize, hw)
+    }
+
     /// Same as [`Self::fetch_entries`], but bounded by the log end rather than the
     /// committed high watermark.
     ///
@@ -834,12 +848,5 @@ impl PartitionManager {
     pub fn is_offset_aborted(&self, offset: u64) -> bool {
         let seg_guard = self.segment_manager.lock();
         seg_guard.is_offset_aborted(offset)
-    }
-
-    /// Whether this partition has any recorded aborted transaction ranges — see
-    /// `SegmentManager::has_aborted_transactions`.
-    pub fn has_aborted_transactions(&self) -> bool {
-        let seg_guard = self.segment_manager.lock();
-        seg_guard.has_aborted_transactions()
     }
 }

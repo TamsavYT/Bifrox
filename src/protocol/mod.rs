@@ -3,7 +3,8 @@ pub mod kafka_adapter;
 pub mod wire;
 
 pub use batch::{
-    BatchCompression, BatchError, BatchRecord, RecordBatch, BATCH_HEADER_SIZE, BATCH_MAGIC_BYTE,
+    BatchCompression, BatchError, BatchRecord, RecordBatch, BATCH_FRAMING_PREFIX_SIZE,
+    BATCH_HEADER_SIZE, BATCH_LENGTH_COVERED_FIXED, BATCH_MAGIC_BYTE,
 };
 
 /// Smallest number of bytes any log entry can occupy, used by scans to know when a buffer

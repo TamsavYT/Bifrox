@@ -469,6 +469,19 @@ impl LogSegment {
         Ok(buf)
     }
 
+    /// An independently-owned handle on this segment's log file, for a zero-copy transmit
+    /// that must outlive the `SegmentManager` lock.
+    ///
+    /// The clone keeps the underlying file alive on its own: compaction or retention may
+    /// rename or unlink the path the moment the lock is released, and the OS keeps the
+    /// inode until the last handle closes — on Unix by construction, and on Windows
+    /// because segments are opened with `FILE_SHARE_DELETE`. The clone also carries its
+    /// own file position, so a concurrent `read_at`/`append_bytes` on `self.file` cannot
+    /// move it out from under an in-flight `TransmitFile`.
+    pub fn try_clone_file(&self) -> IoResult<std::fs::File> {
+        self.file.try_clone()
+    }
+
     /// Flushes log segment to physical disk
     pub fn sync(&mut self) -> IoResult<()> {
         self.file.sync_data()
@@ -626,7 +639,22 @@ pub async fn transmit_zero_copy(
             return Err(err);
         }
         if sent == 0 {
-            break; // peer closed or no more data; caller sees a short transmit as an error via len mismatch
+            // Fewer bytes than promised. The caller has already written a response header
+            // declaring `physical_len`, so silently sending less would leave the client
+            // reading the next response's bytes as the tail of this one. Failing here is
+            // what makes the caller close the connection instead — a dropped connection a
+            // client retries beats a desynchronized one it cannot detect.
+            //
+            // Reachable when the file shrinks under this handle mid-transmit (a Raft-style
+            // truncation shares the inode with our clone) or when the peer goes away.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "zero-copy transmit ended {} bytes short of the {} promised",
+                    end - offset,
+                    physical_len
+                ),
+            ));
         }
         offset = new_offset;
     }

@@ -535,17 +535,57 @@ where
                             } else {
                                 consumed += bytes_used;
 
-                                // Zero-copy fast path: plain `Fetch` requests on a plain
-                                // (non-TLS) TCP connection can be served by streaming the
-                                // exact on-disk frame bytes straight to the socket via the
-                                // kernel (`TransmitFile`/`sendfile`) instead of going
-                                // through `process_request`'s buffered
-                                // read-into-Vec-then-encode path. Any ineligible case
-                                // (TLS, multi-segment span, offset beyond the high
-                                // watermark, unsupported OS) falls straight through to the
-                                // normal buffered handling below — this is purely an
-                                // optimization, never a behavior change.
+                                // Zero-copy fast path: a `Fetch` on a plain (non-TLS) TCP
+                                // connection can be served by streaming the entry bytes
+                                // straight from the segment file to the socket via the
+                                // kernel (`sendfile`/`TransmitFile`), instead of
+                                // `process_request` reading them into a Vec and copying
+                                // them through the response buffer. The response bytes are
+                                // identical either way (see `try_zero_copy_fetch`).
+                                //
+                                // Any ineligible case — TLS, a request that needs to wait
+                                // for data, an unsupported OS, nothing to send — falls
+                                // straight through to the buffered handling below. This is
+                                // purely an optimization, never a behavior change.
+                                let mut zero_copy_handled = false;
+                                #[cfg(any(windows, target_os = "linux"))]
+                                if let RequestPayload::Fetch {
+                                    topic,
+                                    partition,
+                                    offset,
+                                    max_bytes,
+                                } = &req.payload
                                 {
+                                    if let Some(raw_socket) = socket.as_plain_tcp_stream() {
+                                        match try_zero_copy_fetch(
+                                            &engine,
+                                            raw_socket,
+                                            topic,
+                                            *partition,
+                                            *offset,
+                                            *max_bytes,
+                                            &client_principal,
+                                            &client_key,
+                                            &logical_client_id,
+                                            &framing,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => zero_copy_handled = true,
+                                            Ok(false) => {}
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Zero-copy fetch transmit failed for {}: {}",
+                                                    peer_addr,
+                                                    e
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !zero_copy_handled {
                                     let response = process_request(
                                         &engine,
                                         req,
@@ -1456,6 +1496,129 @@ fn decode_heartbeat_packet(
     Ok((bytes_consumed, ack))
 }
 
+/// Attempts to serve a `Fetch` straight from the segment file to `socket` via the kernel
+/// (`sendfile(2)` on Linux, `TransmitFile` on Windows), so the entry bytes never pass
+/// through a user-space buffer at all.
+///
+/// The response it writes is **byte-identical** to what the buffered path in
+/// `process_request` would have written for the same request: the same framing envelope,
+/// the same `WireResponse` status/length prefix, the same header from
+/// `fetch_entries_response_header`, and the same entry bytes — which are the same bytes
+/// because both paths derive them from `SegmentManager::plan_entries_range`. This is not
+/// an incidental property; a fetch response whose shape depended on which internal path
+/// happened to serve it is precisely the bug that got the previous zero-copy path deleted.
+///
+/// Returns `Ok(false)` for anything that simply isn't eligible — a failed authorization or
+/// replica check (the caller falls through to `process_request`, which re-does them and
+/// produces the correct error response), or nothing to send, which includes every case
+/// where the request wants to *wait* for data. Long polling is deliberately left to the
+/// buffered path: parking is not a fast path, and re-implementing the wait loop here would
+/// be a second place for it to be wrong.
+///
+/// Once the response header has been written to the socket, any further error is an
+/// unrecoverable mid-response I/O failure and is returned as `Err` — the caller must close
+/// the connection, since a partial response would desynchronize the client's read stream.
+#[cfg(any(windows, target_os = "linux"))]
+// The parameters are the fetch request's fields plus the connection identity needed to
+// authorize it; grouping them into a struct would just move the same list behind a name.
+#[allow(clippy::too_many_arguments)]
+async fn try_zero_copy_fetch(
+    engine: &StorageEngine,
+    socket: &mut TcpStream,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    max_bytes: u32,
+    principal: &str,
+    client_key: &str,
+    logical_client_id: &Option<String>,
+    framing: &crate::protocol::wire::RequestFraming,
+) -> std::io::Result<bool> {
+    if !engine.authorize(
+        principal,
+        client_key,
+        crate::server::acl::AclOperation::Read as u8,
+        crate::server::acl::ResourceType::Topic as u8,
+        topic,
+    ) {
+        return Ok(false);
+    }
+    if !engine.is_partition_replica(topic, partition) {
+        return Ok(false);
+    }
+
+    let fetch_start = std::time::Instant::now();
+    let plan = match engine
+        .plan_entries_fetch(topic, partition, offset, max_bytes)
+        .await
+    {
+        Ok(Some(plan)) if plan.physical_len > 0 => plan,
+        // Nothing to send. A request that asked to wait must reach the buffered path so it
+        // can park on the high watermark instead of being answered empty here.
+        Ok(_) => return Ok(false),
+        Err(_) => return Ok(false), // let the buffered path surface the real error
+    };
+
+    // `min_bytes` is a floor on what the client considers worth returning; below it the
+    // request is supposed to wait. Only the buffered path can wait, so hand it back.
+    if plan.physical_len < framing.min_bytes() as u64 && framing.max_wait_ms() > 0 {
+        return Ok(false);
+    }
+
+    // Attribute this fetch to the group member it was tagged for (issue #54). A sequential
+    // consumer is served almost entirely from here, so without this, progress tracking
+    // would silently never fire for the case it exists to cover.
+    if let Some((group_id, member_id)) = framing.group_member() {
+        engine
+            .group_coordinator()
+            .record_progress(&group_id, &member_id);
+    }
+
+    // The transactional metadata a read-committed consumer filters with. The broker does
+    // not drop aborted records itself — it cannot, without decoding a compressed batch —
+    // so this path serves transactional partitions exactly as the buffered one does:
+    // identical entry bytes, identical `last_stable_offset` and aborted ranges, and the
+    // consumer applies them.
+    let (lso, aborted) = engine.read_committed_filter(topic, partition, framing.isolation_level());
+    let header = fetch_entries_response_header(lso, &aborted, plan.physical_len as usize);
+
+    let payload_len = header.len() as u64 + plan.physical_len;
+    if payload_len > u32::MAX as u64 {
+        return Ok(false); // not representable in the length prefix; let the buffered path cap it
+    }
+
+    // Recorded here as well as on the buffered arm — measuring only the buffered path
+    // would leave the fetch-latency histogram near-empty on exactly the sequential-read
+    // workload it matters most for. Timed before the throttle sleep and the socket write,
+    // so it reflects broker-side read cost rather than deliberate quota delay or client
+    // backpressure.
+    engine
+        .metrics()
+        .fetch_latency_ms
+        .record(fetch_start.elapsed());
+
+    let quota_key = resolve_quota_key(principal, logical_client_id.as_deref(), client_key);
+    engine
+        .throttle_fetch(topic, &quota_key, plan.physical_len)
+        .await;
+
+    // This path writes straight to the socket rather than returning a `WireResponse`, so
+    // it applies the request's framing itself. Without that, a versioned request would get
+    // an unwrapped reply here and only here, and the client would read the status byte as
+    // the envelope magic it was expecting.
+    let mut prefix = Vec::with_capacity(10 + header.len());
+    if let crate::protocol::wire::RequestFraming::Versioned { correlation_id, .. } = framing {
+        prefix.put_u8(crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
+        prefix.put_u32(*correlation_id);
+    }
+    prefix.put_u8(0u8); // WireResponse status = OK
+    prefix.put_u32(payload_len as u32);
+    prefix.extend_from_slice(&header);
+    socket.write_all(&prefix).await?;
+    plan.transmit(socket).await?;
+    Ok(true)
+}
+
 /// Encodes a record-bearing fetch response.
 ///
 /// ```text
@@ -1478,15 +1641,31 @@ fn encode_fetch_entries_response(
     aborted: &[(u64, u64)],
     entries: &bytes::Bytes,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(20 + aborted.len() * 16 + entries.len());
+    let mut buf = fetch_entries_response_header(last_stable_offset, aborted, entries.len());
+    buf.reserve(entries.len());
+    buf.put_slice(entries);
+    buf
+}
+
+/// Everything in a fetch response up to but not including the entry bytes themselves.
+///
+/// Split out so the zero-copy path (`try_zero_copy_fetch`) can write exactly this header
+/// and then have the kernel append the entry bytes, without a second implementation of the
+/// response layout that could drift from this one. A divergence here is not a cosmetic bug
+/// — the client parses the two as one format, so any difference corrupts its read stream.
+fn fetch_entries_response_header(
+    last_stable_offset: u64,
+    aborted: &[(u64, u64)],
+    entries_len: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + aborted.len() * 16);
     buf.put_u64(last_stable_offset);
     buf.put_u32(aborted.len() as u32);
     for (start, end) in aborted {
         buf.put_u64(*start);
         buf.put_u64(*end);
     }
-    buf.put_u32(entries.len() as u32);
-    buf.put_slice(entries);
+    buf.put_u32(entries_len as u32);
     buf
 }
 
@@ -2023,8 +2202,8 @@ async fn process_request(
             // behalf of a group member) records nothing, same as today.
             //
             // Also duplicated on the zero-copy fast path (`try_zero_copy_fetch`), which
-            // most plain-TCP fetches on a non-transactional partition are served by
-            // instead of reaching this arm at all.
+            // serves most plain-TCP fetches that find data waiting, instead of reaching
+            // this arm at all.
             if let Some((group_id, member_id)) = framing.group_member() {
                 engine
                     .group_coordinator()
@@ -3485,6 +3664,375 @@ mod cluster_metadata_durability_tests {
         assert!(
             !engine.topic_is_registered("should_not_apply"),
             "metadata whose durability could not be confirmed must not be applied"
+        );
+    }
+}
+
+/// The one property that matters about the zero-copy fetch path: a client cannot tell
+/// which path served it.
+///
+/// The previous zero-copy path was deleted because it had quietly drifted into writing a
+/// *different response format* from the buffered one — a divergence that never fired only
+/// because the path happened to always decline. So the test here is not "zero-copy returns
+/// the right records", it is "the bytes on the socket are the same bytes, for the same
+/// request, whichever path produced them". Anything less would not have caught that bug.
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod zero_copy_fetch_tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::protocol::wire::{RequestFraming, RequestTags};
+    use crate::protocol::CommandCode;
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hermes_zero_copy_fetch_{}_{}_{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_engine(dir: &TempDir) -> StorageEngine {
+        StorageEngine::new(EngineConfig {
+            data_dir: dir.0.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            ..EngineConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Produces `payloads` into `topic`/0 and commits them, so a consumer-bound fetch can
+    /// actually see them (entries above the high watermark are withheld).
+    fn seed(engine: &StorageEngine, topic: &str, payloads: &[&[u8]]) {
+        let pm = engine.get_or_create_partition(topic, 0).unwrap();
+        for payload in payloads {
+            pm.produce_frame(payload).unwrap();
+        }
+        pm.advance_committed_hw(pm.latest_offset());
+    }
+
+    /// A connected loopback pair, so the zero-copy path has a real `TcpStream` to
+    /// `sendfile`/`TransmitFile` into and the test can read back exactly what landed.
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (server, client)
+    }
+
+    /// Runs the fetch through `try_zero_copy_fetch` and returns the bytes it wrote to the
+    /// socket, or `None` if it declined.
+    async fn zero_copy_bytes(
+        engine: &StorageEngine,
+        topic: &str,
+        offset: u64,
+        max_bytes: u32,
+        framing: &RequestFraming,
+    ) -> Option<Vec<u8>> {
+        let (mut server, mut client) = socket_pair().await;
+        let served = try_zero_copy_fetch(
+            engine,
+            &mut server,
+            topic,
+            0,
+            offset,
+            max_bytes,
+            "User:ANONYMOUS",
+            "127.0.0.1",
+            &None,
+            framing,
+        )
+        .await
+        .unwrap();
+        // Dropping the server half closes the connection, so the read below sees a clean
+        // EOF instead of blocking on a socket nobody will write to again.
+        drop(server);
+        if !served {
+            return None;
+        }
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        Some(buf)
+    }
+
+    /// The same fetch as `zero_copy_bytes`, served the buffered way, encoded exactly as
+    /// the connection loop encodes a `WireResponse`.
+    async fn buffered_bytes(
+        engine: &StorageEngine,
+        topic: &str,
+        offset: u64,
+        max_bytes: u32,
+        framing: &RequestFraming,
+    ) -> Vec<u8> {
+        let req = WireRequest {
+            cmd: CommandCode::Fetch,
+            payload: RequestPayload::Fetch {
+                topic: topic.to_string(),
+                partition: 0,
+                offset,
+                max_bytes,
+            },
+        };
+        let mut principal = "User:ANONYMOUS".to_string();
+        let mut logical_client_id = None;
+        let mut scram_session = None;
+        let mut mechanism = None;
+        let mut is_plus = false;
+        let response = process_request(
+            engine,
+            req,
+            "127.0.0.1",
+            &mut principal,
+            "127.0.0.1",
+            &mut logical_client_id,
+            &mut scram_session,
+            &mut mechanism,
+            &mut is_plus,
+            framing,
+        )
+        .await;
+        response.encode_framed(framing)
+    }
+
+    #[tokio::test]
+    async fn zero_copy_response_is_byte_identical_to_the_buffered_one() {
+        let dir = TempDir::new("identical");
+        let engine = open_engine(&dir);
+        seed(
+            &engine,
+            "t",
+            &[b"alpha", b"bravo", b"charlie", b"delta", b"echo"],
+        );
+
+        for framing in [
+            RequestFraming::Legacy,
+            RequestFraming::Versioned {
+                api_version: 1,
+                correlation_id: 4242,
+                tags: RequestTags::default(),
+            },
+        ] {
+            // Every start offset, including one past the end, and a budget that cuts the
+            // fetch short — the paths have to agree on where entries begin and end, not
+            // just on "all of them".
+            for offset in 0..=5u64 {
+                for max_bytes in [64u32, 128, 4096] {
+                    let zc = zero_copy_bytes(&engine, "t", offset, max_bytes, &framing).await;
+                    let buffered = buffered_bytes(&engine, "t", offset, max_bytes, &framing).await;
+                    match zc {
+                        Some(zc) => assert_eq!(
+                            zc, buffered,
+                            "zero-copy and buffered responses diverged at offset {} \
+                             with max_bytes {} ({:?})",
+                            offset, max_bytes, framing
+                        ),
+                        None => {
+                            // Declining is always allowed, but only when there is nothing
+                            // to serve — never as a way to hide a disagreement.
+                            let entries_len = u32::from_be_bytes(
+                                buffered[buffered.len() - 4..].try_into().unwrap(),
+                            );
+                            assert_eq!(
+                                entries_len, 0,
+                                "zero-copy declined at offset {} with max_bytes {} even \
+                                 though the buffered path had entries to serve",
+                                offset, max_bytes
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A batch larger than the client's fetch budget must still be served whole, or that
+    /// offset is unreachable forever. Both paths owe the same answer here.
+    #[tokio::test]
+    async fn an_oversized_first_batch_is_served_whole_by_both_paths() {
+        let dir = TempDir::new("oversized");
+        let engine = open_engine(&dir);
+        let big = vec![b'x'; 8 * 1024];
+        seed(&engine, "t", &[&big, b"after"]);
+
+        let framing = RequestFraming::Legacy;
+        let zc = zero_copy_bytes(&engine, "t", 0, 16, &framing)
+            .await
+            .expect("an oversized first batch is still servable");
+        let buffered = buffered_bytes(&engine, "t", 0, 16, &framing).await;
+        assert_eq!(zc, buffered);
+        // ...and it really is the whole batch, not a 16-byte prefix of it.
+        assert!(
+            zc.len() > big.len(),
+            "expected the whole oversized batch, got {} bytes",
+            zc.len()
+        );
+    }
+
+    /// Uncommitted entries are invisible on both paths: the zero-copy path reads the same
+    /// high watermark, it does not get to skip the bound because it never decodes.
+    #[tokio::test]
+    async fn neither_path_serves_past_the_high_watermark() {
+        let dir = TempDir::new("hw");
+        let engine = open_engine(&dir);
+        let pm = engine.get_or_create_partition("t", 0).unwrap();
+        // `produce_frame_eos` appends without advancing the watermark (`produce_frame`
+        // would advance it itself), which is what lets this test hold offsets 1 and 2
+        // uncommitted — the state a leader is in while its ISR has not acknowledged yet.
+        for payload in [b"one".as_slice(), b"two", b"three"] {
+            pm.produce_frame_eos(bytes::Bytes::copy_from_slice(payload), 0, 0, 0)
+                .unwrap()
+                .unwrap();
+        }
+        pm.advance_committed_hw(1); // only offset 0 is committed
+        assert_eq!(pm.high_watermark(), 1);
+        assert_eq!(pm.latest_offset(), 3);
+
+        let framing = RequestFraming::Legacy;
+        let zc = zero_copy_bytes(&engine, "t", 0, 4096, &framing)
+            .await
+            .expect("the committed entry is servable");
+        let buffered = buffered_bytes(&engine, "t", 0, 4096, &framing).await;
+        assert_eq!(zc, buffered);
+
+        // Offset 1 is produced but not committed — nothing to serve, both ways.
+        assert!(zero_copy_bytes(&engine, "t", 1, 4096, &framing)
+            .await
+            .is_none());
+        let buffered_uncommitted = buffered_bytes(&engine, "t", 1, 4096, &framing).await;
+        let entries_len = u32::from_be_bytes(
+            buffered_uncommitted[buffered_uncommitted.len() - 4..]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(entries_len, 0);
+    }
+
+    /// The old zero-copy path had to refuse any partition carrying transactional data: it
+    /// streamed bytes with nothing inspecting them, so aborted records and control markers
+    /// went out unfiltered while the buffered path filtered them — the same request
+    /// answered differently depending on which path took it.
+    ///
+    /// That is no longer a conflict, because the *broker* no longer filters on either
+    /// path. It reports `last_stable_offset` and the aborted ranges in the response header
+    /// and the consumer drops what it must, which is the only thing that works once
+    /// batches are compressed. So the fast path now serves transactional partitions too —
+    /// and owes the identical answer, header included.
+    #[tokio::test]
+    async fn a_transactional_partition_is_served_identically_by_both_paths() {
+        let dir = TempDir::new("txn");
+        let engine = open_engine(&dir);
+        let topic = "txn_t";
+
+        let (tx_id, pid) = ("tx-zero-copy", 4242u64);
+        engine.begin_transaction(tx_id, pid).unwrap();
+        engine
+            .add_partitions_to_txn(tx_id, pid, 0, &[(topic.to_string(), vec![0])])
+            .unwrap();
+        let batch = crate::protocol::RecordBatch::create(
+            0,
+            1,
+            0,
+            pid,
+            0,
+            0,
+            true,
+            crate::protocol::BatchCompression::None,
+            &[
+                (1, None, Some(bytes::Bytes::from_static(b"doomed-1"))),
+                (1, None, Some(bytes::Bytes::from_static(b"doomed-2"))),
+            ],
+        );
+        engine
+            .produce_batch(crate::server::engine::ProduceBatchParams {
+                topic,
+                key: "",
+                transaction_id: Some(tx_id),
+                num_partitions: 1,
+                batch,
+            })
+            .await
+            .unwrap();
+        engine.abort_transaction(tx_id).unwrap();
+
+        let pm = engine.get_or_create_partition(topic, 0).unwrap();
+        pm.produce_frame(b"after-the-abort").unwrap();
+        pm.advance_committed_hw(pm.latest_offset());
+        assert!(
+            !pm.aborted_ranges().is_empty(),
+            "the fixture must actually have an aborted range for this to test anything"
+        );
+
+        // Read-committed is what makes the header non-trivial: a real last stable offset
+        // and a real aborted range, both of which the fast path has to reproduce exactly.
+        let read_committed = RequestFraming::Versioned {
+            api_version: 1,
+            correlation_id: 11,
+            tags: RequestTags {
+                isolation_level: Some(crate::protocol::wire::IsolationLevel::ReadCommitted),
+                ..RequestTags::default()
+            },
+        };
+        for framing in [read_committed, RequestFraming::Legacy] {
+            let zc = zero_copy_bytes(&engine, topic, 0, 4096, &framing)
+                .await
+                .expect("a transactional partition is servable from the fast path");
+            let buffered = buffered_bytes(&engine, topic, 0, 4096, &framing).await;
+            assert_eq!(
+                zc, buffered,
+                "zero-copy and buffered responses diverged on a transactional partition ({:?})",
+                framing
+            );
+        }
+    }
+
+    /// A fetch that wants to wait must reach the buffered path, which is the only one that
+    /// can park on the high watermark. Serving it immediately here would silently turn
+    /// `fetch.min.bytes` into a no-op for every plain-TCP consumer.
+    #[tokio::test]
+    async fn a_waiting_fetch_below_min_bytes_falls_through_to_the_buffered_path() {
+        let dir = TempDir::new("min_bytes");
+        let engine = open_engine(&dir);
+        seed(&engine, "t", &[b"small"]);
+
+        let waiting = RequestFraming::Versioned {
+            api_version: 1,
+            correlation_id: 7,
+            tags: RequestTags {
+                max_wait_ms: Some(50),
+                min_bytes: Some(1_000_000),
+                ..RequestTags::default()
+            },
+        };
+        assert!(
+            zero_copy_bytes(&engine, "t", 0, 4096, &waiting)
+                .await
+                .is_none(),
+            "a fetch asking to wait for more data must not be answered from the fast path"
+        );
+
+        // The same request without the wait tags is served zero-copy.
+        assert!(
+            zero_copy_bytes(&engine, "t", 0, 4096, &RequestFraming::Legacy)
+                .await
+                .is_some()
         );
     }
 }
