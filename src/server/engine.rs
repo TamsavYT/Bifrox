@@ -1648,7 +1648,7 @@ impl StorageEngine {
 
         if !self.config.peer_addrs.is_empty() {
             let repl = self.replication.clone();
-            let frame_for_replication = frame.clone();
+            let entry_for_replication = crate::replication::EncodedEntry::from_batch(&frame);
             let leader_hw = meta_pm.high_watermark();
             // The metadata log is fenced by the controller's Raft term: leadership of this
             // log *is* controller leadership.
@@ -1661,7 +1661,7 @@ impl StorageEngine {
                         fencing_epoch,
                         leader_hw,
                         &[],
-                        std::slice::from_ref(&frame_for_replication),
+                        std::slice::from_ref(&entry_for_replication),
                     )
                     .await
                 {
@@ -1680,7 +1680,7 @@ impl StorageEngine {
             // divergence was not confined to the metadata layer: it changed who was allowed
             // to write and where data landed.
             if !self
-                .await_metadata_commit(frame.offset, std::time::Duration::from_secs(5))
+                .await_metadata_commit(frame.base_offset, std::time::Duration::from_secs(5))
                 .await
             {
                 return Err(std::io::Error::new(
@@ -1688,7 +1688,7 @@ impl StorageEngine {
                     format!(
                         "NOT_ENOUGH_CONTROLLERS: metadata record at offset {} was not \
                          acknowledged by a majority of the controller quorum",
-                        frame.offset
+                        frame.base_offset
                     ),
                 ));
             }
@@ -1698,7 +1698,7 @@ impl StorageEngine {
                     &meta_pm,
                     "__cluster_metadata",
                     0,
-                    frame.offset,
+                    frame.base_offset,
                     std::time::Duration::from_secs(5),
                 )
                 .await?;
@@ -1709,7 +1709,7 @@ impl StorageEngine {
             // `__cluster_metadata` has no pull fetcher at all (it is deliberately excluded,
             // to avoid applying records through two paths at once), so this broadcast is
             // the only thing that ever advances a follower's metadata watermark.
-            meta_pm.advance_committed_hw(frame.offset + 1);
+            meta_pm.advance_committed_hw(frame.base_offset + 1);
             let repl = self.replication.clone();
             let committed_hw = meta_pm.high_watermark();
             let hw_fencing_epoch = self.replication.get_epoch();
@@ -1732,9 +1732,9 @@ impl StorageEngine {
         // On a failed commit the record stays in the local log but is deliberately NOT
         // applied and the caller gets an error, so the leader never serves state the
         // cluster has not agreed on.
-        self.apply_metadata_record(frame.offset, record);
+        self.apply_metadata_record(frame.base_offset, record);
 
-        Ok(frame.offset)
+        Ok(frame.base_offset)
     }
 
     /// `JoinGroup` with the rebalance barrier applied: registers the member, then holds
@@ -2418,7 +2418,7 @@ impl StorageEngine {
         // This intentionally still returns control-marker frames (magic ==
         // CONTROL_MAGIC_BYTE) alongside real records — matching real Kafka, where the
         // server exposes raw control batches at the wire level and it's the client
-        // library's job to recognize and skip them (see `RecordFrame::is_control_marker`
+        // library's job to recognize and skip them (see `Record::is_control`
         // and the client-authoring guidance in docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
         // `fetch_committed` is the path that hides them for callers that want that done
         // for them. Filtering here too would break raw log introspection (this is also
@@ -2431,31 +2431,6 @@ impl StorageEngine {
         })
         .await
         .map_err(|e| std::io::Error::other(format!("fetch join error: {}", e)))?
-    }
-
-    /// Plans a zero-copy fetch for the plain `Fetch` command: same offset/high-watermark
-    /// semantics as `fetch` (clamped to the committed HW, single segment only), but instead
-    /// of reading frame bytes into a `Vec<RecordFrame>`, resolves the exact on-disk byte
-    /// range so the caller can stream it straight to the socket via `TransmitFile`/
-    /// `sendfile` without copying payload bytes through a Rust buffer.
-    ///
-    /// Returns `Ok(None)` whenever there's nothing eligible for a zero-copy transmit (no
-    /// frames at/after `offset` within the committed HW, or the range doesn't start within
-    /// the located segment) — callers should fall back to the buffered `fetch` path in that
-    /// case, not treat it as an error.
-    pub async fn plan_zero_copy_fetch(
-        &self,
-        topic: &str,
-        partition: u32,
-        offset: u64,
-        max_bytes: u32,
-    ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
-        let Some(pm) = self.partition_for_read(topic, partition)? else {
-            return Ok(None); // unknown topic — nothing to stream, and nothing to create
-        };
-        tokio::task::spawn_blocking(move || pm.plan_zero_copy_fetch(offset, max_bytes))
-            .await
-            .map_err(|e| std::io::Error::other(format!("plan_zero_copy_fetch join error: {}", e)))?
     }
 
     /// BUG-02: Fetch records starting from nearest offset for target_timestamp
@@ -2723,7 +2698,7 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            end_offsets.push((topic.clone(), *partition, marker_frame.offset));
+            end_offsets.push((topic.clone(), *partition, marker_frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Commit marker written to '{}' partition {}",
                 topic,
@@ -2822,8 +2797,8 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.offset);
-            end_offsets.push((topic.clone(), *partition, frame.offset));
+            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset);
+            end_offsets.push((topic.clone(), *partition, frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Abort marker written to '{}' partition {}",
                 topic,
@@ -3180,10 +3155,11 @@ impl StorageEngine {
                 else {
                     break;
                 };
+                let bytes = entry_bytes.slice(cursor..cursor + consumed);
                 cursor += consumed;
-                if let crate::segment::LogEntry::Frame(frame) = entry {
-                    frames.push(frame);
-                }
+                let crate::segment::LogEntry::Batch(b) = &entry;
+                let last_offset = b.base_offset + b.last_offset_delta as u64;
+                frames.push(crate::replication::EncodedEntry { bytes, last_offset });
             }
             if frames.is_empty() {
                 continue;

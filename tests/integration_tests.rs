@@ -172,9 +172,8 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
 
 /// The value bytes of a record, for assertions written before values became nullable.
 ///
-/// A null value (tombstone) reads as empty here — which is exactly the conflation that made
-/// `RecordFrame` unfit for the read path, so tests that care about the difference assert on
-/// `record.value` directly instead of using this.
+/// A null value (tombstone) reads as empty here, so tests that care about the difference
+/// assert on `record.value` directly instead of using this.
 fn value_of(record: &hermes::segment::Record) -> &[u8] {
     record.value.as_deref().unwrap_or_default()
 }
@@ -601,9 +600,12 @@ async fn test_scenario_7_milestone3_features() {
     );
     assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
 
-    let frame = hermes::RecordFrame::create(0, 1000, "replicated_payload");
+    let entry = hermes::replication::EncodedEntry::from_batch(&producer_keyed_batch(
+        &[(b"k", Some(b"replicated_payload"))],
+        hermes::protocol::BatchCompression::None,
+    ));
     let res = repl_mgr
-        .replicate_batch("events", 0, 0, 0, &[], &[frame])
+        .replicate_batch("events", 0, 0, 0, &[], &[entry])
         .await;
     assert!(res.is_ok());
 
@@ -7989,12 +7991,7 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
         raw.len(),
         "exactly one entry — the whole batch — should be on disk"
     );
-    let batch = match entry {
-        hermes::segment::LogEntry::Batch(b) => b,
-        hermes::segment::LogEntry::Frame(_) => {
-            panic!("expected a RecordBatch on disk with produce.record.batches.enable on")
-        }
-    };
+    let hermes::segment::LogEntry::Batch(batch) = entry;
 
     assert_eq!(batch.producer_id, 777_888);
     assert_eq!(batch.producer_epoch, 5);
@@ -8267,6 +8264,77 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
     );
 }
 
+/// The log has exactly one entry format. Everything written to it — a client produce,
+/// cluster metadata the broker authors itself, and a transaction control marker — is a
+/// `RecordBatch`, and a control marker is distinguished by a flag in the batch's plaintext
+/// header rather than by being a different kind of entry.
+///
+/// That flag has to be readable without decoding or decompressing the record, because it is
+/// what lets read-committed filter markers and a consumer skip them.
+#[tokio::test]
+async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers() {
+    use hermes::config::EngineConfig;
+
+    let dir = TestDataDirGuard::new("one_entry_format");
+    let engine = StorageEngine::new(EngineConfig {
+        data_dir: dir.path.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        ..EngineConfig::default()
+    })
+    .unwrap();
+
+    let topic = "one_entry_format_topic";
+    let pm = engine.get_or_create_partition(topic, 0).unwrap();
+    pm.produce_batch_eos(producer_keyed_batch(
+        &[(b"k", Some(b"v"))],
+        hermes::protocol::BatchCompression::None,
+    ))
+    .unwrap()
+    .unwrap();
+    // A record the broker authors itself.
+    pm.produce_frame(b"broker-authored").unwrap();
+    // And a transaction control marker.
+    pm.produce_control_marker(1, 42, "txn-1").unwrap();
+
+    // Every entry on disk decodes as a batch — `LogEntry` has no other variant, so an entry
+    // of any other shape would fail to decode rather than surface as something else.
+    let raw = std::fs::read(
+        dir.path
+            .join(format!("{topic}-0"))
+            .join("00000000000000000000.log"),
+    )
+    .unwrap();
+    let mut cursor = 0usize;
+    let mut entries = 0usize;
+    let mut control_batches = 0usize;
+    while cursor < raw.len() {
+        let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..])
+            .unwrap_or_else(|e| panic!("every entry must be a batch, got {e}"));
+        let hermes::segment::LogEntry::Batch(batch) = entry;
+        if batch.is_control() {
+            control_batches += 1;
+        }
+        entries += 1;
+        cursor += consumed;
+    }
+    assert_eq!(entries, 3, "one produce, one broker record, one marker");
+    assert_eq!(
+        control_batches, 1,
+        "exactly the marker must carry the control flag"
+    );
+
+    // And the flag reaches a reader as `is_control`, which is what filtering depends on.
+    pm.advance_committed_hw(3);
+    let records = pm.fetch(0, 65536).unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(!records[0].is_control);
+    assert!(!records[1].is_control);
+    assert!(
+        records[2].is_control,
+        "a control marker must read back as one"
+    );
+}
+
 /// A tombstone must stay distinguishable from an empty value all the way out to a
 /// consumer.
 ///
@@ -8347,12 +8415,12 @@ async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() 
         // The engine writes its own bootstrap records to this partition, so target the one
         // written here by offset rather than assuming an empty log.
         let written = pm.produce_frame(original).unwrap();
-        pm.advance_committed_hw(written.offset + 1);
+        pm.advance_committed_hw(written.base_offset + 1);
 
-        let records = pm.fetch(written.offset, 65536).unwrap();
+        let records = pm.fetch(written.base_offset, 65536).unwrap();
         let mine = records
             .iter()
-            .find(|r| r.offset == written.offset)
+            .find(|r| r.offset == written.base_offset)
             .unwrap_or_else(|| panic!("{codec}: the record just written must be readable"));
         assert_eq!(
             mine.value.as_deref(),
@@ -8730,18 +8798,13 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
     let mut decoded_offsets = Vec::new();
     while cursor < raw.len() {
         let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..]).unwrap();
-        match entry {
-            hermes::segment::LogEntry::Batch(b) => {
-                batch_count += 1;
-                for record in b.records().unwrap() {
-                    decoded_offsets.push(record.offset);
-                }
-            }
-            hermes::segment::LogEntry::Frame(f) => panic!(
-                "client produce must write RecordBatches only; found a plain RecordFrame at \
-                 offset {} — the per-record frame write path has come back",
-                f.offset
-            ),
+        // `LogEntry` has one variant: the log holds batches and nothing else. A stray
+        // per-record entry would not decode at all, which `decode_entry` reports as
+        // corruption rather than as another entry kind.
+        let hermes::segment::LogEntry::Batch(b) = entry;
+        batch_count += 1;
+        for record in b.records().unwrap() {
+            decoded_offsets.push(record.offset);
         }
         cursor += consumed;
     }

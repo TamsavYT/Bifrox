@@ -1,5 +1,5 @@
 use crate::config::EngineConfig;
-use crate::protocol::{RecordBatch, RecordFrame};
+use crate::protocol::RecordBatch;
 use crate::segment::SegmentManager;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
@@ -286,7 +286,7 @@ impl PartitionManager {
         tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
-    /// Appends payload to event log stream, updates high watermark atomic, and returns produced RecordFrame.
+    /// Appends payload to the log as a single-record batch and returns it.
     /// Takes `payload` by value as `Bytes` (a cheap refcounted clone at the caller, not a
     /// copy) so it can be threaded straight through to `SegmentManager::append_with_codec`
     /// without a redundant `Vec<u8>` allocation on this hot path.
@@ -296,7 +296,7 @@ impl PartitionManager {
         producer_id: u64,
         epoch: i16,
         sequence: i32,
-    ) -> IoResult<Result<RecordFrame, u64>> {
+    ) -> IoResult<Result<RecordBatch, u64>> {
         let mut psm = self.producer_state_manager.lock();
         if producer_id != 0 {
             if let Err((is_duplicate, last_offset)) =
@@ -323,10 +323,10 @@ impl PartitionManager {
         let (frame, rolled) = {
             let mut seg_guard = self.segment_manager.lock();
             let base_before = seg_guard.active_base_offset();
-            let frame = seg_guard.append_with_codec(payload, timestamp, codec)?;
+            let frame = seg_guard.append_record(payload, timestamp, codec)?;
             let base_after = seg_guard.active_base_offset();
 
-            let assigned_offset = frame.offset;
+            let assigned_offset = frame.base_offset;
             // Only LEO advances here. `committed_hw` is deliberately NOT bumped on local
             // leader append — it only advances once `produce_batch` confirms ISR quorum
             // (see engine.rs), so a crashed/partitioned leader can never have exposed data
@@ -338,7 +338,7 @@ impl PartitionManager {
         };
 
         if producer_id != 0 {
-            psm.update(producer_id, epoch, sequence, frame.offset);
+            psm.update(producer_id, epoch, sequence, frame.base_offset);
         }
 
         if rolled {
@@ -455,10 +455,10 @@ impl PartitionManager {
     /// commits, transaction-state records, bootstrap) that doesn't itself integrate with
     /// ISR-quorum gating — unlike `produce_batch`'s use of `produce_batch_eos`, which
     /// leaves `committed_hw` ungated so it can advance only after quorum.
-    pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordFrame> {
+    pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordBatch> {
         let f = self.produce_frame_eos(Bytes::copy_from_slice(payload), 0, 0, 0)?;
         let frame = f.unwrap();
-        self.advance_committed_hw(frame.offset + 1);
+        self.advance_committed_hw(frame.base_offset + 1);
         // Single-record callers (this wrapper) sync immediately under a sync-every-write
         // policy, same as before this file split fsync out of `produce_frame_eos`.
         self.flush_if_sync_policy()?;
@@ -536,15 +536,11 @@ impl PartitionManager {
             };
             let (result, next_offset) = {
                 let mut seg_guard = self.segment_manager.lock();
-                match &entry {
-                    crate::segment::LogEntry::Frame(frame) => {
-                        (seg_guard.append_verbatim(frame)?, frame.offset + 1)
-                    }
-                    crate::segment::LogEntry::Batch(batch) => (
-                        seg_guard.append_batch_verbatim(batch)?,
-                        batch.base_offset + batch.last_offset_delta as u64 + 1,
-                    ),
-                }
+                let crate::segment::LogEntry::Batch(batch) = &entry;
+                (
+                    seg_guard.append_batch_verbatim(batch)?,
+                    batch.base_offset + batch.last_offset_delta as u64 + 1,
+                )
             };
             last = result;
             match result {
@@ -553,6 +549,10 @@ impl PartitionManager {
                     // but deliberately not the committed high watermark, which only moves
                     // once the leader tells this follower the record is ISR-committed.
                     self.log_end_offset.store(next_offset, Ordering::Release);
+                    // And the same AsyncPeriodic byte-threshold accounting as every other
+                    // append path, so a follower's unsynced bytes stay bounded.
+                    self.unsynced_bytes
+                        .fetch_add(consumed as u64, Ordering::AcqRel);
                     appended += 1;
                 }
                 crate::segment::VerbatimAppendResult::AlreadyApplied => {}
@@ -564,53 +564,43 @@ impl PartitionManager {
         Ok((appended, last))
     }
 
-    pub fn append_replica_frame_verbatim(
+    /// Applies one leader entry to this replica's log byte-for-byte, whichever kind it is.
+    pub fn append_replica_entry_verbatim(
         &self,
-        frame: &RecordFrame,
+        entry: &crate::segment::LogEntry,
     ) -> IoResult<crate::segment::VerbatimAppendResult> {
-        let result = {
+        let (result, next_offset) = {
             let mut seg_guard = self.segment_manager.lock();
-            seg_guard.append_verbatim(frame)?
+            let crate::segment::LogEntry::Batch(batch) = entry;
+            (
+                seg_guard.append_batch_verbatim(batch)?,
+                batch.base_offset + batch.last_offset_delta as u64 + 1,
+            )
         };
-
         if result == crate::segment::VerbatimAppendResult::Appended {
-            self.log_end_offset
-                .store(frame.offset + 1, Ordering::Release);
-            // Deliberately does NOT advance the committed high watermark.
-            //
-            // It used to, on the reasoning that "committing was the leader's job before
-            // this push was ever sent" — but that isn't true of either replication path.
-            // The leader pushes as soon as it appends and only commits after the ISR
-            // acknowledges, so a record can be in flight here while still uncommitted;
-            // the pull fetcher likewise reads ahead of the leader's committed point. A
-            // follower that advanced its HW per appended frame therefore marked
-            // uncommitted records as committed, which exposes them to follower-fetch
-            // reads and inflates the committed offset this replica would claim if it were
-            // promoted to leader.
-            //
-            // The committed point comes from the leader instead, clamped to the local LEO:
-            // the 0xAA decoder applies `leader_hw`, and the pull fetcher applies
-            // `resp.leader_watermark`.
+            // Same contract as `append_replica_frame_verbatim`: the log end advances but
+            // the committed watermark does not — that only moves when the leader says the
+            // record is ISR-committed.
+            self.log_end_offset.store(next_offset, Ordering::Release);
 
-            // Same group-commit reasoning as `produce_frame_eos`: this is called once per
-            // frame from a replication-push batch that may contain many frames (see
-            // `decode_replication_packet` in handler.rs), so it must not sync here — the
-            // caller syncs once via `flush_if_sync_policy()` after the whole batch.
-            // AsyncPeriodic's byte threshold still applies eagerly per-frame, same as the
-            // local-produce path.
-            let frame_size = frame.encoded_size() as u64;
-            let prev_unsynced = self.unsynced_bytes.fetch_add(frame_size, Ordering::AcqRel);
+            // AsyncPeriodic's byte threshold applies here exactly as it does on the local
+            // produce path. Without this the threshold never fires for replicated data, so
+            // a follower accumulates unsynced bytes without bound and flushes only on the
+            // timer — the caller's `flush_if_sync_policy()` after the whole push does not
+            // cover the eager, mid-push case the threshold exists for.
+            let crate::segment::LogEntry::Batch(b) = entry;
+            let entry_size = b.encoded_size() as u64;
+            let prev_unsynced = self.unsynced_bytes.fetch_add(entry_size, Ordering::AcqRel);
             if let crate::config::FlushPolicy::AsyncPeriodic { max_bytes, .. } = &self.flush_policy
             {
                 let max_bytes = *max_bytes as u64;
-                if max_bytes > 0 && prev_unsynced + frame_size >= max_bytes {
+                if max_bytes > 0 && prev_unsynced + entry_size >= max_bytes {
                     let mut seg_guard = self.segment_manager.lock();
                     seg_guard.sync()?;
                     self.unsynced_bytes.store(0, Ordering::Release);
                 }
             }
         }
-
         Ok(result)
     }
 
@@ -660,7 +650,7 @@ impl PartitionManager {
         control_type: u8,
         producer_id: u64,
         transaction_id: &str,
-    ) -> IoResult<RecordFrame> {
+    ) -> IoResult<RecordBatch> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -675,7 +665,7 @@ impl PartitionManager {
                 timestamp,
             )?;
 
-            let assigned_offset = frame.offset;
+            let assigned_offset = frame.base_offset;
             // Control markers (transaction commit/abort boundaries) are leader-internal
             // bookkeeping, not user-visible records — keep them immediately visible like
             // before rather than gating them behind ISR quorum, which the transaction
@@ -692,8 +682,8 @@ impl PartitionManager {
 
     /// Appends payload to event log stream, updates high watermark atomic, and triggers flush if policy requires
     pub fn produce(&self, payload: &[u8]) -> IoResult<u64> {
-        let frame = self.produce_frame(payload)?;
-        Ok(frame.offset)
+        let batch = self.produce_frame(payload)?;
+        Ok(batch.base_offset)
     }
 
     /// Reads event records starting from target logical offset
@@ -731,20 +721,6 @@ impl PartitionManager {
         let leo = self.latest_offset();
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.fetch_entries(start_offset, max_bytes as usize, leo)
-    }
-
-    /// Plans a zero-copy fetch (frame-aligned physical byte range + a cloned file handle)
-    /// for `start_offset`, clamped to the committed high watermark exactly like `fetch`.
-    /// See `SegmentManager::plan_zero_copy_fetch`. The segment lock is held only for the
-    /// duration of this planning call, not for the caller's subsequent network transmit.
-    pub fn plan_zero_copy_fetch(
-        &self,
-        start_offset: u64,
-        max_bytes: u32,
-    ) -> IoResult<Option<crate::segment::ZeroCopyFetchPlan>> {
-        let hw = self.high_watermark();
-        let mut seg_guard = self.segment_manager.lock();
-        seg_guard.plan_zero_copy_fetch(start_offset, max_bytes as usize, hw)
     }
 
     /// Reads event records starting from target timestamp

@@ -116,10 +116,8 @@ pub type KeyedRecord<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
 /// A record as a consumer sees it: offset, timestamp, and the key and value the producer
 /// wrote, both nullable opaque bytes.
 ///
-/// The same [`crate::segment::Record`] the broker reads out of the log. A `RecordFrame`
-/// cannot stand in for it: with only `payload: Bytes` it has no key field, and it cannot
-/// tell a tombstone (null value) from an ordinary record whose value happens to be empty —
-/// a distinction compaction acts on.
+/// The same [`crate::segment::Record`] the broker reads out of the log, so a null value
+/// (tombstone) stays distinct from an empty one all the way to the consumer.
 pub type ConsumerRecord = crate::segment::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,10 +832,8 @@ impl TestClient {
 
     /// Fetches records including their per-record keys.
     ///
-    /// [`Self::fetch`] returns [`RecordFrame`]s, which have no key field, so keys are
-    /// dropped there. Use this on any topic where the key matters — a compacted topic in
-    /// particular, where the key is what compaction dedupes by and a null value is a
-    /// tombstone.
+    /// Identical to [`Self::fetch`]; kept as a distinct name because it reads as the
+    /// key-aware call at the call site.
     pub async fn fetch_records(
         &mut self,
         topic: &str,
@@ -871,8 +867,7 @@ impl TestClient {
 
     /// Decodes a fetch response into records, keys and null values intact.
     ///
-    /// A `RecordFrame` has no key, so one decoded out of the log surfaces with `key: None`
-    /// and its payload as the value.
+    /// Filtering is applied per the isolation level requested.
     fn decode_fetch_entries_records(
         payload: &[u8],
         start_offset: u64,

@@ -1,10 +1,10 @@
 use crate::config::EngineConfig;
-use crate::protocol::{BatchCompression, RecordBatch, RecordFrame, BATCH_MAGIC_BYTE, HEADER_SIZE};
+use crate::protocol::{BatchCompression, RecordBatch, BATCH_MAGIC_BYTE, HEADER_SIZE};
 use crate::segment::entry::{decode_entry, records_from_entries, LogEntry, Record};
 use crate::segment::index::IndexSegment;
 use crate::segment::log::{format_segment_filename, LogSegment};
 use crate::segment::timeindex::TimeIndexSegment;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use std::fs;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
@@ -23,34 +23,6 @@ pub enum VerbatimAppendResult {
     Gap { expected: u64 },
 }
 
-/// A frame-aligned physical byte range within one segment's log file, ready for a
-/// zero-copy transmit (`TransmitFile` on Windows, `sendfile(2)` on Linux) straight from
-/// `file` to a socket — the caller never needs to copy payload bytes into a Rust buffer.
-/// See `SegmentManager::plan_zero_copy_fetch`.
-#[derive(Debug)]
-pub struct ZeroCopyFetchPlan {
-    pub file: std::fs::File,
-    pub physical_start: u64,
-    pub physical_len: u64,
-    pub frame_count: u32,
-}
-
-impl ZeroCopyFetchPlan {
-    /// Streams this plan's byte range straight from disk (well, the OS page cache) to
-    /// `socket` via the platform's kernel copy primitive. `self.file` is an independently
-    /// owned handle, so no `SegmentManager` lock is held for the duration of this call.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub async fn transmit(&self, socket: &tokio::net::TcpStream) -> IoResult<()> {
-        crate::segment::log::transmit_zero_copy(
-            &self.file,
-            socket,
-            self.physical_start,
-            self.physical_len,
-        )
-        .await
-    }
-}
-
 /// Segment pair holding associated log segment and index segment
 #[derive(Debug)]
 pub struct SegmentPair {
@@ -63,26 +35,7 @@ pub struct SegmentPair {
 }
 
 impl SegmentPair {
-    /// Reads all valid record frames sequentially from this log segment. A `RecordBatch`
-    /// found along the way is skipped by its own reported length rather than decoded into
-    /// the result — its presence must never truncate the scan and lose the frames after it.
-    /// For a scan that decodes batches too instead of skipping them, see `read_all_entries`.
-    pub fn read_all_frames(&mut self) -> IoResult<Vec<RecordFrame>> {
-        Ok(self
-            .read_all_entries()?
-            .into_iter()
-            .filter_map(|entry| match entry {
-                LogEntry::Frame(frame) => Some(frame),
-                LogEntry::Batch(_) => None,
-            })
-            .collect())
-    }
-
-    /// Reads every entry in this log segment in order, fully decoded — both `RecordFrame`s
-    /// and `RecordBatch`es, unlike `read_all_frames` which silently skips batches. Used by
-    /// `SegmentManager::compact_segments` (via `expand_entries_for_compaction`): compaction
-    /// rewrites the segment in place, so skipping a batch there would permanently destroy
-    /// every record inside it rather than merely omitting it from one read.
+    /// Reads every entry in this log segment in order, fully decoded.
     fn read_all_entries(&mut self) -> IoResult<Vec<LogEntry>> {
         let size = self.log.physical_size as usize;
         if size == 0 {
@@ -110,19 +63,10 @@ impl SegmentPair {
     }
 }
 
-/// Flattens a segment's raw entries into individual `RecordFrame`s for log compaction: a
-/// `RecordFrame` entry passes through unchanged, and a `RecordBatch` entry's records are
-/// decoded — already decompressed by `RecordBatch::records` (batch compression applies once
-/// to the whole batch, never per record, so there is nothing left to decompress here, unlike
-/// a compressed `RecordFrame`'s payload) — and each becomes its own uncompressed
-/// `RecordFrame` via `RecordFrame::create`, exactly the flattening `SegmentManager::fetch`
-/// already does when serving a batch to a client.
-///
-/// Design choice (see `SegmentManager::compact_segments`'s doc comment for the fuller
-/// reasoning): compaction always rewrites surviving records as plain frames, never as
-/// reconstituted batches. A batch can be partially compacted away — some of its records
-/// superseded or tombstoned, others kept — at which point it is no longer the batch that was
-/// produced, so the original batch's `base_sequence`/`producer_id`/`producer_epoch` no
+/// Compaction rewrites a partially compacted batch as a batch, keeping survivors at their
+/// original offsets. A batch can be partially compacted away — some of its records
+/// superseded or tombstoned, others kept — at which point the original batch's
+/// `base_sequence`/`producer_id`/`producer_epoch` no
 /// longer describe its contents and cannot be preserved meaningfully. Emitting plain frames
 /// sidesteps that: each surviving record stands on its own, with no batch-level metadata
 /// left half-true. The cost is that a compacted segment loses batching entirely — no more
@@ -141,34 +85,26 @@ impl SegmentPair {
 /// are known-good and there's no reason they should be lost too.
 /// Encoded size of a log entry on disk, whichever kind it is.
 fn entry_encoded_size(entry: &LogEntry) -> usize {
-    match entry {
-        LogEntry::Frame(frame) => frame.encoded_size(),
-        LogEntry::Batch(batch) => batch.encoded_size(),
-    }
+    let LogEntry::Batch(batch) = entry;
+    batch.encoded_size()
 }
 
 /// Encodes a log entry exactly as it is stored.
 fn encode_entry_into(entry: &LogEntry, buf: &mut Vec<u8>) {
-    match entry {
-        LogEntry::Frame(frame) => frame.encode_into(buf),
-        LogEntry::Batch(batch) => batch.encode_into(buf),
-    }
+    let LogEntry::Batch(batch) = entry;
+    batch.encode_into(buf);
 }
 
 /// The offset an entry is indexed by: a frame's own offset, a batch's base offset.
 fn entry_index_offset(entry: &LogEntry) -> u64 {
-    match entry {
-        LogEntry::Frame(frame) => frame.offset,
-        LogEntry::Batch(batch) => batch.base_offset,
-    }
+    let LogEntry::Batch(batch) = entry;
+    batch.base_offset
 }
 
 /// The timestamp an entry is time-indexed by.
 fn entry_index_timestamp(entry: &LogEntry) -> u64 {
-    match entry {
-        LogEntry::Frame(frame) => frame.timestamp,
-        LogEntry::Batch(batch) => batch.base_timestamp,
-    }
+    let LogEntry::Batch(batch) = entry;
+    batch.base_timestamp
 }
 
 /// Rotates log and index segments, manages historical segments, and performs index-accelerated seeks
@@ -428,23 +364,12 @@ impl SegmentManager {
     }
 
     /// Append record frames into active segment. Performs segment rotation if size limit reached.
-    pub fn append(&mut self, payload: &[u8], timestamp: u64) -> IoResult<RecordFrame> {
-        self.append_with_codec(
+    pub fn append(&mut self, payload: &[u8], timestamp: u64) -> IoResult<RecordBatch> {
+        self.append_record(
             Bytes::copy_from_slice(payload),
             timestamp,
             crate::config::CompressionCodec::None,
         )
-    }
-
-    /// Encodes `frame`'s header+payload into the reused `frame_encode_scratch` buffer and
-    /// writes it to the active segment's log file, returning the physical byte position it
-    /// was written at. Shared by every single-frame append path (`append_with_codec`,
-    /// `append_verbatim`, `append_control_marker`) so none of them need a fresh `Vec`
-    /// allocation per call.
-    fn append_frame_to_active(&mut self, frame: &RecordFrame) -> IoResult<u64> {
-        self.frame_encode_scratch.clear();
-        frame.encode_into(&mut self.frame_encode_scratch);
-        self.active.log.append_bytes(&self.frame_encode_scratch)
     }
 
     /// Same as `append_frame_to_active`, for a `RecordBatch` instead of a single frame —
@@ -457,53 +382,39 @@ impl SegmentManager {
         self.active.log.append_bytes(&self.frame_encode_scratch)
     }
 
-    /// Append record frames with optional payload compression. `payload` is taken by
-    /// value as `Bytes` rather than `&[u8]` so the hot produce path (see
-    /// `PartitionManager::produce_frame_eos`) can thread the already-decoded, already-owned
-    /// `Bytes` from the wire straight through to `RecordFrame::create` — a `Bytes` clone is
-    /// a refcount bump, not a copy, whereas the old `&[u8]` signature forced a fresh
-    /// `Vec<u8>` allocation + memcpy here on every single produced record.
-    pub fn append_with_codec(
+    /// Appends one record the broker authored itself, as a single-record batch.
+    ///
+    /// Internal system partitions — cluster metadata, DLQ routing, consumer offsets,
+    /// transaction state, bootstrap — write through here. A batch rather than a frame
+    /// because the log has one record format: whatever is written must be readable by the
+    /// same decode path everything else uses, and only a batch carries a key, a nullable
+    /// value, and its own compression.
+    ///
+    /// `codec` is resolved through `for_broker_authored_frame`, since there is no producer
+    /// whose choice could be honoured for a record the broker wrote.
+    pub fn append_record(
         &mut self,
         payload: Bytes,
         timestamp: u64,
         codec: crate::config::CompressionCodec,
-    ) -> IoResult<RecordFrame> {
-        let assigned_offset = self.high_watermark;
-        // This path only ever writes records the broker authored itself, so there is no
-        // producer codec to honour — `Producer` resolves to uncompressed here.
-        let frame = match codec.for_broker_authored_frame() {
-            crate::config::CompressionCodec::Lz4 => {
-                RecordFrame::create_compressed_lz4(assigned_offset, timestamp, &payload)
-            }
-            crate::config::CompressionCodec::Zstd => {
-                RecordFrame::create_compressed_zstd(assigned_offset, timestamp, &payload)
-            }
-            // `for_broker_authored_frame` has already mapped `Producer` to `None`.
-            crate::config::CompressionCodec::None | crate::config::CompressionCodec::Producer => {
-                RecordFrame::create(assigned_offset, timestamp, payload)
-            }
+    ) -> IoResult<RecordBatch> {
+        let batch_codec = match codec.for_broker_authored_frame() {
+            crate::config::CompressionCodec::Lz4 => BatchCompression::Lz4,
+            crate::config::CompressionCodec::Zstd => BatchCompression::Zstd,
+            _ => BatchCompression::None,
         };
-        let frame_size = frame.encoded_size() as u64;
-
-        self.maybe_rotate_before_append(frame_size)?;
-
-        let physical_pos = self.append_frame_to_active(&frame)?;
-
-        // Sparse index entry placement
-        if self.bytes_since_last_index >= self.config.index_interval_bytes
-            || self.active.index.entries_count() == 0
-        {
-            self.active.index.append(assigned_offset, physical_pos)?;
-            let _ = self.active.time_index.append(timestamp, assigned_offset);
-            self.bytes_since_last_index = 0;
-        }
-
-        self.bytes_since_last_index += frame_size;
-        self.high_watermark += 1;
-        self.active.log.next_offset = self.high_watermark;
-
-        Ok(frame)
+        let batch = RecordBatch::create(
+            0,
+            timestamp,
+            0,
+            0,
+            0,
+            0,
+            false,
+            batch_codec,
+            &[(timestamp, None, Some(payload))],
+        );
+        self.append_batch(batch, 0)
     }
 
     /// Appends a batch of records into the active segment as one `RecordBatch`, assigning
@@ -560,13 +471,6 @@ impl SegmentManager {
         Ok(batch)
     }
 
-    /// Appends a frame produced elsewhere (i.e. a leader's `RecordFrame`) byte-for-byte:
-    /// the offset, timestamp, magic byte, and CRC are all taken from `frame` as given,
-    /// never reassigned locally. This is what makes a replica's on-disk log byte-identical
-    /// to the leader's for the same offset range, instead of diverging (the old replication
-    /// path re-derived offset/timestamp/codec through `append_with_codec` on every
-    /// replicated record). `frame` has already been CRC-validated by `RecordFrame::decode`,
-    /// so no additional integrity check is needed here.
     /// Appends a batch produced elsewhere (a leader's `RecordBatch`) byte-for-byte: base
     /// offset, leader epoch, producer metadata, compression and CRC are all taken exactly
     /// as given, never restamped and never re-compressed. This is what makes a replica's
@@ -611,36 +515,6 @@ impl SegmentManager {
 
         self.bytes_since_last_index += batch_size;
         self.high_watermark = last_offset + 1;
-        self.active.log.next_offset = self.high_watermark;
-
-        Ok(VerbatimAppendResult::Appended)
-    }
-
-    pub fn append_verbatim(&mut self, frame: &RecordFrame) -> IoResult<VerbatimAppendResult> {
-        if frame.offset < self.high_watermark {
-            return Ok(VerbatimAppendResult::AlreadyApplied);
-        }
-        if frame.offset > self.high_watermark {
-            return Ok(VerbatimAppendResult::Gap {
-                expected: self.high_watermark,
-            });
-        }
-
-        let frame_size = frame.encoded_size() as u64;
-        self.maybe_rotate_before_append(frame_size)?;
-
-        let physical_pos = self.append_frame_to_active(frame)?;
-
-        if self.bytes_since_last_index >= self.config.index_interval_bytes
-            || self.active.index.entries_count() == 0
-        {
-            self.active.index.append(frame.offset, physical_pos)?;
-            let _ = self.active.time_index.append(frame.timestamp, frame.offset);
-            self.bytes_since_last_index = 0;
-        }
-
-        self.bytes_since_last_index += frame_size;
-        self.high_watermark = frame.offset + 1;
         self.active.log.next_offset = self.high_watermark;
 
         Ok(VerbatimAppendResult::Appended)
@@ -754,13 +628,6 @@ impl SegmentManager {
                 break;
             }
             match decode_entry(&raw[cursor..]) {
-                Ok((LogEntry::Frame(frame), consumed)) => {
-                    if frame.offset == offset {
-                        return Ok((phys, offset));
-                    }
-                    cursor += consumed;
-                    phys += consumed as u64;
-                }
                 Ok((LogEntry::Batch(batch), consumed)) => {
                     // A batch is atomic — there is no physical position for an offset
                     // partway through it, only for the batch as a whole. Any target
@@ -782,40 +649,42 @@ impl SegmentManager {
         Ok((pair.log.physical_size, offset))
     }
 
-    /// Append a control marker frame into active segment. Performs segment rotation if size limit reached.
+    /// Appends a transaction control marker as a single-record **control batch**.
+    ///
+    /// The control attribute lives in the batch's plaintext header, so a reader recognises
+    /// a marker without decoding or decompressing the record — which is what lets
+    /// `fetch_committed` filter them and a consumer skip them. Kafka's control batches work
+    /// the same way, and for the same reason: a marker occupies a real offset.
+    ///
+    /// The record's value keeps the marker's existing encoding,
+    /// `[control_type:1][producer_id:8][transaction_id: pascal]`. Nothing decodes it — a
+    /// marker exists to occupy an offset and delimit a transaction — but it is preserved so
+    /// the information is there if a reader ever wants it.
     pub fn append_control_marker(
         &mut self,
         control_type: u8,
         producer_id: u64,
         transaction_id: &str,
         timestamp: u64,
-    ) -> IoResult<RecordFrame> {
-        let assigned_offset = self.high_watermark;
-        let frame = RecordFrame::create_control_marker(
-            assigned_offset,
+    ) -> IoResult<RecordBatch> {
+        let mut value = Vec::new();
+        value.put_u8(control_type);
+        value.put_u64(producer_id);
+        crate::protocol::wire::write_pascal_string(&mut value, transaction_id);
+
+        let mut batch = RecordBatch::create(
+            0,
             timestamp,
-            control_type,
+            0,
             producer_id,
-            transaction_id,
+            0,
+            0,
+            true,
+            BatchCompression::None,
+            &[(timestamp, None, Some(Bytes::from(value)))],
         );
-        let frame_size = frame.encoded_size() as u64;
-        self.maybe_rotate_before_append(frame_size)?;
-
-        let physical_pos = self.append_frame_to_active(&frame)?;
-
-        if self.bytes_since_last_index >= self.config.index_interval_bytes
-            || self.active.index.entries_count() == 0
-        {
-            self.active.index.append(assigned_offset, physical_pos)?;
-            let _ = self.active.time_index.append(timestamp, assigned_offset);
-            self.bytes_since_last_index = 0;
-        }
-
-        self.bytes_since_last_index += frame_size;
-        self.high_watermark += 1;
-        self.active.log.next_offset = self.high_watermark;
-
-        Ok(frame)
+        batch.set_control();
+        self.append_batch(batch, 0)
     }
 
     /// Rotate active segment to new segment file
@@ -939,14 +808,9 @@ impl SegmentManager {
 
     /// Read records starting at logical offset using binary search across segments and sparse index ($O(\log N)$)
     ///
-    /// A `RecordBatch` encountered along the way is decoded and its records surfaced as
-    /// synthetic uncompressed `RecordFrame`s (`RecordFrame::create`, magic `0xAB`) — one
-    /// per decoded, already-decompressed `BatchRecord`, filtered to `offset >=
-    /// start_offset` exactly like a real frame is. This gives callers the same records,
-    /// offsets, and payload bytes a frame-per-record produce would have returned; a
-    /// caller that only wants `start_offset` from the middle of a batch still gets it,
-    /// because a batch is atomic on disk and must be decoded whole (see
-    /// `physical_pos_for_offset`) before its later records can be filtered out.
+    /// A batch is atomic on disk, so one containing `start_offset` is decoded whole and its
+    /// earlier records filtered out here — a caller asking from the middle of a batch still
+    /// gets exactly what it asked for.
     pub fn fetch(&mut self, start_offset: u64, max_bytes: usize) -> IoResult<Vec<Record>> {
         let segment_pair = self.find_segment_pair_mut(start_offset);
         let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
@@ -1027,10 +891,8 @@ impl SegmentManager {
                 // could not account for.
                 break;
             };
-            let last_offset = match &entry {
-                LogEntry::Frame(frame) => frame.offset,
-                LogEntry::Batch(batch) => batch.base_offset + batch.last_offset_delta as u64,
-            };
+            let LogEntry::Batch(batch) = &entry;
+            let last_offset = batch.base_offset + batch.last_offset_delta as u64;
             // An entry is included only if it is *entirely* below the committed high
             // watermark. Records inside a batch cannot be filtered individually without
             // decoding it, so a batch straddling the watermark is withheld whole rather
@@ -1093,142 +955,6 @@ impl SegmentManager {
         } else {
             pair.log.read_at(start_pos, total_needed)
         }
-    }
-
-    /// Plans a zero-copy fetch: locates the exact, frame-aligned physical byte range
-    /// covering as much of `[start_offset, high_watermark)` as fits in `max_bytes`
-    /// (within a single segment — same single-segment limitation `fetch` already has),
-    /// and returns a cloned file handle for it.
-    ///
-    /// The scan reads only frame *headers* (`HEADER_SIZE` bytes at a time, via seek+read)
-    /// to find where each frame starts and how long it is — it deliberately never touches
-    /// payload bytes, so this is cheap even for large records. The actual bulk transfer
-    /// (the whole point of "zero-copy") happens later, directly from the returned file
-    /// handle to the socket via `TransmitFile`/`sendfile`, without this function or its
-    /// caller ever copying record payloads into a Rust-owned buffer.
-    ///
-    /// The returned `std::fs::File` is an independently `try_clone`d handle — safe to use
-    /// after this call returns and the caller has released whatever lock guarded this
-    /// `SegmentManager` (compaction/retention can freely rename or delete the segment's
-    /// path afterwards; the OS keeps the underlying file alive as long as this handle is
-    /// open, on both Windows — segments are opened with `FILE_SHARE_DELETE` — and Unix).
-    pub fn plan_zero_copy_fetch(
-        &mut self,
-        start_offset: u64,
-        max_bytes: usize,
-        high_watermark: u64,
-    ) -> IoResult<Option<ZeroCopyFetchPlan>> {
-        const MAX_FRAMES_PER_PLAN: u32 = 20_000; // sanity cap against pathological tiny-record scans
-
-        if start_offset >= high_watermark || max_bytes < HEADER_SIZE {
-            return Ok(None);
-        }
-
-        let segment_pair = self.find_segment_pair_mut(start_offset);
-        let seek_entry = segment_pair.index.find_nearest_physical_pos(start_offset);
-        let mut phys = seek_entry.map_or(0, |e| e.physical_position as u64);
-
-        let mut plan_start: Option<u64> = None;
-        let mut frame_count: u32 = 0;
-        let mut bytes_used: usize = 0;
-
-        loop {
-            let header = segment_pair.log.read_at(phys, HEADER_SIZE)?;
-            if header.len() < HEADER_SIZE {
-                break; // reached the end of this segment's valid data
-            }
-            if header[0] == BATCH_MAGIC_BYTE {
-                // This path ships raw bytes straight to the socket (`ZeroCopyFetchPlan::
-                // transmit`) with no per-entry reinterpretation at send time — the client
-                // parses exactly `frame_count` `RecordFrame`s out of what it receives.
-                // A `RecordBatch` is a different wire format entirely, and its header
-                // isn't even frame-shaped (the bytes this loop otherwise reads as
-                // `frame_offset`/`payload_len` would land on the batch's CRC and base
-                // offset fields instead). Sending it through this path would corrupt the
-                // client's parse — decided deliberately, not left to chance, precisely
-                // because this path already caused one silent bug before (#54, bypassing
-                // `record_progress`) by assuming every on-disk entry needed no special
-                // handling.
-                //
-                // `base_offset` (bytes 9..17) and `last_offset_delta` (bytes 17..21) both
-                // land within the 25-byte header already read above, so a batch entirely
-                // before `start_offset` can still be skipped by its own declared length
-                // (`batch_length`, bytes 1..5) exactly like an ordinary too-early frame —
-                // no need to decline just because a batch happens to sit earlier in the
-                // scan than anything relevant.
-                let batch_length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as u64;
-                let batch_base_offset = u64::from_be_bytes(header[9..17].try_into().unwrap());
-                let batch_last_offset_delta =
-                    u32::from_be_bytes(header[17..21].try_into().unwrap());
-                let batch_end_offset = batch_base_offset + batch_last_offset_delta as u64;
-                const BATCH_PREFIX: u64 = 5; // magic + batch_length, see RecordBatch::decode
-                let batch_total_len = BATCH_PREFIX + batch_length;
-
-                if batch_base_offset >= high_watermark {
-                    break; // never expose data beyond the committed high watermark
-                }
-                if plan_start.is_none() && batch_end_offset < start_offset {
-                    // Nothing in this batch is relevant — skip clean over it and keep
-                    // scanning for start_offset, same as skipping an earlier frame.
-                    phys += batch_total_len;
-                    continue;
-                }
-                // Either `start_offset` falls inside this batch (or it's entirely past
-                // it, since HW is never checked on this path before the fact), or whole
-                // frames were already planned before reaching it. Either way, this batch
-                // itself can never be part of a zero-copy plan:
-                //   - nothing planned yet: this batch is (or covers) the very entry
-                //     `start_offset` needs — decline entirely so the buffered `fetch`
-                //     path, which does understand batches, serves this request instead.
-                //   - something already planned: stop here and ship just the whole
-                //     frames collected so far; the batch itself will be picked up whole
-                //     by the buffered path on the caller's next fetch, which naturally
-                //     starts at this batch's base offset.
-                if plan_start.is_none() {
-                    return Ok(None);
-                }
-                break;
-            }
-            let frame_offset = u64::from_be_bytes(header[5..13].try_into().unwrap());
-            let payload_len = u32::from_be_bytes(header[21..25].try_into().unwrap()) as usize;
-            let frame_total_len = HEADER_SIZE + payload_len;
-
-            if frame_offset >= high_watermark {
-                break; // never expose data beyond the committed high watermark
-            }
-            if plan_start.is_none() {
-                if frame_offset < start_offset {
-                    // The sparse index only guarantees "at or before" start_offset —
-                    // skip forward past any earlier frame(s) it landed us on.
-                    phys += frame_total_len as u64;
-                    continue;
-                }
-                plan_start = Some(phys);
-            }
-            if frame_count > 0 && bytes_used + frame_total_len > max_bytes {
-                break; // this next frame would exceed the byte budget
-            }
-
-            bytes_used += frame_total_len;
-            frame_count += 1;
-            phys += frame_total_len as u64;
-
-            if bytes_used >= max_bytes || frame_count >= MAX_FRAMES_PER_PLAN {
-                break;
-            }
-        }
-
-        let (Some(plan_start), true) = (plan_start, frame_count > 0) else {
-            return Ok(None);
-        };
-
-        let file = segment_pair.log.file.try_clone()?;
-        Ok(Some(ZeroCopyFetchPlan {
-            file,
-            physical_start: plan_start,
-            physical_len: bytes_used as u64,
-            frame_count,
-        }))
     }
 
     /// Fast binary search seek ($O(\log N)$) for nearest physical byte position of logical offset
@@ -1461,27 +1187,10 @@ impl SegmentManager {
 
             for entry in all_entries {
                 let entry_size = entry_encoded_size(&entry) as u64;
-                match entry {
-                    LogEntry::Frame(frame) => {
-                        // A frame carries no key, so the only thing that can drop it is
-                        // being a non-control record whose payload-derived key was purged —
-                        // which cannot happen now that keys come from the record itself.
-                        // Kept as-is.
-                        let record = Record {
-                            offset: frame.offset,
-                            timestamp: frame.timestamp,
-                            key: None,
-                            value: Some(frame.payload.clone()),
-                            is_control: frame.is_control_marker(),
-                        };
-                        if survives(&record) {
-                            kept_entries.push(LogEntry::Frame(frame));
-                        } else {
-                            discarded_bytes += entry_size;
-                            discarded_count += 1;
-                        }
-                    }
-                    LogEntry::Batch(batch) => {
+                {
+                    let LogEntry::Batch(batch) = entry;
+                    {
+                        let batch_is_control = batch.is_control();
                         let Ok(records) = batch.records() else {
                             // Undecodable payload — keep the batch rather than silently
                             // dropping records we cannot inspect.
@@ -1497,7 +1206,7 @@ impl SegmentManager {
                                     timestamp: r.timestamp,
                                     key: r.key.clone(),
                                     value: r.value.clone(),
-                                    is_control: false,
+                                    is_control: batch_is_control,
                                 })
                             })
                             .map(|r| (r.offset, r.timestamp, r.key, r.value))
@@ -1995,6 +1704,24 @@ mod tests {
         }
     }
 
+    /// A single-record batch stamped at `offset`, standing in for what a leader would have
+    /// written and a replica appends byte-for-byte.
+    fn verbatim_batch(offset: u64, timestamp: u64, payload: Vec<u8>) -> RecordBatch {
+        let mut batch = RecordBatch::create(
+            0,
+            timestamp,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &[(timestamp, None, Some(Bytes::from(payload)))],
+        );
+        batch.assign_base_offset_and_leader_epoch(offset, 0);
+        batch
+    }
+
     fn open_manager(dir: &TempDir) -> SegmentManager {
         SegmentManager::open(&dir.0, EngineConfig::default()).unwrap()
     }
@@ -2004,8 +1731,8 @@ mod tests {
         let dir = TempDir::new("verbatim_basic");
         let mut mgr = open_manager(&dir);
 
-        let leader_frame = RecordFrame::create(0, 123_456_789, b"hello".to_vec());
-        let result = mgr.append_verbatim(&leader_frame).unwrap();
+        let leader_frame = verbatim_batch(0, 123_456_789, b"hello".to_vec());
+        let result = mgr.append_batch_verbatim(&leader_frame).unwrap();
         assert_eq!(result, VerbatimAppendResult::Appended);
 
         let fetched = mgr.fetch(0, 4096).unwrap();
@@ -2022,15 +1749,15 @@ mod tests {
         let dir = TempDir::new("verbatim_dup");
         let mut mgr = open_manager(&dir);
 
-        let frame = RecordFrame::create(0, 1, b"a".to_vec());
+        let frame = verbatim_batch(0, 1, b"a".to_vec());
         assert_eq!(
-            mgr.append_verbatim(&frame).unwrap(),
+            mgr.append_batch_verbatim(&frame).unwrap(),
             VerbatimAppendResult::Appended
         );
         // Re-delivering the same offset (e.g. a retried/duplicated replication push)
         // must not double-append or error.
         assert_eq!(
-            mgr.append_verbatim(&frame).unwrap(),
+            mgr.append_batch_verbatim(&frame).unwrap(),
             VerbatimAppendResult::AlreadyApplied
         );
         assert_eq!(mgr.high_watermark(), 1);
@@ -2042,8 +1769,8 @@ mod tests {
         let dir = TempDir::new("verbatim_gap");
         let mut mgr = open_manager(&dir);
 
-        let frame = RecordFrame::create(5, 1, b"a".to_vec());
-        match mgr.append_verbatim(&frame).unwrap() {
+        let frame = verbatim_batch(5, 1, b"a".to_vec());
+        match mgr.append_batch_verbatim(&frame).unwrap() {
             VerbatimAppendResult::Gap { expected } => assert_eq!(expected, 0),
             other => panic!("expected Gap, got {:?}", other),
         }
@@ -2057,8 +1784,8 @@ mod tests {
         let mut mgr = open_manager(&dir);
 
         for i in 0..5u64 {
-            let frame = RecordFrame::create(i, i, format!("v{}", i).into_bytes());
-            mgr.append_verbatim(&frame).unwrap();
+            let frame = verbatim_batch(i, i, format!("v{}", i).into_bytes());
+            mgr.append_batch_verbatim(&frame).unwrap();
         }
         assert_eq!(mgr.high_watermark(), 5);
 
@@ -2068,9 +1795,9 @@ mod tests {
         assert_eq!(mgr.high_watermark(), 3);
         assert_eq!(mgr.fetch(0, 4096).unwrap().len(), 3);
 
-        let replacement = RecordFrame::create(3, 999, b"replacement".to_vec());
+        let replacement = verbatim_batch(3, 999, b"replacement".to_vec());
         assert_eq!(
-            mgr.append_verbatim(&replacement).unwrap(),
+            mgr.append_batch_verbatim(&replacement).unwrap(),
             VerbatimAppendResult::Appended
         );
 
@@ -2084,8 +1811,8 @@ mod tests {
     fn truncate_after_offset_beyond_hw_is_a_no_op() {
         let dir = TempDir::new("truncate_noop");
         let mut mgr = open_manager(&dir);
-        let frame = RecordFrame::create(0, 1, b"a".to_vec());
-        mgr.append_verbatim(&frame).unwrap();
+        let frame = verbatim_batch(0, 1, b"a".to_vec());
+        mgr.append_batch_verbatim(&frame).unwrap();
 
         mgr.truncate_after(50).unwrap();
         assert_eq!(mgr.high_watermark(), 1);
@@ -2104,12 +1831,12 @@ mod tests {
         // One record per historical segment (rotate after every append) so trimming
         // granularity is easy to reason about.
         for i in 0..10u64 {
-            let frame = RecordFrame::create(i, i, format!("payload-{}", i).into_bytes());
-            mgr.append_verbatim(&frame).unwrap();
+            let frame = verbatim_batch(i, i, format!("payload-{}", i).into_bytes());
+            mgr.append_batch_verbatim(&frame).unwrap();
             mgr.rotate_segment().unwrap();
         }
-        let last = RecordFrame::create(10, 10, b"final".to_vec());
-        mgr.append_verbatim(&last).unwrap();
+        let last = verbatim_batch(10, 10, b"final".to_vec());
+        mgr.append_batch_verbatim(&last).unwrap();
 
         let historical_before = mgr.historical.len();
         assert_eq!(historical_before, 10);
@@ -2136,117 +1863,6 @@ mod tests {
         // Trimming again at the same (or lower) point is a safe no-op.
         let removed_again = mgr.trim_before(7).unwrap();
         assert_eq!(removed_again, 0);
-    }
-
-    /// Reads exactly `plan.physical_len` raw bytes from the plan's own cloned file handle
-    /// — this is what a real `TransmitFile`/`sendfile` call would stream to the socket.
-    fn read_plan_bytes(plan: &ZeroCopyFetchPlan) -> Vec<u8> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = plan.file.try_clone().unwrap();
-        file.seek(SeekFrom::Start(plan.physical_start)).unwrap();
-        let mut buf = vec![0u8; plan.physical_len as usize];
-        file.read_exact(&mut buf).unwrap();
-        buf
-    }
-
-    #[test]
-    fn plan_zero_copy_fetch_matches_buffered_fetch_bytes() {
-        let dir = TempDir::new("zero_copy_matches_buffered");
-        let mut mgr = open_manager(&dir);
-
-        for i in 0..5u64 {
-            let frame = RecordFrame::create(i, 1000 + i, format!("payload-{}", i).into_bytes());
-            mgr.append_verbatim(&frame).unwrap();
-        }
-        let hw = mgr.high_watermark();
-        assert_eq!(hw, 5);
-
-        // Re-encode the frames from the same offsets the buffered read covers: the plan
-        // is a byte range, so it is compared against bytes, not against decoded records.
-        let buffered = mgr.fetch(1, 4096).unwrap();
-        let mut expected_bytes = Vec::new();
-        for record in &buffered {
-            let frame = RecordFrame::create(
-                record.offset,
-                record.timestamp,
-                record.value.clone().unwrap_or_default(),
-            );
-            frame.encode_into(&mut expected_bytes);
-        }
-
-        let plan = mgr.plan_zero_copy_fetch(1, 4096, hw).unwrap().unwrap();
-        assert_eq!(plan.frame_count, buffered.len() as u32);
-        assert_eq!(plan.physical_len as usize, expected_bytes.len());
-        assert_eq!(read_plan_bytes(&plan), expected_bytes);
-    }
-
-    #[test]
-    fn plan_zero_copy_fetch_clamps_to_high_watermark() {
-        let dir = TempDir::new("zero_copy_hw_clamp");
-        let mut mgr = open_manager(&dir);
-
-        for i in 0..5u64 {
-            let frame = RecordFrame::create(i, i, format!("v{}", i).into_bytes());
-            mgr.append_verbatim(&frame).unwrap();
-        }
-
-        // Only offsets [0, 3) are "committed" as far as this plan is concerned, even
-        // though 5 frames physically exist on disk.
-        let plan = mgr.plan_zero_copy_fetch(0, 4096, 3).unwrap().unwrap();
-        assert_eq!(plan.frame_count, 3);
-
-        let bytes = read_plan_bytes(&plan);
-        let mut cursor = 0usize;
-        let mut seen_offsets = Vec::new();
-        while cursor < bytes.len() {
-            let (frame, consumed) = RecordFrame::decode(&bytes[cursor..]).unwrap();
-            seen_offsets.push(frame.offset);
-            cursor += consumed;
-        }
-        assert_eq!(seen_offsets, vec![0, 1, 2]);
-
-        // Requesting at/after the watermark must never return a plan.
-        assert!(mgr.plan_zero_copy_fetch(3, 4096, 3).unwrap().is_none());
-        assert!(mgr.plan_zero_copy_fetch(5, 4096, 3).unwrap().is_none());
-    }
-
-    #[test]
-    fn plan_zero_copy_fetch_respects_max_bytes_budget() {
-        let dir = TempDir::new("zero_copy_budget");
-        let mut mgr = open_manager(&dir);
-
-        let mut frame_size = 0usize;
-        for i in 0..5u64 {
-            let frame = RecordFrame::create(i, i, b"fixed-size-payload".to_vec());
-            frame_size = frame.encoded_size();
-            mgr.append_verbatim(&frame).unwrap();
-        }
-        let hw = mgr.high_watermark();
-
-        // Budget for exactly 2 frames plus a few spare bytes (not enough for a 3rd).
-        let budget = frame_size * 2 + 4;
-        let plan = mgr.plan_zero_copy_fetch(0, budget, hw).unwrap().unwrap();
-        assert_eq!(plan.frame_count, 2);
-        assert_eq!(plan.physical_len as usize, frame_size * 2);
-
-        // A single frame larger than the budget is still returned whole — the first
-        // matching frame is never dropped just because it alone exceeds max_bytes,
-        // matching the buffered `fetch` path's "always make progress" behavior.
-        // (max_bytes must be at least HEADER_SIZE for planning to proceed at all.)
-        assert!(frame_size > HEADER_SIZE);
-        let tiny_budget_plan = mgr
-            .plan_zero_copy_fetch(0, HEADER_SIZE, hw)
-            .unwrap()
-            .unwrap();
-        assert_eq!(tiny_budget_plan.frame_count, 1);
-        assert_eq!(tiny_budget_plan.physical_len as usize, frame_size);
-    }
-
-    #[test]
-    fn plan_zero_copy_fetch_returns_none_on_empty_log() {
-        let dir = TempDir::new("zero_copy_empty");
-        let mut mgr = open_manager(&dir);
-        assert!(mgr.plan_zero_copy_fetch(0, 4096, 0).unwrap().is_none());
     }
 
     /// `fetch` must decode a batch's records and hand back the same offsets/timestamps/
@@ -2305,11 +1921,8 @@ mod tests {
         );
     }
 
-    /// A batch decoded by `fetch` is handed back as an uncompressed synthetic
-    /// `RecordFrame` per record — the payload must already be decompressed, exactly what
-    /// a client calling `decompress_payload()` on a per-record-compressed frame would
-    /// have gotten, so a batch-compression-vs-per-record-compression choice on the
-    /// produce side is invisible on the fetch side.
+    /// A compressed batch is decompressed by `fetch`, so the producer's codec choice is
+    /// invisible to a caller reading records back.
     #[test]
     fn fetch_decodes_compressed_batch_records_to_plain_payloads() {
         let dir = TempDir::new("fetch_batch_compressed");
@@ -2372,64 +1985,6 @@ mod tests {
             20,
             "a batch cut short only by max_bytes must still be served whole"
         );
-    }
-
-    /// `plan_zero_copy_fetch` must decline (return `None`) rather than stream a batch's
-    /// raw bytes to the socket, when `start_offset` needs data from within that batch —
-    /// the zero-copy wire format is exactly `frame_count` `RecordFrame`s, which a batch's
-    /// bytes are not. Declining here is what makes `try_zero_copy_fetch` fall back to the
-    /// buffered `fetch` path, which does understand batches.
-    #[test]
-    fn plan_zero_copy_fetch_declines_when_start_offset_needs_a_batch() {
-        let dir = TempDir::new("zero_copy_declines_on_batch");
-        let mut mgr = open_manager(&dir);
-
-        mgr.append(b"frame0", 0).unwrap(); // offset 0
-        append_built_batch(
-            &mut mgr,
-            10,
-            0,
-            0,
-            0,
-            0,
-            false,
-            BatchCompression::None,
-            &sample_batch_records(3),
-        )
-        .unwrap(); // offsets 1..=3
-        mgr.append(b"frame4", 40).unwrap(); // offset 4
-        let hw = mgr.high_watermark();
-        assert_eq!(hw, 5);
-
-        // Starting at the batch's base offset, or anywhere inside it: decline.
-        for start in [1u64, 2, 3] {
-            assert!(
-                mgr.plan_zero_copy_fetch(start, 65536, hw)
-                    .unwrap()
-                    .is_none(),
-                "start_offset {start} lands in the batch; zero-copy must decline"
-            );
-        }
-
-        // Starting before the batch: zero-copy still serves what it can (just frame0)
-        // whole frames before stopping at the batch, rather than declining outright.
-        let plan = mgr.plan_zero_copy_fetch(0, 65536, hw).unwrap().unwrap();
-        assert_eq!(plan.frame_count, 1);
-        assert_eq!(read_plan_bytes(&plan), {
-            let mut expected = Vec::new();
-            let record = mgr.fetch(0, 65536).unwrap().remove(0);
-            RecordFrame::create(
-                record.offset,
-                record.timestamp,
-                record.value.unwrap_or_default(),
-            )
-            .encode_into(&mut expected);
-            expected
-        });
-
-        // Starting at the frame right after the batch: normal zero-copy, unaffected.
-        let plan = mgr.plan_zero_copy_fetch(4, 65536, hw).unwrap().unwrap();
-        assert_eq!(plan.frame_count, 1);
     }
 
     fn compact_config(
@@ -2752,9 +2307,7 @@ mod tests {
 
         let entries = mgr.historical[0].read_all_entries().unwrap();
         assert_eq!(entries.len(), 1, "the segment must still hold one batch");
-        let LogEntry::Batch(rebuilt) = &entries[0] else {
-            panic!("compaction must rewrite a batch as a batch, not flatten it into frames");
-        };
+        let LogEntry::Batch(rebuilt) = &entries[0];
         assert_eq!(
             rebuilt.compression().unwrap(),
             BatchCompression::Zstd,
@@ -2905,45 +2458,6 @@ mod tests {
         assert_eq!(remaining[0].2.as_deref(), Some(b"val2".as_ref()));
     }
 
-    /// `records_for_compaction` must see exactly the records `read_all_frames` sees when a
-    /// segment holds only frames — a direct equivalence check between the record scan
-    /// compaction uses and the plain frame reader, over the same on-disk data.
-    #[test]
-    fn records_for_compaction_matches_read_all_frames_when_no_batches_present() {
-        let dir = TempDir::new("compact_frame_only_equivalence");
-        let mut mgr = open_manager(&dir);
-
-        for i in 0..6u64 {
-            mgr.append(format!("k{i}:v{i}").as_bytes(), i).unwrap();
-        }
-        mgr.rotate_segment().unwrap();
-        for i in 6..9u64 {
-            mgr.append(format!("k{i}:v{i}").as_bytes(), i).unwrap();
-        }
-
-        for pair_frames_and_entries in [
-            (
-                mgr.historical[0].read_all_frames().unwrap(),
-                mgr.historical[0].read_all_entries().unwrap(),
-            ),
-            (
-                mgr.active.read_all_frames().unwrap(),
-                mgr.active.read_all_entries().unwrap(),
-            ),
-        ] {
-            let (frames, entries) = pair_frames_and_entries;
-            let records = records_from_entries(&entries);
-            assert_eq!(records.len(), frames.len());
-            for (record, frame) in records.iter().zip(frames.iter()) {
-                assert_eq!(record.offset, frame.offset);
-                assert_eq!(record.timestamp, frame.timestamp);
-                assert_eq!(record.value.as_deref(), Some(frame.payload.as_ref()));
-                // A frame has no key field, so compaction can never dedupe one by key.
-                assert_eq!(record.key, None);
-            }
-        }
-    }
-
     #[test]
     fn restart_after_clean_rotation_trusts_marker_and_skips_full_scan() {
         let dir = TempDir::new("restart_clean_trust");
@@ -2959,12 +2473,12 @@ mod tests {
             };
             let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
             for i in 0..8u64 {
-                let frame = RecordFrame::create(i, i, format!("payload-{}", i).into_bytes());
-                mgr.append_verbatim(&frame).unwrap();
+                let frame = verbatim_batch(i, i, format!("payload-{}", i).into_bytes());
+                mgr.append_batch_verbatim(&frame).unwrap();
                 mgr.rotate_segment().unwrap();
             }
-            let last = RecordFrame::create(8, 8, b"active-tail".to_vec());
-            mgr.append_verbatim(&last).unwrap();
+            let last = verbatim_batch(8, 8, b"active-tail".to_vec());
+            mgr.append_batch_verbatim(&last).unwrap();
             assert_eq!(mgr.historical.len(), 8);
         }
 
@@ -2994,9 +2508,9 @@ mod tests {
         }
 
         // The restarted manager must still be fully writable/rotatable afterwards.
-        let extra = RecordFrame::create(9, 9, b"post-restart".to_vec());
+        let extra = verbatim_batch(9, 9, b"post-restart".to_vec());
         assert_eq!(
-            mgr2.append_verbatim(&extra).unwrap(),
+            mgr2.append_batch_verbatim(&extra).unwrap(),
             VerbatimAppendResult::Appended
         );
         assert_eq!(mgr2.high_watermark(), 10);
@@ -3011,11 +2525,11 @@ mod tests {
                 ..EngineConfig::default()
             };
             let mut mgr = SegmentManager::open(&dir.0, config).unwrap();
-            let frame = RecordFrame::create(0, 0, b"first".to_vec());
-            mgr.append_verbatim(&frame).unwrap();
+            let frame = verbatim_batch(0, 0, b"first".to_vec());
+            mgr.append_batch_verbatim(&frame).unwrap();
             mgr.rotate_segment().unwrap();
-            let tail = RecordFrame::create(1, 1, b"second".to_vec());
-            mgr.append_verbatim(&tail).unwrap();
+            let tail = verbatim_batch(1, 1, b"second".to_vec());
+            mgr.append_batch_verbatim(&tail).unwrap();
         }
 
         // Corrupt the now-historical (rotated, marker-carrying) segment 0's log file by
@@ -3157,7 +2671,10 @@ mod tests {
             "backup should be consumed by the restore"
         );
         assert_eq!(mgr.historical.len(), 1);
-        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 4);
+        assert_eq!(
+            records_from_entries(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            4
+        );
     }
 
     /// Simulates a crash after both renames but before the backup cleanup: the live file
@@ -3194,7 +2711,10 @@ mod tests {
             !tmp_path.exists(),
             "leftover .compact temporary should be discarded"
         );
-        assert_eq!(mgr.historical[0].read_all_frames().unwrap().len(), 3);
+        assert_eq!(
+            records_from_entries(&mgr.historical[0].read_all_entries().unwrap()).len(),
+            3
+        );
     }
 
     #[test]
@@ -3294,10 +2814,8 @@ mod tests {
         let raw = mgr.active.log.read_at(0, size).unwrap();
         let (entry, consumed) = crate::segment::entry::decode_entry(&raw).unwrap();
         assert_eq!(consumed, raw.len());
-        match entry {
-            LogEntry::Batch(decoded) => assert_eq!(decoded, written),
-            LogEntry::Frame(_) => panic!("expected a batch, decoded a frame"),
-        }
+        let LogEntry::Batch(decoded) = entry;
+        assert_eq!(decoded, written);
 
         // Indexed by base offset: looking up any offset in [0, 3] must resolve to the
         // batch's own physical start (0), the same as a fresh index with one entry would
@@ -3330,57 +2848,9 @@ mod tests {
 
         let frame = mgr.append(b"after-the-batch", 123).unwrap();
         assert_eq!(
-            frame.offset, 5,
-            "the frame after a 5-record batch must be assigned offset 5"
+            frame.base_offset, 5,
+            "the record after a 5-record batch must be assigned offset 5"
         );
-    }
-
-    /// `SegmentPair::read_all_frames` is one of the four scan sites — its callers (log
-    /// compaction) only understand individual frames, so a batch in the middle must be
-    /// skipped by its own length, not decoded and not mistaken for corruption that would
-    /// truncate the scan and lose the frame written after it.
-    #[test]
-    fn read_all_frames_skips_a_batch_without_losing_frames_after_it() {
-        let dir = TempDir::new("read_all_frames_skip_batch");
-        let mut mgr = open_manager(&dir);
-
-        let f0 = mgr.append(b"frame0", 0).unwrap();
-        append_built_batch(
-            &mut mgr,
-            10,
-            0,
-            0,
-            0,
-            0,
-            false,
-            BatchCompression::None,
-            &sample_batch_records(3),
-        )
-        .unwrap();
-        let f4 = mgr.append(b"frame4", 40).unwrap();
-
-        let frames = mgr.active.read_all_frames().unwrap();
-        assert_eq!(
-            frames,
-            vec![f0, f4],
-            "the batch must be skipped, and the frame after it must still be recovered"
-        );
-    }
-
-    /// `read_all_frames` on a segment with no batches at all must behave exactly as before
-    /// this stage — the regression check for the frame-only path.
-    #[test]
-    fn read_all_frames_frame_only_segment_is_unaffected() {
-        let dir = TempDir::new("read_all_frames_regression");
-        let mut mgr = open_manager(&dir);
-
-        let mut expected = Vec::new();
-        for i in 0..4u64 {
-            expected.push(mgr.append(format!("payload-{i}").as_bytes(), i).unwrap());
-        }
-
-        let frames = mgr.active.read_all_frames().unwrap();
-        assert_eq!(frames, expected);
     }
 
     /// `physical_pos_for_offset` is the other manager.rs scan site. A batch is atomic —
@@ -3410,8 +2880,8 @@ mod tests {
         let batch_end = mgr.active.log.physical_size;
         let f4 = mgr.append(b"frame4", 40).unwrap();
 
-        assert_eq!(f0.offset, 0);
-        assert_eq!(f4.offset, 4);
+        assert_eq!(f0.base_offset, 0);
+        assert_eq!(f4.base_offset, 4);
 
         for target in [1u64, 2, 3] {
             let (phys, effective) =
@@ -3462,13 +2932,13 @@ mod tests {
         mgr.truncate_after(1).unwrap();
         assert_eq!(mgr.high_watermark(), 1);
 
-        let frames = mgr.active.read_all_frames().unwrap();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].offset, 0);
+        let records = records_from_entries(&mgr.active.read_all_entries().unwrap());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 0);
 
-        // The freed offset range is reusable, exactly as it is after truncating a frame.
+        // The freed offset range is reusable.
         let refilled = mgr.append(b"replacement", 99).unwrap();
-        assert_eq!(refilled.offset, 1);
+        assert_eq!(refilled.base_offset, 1);
     }
 
     /// Regression for the divergence bug this stage fixes: a batch is atomic on disk, so
@@ -3511,7 +2981,7 @@ mod tests {
         );
 
         // Only frame0 (offset 0) remains on disk — the whole batch and frame4 are gone.
-        let frames = mgr.active.read_all_frames().unwrap();
+        let frames = records_from_entries(&mgr.active.read_all_entries().unwrap());
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].offset, 0);
 
@@ -3519,7 +2989,7 @@ mod tests {
         // watermark and the physical log must agree: the next append lands at 1, exactly
         // where the batch used to start.
         let refilled = mgr.append(b"replacement", 99).unwrap();
-        assert_eq!(refilled.offset, 1);
+        assert_eq!(refilled.base_offset, 1);
 
         // Truncating at the batch's last offset (3, still "mid-batch" in the sense that
         // it doesn't fall on a frame boundary of its own — the whole batch is one atomic

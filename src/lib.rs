@@ -14,7 +14,7 @@ pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
 pub use consumer::{assign_range, GroupConsumer, GroupConsumerConfig};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{
-    AckBatch, AcknowledgeType, AcquiredRecordBatch, CommandCode, FrameError, RecordFrame,
+    AckBatch, AcknowledgeType, AcquiredRecordBatch, BatchError, CommandCode, RecordBatch,
     RequestPayload, WireError, WireRequest, WireResponse,
 };
 pub use replication::{

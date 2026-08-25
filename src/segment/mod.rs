@@ -9,7 +9,7 @@ pub mod txnindex;
 pub use entry::{decode_entry, records_from_entries, EntryError, LogEntry, Record};
 pub use index::{IndexEntry, IndexSegment};
 pub use log::LogSegment;
-pub use manager::{SegmentManager, VerbatimAppendResult, ZeroCopyFetchPlan};
+pub use manager::{SegmentManager, VerbatimAppendResult};
 pub use mmap::MmapLogSegment;
 pub use timeindex::{TimeIndexEntry, TimeIndexSegment};
 pub use txnindex::{TxnIndexEntry, TxnIndexSegment};

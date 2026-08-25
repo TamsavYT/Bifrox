@@ -4,9 +4,8 @@ use bytes::{Buf, BufMut, Bytes};
 use crc32fast::Hasher;
 use thiserror::Error;
 
-/// Magic byte for [`RecordBatch`]. Distinct from every magic byte already in use in this
-/// codebase: the per-record `RecordFrame` magics (`0xAB` plain, `0xAC` LZ4, `0xAD` control,
-/// `0xAE` zstd — `src/protocol/frame.rs`), the inter-node magics (`0xAA` replication push,
+/// Magic byte for [`RecordBatch`], the log's only entry format. Distinct from every other
+/// magic byte in use: the inter-node magics (`0xAA` replication push,
 /// `0xAE`/`0xAF` vote request/response, `0xBB` gRPC replication — `src/replication/mod.rs`,
 /// `src/replication/grpc.rs`), the client wire protocol's `0xF1` versioned envelope
 /// (`src/protocol/wire.rs`), `0xCE`/`0xCF` (share-group/consumer-offset snapshot magics), the
@@ -34,6 +33,10 @@ const RECORD_ENTRY_MIN_SIZE: usize = 20;
 
 const ATTR_COMPRESSION_MASK: u16 = 0x0007;
 const ATTR_TRANSACTIONAL_FLAG: u16 = 0x0008;
+/// Marks a batch whose records are transaction control markers rather than data. Kafka has
+/// the same flag for the same reason: a control record occupies a real offset, so consumers
+/// must be able to recognise and skip it without interpreting its contents.
+const ATTR_CONTROL_FLAG: u16 = 0x0010;
 
 #[derive(Debug, Error)]
 pub enum BatchError {
@@ -97,7 +100,7 @@ pub struct BatchRecord {
 }
 
 /// Disk/wire binary representation of a batch of records sharing one header, one CRC, and
-/// (optionally) one compressed payload — replacing per-record `RecordFrame` framing for the
+/// (optionally) one compressed payload — for the
 /// common case of producing/replicating many records together.
 ///
 /// Layout (all integers big-endian):
@@ -111,8 +114,8 @@ pub struct BatchRecord {
 /// batch without decoding this one.
 ///
 /// `Attributes` is a bitfield: bits 0-2 hold the compression codec (0 = none, 1 = LZ4,
-/// 2 = zstd; 3-7 reserved for future codecs), bit 3 is the transactional flag, bits 4-15 are
-/// reserved for future use.
+/// 2 = zstd; 3-7 reserved for future codecs), bit 3 is the transactional flag, bit 4 marks a
+/// control batch (transaction markers rather than data), bits 5-15 are reserved.
 ///
 /// `CRC32` covers everything from `Base Offset` through the end of `Record Data` (i.e. the
 /// stored, possibly-compressed bytes — corruption of the compressed form is caught even
@@ -226,6 +229,30 @@ impl RecordBatch {
     /// Whether the transactional attribute bit is set.
     pub fn is_transactional(&self) -> bool {
         self.attributes & ATTR_TRANSACTIONAL_FLAG != 0
+    }
+
+    /// Whether this batch carries transaction control markers rather than data.
+    pub fn is_control(&self) -> bool {
+        self.attributes & ATTR_CONTROL_FLAG != 0
+    }
+
+    /// Marks this batch's records as control markers. Used when building a control batch;
+    /// the flag lives in the plaintext header, so a reader recognises one without decoding
+    /// or decompressing anything.
+    pub fn set_control(&mut self) {
+        self.attributes |= ATTR_CONTROL_FLAG;
+        self.crc = Self::calculate_crc(
+            self.base_offset,
+            self.last_offset_delta,
+            self.base_timestamp,
+            self.producer_id,
+            self.producer_epoch,
+            self.base_sequence,
+            self.leader_epoch,
+            self.attributes,
+            self.record_count,
+            &self.record_data,
+        );
     }
 
     /// Builds a batch whose records carry **explicit, possibly non-contiguous** offsets.
@@ -435,7 +462,7 @@ impl RecordBatch {
     }
 
     /// Serializes the batch into the provided output buffer. Generic over `BufMut` (rather
-    /// than concretely `&mut Vec<u8>`), matching `RecordFrame::encode_into`, so callers on a
+    /// than concretely `&mut Vec<u8>`), so callers on a
     /// hot path can reuse a scratch buffer instead of allocating a fresh `Vec` per call.
     pub fn encode_into(&self, buf: &mut impl BufMut) {
         let batch_length = (BATCH_LENGTH_COVERED_FIXED + self.record_data.len()) as u32;
@@ -609,7 +636,6 @@ fn decode_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::frame::RecordFrame;
 
     /// `(timestamp, key, value)` triples with a null key and the payload as the value —
     /// matching how `SegmentManager::append_batch` populates records today.
@@ -1019,99 +1045,6 @@ mod tests {
         for len in 0..encoded.len() {
             let _ = RecordBatch::decode(&encoded[..len]);
         }
-    }
-
-    /// The headline claim of #18: batching similar records and compressing the batch as one
-    /// unit beats compressing each record individually, both in ratio (shared structure
-    /// compresses away once instead of per record) and in overhead (one header/CRC instead
-    /// of one per record). Measure it, don't just assert it's possible.
-    #[test]
-    fn batch_compression_beats_individual_record_compression_zstd() {
-        let n = 200;
-        let records = sample_records(n);
-
-        let individual_total: usize = records
-            .iter()
-            .enumerate()
-            .map(|(i, (ts, _key, value))| {
-                RecordFrame::create_compressed_zstd(i as u64, *ts, value.as_ref().unwrap())
-                    .encoded_size()
-            })
-            .sum();
-
-        let batch = RecordBatch::create(
-            0,
-            1_700_000_000_000,
-            0,
-            0,
-            0,
-            0,
-            false,
-            BatchCompression::Zstd,
-            &records,
-        );
-        let batch_total = batch.encoded_size();
-
-        eprintln!(
-            "zstd: {n} individually-compressed RecordFrames = {individual_total} bytes, \
-             1 compressed RecordBatch = {batch_total} bytes ({:.1}% of individual)",
-            100.0 * batch_total as f64 / individual_total as f64
-        );
-
-        assert!(
-            batch_total < individual_total,
-            "batch ({batch_total}b) should beat individually-compressed records ({individual_total}b)"
-        );
-        // The win should be substantial, not marginal — this is the point of batching.
-        assert!(
-            batch_total * 2 < individual_total,
-            "expected the batch to be less than half the size of individually compressed records: \
-             batch={batch_total}b individual={individual_total}b"
-        );
-    }
-
-    #[test]
-    fn batch_compression_beats_individual_record_compression_lz4() {
-        let n = 200;
-        let records = sample_records(n);
-
-        let individual_total: usize = records
-            .iter()
-            .enumerate()
-            .map(|(i, (ts, _key, value))| {
-                RecordFrame::create_compressed_lz4(i as u64, *ts, value.as_ref().unwrap())
-                    .encoded_size()
-            })
-            .sum();
-
-        let batch = RecordBatch::create(
-            0,
-            1_700_000_000_000,
-            0,
-            0,
-            0,
-            0,
-            false,
-            BatchCompression::Lz4,
-            &records,
-        );
-        let batch_total = batch.encoded_size();
-
-        eprintln!(
-            "lz4: {n} individually-compressed RecordFrames = {individual_total} bytes, \
-             1 compressed RecordBatch = {batch_total} bytes ({:.1}% of individual)",
-            100.0 * batch_total as f64 / individual_total as f64
-        );
-
-        assert!(
-            batch_total < individual_total,
-            "batch ({batch_total}b) should beat individually-compressed records ({individual_total}b)"
-        );
-        assert!(
-            batch_total * 2 < individual_total,
-            "expected the batch to be less than half the size of individually compressed records: \
-             batch={batch_total}b individual={individual_total}b"
-        );
     }
 
     /// Round-trips every combination of null/present key and null/present value, checking

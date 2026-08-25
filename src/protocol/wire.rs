@@ -776,7 +776,7 @@ pub struct AcquiredRecordBatch {
     pub first_offset: u64,
     pub last_offset: u64,
     pub delivery_count: u16,
-    pub records: Vec<crate::protocol::RecordFrame>,
+    pub records: Vec<crate::segment::Record>,
 }
 
 #[derive(Debug, Clone)]
@@ -1816,7 +1816,7 @@ pub fn encode_describe_configs_response(configs: &[(String, String)]) -> Vec<u8>
     buf
 }
 
-/// Encodes ShareFetch binary payload: `[NumBatches: 4b] | { [FirstOffset: 8b] | [LastOffset: 8b] | [DeliveryCount: 2b] | [RecordsLen: 4b] | [RecordFrames...] }...`
+/// Encodes ShareFetch binary payload: `[NumBatches: 4b] | { [FirstOffset: 8b] | [LastOffset: 8b] | [DeliveryCount: 2b] | [RecordCount: 4b] | [Records...] }...`
 pub fn encode_share_fetch_response(batches: &[AcquiredRecordBatch]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.put_u32(batches.len() as u32);
@@ -1825,8 +1825,25 @@ pub fn encode_share_fetch_response(batches: &[AcquiredRecordBatch]) -> Vec<u8> {
         buf.put_u64(batch.last_offset);
         buf.put_u16(batch.delivery_count);
         buf.put_u32(batch.records.len() as u32);
-        for frame in &batch.records {
-            frame.encode_into(&mut buf);
+        for record in &batch.records {
+            // `[Offset: 8b][Timestamp: 8b][KeyLen: 4b signed][Key][ValueLen: 4b signed][Value]`
+            // — `-1` for null, matching the record format everywhere else.
+            buf.put_u64(record.offset);
+            buf.put_u64(record.timestamp);
+            match &record.key {
+                None => buf.put_i32(-1),
+                Some(k) => {
+                    buf.put_i32(k.len() as i32);
+                    buf.put_slice(k);
+                }
+            }
+            match &record.value {
+                None => buf.put_i32(-1),
+                Some(v) => {
+                    buf.put_i32(v.len() as i32);
+                    buf.put_slice(v);
+                }
+            }
         }
     }
     buf

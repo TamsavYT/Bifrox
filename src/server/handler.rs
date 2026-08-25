@@ -1,6 +1,4 @@
-use crate::protocol::{
-    RecordFrame, RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE,
-};
+use crate::protocol::{RequestPayload, WireError, WireRequest, WireResponse, HEADER_SIZE};
 use crate::scram::{self, ScramCredential};
 use crate::server::engine::StorageEngine;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -547,45 +545,7 @@ where
                                 // watermark, unsupported OS) falls straight through to the
                                 // normal buffered handling below — this is purely an
                                 // optimization, never a behavior change.
-                                let mut zero_copy_handled = false;
-                                #[cfg(any(windows, target_os = "linux"))]
-                                if let RequestPayload::Fetch {
-                                    topic,
-                                    partition,
-                                    offset,
-                                    max_bytes,
-                                } = &req.payload
                                 {
-                                    if let Some(raw_socket) = socket.as_plain_tcp_stream() {
-                                        match try_zero_copy_fetch(
-                                            &engine,
-                                            raw_socket,
-                                            topic,
-                                            *partition,
-                                            *offset,
-                                            *max_bytes,
-                                            &client_principal,
-                                            &client_key,
-                                            &logical_client_id,
-                                            &framing,
-                                        )
-                                        .await
-                                        {
-                                            Ok(true) => zero_copy_handled = true,
-                                            Ok(false) => {}
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Zero-copy fetch transmit failed for {}: {}",
-                                                    peer_addr,
-                                                    e
-                                                );
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !zero_copy_handled {
                                     let response = process_request(
                                         &engine,
                                         req,
@@ -1160,22 +1120,25 @@ fn decode_replication_packet(
     // instead of reassigning them locally, which is what previously let a replica's log
     // diverge from its leader's.
     let is_cluster_meta = topic == "__cluster_metadata";
-    let mut parsed_frames: Vec<RecordFrame> = Vec::with_capacity(count);
+    // Entries, not frames: the log has one record format and a push carries whatever the
+    // leader stored, which for everything the broker writes itself is now a single-record
+    // batch.
+    let mut parsed_entries: Vec<crate::segment::LogEntry> = Vec::with_capacity(count);
 
     for _ in 0..count {
         if src.len() < HEADER_SIZE {
             return Err(PacketError::NeedMoreData);
         }
-        match RecordFrame::decode(src) {
-            Ok((frame, frame_bytes)) => {
-                src = &src[frame_bytes..];
-                parsed_frames.push(frame);
+        match crate::segment::decode_entry(src) {
+            Ok((entry, entry_bytes)) => {
+                src = &src[entry_bytes..];
+                parsed_entries.push(entry);
             }
-            Err(crate::protocol::FrameError::BufferTooShort { .. }) => {
+            Err(e) if e.is_buffer_too_short() => {
                 return Err(PacketError::NeedMoreData);
             }
             Err(e) => {
-                return Err(PacketError::Fatal(format!("Frame decode error: {}", e)));
+                return Err(PacketError::Fatal(format!("Entry decode error: {}", e)));
             }
         }
     }
@@ -1197,8 +1160,11 @@ fn decode_replication_packet(
     // ahead of disk with nothing to signal it, so the broker would serve authorization
     // decisions that silently revert on restart.
     let mut pending_metadata: Vec<(u64, crate::replication::MetadataRecord)> = Vec::new();
-    for (i, frame) in parsed_frames.iter().enumerate() {
-        match pm.append_replica_frame_verbatim(frame) {
+    for (i, entry) in parsed_entries.iter().enumerate() {
+        // The offset an entry starts at, for the diagnostics below.
+        let crate::segment::LogEntry::Batch(b) = entry;
+        let entry_offset = b.base_offset;
+        match pm.append_replica_entry_verbatim(entry) {
             Ok(crate::segment::VerbatimAppendResult::Appended) => {}
             Ok(crate::segment::VerbatimAppendResult::AlreadyApplied) => {
                 tracing::debug!(
@@ -1207,7 +1173,7 @@ fn decode_replication_packet(
                     count,
                     topic,
                     partition,
-                    frame.offset
+                    entry_offset
                 );
             }
             Ok(crate::segment::VerbatimAppendResult::Gap { expected }) => {
@@ -1215,7 +1181,7 @@ fn decode_replication_packet(
                     "HA Replication: Gap on '{}' P{} — got offset {} but expected {}. Rejecting batch.",
                     topic,
                     partition,
-                    frame.offset,
+                    entry_offset,
                     expected
                 );
                 write_failed = true;
@@ -1241,8 +1207,11 @@ fn decode_replication_packet(
         // decode it now but hold the state effects until the batch is durable (see the
         // apply pass below the flush).
         if is_cluster_meta {
-            if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&frame.payload) {
-                pending_metadata.push((frame.offset, meta_rec));
+            for record in crate::segment::records_from_entries(std::slice::from_ref(entry)) {
+                let payload = record.value.unwrap_or_default();
+                if let Ok(meta_rec) = crate::replication::MetadataRecord::decode(&payload) {
+                    pending_metadata.push((record.offset, meta_rec));
+                }
             }
         }
     }
@@ -1485,125 +1454,6 @@ fn decode_heartbeat_packet(
     ack.put_u8(role_bytes.len() as u8);
     ack.extend_from_slice(&role_bytes);
     Ok((bytes_consumed, ack))
-}
-
-/// Attempts to serve a plain `Fetch` request via zero-copy transmit straight from the
-/// segment file to `socket`. Runs the same authorization / partition-replica checks as the
-/// buffered `Fetch` arm in `process_request` and, on failure, returns `Ok(false)` rather
-/// than an error — the caller falls through to `process_request`, which re-does those
-/// checks and produces the correct `WireResponse::error` payload. `Ok(false)` is likewise
-/// returned for anything that just isn't eligible for zero-copy (no matching frames within
-/// the committed high watermark, range spans past the located segment, etc.) — none of
-/// this is a failure, it's just "use the normal path instead."
-///
-/// Once the response header has actually been written to the socket, any further error is
-/// a genuine, unrecoverable mid-response I/O failure and is propagated as `Err` — the
-/// caller must close the connection rather than fall back, since a partial response would
-/// otherwise corrupt the client's read stream.
-#[cfg(any(windows, target_os = "linux"))]
-// The parameters are the fetch request's fields plus the connection identity needed to
-// authorize it; grouping them into a struct would just move the same list behind a name.
-#[allow(clippy::too_many_arguments)]
-async fn try_zero_copy_fetch(
-    engine: &StorageEngine,
-    socket: &mut TcpStream,
-    topic: &str,
-    partition: u32,
-    offset: u64,
-    max_bytes: u32,
-    principal: &str,
-    client_key: &str,
-    logical_client_id: &Option<String>,
-    framing: &crate::protocol::wire::RequestFraming,
-) -> std::io::Result<bool> {
-    if !engine.authorize(
-        principal,
-        client_key,
-        crate::server::acl::AclOperation::Read as u8,
-        crate::server::acl::ResourceType::Topic as u8,
-        topic,
-    ) {
-        return Ok(false);
-    }
-    if !engine.is_partition_replica(topic, partition) {
-        return Ok(false);
-    }
-
-    // Attribute this fetch to the group member it was tagged for, if any (issue #54).
-    // This is the zero-copy fast path — most plain-TCP fetches on a partition with no
-    // transactional data are served here rather than by `process_request`'s `Fetch` arm,
-    // so progress attribution has to be duplicated here too or it would silently never
-    // fire for the common case.
-    if let Some((group_id, member_id)) = framing.group_member() {
-        engine
-            .group_coordinator()
-            .record_progress(&group_id, &member_id);
-    }
-
-    // Never serve a partition with transactional data from the zero-copy path.
-    //
-    // This path streams raw bytes straight from the segment file to the socket, so nothing
-    // inspects the frames: control markers and records belonging to aborted transactions
-    // go out exactly as stored. That silently bypassed every filter the buffered path
-    // applies, and because zero-copy is eligible precisely for the common sequential read,
-    // the *default* behavior was the unfiltered one — the same request could return
-    // different data depending only on which internal path happened to serve it.
-    //
-    // Declining here falls through to the buffered path, which can filter. The cost is
-    // paid only by partitions that actually carry transactional data; a partition that has
-    // never seen a transaction still gets the zero-copy fast path.
-    if engine.partition_has_transactional_data(topic, partition) {
-        return Ok(false);
-    }
-
-    let fetch_start = std::time::Instant::now();
-    let plan = match engine
-        .plan_zero_copy_fetch(topic, partition, offset, max_bytes)
-        .await
-    {
-        Ok(Some(plan)) if plan.frame_count > 0 => plan,
-        Ok(_) => return Ok(false),
-        Err(_) => return Ok(false), // let the buffered path surface the real error
-    };
-
-    let payload_len: u64 = 4 + plan.physical_len;
-    if payload_len > u32::MAX as u64 {
-        return Ok(false);
-    }
-
-    // Record fetch latency here too, not just on the buffered `RequestPayload::Fetch`
-    // path — a sequential consumer is served almost entirely by this zero-copy path, so
-    // measuring only the buffered one would leave the fetch-latency histogram reading
-    // near-empty on exactly the workload it's most needed for. Timed before the throttle
-    // sleep and the socket write so the metric reflects broker-side read cost rather than
-    // deliberate quota delay or client-side backpressure.
-    engine
-        .metrics()
-        .fetch_latency_ms
-        .record(fetch_start.elapsed());
-
-    let quota_key = resolve_quota_key(principal, logical_client_id.as_deref(), client_key);
-    engine
-        .throttle_fetch(topic, &quota_key, plan.physical_len)
-        .await;
-
-    // The zero-copy path writes its response straight to the socket rather than going
-    // through `WireResponse`, so it has to apply the request's framing itself. Without
-    // this, a versioned request gets an unwrapped reply here — and only here — so the
-    // client reads the status byte as the envelope magic it was expecting. It only shows
-    // up on partitions with no transactional data, since anything transactional makes this
-    // path decline and fall through to the buffered one.
-    let mut header = Vec::with_capacity(14);
-    if let crate::protocol::wire::RequestFraming::Versioned { correlation_id, .. } = framing {
-        header.put_u8(crate::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
-        header.put_u32(*correlation_id);
-    }
-    header.put_u8(0u8); // WireResponse status = OK
-    header.put_u32(payload_len as u32);
-    header.put_u32(plan.frame_count);
-    socket.write_all(&header).await?;
-    plan.transmit(socket).await?;
-    Ok(true)
 }
 
 /// Encodes a record-bearing fetch response.
@@ -2905,7 +2755,11 @@ async fn process_request(
                     let mut fetched_bytes: u64 = 0;
                     for b in &batches {
                         for rec in &b.records {
-                            fetched_bytes += rec.encoded_size() as u64;
+                            // Key + value bytes plus the fixed per-record fields the encoder writes.
+                            fetched_bytes += (24
+                                + rec.key.as_ref().map_or(0, |k| k.len())
+                                + rec.value.as_ref().map_or(0, |v| v.len()))
+                                as u64;
                         }
                     }
                     let payload = crate::protocol::wire::encode_share_fetch_response(&batches);
@@ -3223,33 +3077,19 @@ mod grpc_replication_fetch_tests {
         framed
     }
 
-    /// Mirrors how `send_grpc_replication_fetch` reads the leader's response back:
-    /// `[u32 resp_len][resp_payload]`.
-    /// Walks the raw entry bytes a replication fetch returns, flattening them into frames
-    /// for assertion purposes only — the follower itself appends the bytes verbatim and
-    /// never does this.
-    fn decode_entries_as_frames(entries: &[u8]) -> Vec<crate::protocol::RecordFrame> {
-        let mut out = Vec::new();
+    /// Walks the raw entry bytes a replication fetch returns, flattening them into records
+    /// for assertion purposes only — the follower itself appends the bytes verbatim.
+    fn decode_entries_as_records(entries: &[u8]) -> Vec<crate::segment::Record> {
+        let mut decoded = Vec::new();
         let mut cursor = 0usize;
         while cursor < entries.len() {
             let Ok((entry, consumed)) = crate::segment::decode_entry(&entries[cursor..]) else {
                 break;
             };
-            match entry {
-                crate::segment::LogEntry::Frame(f) => out.push(f),
-                crate::segment::LogEntry::Batch(b) => {
-                    for r in b.records().unwrap() {
-                        out.push(crate::protocol::RecordFrame::create(
-                            r.offset,
-                            r.timestamp,
-                            r.value.unwrap_or_default(),
-                        ));
-                    }
-                }
-            }
+            decoded.push(entry);
             cursor += consumed;
         }
-        out
+        crate::segment::records_from_entries(&decoded)
     }
 
     fn decode_response(bytes: &[u8]) -> ReplicationFetchResponse {
@@ -3290,12 +3130,12 @@ mod grpc_replication_fetch_tests {
         let resp = decode_response(&response_bytes);
         // The response carries the leader's stored bytes, so decode entries out of it the
         // way a follower does rather than expecting pre-decoded frames.
-        let frames = decode_entries_as_frames(&resp.entries);
+        let frames = decode_entries_as_records(&resp.entries);
         assert_eq!(frames.len(), 2, "expected offsets 1 and 2 (fetch_offset=1)");
         assert_eq!(frames[0].offset, 1);
-        assert_eq!(frames[0].payload.as_ref(), b"rec1");
+        assert_eq!(frames[0].value.as_deref().unwrap_or_default(), b"rec1");
         assert_eq!(frames[1].offset, 2);
-        assert_eq!(frames[1].payload.as_ref(), b"rec2");
+        assert_eq!(frames[1].value.as_deref().unwrap_or_default(), b"rec2");
     }
 
     #[tokio::test]
@@ -3439,7 +3279,7 @@ mod cluster_metadata_durability_tests {
         partition: u32,
         epoch: u64,
         leader_hw: u64,
-        frames: &[RecordFrame],
+        batches: &[crate::protocol::RecordBatch],
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.put_u8(0xAA);
@@ -3448,11 +3288,28 @@ mod cluster_metadata_durability_tests {
         buf.put_u32(partition);
         buf.put_u64(epoch);
         buf.put_u64(leader_hw);
-        buf.put_u32(frames.len() as u32);
-        for frame in frames {
-            frame.encode_into(&mut buf);
+        buf.put_u32(batches.len() as u32);
+        for batch in batches {
+            batch.encode_into(&mut buf);
         }
         buf
+    }
+
+    /// A single-record batch at `offset`, the shape everything the broker authors now takes.
+    fn broker_record(offset: u64, payload: Vec<u8>) -> crate::protocol::RecordBatch {
+        let mut batch = crate::protocol::RecordBatch::create(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            crate::protocol::BatchCompression::None,
+            &[(0, None, Some(bytes::Bytes::from(payload)))],
+        );
+        batch.assign_base_offset_and_leader_epoch(offset, 0);
+        batch
     }
 
     #[tokio::test]
@@ -3465,7 +3322,7 @@ mod cluster_metadata_durability_tests {
             num_partitions: 1,
             replication_factor: 1,
         };
-        let frame = RecordFrame::create(0, 0, record.encode());
+        let frame = broker_record(0, record.encode());
         let epoch = engine.replication().get_epoch();
         let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 1, &[frame]);
 
@@ -3502,7 +3359,7 @@ mod cluster_metadata_durability_tests {
         let dir = TempDir::new("data_topic_unaffected");
         let engine = open_engine(&dir);
 
-        let frame = RecordFrame::create(0, 0, b"data record".to_vec());
+        let frame = broker_record(0, b"data record".to_vec());
         let packet = build_push_packet(&engine, "orders", 0, 0, 1, &[frame]);
 
         let (_, ack) = decode_replication_packet(&engine, &packet).unwrap();
@@ -3591,8 +3448,11 @@ mod cluster_metadata_durability_tests {
         // Prime the index: the very first append always writes an index entry (see
         // `SegmentManager::append_verbatim`), so this is out of the way before the fd gets
         // closed below.
-        pm.append_replica_frame_verbatim(&RecordFrame::create(0, 0, b"priming record".to_vec()))
-            .unwrap();
+        pm.append_replica_entry_verbatim(&crate::segment::LogEntry::Batch(broker_record(
+            0,
+            b"priming record".to_vec(),
+        )))
+        .unwrap();
         pm.flush_durable().unwrap();
 
         let index_path = dir.0.join("__cluster_metadata-0").join(format!(
@@ -3609,7 +3469,7 @@ mod cluster_metadata_durability_tests {
         // Offset 1, tiny payload: well under `index_interval_bytes` (4096 by default), so
         // this append writes only to the log — the index file (whose fd is now closed) is
         // untouched by the write itself, only by the sync that follows.
-        let frame = RecordFrame::create(1, 0, record.encode());
+        let frame = broker_record(1, record.encode());
         let epoch = engine.replication().get_epoch();
         let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 2, &[frame]);
 

@@ -9,7 +9,6 @@ pub use grpc::{
 };
 pub use metadata::MetadataRecord;
 
-use crate::protocol::RecordFrame;
 use bytes::BufMut;
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -1012,12 +1011,12 @@ impl ReplicationManager {
         partition: u32,
         fencing_epoch: u64,
         leader_hw: u64,
-        frames: &[RecordFrame],
+        entries: &[EncodedEntry],
     ) -> IoResult<()> {
-        if frames.is_empty() {
+        if entries.is_empty() {
             return Ok(());
         }
-        let last_offset = frames.last().unwrap().offset;
+        let last_offset = entries.last().unwrap().last_offset;
         let peer_conn = self.get_or_connect_peer(peer_addr);
         send_replication_push_pooled(
             &peer_conn,
@@ -1027,7 +1026,7 @@ impl ReplicationManager {
             partition,
             fencing_epoch,
             leader_hw,
-            frames,
+            entries,
         )
         .await?;
         self.update_replica_watermark(topic, partition, peer_addr, last_offset);
@@ -1110,9 +1109,9 @@ impl ReplicationManager {
         fencing_epoch: u64,
         leader_hw: u64,
         pull_covered: &[String],
-        frames: &[RecordFrame],
+        entries: &[EncodedEntry],
     ) -> IoResult<()> {
-        if self.config.peer_addrs.is_empty() || frames.is_empty() {
+        if self.config.peer_addrs.is_empty() || entries.is_empty() {
             return Ok(());
         }
 
@@ -1121,7 +1120,7 @@ impl ReplicationManager {
             return Ok(());
         }
 
-        let last_offset = frames.last().unwrap().offset;
+        let last_offset = entries.last().unwrap().last_offset;
         let epoch = fencing_epoch;
         let cluster_id = self.config.cluster_id.clone();
 
@@ -1130,7 +1129,7 @@ impl ReplicationManager {
         for peer in &target_peers {
             let peer_addr = peer.clone();
             let topic_name = topic.to_string();
-            let frames_vec = frames.to_vec();
+            let entries_vec = entries.to_vec();
             let cid = cluster_id.clone();
             let peer_conn = self.get_or_connect_peer(&peer_addr);
             handles.push(tokio::spawn(async move {
@@ -1143,7 +1142,7 @@ impl ReplicationManager {
                     partition,
                     epoch,
                     leader_hw,
-                    &frames_vec,
+                    &entries_vec,
                 )
                 .await;
                 (peer_addr, result)
@@ -1382,13 +1381,40 @@ pub async fn send_leader_heartbeat(
 
 /// Streams replication batch frames to a peer follower node over TCP (0xAA protocol).
 ///
-/// Wire format: `[0xAA] [ClusterId: pascal] [Topic: pascal] [Partition: 4b] [Epoch: 8b] [Count: 4b] [RecordFrame...]`
+/// Wire format: `[0xAA] [ClusterId: pascal] [Topic: pascal] [Partition: 4b] [Epoch: 8b] [Count: 4b] [RecordBatch...]`
 ///
 /// CRIT-01: cluster_id is prepended immediately after the magic byte so followers can authenticate
 /// the sender before touching any partition state.
 // The 0xAA packet genuinely carries this many independent fields; bundling them into a
 // struct purely to satisfy the lint would add indirection without making the call sites
 // clearer.
+#[allow(clippy::too_many_arguments)]
+/// One log entry as stored, ready to be pushed to a follower verbatim.
+///
+/// Push replication carries the leader's bytes rather than re-encoding decoded records: a
+/// follower appends what arrives byte-for-byte, so rebuilding an entry from decoded fields
+/// would produce different bytes (an uncompressed entry where the leader stored a
+/// compressed one) and break the byte-identity a replica relies on.
+#[derive(Debug, Clone)]
+pub struct EncodedEntry {
+    /// The entry exactly as it sits in the leader's log.
+    pub bytes: bytes::Bytes,
+    /// The highest offset this entry covers, used to track how far a push got.
+    pub last_offset: u64,
+}
+
+impl EncodedEntry {
+    /// Encodes a batch for the push path.
+    pub fn from_batch(batch: &crate::protocol::RecordBatch) -> Self {
+        let mut bytes = Vec::with_capacity(batch.encoded_size());
+        batch.encode_into(&mut bytes);
+        Self {
+            bytes: bytes.into(),
+            last_offset: batch.base_offset + batch.last_offset_delta as u64,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_replication_push_pooled(
     peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
@@ -1398,9 +1424,9 @@ pub async fn send_replication_push_pooled(
     partition: u32,
     epoch: u64,
     leader_hw: u64,
-    frames: &[RecordFrame],
+    entries: &[EncodedEntry],
 ) -> IoResult<()> {
-    let mut buf = Vec::with_capacity(256 + frames.len() * 64);
+    let mut buf = Vec::with_capacity(256 + entries.len() * 64);
     buf.put_u8(0xAA);
     crate::protocol::wire::write_pascal_string(&mut buf, cluster_id);
     crate::protocol::wire::write_pascal_string(&mut buf, topic);
@@ -1414,9 +1440,9 @@ pub async fn send_replication_push_pooled(
     // NOTE: this is an inter-node wire change. All brokers in a cluster must run a build
     // that agrees on this layout; there is no version negotiation on this path yet.
     buf.put_u64(leader_hw);
-    buf.put_u32(frames.len() as u32);
-    for frame in frames {
-        frame.encode_into(&mut buf);
+    buf.put_u32(entries.len() as u32);
+    for entry in entries {
+        buf.put_slice(&entry.bytes);
     }
 
     let mut lock = peer_conn.lock().await;
@@ -1469,7 +1495,7 @@ pub async fn send_replication_push(
     topic: &str,
     partition: u32,
     epoch: u64,
-    frames: &[RecordFrame],
+    entries: &[EncodedEntry],
 ) -> IoResult<()> {
     let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
         Ok(Ok(s)) => s,
@@ -1491,8 +1517,8 @@ pub async fn send_replication_push(
         }
     };
 
-    let first_offset = frames.first().map_or(0, |f| f.offset);
-    let last_offset = frames.last().map_or(0, |f| f.offset);
+    let first_offset = entries.first().map_or(0, |e| e.last_offset);
+    let last_offset = entries.last().map_or(0, |e| e.last_offset);
 
     let mut buf = Vec::with_capacity(256);
     buf.put_u8(0xAA);
@@ -1501,9 +1527,9 @@ pub async fn send_replication_push(
     crate::protocol::wire::write_pascal_string(&mut buf, topic);
     buf.put_u32(partition);
     buf.put_u64(epoch);
-    buf.put_u32(frames.len() as u32);
-    for frame in frames {
-        frame.encode_into(&mut buf);
+    buf.put_u32(entries.len() as u32);
+    for entry in entries {
+        buf.put_slice(&entry.bytes);
     }
 
     stream.write_all(&buf).await.map_err(|e| {
@@ -1520,7 +1546,7 @@ pub async fn send_replication_push(
     if ack[0] == 0 {
         tracing::info!(
             "HA Replication: Replicated {} record(s) [offsets {}..={}] Topic '{}' Partition {} -> peer {}",
-            frames.len(), first_offset, last_offset, topic, partition, peer_addr
+            entries.len(), first_offset, last_offset, topic, partition, peer_addr
         );
         Ok(())
     } else if ack[0] == 0x02 {

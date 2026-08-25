@@ -263,10 +263,6 @@ impl LogSegment {
                             let mut last_offset = base_offset;
                             while pos < tail.len() {
                                 match decode_entry(&tail[pos..]) {
-                                    Ok((LogEntry::Frame(frame), consumed)) => {
-                                        last_offset = frame.offset;
-                                        pos += consumed;
-                                    }
                                     Ok((LogEntry::Batch(batch), consumed)) => {
                                         last_offset =
                                             batch.base_offset + batch.last_offset_delta as u64;
@@ -356,19 +352,12 @@ impl LogSegment {
                             let phys_pos = file_offset + pos as u64;
                             // A batch spans a range of offsets (`base_offset` through
                             // `base_offset + last_offset_delta`), so it's indexed by its
-                            // base offset and advances `next_offset` past its whole range —
-                            // a frame is just the range-of-one special case of the same
-                            // bookkeeping.
-                            let (relative_offset, last_offset_in_entry) = match &entry {
-                                LogEntry::Frame(frame) => (
-                                    frame.offset.saturating_sub(base_offset) as u32,
-                                    frame.offset,
-                                ),
-                                LogEntry::Batch(batch) => (
-                                    batch.base_offset.saturating_sub(base_offset) as u32,
-                                    batch.base_offset + batch.last_offset_delta as u64,
-                                ),
-                            };
+                            // base offset and advances `next_offset` past its whole range.
+                            let LogEntry::Batch(batch) = &entry;
+                            let (relative_offset, last_offset_in_entry) = (
+                                batch.base_offset.saturating_sub(base_offset) as u32,
+                                batch.base_offset + batch.last_offset_delta as u64,
+                            );
 
                             if bytes_since_last_index >= index_interval
                                 || rebuilt_index_entries.is_empty()
@@ -648,7 +637,7 @@ pub async fn transmit_zero_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{BatchCompression, RecordBatch, RecordFrame};
+    use crate::protocol::{BatchCompression, RecordBatch};
     use bytes::Bytes;
 
     struct TempDir(PathBuf);
@@ -676,10 +665,24 @@ mod tests {
         }
     }
 
+    /// One record as a single-record batch stamped at `offset` — the shape every
+    /// broker-authored record takes, and what the recovery scan sees between multi-record
+    /// batches.
     fn frame_bytes(offset: u64, timestamp: u64, payload: &[u8]) -> Vec<u8> {
-        let frame = RecordFrame::create(offset, timestamp, Bytes::copy_from_slice(payload));
+        let mut batch = RecordBatch::create(
+            0,
+            timestamp,
+            0,
+            0,
+            0,
+            0,
+            false,
+            BatchCompression::None,
+            &[(timestamp, None, Some(Bytes::copy_from_slice(payload)))],
+        );
+        batch.assign_base_offset_and_leader_epoch(offset, 0);
         let mut buf = Vec::new();
-        frame.encode_into(&mut buf);
+        batch.encode_into(&mut buf);
         buf
     }
 
