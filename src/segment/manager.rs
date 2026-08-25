@@ -534,14 +534,17 @@ impl SegmentManager {
         codec: crate::config::CompressionCodec,
     ) -> IoResult<RecordFrame> {
         let assigned_offset = self.high_watermark;
-        let frame = match codec {
+        // This path only ever writes records the broker authored itself, so there is no
+        // producer codec to honour — `Producer` resolves to uncompressed here.
+        let frame = match codec.for_broker_authored_frame() {
             crate::config::CompressionCodec::Lz4 => {
                 RecordFrame::create_compressed_lz4(assigned_offset, timestamp, &payload)
             }
             crate::config::CompressionCodec::Zstd => {
                 RecordFrame::create_compressed_zstd(assigned_offset, timestamp, &payload)
             }
-            crate::config::CompressionCodec::None => {
+            // `for_broker_authored_frame` has already mapped `Producer` to `None`.
+            crate::config::CompressionCodec::None | crate::config::CompressionCodec::Producer => {
                 RecordFrame::create(assigned_offset, timestamp, payload)
             }
         };

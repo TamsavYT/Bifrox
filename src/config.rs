@@ -108,13 +108,55 @@ impl Default for FlushPolicy {
     }
 }
 
-/// Compression Codec for Record Batch Storage (compression.type)
+/// `compression.type`.
+///
+/// Read this alongside how compression actually works here: **the broker never compresses
+/// or decompresses a client's records.** A producer builds and compresses its own
+/// [`crate::protocol::RecordBatch`], the broker stores those bytes as they arrive, and the
+/// consumer decompresses. Compaction is the sole exception, because it cannot compare keys
+/// without reading them.
+///
+/// So this setting does *not* decide how client data is stored — the producer's own codec
+/// does, whatever this says. It applies only to records the broker authors itself: the
+/// single frames written to internal system partitions (cluster metadata, DLQ routing,
+/// consumer offsets, transaction state, bootstrap) via `PartitionManager::produce_frame`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionCodec {
+    /// Keep whatever the producer sent, imposing nothing. Kafka's default for
+    /// `compression.type`, and the only setting that describes the produce path honestly —
+    /// the broker has no codec of its own to apply to a client's batch.
+    ///
+    /// Broker-authored frames are written uncompressed under this setting: there is no
+    /// producer whose choice could be honoured for a record the broker wrote itself.
     #[default]
+    Producer = 3,
+    /// Broker-authored frames are stored uncompressed. Identical to [`Self::Producer`] for
+    /// client data, which is never touched either way.
     None = 0,
     Lz4 = 1,
     Zstd = 2,
+}
+
+impl CompressionCodec {
+    /// How a broker-authored frame should be compressed under this setting. `Producer` has
+    /// no producer to defer to, so it behaves as uncompressed.
+    pub fn for_broker_authored_frame(self) -> Self {
+        match self {
+            CompressionCodec::Producer => CompressionCodec::None,
+            other => other,
+        }
+    }
+}
+
+impl std::fmt::Display for CompressionCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressionCodec::Producer => write!(f, "producer"),
+            CompressionCodec::None => write!(f, "none"),
+            CompressionCodec::Lz4 => write!(f, "lz4"),
+            CompressionCodec::Zstd => write!(f, "zstd"),
+        }
+    }
 }
 
 impl std::str::FromStr for CompressionCodec {
@@ -123,7 +165,10 @@ impl std::str::FromStr for CompressionCodec {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let normalized = s.trim().to_lowercase();
         match normalized.as_str() {
-            "none" | "" | "uncompressed" | "producer" => Ok(CompressionCodec::None),
+            // "producer" is its own thing, not an alias for "none": it says the broker
+            // imposes no codec, which is the truth for every client-produced batch.
+            "producer" => Ok(CompressionCodec::Producer),
+            "none" | "" | "uncompressed" => Ok(CompressionCodec::None),
             "lz4" => Ok(CompressionCodec::Lz4),
             "zstd" => Ok(CompressionCodec::Zstd),
             _ => Err(format!("Unknown compression.type: '{}'", s)),
@@ -832,5 +877,82 @@ impl EngineConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod compression_type_tests {
+    use super::*;
+
+    /// `producer` is the default and is its own value, not an alias for `none`. It used to
+    /// parse to `None`, which quietly conflated "the broker imposes no codec" with "the
+    /// broker imposes no compression" — the same outcome on the produce path today, but
+    /// different statements, and only one of them describes what actually happens.
+    #[test]
+    fn producer_is_the_default_and_not_an_alias_for_none() {
+        assert_eq!(CompressionCodec::default(), CompressionCodec::Producer);
+        assert_eq!(
+            "producer".parse::<CompressionCodec>().unwrap(),
+            CompressionCodec::Producer
+        );
+        assert_ne!(
+            "producer".parse::<CompressionCodec>().unwrap(),
+            "none".parse::<CompressionCodec>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_every_accepted_spelling() {
+        for (input, expected) in [
+            ("producer", CompressionCodec::Producer),
+            ("PRODUCER", CompressionCodec::Producer),
+            ("none", CompressionCodec::None),
+            ("uncompressed", CompressionCodec::None),
+            ("", CompressionCodec::None),
+            ("lz4", CompressionCodec::Lz4),
+            ("  Zstd  ", CompressionCodec::Zstd),
+        ] {
+            assert_eq!(
+                input.parse::<CompressionCodec>().unwrap(),
+                expected,
+                "input {input:?}"
+            );
+        }
+        assert!("gzip".parse::<CompressionCodec>().is_err());
+    }
+
+    /// Round-trips through `Display`, so a config read back out means the same thing it did
+    /// going in — `producer` in particular must not come back as `none`.
+    #[test]
+    fn display_round_trips_through_parse() {
+        for codec in [
+            CompressionCodec::Producer,
+            CompressionCodec::None,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ] {
+            assert_eq!(
+                codec.to_string().parse::<CompressionCodec>().unwrap(),
+                codec
+            );
+        }
+        assert_eq!(CompressionCodec::Producer.to_string(), "producer");
+    }
+
+    /// A broker-authored frame has no producer whose choice could be honoured, so
+    /// `Producer` resolves to uncompressed there. Every explicit codec passes through.
+    #[test]
+    fn broker_authored_frames_resolve_producer_to_uncompressed() {
+        assert_eq!(
+            CompressionCodec::Producer.for_broker_authored_frame(),
+            CompressionCodec::None
+        );
+        for codec in [
+            CompressionCodec::None,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ] {
+            assert_eq!(codec.for_broker_authored_frame(), codec);
+        }
     }
 }

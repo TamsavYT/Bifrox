@@ -7951,6 +7951,108 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
     assert_eq!(batch.record_count, 3);
 }
 
+/// `compression.type=producer` must mean what it says: whatever the producer sent is what
+/// is stored, byte for byte. Asserted against an explicitly configured `producer` *and*
+/// against the default, since the default is what almost every deployment runs on.
+///
+/// Both directions are covered — a compressed producer stays compressed, an uncompressed
+/// one stays uncompressed — because either alone is satisfiable by a broker that always
+/// does one or the other.
+#[tokio::test]
+async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
+    use hermes::config::{CompressionCodec, EngineConfig};
+
+    async fn stored_codec(
+        dir_name: &str,
+        topic: &str,
+        broker_codec: CompressionCodec,
+        client_codec: hermes::protocol::BatchCompression,
+    ) -> hermes::protocol::BatchCompression {
+        let dir_guard = TestDataDirGuard::new(dir_name);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = EngineConfig {
+            node_id: 1,
+            data_dir: dir_guard.path.clone(),
+            bind_addr: addr.to_string(),
+            compression_codec: broker_codec,
+            ..Default::default()
+        };
+        let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+        let server = hermes::server::Server::new(engine.clone());
+        tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+        client.set_compression(client_codec);
+        let payload = bytes::Bytes::from(
+            "compressible_payload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        client
+            .produce_batch(topic, "", None, 1, std::slice::from_ref(&payload))
+            .await
+            .unwrap();
+
+        let log_bytes = std::fs::read(
+            dir_guard
+                .path
+                .join(format!("{topic}-0"))
+                .join("00000000000000000000.log"),
+        )
+        .unwrap();
+        let (batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+        assert_eq!(
+            batch.records().unwrap()[0].value.as_deref(),
+            Some(payload.as_ref()),
+            "the payload must survive whatever the codec"
+        );
+        batch.compression().unwrap()
+    }
+
+    // `producer` is the default, so this is what an unconfigured broker does.
+    assert_eq!(CompressionCodec::default(), CompressionCodec::Producer);
+
+    assert_eq!(
+        stored_codec(
+            "codec_producer_explicit_zstd",
+            "codec_producer_explicit_zstd_topic",
+            CompressionCodec::Producer,
+            hermes::protocol::BatchCompression::Zstd,
+        )
+        .await,
+        hermes::protocol::BatchCompression::Zstd,
+        "compression.type=producer must keep the producer's zstd"
+    );
+
+    assert_eq!(
+        stored_codec(
+            "codec_producer_explicit_none",
+            "codec_producer_explicit_none_topic",
+            CompressionCodec::Producer,
+            hermes::protocol::BatchCompression::None,
+        )
+        .await,
+        hermes::protocol::BatchCompression::None,
+        "compression.type=producer must not compress what the producer left uncompressed"
+    );
+
+    // An explicit broker codec changes nothing for client data either — the broker has no
+    // hand in it at all.
+    assert_eq!(
+        stored_codec(
+            "codec_broker_lz4_client_zstd",
+            "codec_broker_lz4_client_zstd_topic",
+            CompressionCodec::Lz4,
+            hermes::protocol::BatchCompression::Zstd,
+        )
+        .await,
+        hermes::protocol::BatchCompression::Zstd,
+        "an explicit broker codec must not re-compress a producer's batch"
+    );
+}
+
 /// A compacted topic dedupes by key, so a record without one can never be superseded and
 /// can never be compacted away — it would sit in the log forever. Kafka rejects such a
 /// produce outright and so does this.
