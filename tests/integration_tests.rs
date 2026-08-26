@@ -1837,25 +1837,6 @@ async fn test_scenario_22_per_client_quota_throttling() {
 async fn test_scenario_23_cleanup_policy_log_compaction() {
     use hermes::config::CleanupPolicy;
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     // 1. Verify parsing cleanup.policy from server.properties
     let dir_guard = TestDataDirGuard::new("cleanup_policy_config_test");
     let props_path = dir_guard.path.join("server.properties");
@@ -1939,25 +1920,6 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
 async fn test_scenario_24_sasl_and_acls() {
     use hermes::config::{EngineConfig, SecurityProtocol};
     use hermes::server::acl::{AclBinding, AclOperation, AclPermissionType, ResourceType};
-
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     let dir_guard = TestDataDirGuard::new("sasl_acls_test");
     let props_path = dir_guard.path.join("server.properties");
@@ -2147,25 +2109,6 @@ async fn test_scenario_24_sasl_and_acls() {
 async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     use hermes::config::{EngineConfig, SecurityProtocol};
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     // 1. Test SSL mode over encrypted TLS transport
     let dir_guard = TestDataDirGuard::new("ssl_transport_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2276,25 +2219,6 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
 async fn test_scenario_26_pem_file_tls_key_and_mtls() {
     use hermes::config::{EngineConfig, SecurityProtocol};
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     let dir_guard = TestDataDirGuard::new("pem_tls_file_test");
 
     // Generate real X.509 CA certificate, server certificate, and client certificate
@@ -2384,25 +2308,6 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
 async fn test_scenario_27_dynamic_broker_registration_and_membership() {
     use hermes::config::EngineConfig;
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     let dir_guard = TestDataDirGuard::new("dynamic_broker_membership_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2457,25 +2362,6 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
 #[tokio::test]
 async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     use hermes::config::EngineConfig;
-
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     let dir_guard = TestDataDirGuard::new("prometheus_and_lz4_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5655,25 +5541,6 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
 #[tokio::test]
 async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_registering_it() {
     use hermes::config::EngineConfig;
-
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     let dir_guard = TestDataDirGuard::new("auto_create_disabled_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
