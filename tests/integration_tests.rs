@@ -5636,6 +5636,7 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
         heartbeat_interval: Duration::from_millis(200),
         ..GroupConsumerConfig::default()
     };
+    let session_timeout = config.session_timeout;
     let consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
     let member_id = consumer.member_id().to_string();
     assert_eq!(
@@ -5653,9 +5654,19 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
 
     // Wait comfortably past the 1s session timeout, checking throughout — not just at the
     // end — that the member never drops out along the way.
-    let deadline = std::time::Instant::now() + Duration::from_millis(1_600);
+    //
+    // The loop ends only once it has *both* outlasted the wait window and accumulated
+    // enough observations. Bounding it on the clock alone made the check count a hidden
+    // assertion about latency: each iteration costs `80ms + one describe_group round
+    // trip`, so 15 checks inside a fixed 1600ms window silently required every round trip
+    // to complete in under ~27ms. A loaded CI runner answering in ~34ms produced 14 checks
+    // and failed a test that had observed exactly what it meant to observe. Requiring both
+    // conditions means a slow round trip makes this take longer, never makes it check less.
+    const MIN_CHECKS: u32 = 15;
+    let wait_window = Duration::from_millis(1_600);
+    let started = std::time::Instant::now();
     let mut checks = 0u32;
-    while std::time::Instant::now() < deadline {
+    while started.elapsed() < wait_window || checks < MIN_CHECKS {
         let (_, members) = observer.describe_group(group_id).await.unwrap();
         assert!(
             members.iter().any(|m| m.member_id == member_id),
@@ -5666,10 +5677,17 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
         checks += 1;
         sleep(Duration::from_millis(80)).await;
     }
+    // Both are guaranteed by the loop's own exit condition; asserted so that a future edit
+    // to that condition which stops covering the session timeout fails here rather than
+    // quietly testing nothing.
     assert!(
-        checks >= 15,
-        "the wait must actually span the session timeout with many checks along the way, \
-         only ran {}",
+        started.elapsed() >= session_timeout,
+        "the wait must actually span the session timeout, only ran for {:?}",
+        started.elapsed()
+    );
+    assert!(
+        checks >= MIN_CHECKS,
+        "the wait must include many checks along the way, only ran {}",
         checks
     );
 
