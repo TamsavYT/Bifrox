@@ -1837,25 +1837,6 @@ async fn test_scenario_22_per_client_quota_throttling() {
 async fn test_scenario_23_cleanup_policy_log_compaction() {
     use hermes::config::CleanupPolicy;
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     // 1. Verify parsing cleanup.policy from server.properties
     let dir_guard = TestDataDirGuard::new("cleanup_policy_config_test");
     let props_path = dir_guard.path.join("server.properties");
@@ -1939,25 +1920,6 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
 async fn test_scenario_24_sasl_and_acls() {
     use hermes::config::{EngineConfig, SecurityProtocol};
     use hermes::server::acl::{AclBinding, AclOperation, AclPermissionType, ResourceType};
-
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     let dir_guard = TestDataDirGuard::new("sasl_acls_test");
     let props_path = dir_guard.path.join("server.properties");
@@ -2147,25 +2109,6 @@ async fn test_scenario_24_sasl_and_acls() {
 async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     use hermes::config::{EngineConfig, SecurityProtocol};
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     // 1. Test SSL mode over encrypted TLS transport
     let dir_guard = TestDataDirGuard::new("ssl_transport_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2276,25 +2219,6 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
 async fn test_scenario_26_pem_file_tls_key_and_mtls() {
     use hermes::config::{EngineConfig, SecurityProtocol};
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     let dir_guard = TestDataDirGuard::new("pem_tls_file_test");
 
     // Generate real X.509 CA certificate, server certificate, and client certificate
@@ -2384,25 +2308,6 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
 async fn test_scenario_27_dynamic_broker_registration_and_membership() {
     use hermes::config::EngineConfig;
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     let dir_guard = TestDataDirGuard::new("dynamic_broker_membership_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2457,25 +2362,6 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
 #[tokio::test]
 async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     use hermes::config::EngineConfig;
-
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     let dir_guard = TestDataDirGuard::new("prometheus_and_lz4_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5656,25 +5542,6 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
 async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_registering_it() {
     use hermes::config::EngineConfig;
 
-    struct TestDataDirGuard {
-        pub path: std::path::PathBuf,
-    }
-
-    impl TestDataDirGuard {
-        fn new(prefix: &str) -> Self {
-            let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!("hermes_test_{}_{}", prefix, count));
-            let _ = std::fs::create_dir_all(&path);
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDataDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     let dir_guard = TestDataDirGuard::new("auto_create_disabled_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -5769,6 +5636,7 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
         heartbeat_interval: Duration::from_millis(200),
         ..GroupConsumerConfig::default()
     };
+    let session_timeout = config.session_timeout;
     let consumer = GroupConsumer::join(consumer_client, config).await.unwrap();
     let member_id = consumer.member_id().to_string();
     assert_eq!(
@@ -5786,9 +5654,19 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
 
     // Wait comfortably past the 1s session timeout, checking throughout — not just at the
     // end — that the member never drops out along the way.
-    let deadline = std::time::Instant::now() + Duration::from_millis(1_600);
+    //
+    // The loop ends only once it has *both* outlasted the wait window and accumulated
+    // enough observations. Bounding it on the clock alone made the check count a hidden
+    // assertion about latency: each iteration costs `80ms + one describe_group round
+    // trip`, so 15 checks inside a fixed 1600ms window silently required every round trip
+    // to complete in under ~27ms. A loaded CI runner answering in ~34ms produced 14 checks
+    // and failed a test that had observed exactly what it meant to observe. Requiring both
+    // conditions means a slow round trip makes this take longer, never makes it check less.
+    const MIN_CHECKS: u32 = 15;
+    let wait_window = Duration::from_millis(1_600);
+    let started = std::time::Instant::now();
     let mut checks = 0u32;
-    while std::time::Instant::now() < deadline {
+    while started.elapsed() < wait_window || checks < MIN_CHECKS {
         let (_, members) = observer.describe_group(group_id).await.unwrap();
         assert!(
             members.iter().any(|m| m.member_id == member_id),
@@ -5799,10 +5677,17 @@ async fn test_scenario_63_background_heartbeat_keeps_membership_alive_without_po
         checks += 1;
         sleep(Duration::from_millis(80)).await;
     }
+    // Both are guaranteed by the loop's own exit condition; asserted so that a future edit
+    // to that condition which stops covering the session timeout fails here rather than
+    // quietly testing nothing.
     assert!(
-        checks >= 15,
-        "the wait must actually span the session timeout with many checks along the way, \
-         only ran {}",
+        started.elapsed() >= session_timeout,
+        "the wait must actually span the session timeout, only ran for {:?}",
+        started.elapsed()
+    );
+    assert!(
+        checks >= MIN_CHECKS,
+        "the wait must include many checks along the way, only ran {}",
         checks
     );
 
