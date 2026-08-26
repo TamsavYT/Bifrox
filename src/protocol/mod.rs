@@ -1,5 +1,4 @@
 pub mod batch;
-pub mod kafka_adapter;
 pub mod wire;
 
 pub use batch::{
@@ -11,7 +10,6 @@ pub use batch::{
 /// cannot possibly hold another entry. Every entry is a [`RecordBatch`], so this is the
 /// batch header.
 pub const HEADER_SIZE: usize = BATCH_HEADER_SIZE;
-pub use kafka_adapter::{KafkaHeader, KafkaWireAdapter};
 pub use wire::{
     AckBatch, AcknowledgeType, AcquiredRecordBatch, CommandCode, RequestPayload, WireError,
     WireRequest, WireResponse,
