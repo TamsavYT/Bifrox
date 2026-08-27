@@ -25,7 +25,7 @@ be implemented, not reverse-engineered.
 - [Quickstart](#quickstart)
 - [Design principles](#design-principles)
 - [Feature status](#feature-status)
-- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
 - [Configuration](#configuration)
 - [Operating Bifrox](#operating-bifrox)
 - [Building a client](#building-a-client)
@@ -281,39 +281,7 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 
 ---
 
-## Architecture
-
-```mermaid
-flowchart TD
-    subgraph clients [ ]
-        C["Client / CLI / Agent"]
-    end
-
-    C -->|"versioned binary protocol"| L["TCP Listener"]
-    L --> H["Request Handler<br/><i>auth · ACLs · quotas</i>"]
-    H --> E["Storage Engine"]
-
-    E --> P["Partition Managers"]
-    P --> SEG["Log Segments<br/><code>.log .index .timeindex .txnindex</code>"]
-
-    E --> GC["Group Coordinator"]
-    E --> TX["Transaction Coordinator"]
-
-    E -.-> CO[("__consumer_offsets")]
-    E -.-> TS[("__transaction_state")]
-    E -.-> CM[("__cluster_metadata")]
-
-    H -.->|"sendfile / TransmitFile"| SEG
-
-    E --> R["Replication Manager"]
-    R <-->|"versioned inter-node frames"| PEERS["Peer Brokers"]
-    CM --> RAFT["Raft election<br/>+ metadata replay"]
-```
-
-The dotted line from the handler to the segments is the zero-copy fetch path: bytes go
-from the page cache to the socket without passing through the engine.
-
-### Repository layout
+## Repository layout
 
 | Path | Purpose |
 |---|---|
