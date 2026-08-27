@@ -67,7 +67,7 @@ fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
     trimmed.parse::<u64>().ok().map(Some)
 }
 
-/// Kafka-style striped replica placement (`AdminUtils.assignReplicasToBrokers` /
+/// striped replica placement (`AdminUtils.assignReplicasToBrokers` /
 /// `StripedReplicaPlacer`).
 ///
 /// Plain round-robin — `replicas[i] = brokers[(partition + i) % n]`, which is what this
@@ -78,7 +78,7 @@ fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
 /// followers on different brokers and the loss of any two brokers costs far fewer
 /// partitions.
 ///
-/// `seed` replaces Kafka's random start index. Kafka randomizes so that every topic does
+/// `seed` replaces a random start index. Randomizing so that every topic does
 /// not begin at broker 0; deriving the offset from the topic name instead gives the same
 /// spread across topics while keeping a single topic's layout reproducible — which matters
 /// because assignment here can be recomputed by a sweep rather than only at creation.
@@ -242,7 +242,7 @@ pub struct TopicConfig {
     pub replication_factor: u16,
     pub cleanup_policy: crate::config::CleanupPolicy,
     pub partitions: std::collections::HashMap<u32, PartitionAssignment>,
-    /// Dynamic per-topic config overrides (Kafka `AlterConfigs`/`IncrementalAlterConfigs`).
+    /// Dynamic per-topic config overrides (`AlterConfigs`/`IncrementalAlterConfigs`).
     /// Recognized keys (`cleanup.policy`, `compression.type`, `retention.ms`,
     /// `retention.bytes`, `min.insync.replicas`) are applied to every open partition of
     /// this topic; unrecognized keys are stored and returned by `DescribeConfigs` but
@@ -408,7 +408,7 @@ impl StorageEngine {
         }
 
         // Per-partition pull-fetcher loop (`start_per_partition_fetcher_manager`, gRPC
-        // magic 0xBB) — Kafka-style follower-driven replication: for every partition this
+        // magic 0xBB) — follower-driven replication: for every partition this
         // node replicates but doesn't lead, a background loop asks the leader for
         // everything past its own log end offset and applies it verbatim. This is now the
         // sole mechanism for *data-topic* replication (see `StorageEngine::produce_batch`,
@@ -511,14 +511,14 @@ impl StorageEngine {
     /// trying to dial back — for as long as it takes the periodic heartbeat loop to
     /// self-correct (issue #62). This closes that gap immediately instead.
     ///
-    /// An explicit `advertised_addr` config override (Kafka's `advertised.listeners`)
+    /// An explicit `advertised_addr` config override (`advertised.listeners`)
     /// takes precedence over `bound_addr` when set — e.g. behind NAT or a load balancer,
     /// where the locally bound address isn't what a peer should dial.
     ///
     /// Returns `Err` (naming the config key to set) without changing anything, rather
     /// than advertising it, if the resolved address is unusable as an identity — an
     /// unspecified IP (`0.0.0.0`/`::`), port `0`, or simply not parseable as a
-    /// `host:port`. Matches Kafka, which refuses to start in the equivalent case; here
+    /// `host:port`. Refuses to start in this case; here
     /// the caller (`Server::bind`) turns this into a startup-time `Err`, which is a hard
     /// failure in the real server entry point (`main.rs` propagates it and exits) without
     /// this function itself needing to reach for `std::process::exit`.
@@ -850,7 +850,7 @@ impl StorageEngine {
     /// Replays the local cluster metadata log to initialize partitions registered on this node.
     ///
     /// If a snapshot exists (see `snapshot_metadata_if_needed`), it's loaded first and
-    /// replay resumes from the snapshot's offset instead of 0 — the KRaft-style mechanism
+    /// replay resumes from the snapshot's offset instead of 0 — the mechanism
     /// that keeps startup fast and keeps the on-disk log itself trimmable, since replay
     /// no longer needs every record back to the beginning of time to reconstruct state.
     pub fn replay_metadata_log(&self) -> IoResult<()> {
@@ -1419,7 +1419,7 @@ impl StorageEngine {
             .unwrap_or_default()
     }
 
-    /// Full-replace config update (Kafka `AlterConfigs`). Only the cluster leader may
+    /// Full-replace config update (`AlterConfigs`). Only the cluster leader may
     /// propose — routes through the same `propose_metadata` gate as every other
     /// controller-plane mutation.
     pub async fn alter_configs(&self, topic: &str, configs: Vec<(String, String)>) -> IoResult<()> {
@@ -1441,7 +1441,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Merge-then-replace config update (Kafka `IncrementalAlterConfigs`): computes the
+    /// Merge-then-replace config update (`IncrementalAlterConfigs`): computes the
     /// new full config map from the topic's current one plus `upserts`/`deletes`, then
     /// proposes it the same way `alter_configs` does.
     pub async fn incremental_alter_configs(
@@ -2057,7 +2057,7 @@ impl StorageEngine {
 
     /// Aborts any transaction that has sat in a non-terminal state
     /// (`Ongoing`/`PrepareCommit`/`PrepareAbort`) longer than `config.transaction_timeout_ms`
-    /// (Kafka `transaction.timeout.ms`). Meant to be called periodically (see
+    /// (`transaction.timeout.ms`). Meant to be called periodically (see
     /// `Server::run_with_listener`'s background task loop).
     ///
     /// This is also what makes a hanging transaction restored from `__transaction_state` on
@@ -2097,7 +2097,7 @@ impl StorageEngine {
         let transaction_id = params.transaction_id;
         let num_partitions = params.num_partitions;
         let batch = params.batch;
-        // Idempotence identity travels inside the batch header, where Kafka keeps it —
+        // Idempotence identity travels inside the batch header, where it belongs —
         // readable without touching the (possibly compressed) records.
         let producer_id = batch.producer_id;
         let producer_epoch = batch.producer_epoch;
@@ -2121,7 +2121,7 @@ impl StorageEngine {
             }
         }
         // Enforce `message.max.bytes` before doing any disk work. This is measured on the
-        // batch as stored — its encoded, compressed size — which is both what Kafka limits
+        // batch as stored — its encoded, compressed size — which is both what is limited
         // and the only size the broker can know without decompressing.
         let batch_encoded_size = batch.encoded_size() as u64;
         if let Some(max_bytes) = self.config.message_max_bytes {
@@ -2158,9 +2158,8 @@ impl StorageEngine {
 
         // A compacted topic dedupes by key, so a record without one has no meaning there:
         // it can never be superseded and can never be compacted away, so it would sit in
-        // the log forever and surface much later as unexplained growth. Kafka rejects such
-        // a produce outright (`InvalidRecordException`, "Compacted topic cannot accept
-        // message without key"); this does the same.
+        // the log forever and surface much later as unexplained growth, so such a
+        // produce is rejected outright.
         //
         // Checked against the batch's decoded records, which means decompressing it — the
         // one produce-path decompression, and only on compacted topics.
@@ -2227,14 +2226,14 @@ impl StorageEngine {
         }
 
         // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
-        // Bifrox assigns an independent leader per partition (KIP-392-style; see
+        // Bifrox assigns an independent leader per partition; see
         // `is_partition_leader`/produce-forwarding in handler.rs), and the cluster Raft
         // leader is really the controller for `__cluster_metadata`, not necessarily the
         // leader of every data partition. Gating on cluster leadership here would silently
         // stop replication for any partition led by a node that isn't currently the
         // cluster leader.
         //
-        // Data-topic replication is Kafka-style follower-pull only. Every follower's
+        // Data-topic replication is follower-pull only. Every follower's
         // background fetch loop (`ReplicationManager::start_per_partition_fetcher_manager`)
         // independently pulls from this partition's log, and the leader's `handler.rs`
         // 0xBB handler (`decode_grpc_replication_fetch_packet`) records each follower's
@@ -2279,12 +2278,12 @@ impl StorageEngine {
     ///
     /// Entries are clamped to the committed high watermark, and an entry containing
     /// `offset` is returned whole — a batch is atomic on disk, so a consumer asking from
-    /// the middle of one gets the whole batch and filters it itself, as in Kafka.
+    /// the middle of one gets the whole batch and filters it itself.
     /// A fetch that waits for data rather than answering an idle partition with an empty
     /// response.
     ///
     /// Returns as soon as at least `min_bytes` are available, or when `max_wait_ms`
-    /// elapses, whichever comes first — Kafka's `fetch.max.wait.ms` / `fetch.min.bytes`.
+    /// elapses, whichever comes first — `fetch.max.wait.ms` / `fetch.min.bytes`.
     /// With `max_wait_ms` of 0 (an untagged request) this is exactly
     /// [`Self::fetch_entries`], so nothing changes for a client that does not ask to wait.
     ///
@@ -2422,7 +2421,7 @@ impl StorageEngine {
         // out from under every other in-flight request.
         //
         // This intentionally still returns control-marker frames (magic ==
-        // CONTROL_MAGIC_BYTE) alongside real records — matching real Kafka, where the
+        // CONTROL_MAGIC_BYTE) alongside real records — — where the
         // server exposes raw control batches at the wire level and it's the client
         // library's job to recognize and skip them (see `Record::is_control`
         // and the client-authoring guidance in docs/BIFROX_CLIENT_CREATOR_REFERENCE.md).
@@ -2887,7 +2886,7 @@ impl StorageEngine {
 
     /// Runs retention/compaction across every partition, fanning out up to
     /// `config.compaction_worker_threads` partitions' `apply_retention()` calls
-    /// concurrently (Kafka-style `log.cleaner.threads`) instead of one sequential loop.
+    /// concurrently (`log.cleaner.threads`) instead of one sequential loop.
     /// A slow or large compaction pass on one partition no longer delays every other
     /// partition's GC within the same tick, and one partition's error no longer aborts
     /// the rest (each is caught, logged, and skipped independently).
@@ -3531,8 +3530,8 @@ impl StorageEngine {
     ///
     /// Unlike `create_topic`, which treats the configured default as a preference and
     /// clamps it to the cluster size, an explicit factor is a durability contract: if the
-    /// cluster cannot satisfy it the topic is not created at all, matching Kafka's
-    /// `INVALID_REPLICATION_FACTOR`. Silently returning fewer replicas than the caller
+    /// cluster cannot satisfy it the topic is not created at all, and the caller is told
+    /// so with `INVALID_REPLICATION_FACTOR`. Silently returning fewer replicas than the caller
     /// asked for would leave them believing data is replicated when it isn't — and because
     /// replication factor is fixed at creation and never raised automatically, that belief
     /// would persist for the life of the topic.
@@ -3592,10 +3591,10 @@ impl StorageEngine {
             ));
         }
         // Implicit (default) replication factor: clamp to what the cluster can satisfy,
-        // but say so. Kafka instead rejects the whole creation with
+        // but say so. An alternative would reject the whole creation with
         // INVALID_REPLICATION_FACTOR and never degrades silently — the right instinct, but
         // adopting it wholesale would leave a single-broker deployment unable to create any
-        // topic at all, since our default is 3 rather than Kafka's 1.
+        // topic at all, since our default is 3 rather than 1.
         //
         // So the contract is split by intent: a *default* RF is a preference and gets
         // clamped loudly, while an explicitly requested one is a durability contract and
@@ -3654,7 +3653,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Dynamically update a topic's cleanup policy (Kafka topic config alteration)
+    /// Dynamically update a topic's cleanup policy (topic config alteration)
     pub fn set_topic_cleanup_policy(&self, topic: &str, policy: crate::config::CleanupPolicy) {
         if let Some(mut cfg) = self.topic_registry.get_mut(topic) {
             cfg.cleanup_policy = policy;
@@ -3903,7 +3902,7 @@ impl StorageEngine {
     }
 
     /// Returns true if this broker node is a leader or registered replica hosting the
-    /// specified partition (KIP-392 Follower Fetch). Non-creating, for the same reason as
+    /// specified partition Follower Fetch). Non-creating, for the same reason as
     /// `is_partition_leader` — this is on the `Fetch` path.
     pub fn is_partition_replica(&self, topic: &str, partition: u32) -> bool {
         if let Some(pm) = self.get_partition(topic, partition) {

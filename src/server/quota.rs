@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 ///
 /// The bucket refills continuously at `rate` bytes/sec, up to a burst capacity of
 /// `rate` bytes (i.e. clients may burst up to one second's worth of quota before
-/// being throttled). This mirrors Kafka's `client.quota.callback` byte-rate model,
+/// being throttled). This mirrors `client.quota.callback` byte-rate model,
 /// simplified to a single default quota (no per-user overrides).
 #[derive(Debug)]
 struct TokenBucket {
@@ -24,7 +24,7 @@ impl TokenBucket {
 
     /// Consumes `amount` tokens, refilling first based on elapsed time.
     /// Returns the delay the caller should wait before its response is released,
-    /// matching Kafka's "throttle_time_ms" behavior: the request is still processed,
+    /// Throttling rather than rejecting: the request is still processed,
     /// but its response is delayed to force the client to slow down.
     fn consume(&mut self, amount: f64, rate: f64, capacity: f64) -> Duration {
         let now = Instant::now();

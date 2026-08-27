@@ -243,13 +243,13 @@ where
                     // Produce Forwarding: if this node is not the leader for the target
                     // partition, transparently proxy the raw request bytes to the actual
                     // partition leader broker and relay its response, rather than making
-                    // the client discover the leader itself.  This restores Kafka's
+                    // the client discover the leader itself.  This restores the
                     // "connect to any broker" client experience for non-leader brokers.
                     //
                     // IMPORTANT: this must check *partition*-level leadership
                     // (`is_partition_leader`), not cluster-level Raft leadership
                     // (`engine.is_leader()`).  A node can be a Raft Follower yet still be
-                    // the assigned leader for a specific partition under KIP-392-style
+                    // the assigned leader for a specific partition under
                     // per-partition leader assignment; forwarding based on Raft role alone
                     // would incorrectly proxy those produces away from the correct broker.
                     let target_partition = match &req.payload {
@@ -596,7 +596,7 @@ where
 /// Forwards raw produce request bytes to the leader node and returns the raw response bytes.
 ///
 /// Used by follower brokers to transparently proxy `ProduceBatch` requests to the current
-/// cluster leader, so Kafka-style clients can "connect to any broker" without needing to
+/// cluster leader, so clients can "connect to any broker" without needing to
 /// discover partition leadership themselves.
 async fn forward_to_leader(
     leader_addr: &str,
@@ -934,7 +934,7 @@ fn handle_vote_request(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>
 }
 
 /// Serves a [`FrameType::ReplicationFetch`] — a follower pulling from its leader,
-/// Kafka-style — returning the encoded [`FrameType::ReplicationFetchResponse`].
+/// — returning the encoded [`FrameType::ReplicationFetchResponse`].
 fn handle_replication_fetch(
     engine: &StorageEngine,
     payload: &[u8],
@@ -1308,7 +1308,7 @@ fn handle_heartbeat(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>, P
     // front — its port may be ephemeral, or simply not yet known — which is exactly what
     // made broker discovery deadlock: a follower with no way to list its leader's address
     // rejected every heartbeat forever, so the leader never learned it existed and no
-    // replica assignment was ever published. Kafka's answer here is that cluster
+    // replica assignment was ever published. The answer here is that cluster
     // membership is gated by authentication (Bifrox has SCRAM/ACLs for that), not by a
     // static address allowlist — so once the CRIT-03 self-address check above and the
     // cluster_id check further above both pass, an empty allowlist accepts. A non-empty
@@ -1507,7 +1507,7 @@ async fn try_zero_copy_fetch(
 /// The transactional metadata is what makes read-committed work without the broker
 /// decoding anything: aborted records cannot be filtered out of a compressed batch
 /// server-side, so the broker reports which offset ranges were aborted and how far the log
-/// is stable, and the consumer drops them after decompressing. Kafka's fetch response
+/// is stable, and the consumer drops them after decompressing. A fetch response
 /// carries `last_stable_offset` and `aborted_transactions` for exactly this reason.
 /// `u64::MAX` with an empty list means "nothing to filter" (read-uncommitted).
 fn encode_fetch_entries_response(

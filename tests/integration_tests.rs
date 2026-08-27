@@ -61,7 +61,7 @@ async fn start_test_server() -> TestEnv {
 }
 
 /// Same as `start_test_server` but allows configuring per-client produce/fetch byte-rate
-/// quotas, used to verify Kafka-style throttling behavior end-to-end over the wire.
+/// quotas, used to verify throttling behavior end-to-end over the wire.
 async fn start_test_server_with_quota(
     produce_quota_bytes_per_sec: Option<u64>,
     fetch_quota_bytes_per_sec: Option<u64>,
@@ -95,7 +95,7 @@ async fn start_test_server_with_quota(
         retention_check_interval: Duration::from_secs(60),
         produce_quota_bytes_per_sec,
         fetch_quota_bytes_per_sec,
-        // The production default (3s, matching Kafka) would add that much latency to
+        // The production default (3s) would add that much latency to
         // every JoinGroup in the suite. The barrier's behavior is what's under test, not
         // its duration, so keep the window short here.
         group_initial_rebalance_delay_ms: 60,
@@ -613,7 +613,7 @@ async fn test_scenario_7_milestone3_features() {
 }
 
 #[tokio::test]
-async fn test_scenario_8_kraft_grpc_isr() {
+async fn test_scenario_8_metadata_quorum_grpc_isr() {
     // 1. Priority 1 & 3: gRPC Pull Replication Codec Test
     let fetch_req = bifrox::ReplicationFetchRequest {
         follower_node_id: 2,
@@ -1683,7 +1683,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
     let _ = std::fs::remove_dir_all(&base_dir);
 }
 
-/// Scenario 22: Per-client produce/fetch byte-rate quotas throttle responses (Kafka-style
+/// Scenario 22: Per-client produce/fetch byte-rate quotas throttle responses (
 /// "process the request, delay the response") instead of rejecting them outright.
 #[tokio::test]
 async fn test_scenario_22_per_client_quota_throttling() {
@@ -1774,7 +1774,7 @@ async fn test_scenario_22_per_client_quota_throttling() {
     // 4. Two clients behind the same source IP can opt into separate quota buckets by
     // setting distinct logical client_ids on their connections.
     // Produce quota is charged on the batch as stored — its encoded, compressed size —
-    // rather than the sum of record payloads, matching how Kafka charges request bytes.
+    // rather than the sum of record payloads, which is how request bytes are charged.
     // A 100-byte payload costs 173 (53-byte batch header + 20-byte record entry +
     // payload). The bucket starts full at one second's worth of quota, so with a 200 B/s
     // rate the first such produce passes with 27 tokens left and a second one must wait.
@@ -2404,7 +2404,7 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
 
     // Verify on-disk log segment file directly: confirm 0xAC magic byte stored on disk
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
-    // (as in Kafka), not a per-record frame magic — so the codec is asserted on the
+    // (in the batch header), not a per-record frame magic — so the codec is asserted on the
     // stored `RecordBatch`'s attributes, and the records must still decompress back to
     // exactly what was produced.
     let log_file_path = dir_guard
@@ -2507,7 +2507,7 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
 
     // Verify on-disk log segment file directly: confirm 0xAE magic byte stored on disk.
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
-    // (as in Kafka), not a per-record frame magic — so the codec is asserted on the
+    // (in the batch header), not a per-record frame magic — so the codec is asserted on the
     // stored `RecordBatch`'s attributes, and the records must still decompress back to
     // exactly what was produced.
     let log_file_path = dir_guard
@@ -3155,7 +3155,7 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
     // generation heartbeats are errors carrying the same recognizable
     // "REBALANCE_IN_PROGRESS" signal (so a client never has to guess from free-form text
     // whether it means "just rejoin" versus something fatal) — the actual behavioral
-    // difference KIP-429 cooperative rebalancing is about is what happens *after* that
+    // difference cooperative rebalancing is about is what happens *after* that
     // signal: a cooperative member's heartbeat still gets refreshed (so it isn't pruned
     // as expired while it takes its time rejoining and keeps processing partitions it
     // already owns), while an eager member's does not.
@@ -6454,8 +6454,8 @@ async fn test_scenario_70_advertised_addr_resolves_to_real_bound_address() {
     );
 }
 
-/// Issue #62 / Commit 1: an explicit `advertised_addr` override (Kafka's
-/// `advertised.listeners`) takes precedence over the real bound address — needed behind
+/// Issue #62 / Commit 1: an explicit `advertised_addr` override
+/// (`advertised.listeners`) takes precedence over the real bound address — needed behind
 /// NAT / a load balancer, where the locally bound address isn't what a peer should dial.
 #[tokio::test]
 async fn test_scenario_71_advertised_addr_override_takes_precedence() {
@@ -6485,7 +6485,7 @@ async fn test_scenario_71_advertised_addr_override_takes_precedence() {
 /// Issue #62 / Commit 1: refusing to advertise a wildcard identity. A node bound to
 /// `0.0.0.0` (with no `advertised_addr` override) has no real address to fall back on —
 /// `local_addr()` after such a bind still reports the wildcard IP, since the OS never
-/// picks a concrete interface for it. Kafka refuses to start in the equivalent case;
+/// picks a concrete interface for it. Bifrox refuses to start;
 /// here that surfaces as `Server::bind` returning `Err` (a hard failure — `main.rs`
 /// propagates it straight out of `run()` and the process exits without ever starting the
 /// listener loop).
@@ -6664,7 +6664,7 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
 // Issue #20: client-side request pipelining
 // ─────────────────────────────────────────────────────────
 //
-// The Kafka protocol guide is explicit that the broker does *not* answer out of order:
+// The protocol is explicit that the broker does *not* answer out of order:
 // "The server guarantees that on a single TCP connection, requests will be processed in
 // the order they are sent and responses will return in that order as well." Bifrox's
 // broker already relies on exactly that guarantee (`WireResponse::encode_framed_into`
@@ -6809,7 +6809,7 @@ fn test_scenario_78_correlation_id_mismatch_is_reported_as_error() {
     );
 }
 
-/// The key claim of incremental cooperative rebalancing (issue #66, Kafka's KIP-429):
+/// The key claim of incremental cooperative rebalancing (issue #66):
 /// when a new member joins a `cooperative-sticky` group, partitions that are NOT moving
 /// keep their in-memory consumption position across the rebalance — the existing member
 /// (a real `GroupConsumer`, exercising the actual `rejoin()` implementation, not a
@@ -7999,8 +7999,8 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
 }
 
 /// A compacted topic dedupes by key, so a record without one can never be superseded and
-/// can never be compacted away — it would sit in the log forever. Kafka rejects such a
-/// produce outright and so does this.
+/// can never be compacted away — it would sit in the log forever, so such a produce
+/// is rejected outright.
 ///
 /// The same produce must still succeed on an ordinary (delete-policy) topic, otherwise the
 /// rule is not a compaction rule but a global one.

@@ -3,7 +3,7 @@
 //! The doc is the contract a third-party client is built against, and it had drifted badly
 //! — it documented a `RecordFrame` type that no longer exists, and a tombstone rule (empty
 //! value, with the broker string-parsing a key out of the payload) that had been replaced
-//! by Kafka's null-value semantics. Nothing caught either, because prose has no compiler.
+//! by null-value semantics. Nothing caught either, because prose has no compiler.
 //!
 //! These tests are that compiler for the byte-level claims. Each one asserts a specific
 //! statement the doc makes, so a change that invalidates the doc fails here rather than
@@ -177,7 +177,7 @@ fn batches_in_a_fetch_response_are_walkable_by_their_declared_length() {
 }
 
 /// The doc's most consequential correction. It used to say an *empty* value was a delete
-/// marker; the rule is Kafka's — only a *null* value is. A client whose value type cannot
+/// marker; the rule is that only a *null* value is. A client whose value type cannot
 /// represent null cannot express a delete at all, which is why the doc now says so
 /// explicitly, and why this asserts the distinction survives a real encode/decode.
 #[test]

@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100)
                 .max(1);
-            // Matches Kafka's kafka-producer-perf-test.sh --throughput: target records/sec,
+            // Target-rate pacing: target records/sec,
             // -1 (or any non-positive value) means unthrottled — send as fast as possible.
             let throughput: i64 = get_arg_val(&args, "--throughput")
                 .and_then(|s| s.parse().ok())
@@ -263,7 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Simple target-rate pacing (matches Kafka perf test's --throughput):
+                // Simple target-rate pacing:
                 // sleep just enough to keep cumulative send rate at or below the target,
                 // rather than pacing every individual request independently.
                 if throughput > 0 {
@@ -458,14 +458,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .fetch(&topic, partition, start_offset, max_bytes)
                 .await?;
             // Plain Fetch returns raw frames, including transaction commit/abort control
-            // markers — the server exposes them at the wire level (same as real Kafka)
+            // markers — the server exposes them at the wire level (by design)
             // and expects the client to skip them. Filter them out here so the CLI never
             // prints a control marker's raw payload as if it were a real record.
             let frames: Vec<_> = frames.into_iter().filter(|f| !f.is_control).collect();
 
             if let Some(ref group_id) = group_opt {
                 println!(
-                    "📥 Kafka-Style Group Fetch ('{}') from Server {} [Topic '{}' Partition {}]:",
+                    "📥 Group Fetch ('{}') from Server {} [Topic '{}' Partition {}]:",
                     group_id, server_addr, topic, partition
                 );
             } else {
@@ -961,20 +961,20 @@ fn print_usage() {
     println!(
         "                  --topic <NAME> [--messages a,b,c | --stdin] [--key <KEY>] [--partitions <N>] [--tx-id <ID>]"
     );
-    println!("  perf-produce    Producer performance test (like kafka-producer-perf-test.sh)");
+    println!("  perf-produce    Producer performance benchmark");
     println!(
         "                  --topic <NAME> [--num-records <N>] [--record-size <BYTES>] [--batch-size <N>] [--throughput <N>] [--partitions <N>]"
     );
-    println!("  perf-consume    Consumer performance test (like kafka-consumer-perf-test.sh)");
+    println!("  perf-consume    Consumer performance benchmark");
     println!(
         "                  --topic <NAME> [--partition <ID>] [--messages <N>] [--offset <N> | --from-beginning] [--max-bytes <N>]"
     );
     println!(
-        "  fetch / consume Kafka-style fetch (supports consumer group tracking & --from-beginning)"
+        "  fetch / consume Fetch records (supports consumer group tracking & --from-beginning)"
     );
     println!("                  --topic <NAME> [--group <GROUP>] [--partition <ID>] [--offset <N>] [--from-beginning]");
     println!(
-        "  group-consume   Kafka-style Consumer Group continuous loop (joins the group, \
+        "  group-consume   Consumer group continuous loop (joins the group, \
 consumes its assigned partitions, auto-commits)"
     );
     println!(

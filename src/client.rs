@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 
 const MAX_CLIENT_RESPONSE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-/// Kafka's `max.in.flight.requests.per.connection` default: how many requests
+/// `max.in.flight.requests.per.connection` default: how many requests
 /// [`TestClient::send_pipelined`] keeps outstanding on one connection before it must wait
 /// for a response to free a slot, rather than growing the pipeline unboundedly.
 pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 5;
@@ -25,7 +25,7 @@ pub type PipelinedRequest = (CommandCode, Vec<(u8, Vec<u8>)>, Vec<u8>);
 /// response with the wrong request.
 ///
 /// The broker guarantees responses return in the same order requests were sent on a
-/// connection (Kafka protocol guide: "requests will be processed in the order they are
+/// connection (protocol guide: "requests will be processed in the order they are
 /// sent and responses will return in that order as well"), so pipelined responses are
 /// matched to requests with a plain FIFO queue of expected ids ([`InFlightWindow`]) rather
 /// than a map keyed by id. This check still runs on every response: a mismatch means a
@@ -407,7 +407,7 @@ impl TestClient {
     ///
     /// This is the client half of request pipelining (issue #20). The wire format and the
     /// broker's in-order response guarantee are unchanged; this only stops the client from
-    /// blocking on a full round trip per request, per the Kafka protocol guide: "clients
+    /// blocking on a full round trip per request, by design: "clients
     /// can (and ideally should) use non-blocking IO to implement request pipelining ...
     /// since the outstanding requests will be buffered in the underlying OS socket buffer."
     ///
@@ -785,7 +785,7 @@ impl TestClient {
     /// `min_bytes` are available or `max_wait` elapses, instead of answering an idle
     /// partition immediately with nothing.
     ///
-    /// This is the consumer half of Kafka's `fetch.max.wait.ms` / `fetch.min.bytes`. It
+    /// This is the consumer half of `fetch.max.wait.ms` / `fetch.min.bytes`. It
     /// cuts request volume on an idle partition and lowers delivery latency at the same
     /// time — a plain polling loop waits on average half its poll interval for a record
     /// that has already landed, whereas a parked fetch returns as soon as one commits.

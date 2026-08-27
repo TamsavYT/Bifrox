@@ -70,7 +70,7 @@ pub enum MetadataRecord {
         producer_id: u64,
         producer_epoch: i16,
     },
-    /// Full-replace of a topic's dynamic config map (Kafka `AlterConfigs`/
+    /// Full-replace of a topic's dynamic config map (`AlterConfigs`/
     /// `IncrementalAlterConfigs` both resolve to this — the engine computes the merged
     /// result before proposing for the incremental case, so there's only one on-disk
     /// representation to replay).

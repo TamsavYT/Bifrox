@@ -5,7 +5,7 @@ harness.
 
 ## 1. First rule: Bifrox uses a custom protocol
 
-Bifrox is **not** a Kafka wire-compatible broker. Build against Bifrox behavior and
+Bifrox speaks its own binary protocol. Build against Bifrox behavior and
 Bifrox commands directly.
 
 Start from:
@@ -143,7 +143,7 @@ Why it matters:
 
 - better quota separation
 - clearer operational identity
-- behavior closer to Kafka's `client.id`
+- behavior closer to `client.id`
 
 ## 6. Core command groups
 
@@ -229,7 +229,7 @@ decompressing your batches. Instead it reports what you need to filter with:
   transaction commit/abort markers, not data. They occupy real offsets, so you must
   recognise and skip them rather than treating their contents as records.
 
-Real Kafka works the same way and for the same reason. Do this filtering in your consumer
+This is the only thing that works once batches are compressed. Do this filtering in your consumer
 after decompressing, or you will surface aborted records as if they were committed.
 
 #### Long-polling fetch
@@ -316,16 +316,16 @@ Behavior notes:
   (re)form the group from empty picks the group's protocol for that generation.
 - **Eager groups** (protocol name without "cooperative" in it): a `Heartbeat`/`SyncGroup`
   call at a stale `generation_id` is a hard failure — you must call `JoinGroup` again.
-- **Cooperative groups** (protocol name containing "cooperative", matching Kafka's
+- **Cooperative groups** (protocol name containing "cooperative", matching the
   `cooperative-sticky` convention): a `Heartbeat`/`SyncGroup` call at a stale
   `generation_id` returns a distinguishable, retryable error containing the string
   `"REBALANCE_IN_PROGRESS"` instead of a hard failure — you were not kicked, you just
   haven't rejoined the current generation yet, and can keep processing the partitions you
   already own (they're never revoked out from under you server-side) until you get around
-  to calling `JoinGroup` again. This is the actual behavioral difference KIP-429
+  to calling `JoinGroup` again. This is the actual behavioral difference incremental
   cooperative rebalancing is about; computing a minimal reassignment diff (rather than
   Bifrox forcing one) is still the client-side assignor's job.
-- **Static membership** (KIP-345): pass a stable `group_instance_id` on `JoinGroup` and a
+- **Static membership**: pass a stable `group_instance_id` on `JoinGroup` and a
   restarting member reclaims its own slot instead of triggering a rebalance — it keeps its
   existing member id and the group's generation does not advance. Use it for consumers with
   stable identity (a StatefulSet pod, a named worker); omit it and the member is dynamic,
@@ -405,10 +405,8 @@ authors for that topic. Your batches are still stored as you sent them.
 - **Every record must have a key.** A produce to a `cleanup.policy=compact` topic
   containing a record with a null key is **rejected** — a keyless record can never be
   superseded and can never be compacted away, so it would sit in the log forever and
-  surface later as unexplained growth. Kafka rejects the same case
-  (`InvalidRecordException`, "Compacted topic cannot accept message without key").
-- **Tombstones are null-valued records**, matching Kafka exactly: `value_len == -1` in the
-  record encoding. A record with a **present but empty** value (`value_len == 0`) is an
+  surface later as unexplained growth. Such a produce is rejected outright.
+- **Tombstones are null-valued records**: `value_len == -1` in the record encoding. A record with a **present but empty** value (`value_len == 0`) is an
   ordinary record and does *not* delete anything.
 
   > If you are porting from an older Bifrox note: there is no string-parsing rule here.
@@ -420,7 +418,7 @@ authors for that topic. Your batches are still stored as you sent them.
 - **Keys are compared byte-for-byte.** The broker never parses a payload looking for a key
   — it uses the key field you wrote.
 - **`delete.retention.ms`** (default 24h) controls how long a tombstone is kept as the
-  latest record for its key — matching Kafka, this exists so slow/lagging consumers still
+  latest record for its key —, this exists so slow/lagging consumers still
   get a chance to observe the delete before it's fully purged. Once a tombstone is older
   than this, the next compaction pass erases the key entirely, including the tombstone
   itself. `0` (or a very small value) purges tombstones on the next compaction tick.
@@ -437,7 +435,7 @@ authors for that topic. Your batches are still stored as you sent them.
 - `UpsertScramUser`
 - `DeleteScramUser`
 
-### Share groups (queue-style consumption, KIP-932-like)
+### Share groups (queue-style consumption-like)
 
 Share groups are Bifrox's cooperative "queue" consumption model: any member of the group
 can be handed any available record from a partition (no per-consumer partition ownership,
