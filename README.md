@@ -4,7 +4,7 @@
 
 **A distributed event streaming broker, written in Rust.**
 
-Kafka's semantics — partitioned append-only logs, consumer groups, exactly-once
+Queue's semantics — partitioned append-only logs, consumer groups, exactly-once
 transactions, log compaction — on a small, auditable codebase and a protocol designed to
 be implemented, not reverse-engineered.
 
