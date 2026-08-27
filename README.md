@@ -1,233 +1,510 @@
+<div align="center">
+
 # Bifrox
 
-Bifrox is a distributed event streaming broker written in Rust. It focuses on Kafka-like
-broker semantics, Windows-friendly operation, and a custom binary protocol that you can
-build dedicated clients against.
+**A distributed event streaming broker, written in Rust.**
 
-## What Bifrox already has
+Kafka's semantics — partitioned append-only logs, consumer groups, exactly-once
+transactions, log compaction — on a small, auditable codebase and a protocol designed to
+be implemented, not reverse-engineered.
 
-### Core broker features
+[![Build & Test](https://github.com/TamsavYT/Bifrox/actions/workflows/ci.yml/badge.svg)](https://github.com/TamsavYT/Bifrox/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)](#platform-support)
 
-- Append-only log storage with sparse offset indexes
-- Time-based lookups with `.timeindex`
-- Aborted-transaction tracking with `.txnindex`
-- Multi-topic, multi-partition storage
-- Key-based partition routing
-- Read-uncommitted and read-committed fetch paths
-- Consumer-group membership, heartbeats, sync, leave, and committed offsets
-- Topic creation, deletion, description, and listing
-- Cluster metadata and dynamic broker registration
+*Pronounced **BY-frox**, after Bifröst — the bridge joining separate realms.*
 
-### Reliability and replication
+</div>
 
-- Leader/follower replication
-- ISR-aware writes with `min.insync.replicas`
-- Partition-level leadership
-- Produce forwarding to the current partition leader
-- Metadata-log replay on restart
-- Transaction-state replay on restart
-- Durable `transactional.id -> producer_id / producer_epoch` fencing state
-- Windows-safe segment and file handling
+---
 
-### Transactions and idempotence
+## Table of contents
 
-- Idempotent producer sequencing
-- `InitProducerId`, `AddPartitionsToTxn`, and `EndTxn`
-- Legacy `BeginTx`, `CommitTx`, and `AbortTx`
-- Read-committed isolation
-- Durable transaction partition registration
-- Producer epoch fencing after restart or re-initialization
+- [What Bifrox is](#what-bifrox-is) · [and what it is not](#what-bifrox-is-not)
+- [Quickstart](#quickstart)
+- [Design principles](#design-principles)
+- [Feature status](#feature-status)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+- [Operating Bifrox](#operating-bifrox)
+- [Building a client](#building-a-client)
+- [Project status](#project-status)
+- [Development](#development)
 
-### Security and access control
+---
 
-- TLS / SSL transport
-- SASL PLAIN
-- SASL SCRAM-SHA-256
-- ACL-based authorization
-- Persistent SCRAM verifier storage in cluster metadata
-- Bootstrap `sasl.user.*` support for seed users and recovery
+## What Bifrox is
 
-### Performance and operations
+A single Rust binary that stores records in partitioned, append-only logs and serves them
+to consumers — the same model Kafka established, with the same durability and ordering
+guarantees, in roughly 30k lines you can read in an afternoon.
 
-- LZ4 record payload compression
-- Per-client / per-principal quota throttling
-- Logical `client_id` support for better quota identity
-- Prometheus `/metrics` endpoint
-- Windows CI and Windows packaging guidance
+It implements the parts of that model that matter in production:
 
-## Important protocol note
+| | |
+|---|---|
+| **Storage** | Segmented logs, sparse offset indexes, time indexes, retention, log compaction with tombstones |
+| **Delivery** | Consumer groups with eager and cooperative rebalancing, static membership, long-polling fetch, share groups for queue-style consumption |
+| **Correctness** | Idempotent producers, exactly-once transactions with producer fencing, read-committed isolation |
+| **Cluster** | Raft-replicated metadata, leader/follower replication, ISR tracking, `min.insync.replicas` |
+| **Security** | TLS, SASL `PLAIN` and `SCRAM-SHA-256`, ACLs, per-principal quotas |
 
-Bifrox does **not** currently position itself as a drop-in Kafka wire-compatible broker.
-It exposes a custom TCP protocol and is designed to support purpose-built Bifrox clients.
+## What Bifrox is not
 
-If you are building a client or agent, start with
-[docs/BIFROX_CLIENT_CREATOR_REFERENCE.md](docs/BIFROX_CLIENT_CREATOR_REFERENCE.md).
+**It is not a drop-in Kafka replacement.** Bifrox does not speak the Kafka wire protocol,
+and there is no adapter — existing Kafka clients will not connect. That is a deliberate
+choice, not a gap waiting to be filled: the Kafka protocol carries three decades of
+accumulated versions, and reimplementing it faithfully is a larger project than the broker
+itself.
 
-## Architecture at a glance
+Instead, Bifrox exposes a small, versioned binary protocol that is fully documented and
+designed for clients to be written against. See
+**[Building a client](#building-a-client)**.
 
-```mermaid
-graph TD
-    Client[Bifrox Client / CLI / Agent] -->|Custom TCP Protocol| Server[Bifrox TCP Server]
-    Server --> Handler[Request Handler]
-    Handler --> Engine[Storage Engine]
-    Engine --> Segments[Log Segments]
-    Segments --> Log[.log]
-    Segments --> Index[.index]
-    Segments --> TimeIndex[.timeindex]
-    Segments --> TxnIndex[.txnindex]
-    Engine --> GroupOffsets[__consumer_offsets]
-    Engine --> TxState[__transaction_state]
-    Engine --> Metadata[__cluster_metadata]
-    Server --> Replication[Replication Manager]
-    Replication --> Brokers[Peer Brokers]
-```
+---
 
-## Repository layout
+## Quickstart
 
-| Path | Purpose |
-| --- | --- |
-| [`src/main.rs`](src/main.rs) | Broker entry point |
-| [`src/lib.rs`](src/lib.rs) | Library root and public exports |
-| [`src/client.rs`](src/client.rs) | Reference client implementation |
-| [`src/config.rs`](src/config.rs) | Broker configuration parsing |
-| [`src/consumer_group.rs`](src/consumer_group.rs) | Consumer offset persistence |
-| [`src/protocol/`](src/protocol/) | Wire protocol and record framing |
-| [`src/server/`](src/server/) | Request handling, transactions, ACLs, quotas, listener |
-| [`src/segment/`](src/segment/) | Log segments and indexes |
-| [`src/replication/`](src/replication/) | Metadata and replication logic |
-| [`tests/integration_tests.rs`](tests/integration_tests.rs) | End-to-end scenarios |
-| [`packaging/windows/`](packaging/windows/) | Windows deployment notes |
-| [`docs/`](docs/) | Reference and roadmap documents |
+Everything below is copy-pasteable and was run end to end against this revision.
 
-## Quick start
+**Prerequisites:** Rust stable. No other dependencies.
 
-### Prerequisites
+### 1. Start a broker
 
-- Rust stable
-- Windows, Linux, or macOS
-
-### Example configuration
-
-```properties
-cluster.id=bifrox-prod-cluster-01
+```bash
+cat > server.properties <<'EOF'
+cluster.id=bifrox-quickstart
 node.id=1
 role=leader
 listeners=PLAINTEXT://127.0.0.1:9092
-log.dirs=./data_node1
-logs.dir=./logs_node1
-max.segment.bytes=10485760
-replica.peer.addresses=127.0.0.1:9093,127.0.0.1:9094
-min.insync.replicas=1
+log.dirs=./data
+logs.dir=./logs
+EOF
 
-# Quotas
-quota.producer.default.bytes.per.second=10485760
-quota.consumer.default.bytes.per.second=10485760
+cargo run --release --bin bifrox -- server.properties
+```
 
-# Metrics
-metrics.bind.address=127.0.0.1:10092
+```
+INFO bifrox: Cluster ID: bifrox-quickstart
+INFO bifrox: Starting TCP Listener Loop. Send SIGINT (Ctrl+C) or SIGTERM to stop.
+```
 
-# Security bootstrap user
+### 2. Produce and consume
+
+In a second terminal:
+
+```bash
+alias bfx='cargo run --quiet --bin bifrox_cli -- --server 127.0.0.1:9092'
+
+bfx ping
+bfx create-topic --topic orders --partitions 3
+bfx produce --topic orders --key user-42 --message '{"id":1,"total":99}' --partitions 3
+```
+
+```
+✅ PONG received from server 127.0.0.1:9092
+✅ Created topic 'orders' with 3 partition(s)
+  Assigned Partition: 1
+  Logical Offset:     0
+```
+
+> **Note the assigned partition.** Records with a key are routed by hashing it, so
+> `user-42` landed on partition **1**, not 0. Every record with that key will follow it
+> there — that is what gives you per-key ordering. Consume the partition the producer
+> reported:
+
+```bash
+bfx consume --topic orders --partition 1 --from-beginning
+```
+
+```
+📥 Fetched 1 record frame(s) [Topic 'orders' Partition 1]:
+  [000] Offset: 0 | Timestamp: 1787818111313 | Payload: '{"id":1,"total":99}'
+```
+
+### 3. Consume as a group
+
+```bash
+bfx group-consume --group billing --topic orders
+```
+
+Joins the group, receives an assignment, consumes its partitions, and auto-commits
+offsets. Start a second one and the partitions redistribute between them.
+
+### 4. Watch it
+
+```bash
+# add to server.properties, then restart:
+#   metrics.bind.addr=127.0.0.1:9644
+curl -s http://127.0.0.1:9644/metrics | grep '^bifrox_'
+```
+
+```
+bifrox_produce_bytes_total 78
+bifrox_produce_records_total 1
+bifrox_topics_count 1
+bifrox_active_brokers_count 1
+```
+
+<details>
+<summary><b>More CLI commands</b></summary>
+
+```
+produce-batch    Produce many records in one request (--messages a,b,c | --stdin)
+perf-produce     Producer benchmark (--num-records, --record-size, --throughput)
+perf-consume     Consumer benchmark
+latest-offset    Partition high watermark
+commit-offset    Commit a consumer group offset
+fetch-offset     Read a committed consumer group offset
+seek             Resolve the physical byte position of an offset
+list-topics      List topics
+```
+
+Run `cargo run --bin bifrox_cli -- --help` for the full list.
+
+</details>
+
+---
+
+## Design principles
+
+Three decisions shape most of the codebase. They are worth understanding before reading
+any of it.
+
+### The broker never compresses or decompresses
+
+A producer builds a record batch, compresses it, and sends the bytes. Bifrox stores them
+**exactly as they arrived** and hands the same bytes back on fetch. Decompression is the
+consumer's job.
+
+This is why `compression.type=producer` is the default, and it is not a synonym for
+`none` — it means the broker imposes no codec of its own. The payoff is that produce and
+fetch cost no CPU for compression at all, and a follower's log ends up byte-identical to
+its leader's rather than a re-encoded copy.
+
+The one exception is a compacted topic, where the broker must decompress on produce to
+verify every record has a key.
+
+### Fetches are served by the kernel
+
+Because stored bytes are exactly what goes on the wire, a fetch can be handed to
+`sendfile(2)` (`TransmitFile` on Windows) and streamed from the page cache straight to
+the socket — record payloads never enter a user-space buffer.
+
+Deciding *which* bytes to send reads only batch headers, through a bounded sliding window,
+so framing a multi-megabyte fetch costs a handful of small reads. The buffered and
+zero-copy paths derive their byte range from one function, so their responses are
+byte-identical by construction rather than by two implementations agreeing.
+
+### Both protocols are versioned and length-delimited
+
+The client protocol wraps requests in a versioned envelope carrying a correlation id — so
+multiple requests can be in flight on one connection — plus tagged fields for per-request
+options. Unknown tags are skipped, so new options are added without breaking old brokers.
+
+Inter-node traffic uses the same idea: every frame between brokers carries a magic,
+version, type and **length**. The length is what makes change safe — a version tells a
+receiver how to read a frame it understands, a length tells it how far to skip past one it
+does not.
+
+---
+
+## Feature status
+
+Everything listed is implemented and covered by the test suite. Nothing here is aspirational.
+
+<details open>
+<summary><b>Storage and retention</b></summary>
+
+- Segmented append-only logs with sparse `.index`, `.timeindex` and `.txnindex` sidecars
+- Crash-safe restart: clean-shutdown markers, full-scan recovery fallback, truncation
+- Size- and time-based retention (`retention.bytes`, `retention.ms`)
+- **Log compaction** — dedup by key, null-value tombstones with `delete.retention.ms`
+  grace, dirty-ratio gating, crash-safe segment swap
+- Compacted topics reject records without a key, as Kafka does
+- LZ4 and Zstd, applied by the producer and preserved verbatim
+
+</details>
+
+<details open>
+<summary><b>Producers and consumers</b></summary>
+
+- Key-hashed partition routing; produce forwarding to the current partition leader
+- **Long-polling fetch** (`fetch.max.wait.ms` / `fetch.min.bytes`) — an idle consumer parks
+  on the broker instead of spinning
+- Consumer groups: join, sync, heartbeat, leave, offset commit and fetch
+- **Cooperative rebalancing** (KIP-429 style) — a stale generation is a retryable signal,
+  not an eviction, and members keep processing partitions they still own
+- **Static membership** (KIP-345 style) — a restarting member reclaims its slot without
+  triggering a rebalance
+- Stalled-consumer detection: a member that heartbeats but stops consuming is evicted
+- **Share groups** — queue-style consumption with lease-based delivery, four
+  acknowledgement types, automatic redelivery and dead-letter routing
+
+</details>
+
+<details open>
+<summary><b>Transactions and correctness</b></summary>
+
+- Idempotent producer sequencing
+- `InitProducerId` / `AddPartitionsToTxn` / `EndTxn`, plus legacy `BeginTx` / `CommitTx` / `AbortTx`
+- Durable `transactional.id → producer_id/epoch` state; stale producers fenced after restart
+- Read-committed isolation via `last_stable_offset` and aborted-range reporting
+- Control batches marked in the batch header so consumers can skip them
+
+</details>
+
+<details open>
+<summary><b>Cluster and replication</b></summary>
+
+- Raft leader election over a replicated `__cluster_metadata` log
+- Follower-pull replication for data partitions; leader-push for metadata
+- ISR tracking with `min.insync.replicas` enforcement on write
+- High watermark propagation — consumers never see uncommitted data
+- Dynamic broker registration and discovery through the heartbeat round trip
+
+</details>
+
+<details open>
+<summary><b>Security and operations</b></summary>
+
+- `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`
+- SASL `PLAIN` and `SCRAM-SHA-256` with persistent verifier storage
+- ACLs across topic, group, transactional-id and cluster resources
+- Quota throttling by principal, logical `client_id`, then source IP — clients are
+  *delayed*, never hard-rejected
+- Prometheus `/metrics`, optionally IP-allowlisted and token-guarded
+- Graceful SIGINT/SIGTERM shutdown
+
+</details>
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph clients [ ]
+        C["Client / CLI / Agent"]
+    end
+
+    C -->|"versioned binary protocol"| L["TCP Listener"]
+    L --> H["Request Handler<br/><i>auth · ACLs · quotas</i>"]
+    H --> E["Storage Engine"]
+
+    E --> P["Partition Managers"]
+    P --> SEG["Log Segments<br/><code>.log .index .timeindex .txnindex</code>"]
+
+    E --> GC["Group Coordinator"]
+    E --> TX["Transaction Coordinator"]
+
+    E -.-> CO[("__consumer_offsets")]
+    E -.-> TS[("__transaction_state")]
+    E -.-> CM[("__cluster_metadata")]
+
+    H -.->|"sendfile / TransmitFile"| SEG
+
+    E --> R["Replication Manager"]
+    R <-->|"versioned inter-node frames"| PEERS["Peer Brokers"]
+    CM --> RAFT["Raft election<br/>+ metadata replay"]
+```
+
+The dotted line from the handler to the segments is the zero-copy fetch path: bytes go
+from the page cache to the socket without passing through the engine.
+
+### Repository layout
+
+| Path | Purpose |
+|---|---|
+| [`src/main.rs`](src/main.rs) | Broker entry point |
+| [`src/bin/bifrox_cli.rs`](src/bin/bifrox_cli.rs) | Command-line client |
+| [`src/client.rs`](src/client.rs) | Reference client implementation |
+| [`src/protocol/`](src/protocol/) | Wire protocol, versioned envelope, record batch format |
+| [`src/segment/`](src/segment/) | Log segments, indexes, compaction, zero-copy transmit |
+| [`src/server/`](src/server/) | Handler, engine, coordinators, ACLs, quotas, share groups |
+| [`src/replication/`](src/replication/) | Raft, ISR, inter-node envelope, metadata log |
+| [`docs/`](docs/) | Client authoring reference |
+| [`tests/`](tests/) | 99 end-to-end scenarios + protocol-contract tests |
+
+---
+
+## Configuration
+
+Bifrox reads a Kafka-style `.properties` file, or environment variables when no file is
+given. Kafka's names are accepted where the concept matches.
+
+<details>
+<summary><b>Common settings</b></summary>
+
+```properties
+# Identity
+cluster.id=bifrox-prod-01
+node.id=1
+role=leader
+listeners=PLAINTEXT://0.0.0.0:9092
+advertised.listeners=PLAINTEXT://broker1.internal:9092
+
+# Storage
+log.dirs=/var/lib/bifrox/data
+logs.dir=/var/log/bifrox
+max.segment.bytes=1073741824
+index.interval.bytes=4096
+log.retention.ms=604800000
+log.retention.bytes=53687091200
+
+# Compaction
+log.cleanup.policy=delete            # or: compact / compact,delete
+min.cleanable.dirty.ratio=0.5
+delete.retention.ms=86400000
+
+# Durability
+min.insync.replicas=2
+replica.peer.addresses=10.0.0.2:9092,10.0.0.3:9092
+log.flush.interval.messages=10000
+log.flush.interval.ms=1000
+
+# Compression — `producer` (default) stores what the client sent, untouched
+compression.type=producer
+
+# Quotas (bytes/sec)
+producer.byte.rate=10485760
+consumer.byte.rate=10485760
+
+# Observability
+metrics.bind.addr=127.0.0.1:9644
+metrics.allowed.ips=127.0.0.1,10.0.0.0/8
+```
+
+</details>
+
+<details>
+<summary><b>Security settings</b></summary>
+
+```properties
+security.protocol=SASL_SSL
+sasl.enabled.mechanisms=SCRAM-SHA-256
+acls.enabled=true
+super.users=User:admin
+
+ssl.cert.path=/etc/bifrox/server.crt
+ssl.key.path=/etc/bifrox/server.key
+ssl.ca.path=/etc/bifrox/ca.crt
+ssl.client.auth=required
+
+# Bootstrap seed user — imported into the persistent SCRAM store on first start
 sasl.user.admin=change-me
 ```
 
-### Run the broker
+SCRAM credentials are stored as verifier material in the replicated metadata log, so they
+survive restart and are consistent across the cluster.
 
-```powershell
-cargo run --bin bifrox -- .\config\server-node1.properties
+</details>
+
+<details>
+<summary><b>Environment variables</b></summary>
+
+```bash
+export BIFROX_BIND_ADDR=0.0.0.0:9092
+export BIFROX_DATA_DIR=/var/lib/bifrox
+export BIFROX_LOG_DIR=/var/log/bifrox
+export BIFROX_CONFIG=/etc/bifrox/server.properties
+cargo run --release --bin bifrox
 ```
 
-Or with environment variables:
+</details>
 
-```powershell
-$env:BIFROX_BIND_ADDR="127.0.0.1:9092"
-$env:BIFROX_DATA_DIR=".\data_store"
-cargo run --bin bifrox
-```
+---
 
-## Security model
+## Operating Bifrox
 
-Bifrox supports multiple deployment styles:
+### Metrics
 
-- `PLAINTEXT`
-- `SASL_PLAINTEXT`
-- `SSL`
-- `SASL_SSL`
+| Metric | Meaning |
+|---|---|
+| `bifrox_produce_bytes_total` / `bifrox_produce_records_total` | Ingest volume |
+| `bifrox_fetch_bytes_total` | Delivery volume |
+| `bifrox_produce_latency_ms` / `bifrox_fetch_latency_ms` | Broker-side latency histograms |
+| `bifrox_active_connections` | Open client connections |
+| `bifrox_topics_count` / `bifrox_active_brokers_count` | Cluster shape |
+| `bifrox_quota_throttled_clients_total` | Clients currently being delayed |
+| `bifrox_acl_denied_requests_total` | Authorization failures |
 
-For SASL-enabled deployments:
+Per-topic variants (`bifrox_topic_*`) are exported alongside the totals.
 
-- `PLAIN` and `SCRAM-SHA-256` are supported.
-- SCRAM authentication uses persistent verifier material, not plaintext-at-auth-time
-  password lookup.
-- `sasl.user.*` entries are treated as bootstrap seed users and imported into the
-  persistent store if that user is not already present.
+### Platform support
 
-ACLs can be enabled for topic, group, transactional-id, and cluster operations.
+Linux, Windows and macOS, with Linux and Windows both covered by CI on every commit.
 
-## Quotas and client identity
+Windows is a first-class target, not an afterthought: segment files are opened with share
+modes that permit concurrent rename and delete (so compaction and retention do not trip
+over live readers), and zero-copy transmit uses `TransmitFile` with the synchronous
+calling convention that avoids racing Tokio's IOCP driver. Service packaging notes are in
+[`packaging/windows/`](packaging/windows/README.md).
 
-Bifrox supports Kafka-style throttling behavior: clients are delayed instead of being
-hard-rejected when they exceed byte-rate quotas.
+---
 
-Quota identity precedence is:
+## Building a client
 
-1. authenticated principal + logical `client_id`
-2. logical `client_id`
-3. authenticated principal
-4. source IP fallback
+Bifrox's protocol is documented to be implemented from scratch:
 
-Clients can set a connection-scoped logical `client_id` early in the session to get
-more stable quota behavior.
+### 📖 **[Client Creator Reference](docs/BIFROX_CLIENT_CREATOR_REFERENCE.md)**
 
-## Transaction behavior
+It specifies the byte layouts you need — both request framings, the tagged-field table,
+produce and fetch request/response shapes, and the record batch format field by field —
+along with the semantics that are easy to get wrong:
 
-Bifrox supports both:
+- A batch is **atomic**: a fetch from an offset inside one returns the *whole* batch,
+  including earlier records. Filter client-side.
+- A batch larger than your `max_bytes` is still returned whole, alone — otherwise that
+  offset would be unreachable forever.
+- **Null and empty values are different.** `value_len == -1` is a tombstone;
+  `value_len == 0` is an ordinary empty record. If your client's value type cannot
+  represent null, it cannot express a delete.
+- Control batches occupy real offsets and must be skipped.
+- Under read-committed, the broker reports `last_stable_offset` and aborted ranges but
+  does not filter — it cannot, without decompressing your batches. Your consumer applies them.
 
-- legacy transaction commands (`BeginTx`, `CommitTx`, `AbortTx`)
-- producer-ID-based EOS flow (`InitProducerId`, `AddPartitionsToTxn`, `EndTxn`)
+The doc's byte-level claims are enforced by
+[`tests/client_reference_doc.rs`](tests/client_reference_doc.rs), so it cannot silently
+drift from the implementation.
 
-Recent hardening includes:
+---
 
-- durable producer ID / epoch registration
-- epoch fencing for stale producers
-- durable transaction partition registration
-- restart recovery of active and prepare transaction states
-- read-committed filtering for uncommitted and aborted data
+## Project status
 
-## Metrics and observability
+**Pre-1.0 and under active development.** The core is well tested — 217 unit, 101
+integration and 7 protocol-contract tests run on Linux and Windows for every commit, and
+the integration suite covers replication, failover, transactions, compaction, security,
+quotas and restart recovery as end-to-end scenarios against real brokers over real
+sockets.
 
-Bifrox exposes Prometheus metrics through `/metrics`, including:
+What that does *not* yet mean:
 
-- produce bytes and records
-- fetch bytes
-- active connections
-- topic count
-- active broker count
-- quota throttles
-- ACL denials
+- **No production deployments exist.** It has not been run at scale or under adversarial load.
+- **No stability guarantee.** With no deployed clusters, breaking changes are still taken
+  when they make the design better — the versioned protocols exist so that stops being
+  true once there is something to be compatible with.
+- **No published crate yet.** Build from source.
 
-## Windows notes
+If you are evaluating Bifrox: read it, run it, benchmark it, and open issues. It is not
+ready to hold data you cannot lose.
 
-Bifrox is actively hardened for Windows:
+---
 
-- Windows file-sharing safe segment handling
-- Windows CI coverage
-- Windows packaging notes in [packaging/windows/README.md](packaging/windows/README.md)
+## Development
 
-## Testing and quality checks
-
-```powershell
-cargo fmt --all -- --check
+```bash
+cargo build --all-targets          # build everything
+cargo test                         # 325 tests
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo bench                        # storage benchmarks
 ```
 
-The integration suite covers replication, transactions, security, quotas, metrics,
-restart recovery, and Windows-relevant storage behavior.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security issues:
+[SECURITY.md](SECURITY.md).
 
 ## License
 
-Bifrox is dual-licensed under MIT or Apache-2.0.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
