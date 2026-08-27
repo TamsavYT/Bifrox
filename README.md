@@ -37,8 +37,8 @@ be implemented, not reverse-engineered.
 ## What Bifrox is
 
 A single Rust binary that stores records in partitioned, append-only logs and serves them
-to consumers — the same model Kafka established, with the same durability and ordering
-guarantees, in roughly 30k lines you can read in an afternoon.
+to consumers, with strict per-partition ordering and durability backed by replication —
+in roughly 30k lines you can read in an afternoon.
 
 It implements the parts of that model that matter in production:
 
@@ -52,14 +52,14 @@ It implements the parts of that model that matter in production:
 
 ## What Bifrox is not
 
-**It is not a drop-in Kafka replacement.** Bifrox does not speak the Kafka wire protocol,
-and there is no adapter — existing Kafka clients will not connect. That is a deliberate
-choice, not a gap waiting to be filled: the Kafka protocol carries three decades of
-accumulated versions, and reimplementing it faithfully is a larger project than the broker
-itself.
+**It is not a drop-in replacement for an existing broker.** Bifrox speaks only its own
+protocol, and there is no compatibility adapter — a client written for another system will
+not connect. That is a deliberate choice, not a gap waiting to be filled: mature streaming
+protocols carry decades of accumulated versions, and reimplementing one faithfully is a
+larger project than this broker itself.
 
-Instead, Bifrox exposes a small, versioned binary protocol that is fully documented and
-designed for clients to be written against. See
+What Bifrox offers instead is a small, versioned binary protocol that is fully documented
+and designed for clients to be written against. See
 **[Building a client](#building-a-client)**.
 
 ---
@@ -222,7 +222,7 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 - Size- and time-based retention (`retention.bytes`, `retention.ms`)
 - **Log compaction** — dedup by key, null-value tombstones with `delete.retention.ms`
   grace, dirty-ratio gating, crash-safe segment swap
-- Compacted topics reject records without a key, as Kafka does
+- Compacted topics reject records without a key, by design
 - LZ4 and Zstd, applied by the producer and preserved verbatim
 
 </details>
@@ -234,9 +234,11 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 - **Long-polling fetch** (`fetch.max.wait.ms` / `fetch.min.bytes`) — an idle consumer parks
   on the broker instead of spinning
 - Consumer groups: join, sync, heartbeat, leave, offset commit and fetch
-- **Cooperative rebalancing** (KIP-429 style) — a stale generation is a retryable signal,
+- **Assignment strategies** — range, round-robin, sticky and cooperative-sticky,
+  negotiated across the group from each member's preference list
+- **Cooperative rebalancing** — a stale generation is a retryable signal,
   not an eviction, and members keep processing partitions they still own
-- **Static membership** (KIP-345 style) — a restarting member reclaims its slot without
+- **Static membership** — a restarting member reclaims its slot without
   triggering a rebalance
 - Stalled-consumer detection: a member that heartbeats but stops consuming is evicted
 - **Share groups** — queue-style consumption with lease-based delivery, four
@@ -260,6 +262,8 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 
 - Raft leader election over a replicated `__cluster_metadata` log
 - Follower-pull replication for data partitions; leader-push for metadata
+- **Follower fetch** — any node holding a replica of a partition can serve a consumer's
+  fetch, not only its leader
 - ISR tracking with `min.insync.replicas` enforcement on write
 - High watermark propagation — consumers never see uncommitted data
 - Dynamic broker registration and discovery through the heartbeat round trip
@@ -299,8 +303,8 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 
 ## Configuration
 
-Bifrox reads a Kafka-style `.properties` file, or environment variables when no file is
-given. Kafka's names are accepted where the concept matches.
+Bifrox reads a `.properties` file, or environment variables when no file is
+given. Conventional broker config names are accepted where the concept matches.
 
 <details>
 <summary><b>Common settings</b></summary>

@@ -77,7 +77,7 @@ impl LatencyHistogram {
     }
 }
 
-/// Per-topic produce/fetch counters (Kafka-style per-topic metric dimensions).
+/// Per-topic produce/fetch counters (per-topic metric dimensions).
 #[derive(Debug, Default)]
 struct TopicMetrics {
     produce_bytes_total: AtomicU64,

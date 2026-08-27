@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 
-/// Kafka Resource Types
+/// Resource Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ResourceType {
@@ -27,7 +27,7 @@ impl From<u8> for ResourceType {
     }
 }
 
-/// Kafka Resource Pattern Types
+/// Resource Pattern Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ResourcePatternType {
@@ -50,7 +50,7 @@ impl From<u8> for ResourcePatternType {
     }
 }
 
-/// Kafka ACL Operations
+/// ACL Operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AclOperation {
@@ -89,7 +89,7 @@ impl From<u8> for AclOperation {
     }
 }
 
-/// Kafka ACL Permission Types
+/// ACL Permission Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AclPermissionType {
@@ -126,7 +126,7 @@ pub struct AclBinding {
     pub permission_type: u8,
 }
 
-/// Persistent in-memory ACL Manager enforcing Kafka Access Control Lists.
+/// Persistent in-memory ACL Manager enforcing Access Control Lists.
 ///
 /// Bindings are split into two `DashMap`s rather than one global `RwLock<HashSet<_>>`:
 /// - `literal`, keyed by `(resource_type, resource_name)`, holds `Literal`-pattern
@@ -263,7 +263,7 @@ impl AclManager {
         out
     }
 
-    /// Kafka ACL Authorization Check Algorithm
+    /// ACL Authorization Check Algorithm
     #[allow(clippy::too_many_arguments)]
     pub fn authorize(
         &self,
@@ -285,7 +285,7 @@ impl AclManager {
         }
 
         if self.is_empty() {
-            // Kafka ACL Security Standard: When ACL enforcement is enabled (`acls_enabled = true`),
+            // When ACL enforcement is enabled (`acls_enabled = true`),
             // default to DENY for User:ANONYMOUS unless superuser or explicit allow rules exist.
             return super_users.iter().any(|u| u == principal);
         }
@@ -374,7 +374,7 @@ impl AclManager {
                 }
             }
             ResourcePatternType::Match | ResourcePatternType::Any => {
-                // Kafka's MATCH pattern type: `rule.resource_name` may contain `*` as a
+                // MATCH pattern type: `rule.resource_name` may contain `*` as a
                 // wildcard matching any run of characters (anywhere in the pattern, not
                 // just as a suffix) — e.g. `"orders-*-eu"` matches `"orders-42-eu"`. A
                 // bare `"*"` (or an `Any` pattern type) matches everything, same as today.
@@ -572,7 +572,7 @@ mod tests {
             "10.1.2.3",
             AclOperation::ClusterAction as u8,
             ResourceType::Cluster as u8,
-            "kafka-cluster",
+            "bifrox-cluster",
             &[],
             true,
         ));
@@ -581,7 +581,7 @@ mod tests {
             "192.168.1.1",
             AclOperation::ClusterAction as u8,
             ResourceType::Cluster as u8,
-            "kafka-cluster",
+            "bifrox-cluster",
             &[],
             true,
         ));

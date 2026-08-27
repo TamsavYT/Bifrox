@@ -135,7 +135,7 @@ pub struct PartitionManager {
     /// Log-end-offset: the next offset to be assigned locally. Bumped synchronously on
     /// every local append (leader produce, replica verbatim-append, control marker).
     log_end_offset: AtomicU64,
-    /// The real Kafka-style high watermark: the highest offset guaranteed replicated to
+    /// The high watermark: the highest offset guaranteed replicated to
     /// a full ISR quorum. Only advanced explicitly (see `advance_committed_hw`) — never
     /// implicitly by an append — so fetch/describe can expose only what's actually
     /// durable across the ISR instead of whatever the leader happens to have on disk.
@@ -380,9 +380,9 @@ impl PartitionManager {
     /// a batch is atomic on disk (`SegmentManager::append_batch`), so a retried produce
     /// can only be recognized as "the whole batch was already durably written" (checked
     /// once, via `base_sequence`) or "the whole batch is new" — there's no such thing as
-    /// writing half of one. This is actually closer to real Kafka's own idempotent-
-    /// producer semantics, which dedups by `(baseSequence, lastSequence)` per batch, than
-    /// the frame path's per-record check is.
+    /// writing half of one. Batch-level dedup by `(base_sequence, last_sequence)` is a
+    /// closer fit for idempotent-producer semantics than the frame path's per-record
+    /// check is.
     #[allow(clippy::too_many_arguments)]
     pub fn produce_batch_eos(&self, batch: RecordBatch) -> IoResult<Result<RecordBatch, u64>> {
         let producer_id = batch.producer_id;
@@ -485,7 +485,7 @@ impl PartitionManager {
     ///
     /// `flush_if_sync_policy` is a no-op under `FlushPolicy::AsyncPeriodic` (the default)
     /// until its time interval or byte threshold is reached, which is the right trade for
-    /// data topics — Kafka's model is that durability comes from replication, not fsync,
+    /// data topics — durability comes from replication, not fsync,
     /// and paying an fsync per produce there would be a large, unrequested performance
     /// regression. `__cluster_metadata` is different: it is low-volume control-plane
     /// traffic (topic/ACL/partition-assignment changes), so an unconditional fsync costs
@@ -777,26 +777,26 @@ impl PartitionManager {
         seg_guard.set_cleanup_policy(policy);
     }
 
-    /// Dynamic per-topic config override (Kafka `compression.type` `AlterConfigs`).
+    /// Dynamic per-topic config override (`compression.type` via `AlterConfigs`).
     pub fn set_compression_codec(&self, codec: crate::config::CompressionCodec) {
         *self.compression_codec.write() = codec;
     }
 
-    /// Dynamic per-topic config override (Kafka `retention.ms` `AlterConfigs`).
+    /// Dynamic per-topic config override (`retention.ms` via `AlterConfigs`).
     /// `None` reverts to no time-based retention for this partition.
     pub fn set_retention_millis(&self, millis: Option<u64>) {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.set_retention_millis(millis);
     }
 
-    /// Dynamic per-topic config override (Kafka `retention.bytes` `AlterConfigs`).
+    /// Dynamic per-topic config override (`retention.bytes` via `AlterConfigs`).
     /// `None` reverts to no size-based retention for this partition.
     pub fn set_retention_bytes(&self, bytes: Option<u64>) {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.set_retention_bytes(bytes);
     }
 
-    /// Dynamic per-topic config override (Kafka `delete.retention.ms` `AlterConfigs`).
+    /// Dynamic per-topic config override (`delete.retention.ms` via `AlterConfigs`).
     /// `None` disables tombstone expiry — tombstones are kept forever, like any other
     /// record, once written.
     pub fn set_delete_retention_millis(&self, millis: Option<u64>) {
@@ -804,7 +804,7 @@ impl PartitionManager {
         seg_guard.set_delete_retention_millis(millis);
     }
 
-    /// Dynamic per-topic config override (Kafka `min.cleanable.dirty.ratio` `AlterConfigs`).
+    /// Dynamic per-topic config override (`min.cleanable.dirty.ratio` via `AlterConfigs`).
     pub fn set_min_cleanable_dirty_ratio(&self, ratio: f64) {
         let mut seg_guard = self.segment_manager.lock();
         seg_guard.set_min_cleanable_dirty_ratio(ratio);

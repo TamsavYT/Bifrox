@@ -93,7 +93,7 @@ pub enum FrameType {
     VoteRequest = 5,
     /// Peer's answer to [`FrameType::VoteRequest`].
     VoteResponse = 6,
-    /// Follower pulls batch bytes from its leader (Kafka-style follower fetch).
+    /// Follower pulls batch bytes from its leader (follower fetch).
     ReplicationFetch = 7,
     /// Leader's answer to [`FrameType::ReplicationFetch`].
     ReplicationFetchResponse = 8,

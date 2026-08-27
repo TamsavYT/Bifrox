@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Kafka-style range assignor: divides `partition_count` partitions evenly across
+/// Range assignor: divides `partition_count` partitions evenly across
 /// `member_ids`, giving the first `partition_count % member_ids.len()` members one extra
 /// partition each so every partition still lands somewhere. Members are sorted first so
 /// every member (and the leader submitting on everyone's behalf) computes the same answer
@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 /// it and every follower has to trust the result without recomputing it.
 ///
 /// Partitions are handed out in contiguous blocks (member 0 gets `[0, k)`, member 1 gets
-/// `[k, 2k)`, ...), matching Kafka's `RangeAssignor` convention rather than an interleaved
+/// `[k, 2k)`, ...), a contiguous-range convention rather than an interleaved
 /// round-robin.
 ///
 /// Every member id passed in is present in the output, even one that lands past the
@@ -49,7 +49,7 @@ pub fn assign_range(partition_count: u32, member_ids: &[String]) -> Vec<(String,
     result
 }
 
-/// Kafka-style round-robin assignor: deals `partition_count` partitions out one at a time
+/// Round-robin assignor: deals `partition_count` partitions out one at a time
 /// across `member_ids`, in order, wrapping back to the first member after the last. Members
 /// are sorted first for the same reason as [`assign_range`] — only the leader runs this, and
 /// every follower has to trust the result without recomputing it, so the answer must be
@@ -84,7 +84,7 @@ pub fn assign_roundrobin(partition_count: u32, member_ids: &[String]) -> Vec<(St
     result
 }
 
-/// Sticky assignor (KIP-54-style, minus the cooperative-protocol half of it): unlike
+/// Sticky assignor (minus the cooperative-protocol half of it): unlike
 /// [`assign_range`] and [`assign_roundrobin`], which derive every member's share purely
 /// from its *position* in a sorted member list, this one takes the group's *previous*
 /// assignment into account so that a membership change moves as few partitions as possible.
@@ -263,7 +263,7 @@ pub enum AssignmentStrategy {
     /// Keeps each member's previous partitions where possible — see [`assign_sticky`].
     Sticky,
     /// Same underlying computation as [`Sticky`](Self::Sticky) — see [`assign_sticky`] —
-    /// but applied incrementally (Kafka's KIP-429): the leader hands out only the
+    /// but applied incrementally (cooperative rebalancing): the leader hands out only the
     /// intersection of a member's current and target partitions in a first round, and
     /// only the partitions that actually have to move go through a revoke-then-reassign
     /// second round. See `GroupConsumer::rejoin`'s leader branch and
@@ -285,7 +285,7 @@ impl AssignmentStrategy {
             "roundrobin" => AssignmentStrategy::RoundRobin,
             "range" => AssignmentStrategy::Range,
             "sticky" => AssignmentStrategy::Sticky,
-            // Kafka's own convention for its cooperative sticky assignor name — matching
+            // The conventional cooperative sticky assignor name — matching
             // it exactly is what lets `ConsumerGroup::is_cooperative`'s "contains
             // cooperative" check recognise a group that negotiated this without any
             // wire-visible change.
@@ -324,7 +324,7 @@ impl AssignmentStrategy {
         }
     }
 
-    /// Whether this strategy is applied incrementally (KIP-429) rather than
+    /// Whether this strategy is applied incrementally rather than
     /// stop-the-world. Only [`CooperativeSticky`](Self::CooperativeSticky) is — `Sticky`
     /// computes the same *target*, per [`assign_sticky`], but still hands it out in one
     /// shot, same as `Range`/`RoundRobin` always have.
@@ -338,7 +338,7 @@ impl AssignmentStrategy {
     }
 }
 
-/// Round one of a cooperative (KIP-429) rebalance: for each member, narrows its freshly
+/// Round one of a cooperative rebalance: for each member, narrows its freshly
 /// computed `target` down to the intersection with what it already owned per
 /// `previous_assignment` — literally `target(m) ∩ previous(m)`, nothing cleverer. A
 /// partition in a member's target that it did not already own itself — whether it's
@@ -392,7 +392,7 @@ pub fn cooperative_round_one(
 pub struct GroupConsumerConfig {
     pub group_id: String,
     pub topic: String,
-    /// `group.instance.id` (KIP-345 static membership). `None` means this member joins
+    /// `group.instance.id` (static membership). `None` means this member joins
     /// dynamically — every process start is a new arrival and the group rebalances around
     /// it. See `TestClient::join_group_static` for what setting this buys.
     pub instance_id: Option<String>,
@@ -461,7 +461,7 @@ impl GroupConsumerConfig {
     /// (`GroupCoordinator::prune_expired_members`), so a heartbeat that lands no more often
     /// than the timeout itself can never land in time. This requires a comfortable margin
     /// rather than merely `<`: `heartbeat_interval <= session_timeout / 3`, the common rule
-    /// of thumb (and Kafka's own default ratio), so a couple of missed or delayed
+    /// of thumb (a common default ratio), so a couple of missed or delayed
     /// heartbeats in a row still don't cost the member its slot. A bad value fails loudly
     /// here rather than being silently clamped into something that happens to work.
     pub fn validate(&self) -> IoResult<()> {
@@ -482,7 +482,7 @@ impl GroupConsumerConfig {
     }
 }
 
-/// A consumer that belongs to a Kafka-style consumer group.
+/// A consumer that belongs to a consumer group.
 ///
 /// Which partitions this consumer reads from `config.topic` comes from the group's
 /// membership and the negotiated assignment — never from a partition number the caller
@@ -659,7 +659,7 @@ impl GroupConsumer {
         // — this is the last moment this member unambiguously owns them, and no one else
         // has been handed them yet. Without it, whoever inherits a partition after this
         // rebalance resumes from a stale commit and re-processes everything this member
-        // already handed back, on every single rebalance. Kafka commits in
+        // already handed back, on every single rebalance. Other systems commit in
         // `onPartitionsRevoked` for the same reason.
         //
         // Best-effort: a rejoin is often triggered by a broken connection in the first

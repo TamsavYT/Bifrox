@@ -202,7 +202,7 @@ pub struct SegmentManager {
     frame_encode_scratch: bytes::BytesMut,
     /// Wall-clock time (ms since epoch) the current active segment became active — either
     /// this `SegmentManager` opening it for the first time or the last `rotate_segment`
-    /// call. Used for `config.segment_ms`-based time rolling (Kafka `segment.ms`):
+    /// call. Used for `config.segment_ms`-based time rolling (`segment.ms`):
     /// low-volume topics that never hit `max_segment_bytes` still get rotated eventually,
     /// so their data becomes eligible for retention/compaction instead of sitting in a
     /// perpetually-active segment forever.
@@ -420,8 +420,8 @@ impl SegmentManager {
         Ok(())
     }
 
-    /// Whether the active segment should be rolled purely due to age (Kafka
-    /// `segment.ms`), independent of `max_segment_bytes`. Never rolls an already-empty
+    /// Whether the active segment should be rolled purely due to age
+    /// (`segment.ms`), independent of `max_segment_bytes`. Never rolls an already-empty
     /// active segment — an idle topic with nothing written yet has nothing to gain from
     /// rotating, and doing so would just churn empty segment files forever.
     fn should_roll_by_time(&self) -> bool {
@@ -731,7 +731,7 @@ impl SegmentManager {
     ///
     /// The control attribute lives in the batch's plaintext header, so a reader recognises
     /// a marker without decoding or decompressing the record — which is what lets
-    /// `fetch_committed` filter them and a consumer skip them. Kafka's control batches work
+    /// `fetch_committed` filter them and a consumer skip them. Control batches work
     /// the same way, and for the same reason: a marker occupies a real offset.
     ///
     /// The record's value keeps the marker's existing encoding,
@@ -848,7 +848,7 @@ impl SegmentManager {
     ///
     /// Sent to read-committed consumers so they can drop aborted records themselves: the
     /// broker cannot filter them out of a compressed batch without decoding it, and it does
-    /// not decode. This is what Kafka's `aborted_transactions` fetch-response field is for.
+    /// not decode. This is what `aborted_transactions` fetch-response field is for.
     pub fn aborted_ranges(&self) -> Vec<(u64, u64)> {
         // Active *and* historical, matching `is_offset_aborted`'s coverage — a consumer
         // reading from an old offset must be told about aborts recorded in rolled segments
@@ -915,8 +915,8 @@ impl SegmentManager {
     ///
     /// An entry is atomic — there is no such thing as decoding "the first part" of a batch
     /// — so a caller whose `start_offset` lands in an entry longer than `max_bytes` must
-    /// still be served it, mirroring Kafka's "return at least one batch even if it exceeds
-    /// the requested budget" rule, rather than being handed nothing for that offset range
+    /// still be served it — the "return at least one batch even if it exceeds the
+    /// requested budget" rule — rather than being handed nothing for that offset range
     /// forever. (`plan_entries_range` applies the same rule to the byte-serving path; this
     /// is the record-decoding `fetch`'s copy of it, which reads into a buffer rather than
     /// planning a range.)
@@ -957,7 +957,7 @@ impl SegmentManager {
     /// Only whole entries are returned. An entry whose offset range *contains*
     /// `start_offset` is included in full — a batch is atomic on disk and cannot be cut in
     /// half — so a caller asking from the middle of a batch receives the whole batch and
-    /// filters it itself, exactly as a Kafka consumer does. Entries that end strictly
+    /// filters it itself. Entries that end strictly
     /// before `start_offset` are skipped.
     ///
     /// Offset ranges are read from each entry's plaintext header (`base_offset` plus
@@ -1022,10 +1022,10 @@ impl SegmentManager {
     /// decompresses one. (It deliberately does not verify batch CRCs either: a CRC
     /// covers the record data, which only the consumer decodes, and checking it here
     /// would mean reading and hashing every byte of every fetch purely to decide where
-    /// entries begin. Kafka frames fetches from batch headers for exactly this reason and
-    /// leaves the CRC to the consumer, which is where a corrupt batch actually surfaces.)
+    /// entries begin. Fetches are framed from batch headers for exactly this reason, and
+    /// the CRC is left to the consumer, which is where a corrupt batch actually surfaces.)
     ///
-    /// The rules, matching Kafka's fetch semantics:
+    /// The rules:
     /// - Only whole entries. An entry whose offset range *contains* `start_offset` is
     ///   returned in full — a batch is atomic on disk and cannot be cut in half — so a
     ///   caller asking from the middle of one receives the whole batch and filters it
@@ -1036,7 +1036,7 @@ impl SegmentManager {
     ///   filtered individually without decoding it, so a batch straddling the bound is
     ///   withheld whole and becomes visible once the bound moves past its last offset.
     /// - `max_bytes` is a budget, except that the first entry is always served whole even
-    ///   when it alone exceeds it — Kafka's "return at least one batch" rule, without
+    ///   when it alone exceeds it — the "return at least one batch" rule, without
     ///   which a record larger than a client's fetch size would stall the log forever.
     ///
     /// The range never spans segments: it is bounded by the segment `start_offset` lands
@@ -1140,22 +1140,22 @@ impl SegmentManager {
         self.config.cleanup_policy = policy;
     }
 
-    /// Dynamic per-topic config override (Kafka `retention.ms`).
+    /// Dynamic per-topic config override (`retention.ms`).
     pub fn set_retention_millis(&mut self, millis: Option<u64>) {
         self.config.retention_millis = millis;
     }
 
-    /// Dynamic per-topic config override (Kafka `retention.bytes`).
+    /// Dynamic per-topic config override (`retention.bytes`).
     pub fn set_retention_bytes(&mut self, bytes: Option<u64>) {
         self.config.retention_bytes = bytes;
     }
 
-    /// Dynamic per-topic config override (Kafka `delete.retention.ms`).
+    /// Dynamic per-topic config override (`delete.retention.ms`).
     pub fn set_delete_retention_millis(&mut self, millis: Option<u64>) {
         self.config.delete_retention_millis = millis;
     }
 
-    /// Dynamic per-topic config override (Kafka `min.cleanable.dirty.ratio`).
+    /// Dynamic per-topic config override (`min.cleanable.dirty.ratio`).
     pub fn set_min_cleanable_dirty_ratio(&mut self, ratio: f64) {
         self.config.min_cleanable_dirty_ratio = ratio;
     }
@@ -1192,11 +1192,11 @@ impl SegmentManager {
     ///
     /// Tombstones (a record whose value is empty — see `extract_key_value`) are kept as
     /// the latest record for their key like any other record, until they've been the
-    /// latest record for at least `config.delete_retention_millis` (Kafka
-    /// `delete.retention.ms`) — at that point the key is purged entirely, including the
+    /// latest record for at least `config.delete_retention_millis`
+    /// (`delete.retention.ms`) — at that point the key is purged entirely, including the
     /// tombstone itself, actually finishing the delete. A historical segment is only
     /// rewritten once the fraction of its bytes that are superseded ("dirty") reaches
-    /// `config.min_cleanable_dirty_ratio` (Kafka `min.cleanable.dirty.ratio`), so segments
+    /// `config.min_cleanable_dirty_ratio` (`min.cleanable.dirty.ratio`), so segments
     /// with only a handful of stale keys aren't rewritten on every GC tick.
     ///
     /// Every scan below reads entries via `SegmentPair::read_all_entries` and
@@ -1252,7 +1252,7 @@ impl SegmentManager {
         // parses a payload looking for one. A record with no key cannot be deduped and is
         // skipped here entirely, so it survives Phase 2 untouched.
         //
-        // A tombstone is a record with a *null* value, matching Kafka. An empty-but-present
+        // A tombstone is a record with a *null* value. An empty-but-present
         // value is an ordinary record, not a delete.
         for pair in &mut self.historical {
             let entries = pair.read_all_entries()?;
@@ -1390,7 +1390,7 @@ impl SegmentManager {
 
                         // Rebuilt as a batch, not flattened into frames: a compacted
                         // segment stays batched and stays compressed in the producer's
-                        // codec, which is what Kafka's cleaner does too. Survivors keep
+                        // codec, which is what a log cleaner does. Survivors keep
                         // their original offsets, so the rebuilt batch has gaps — the
                         // format expresses that, `create_with_offsets` builds it.
                         //
@@ -1673,8 +1673,8 @@ impl SegmentManager {
 
     /// Deletes any historical segment whose entire offset range lies strictly below
     /// `offset` — used after a snapshot durably captures everything up to `offset`, so
-    /// the pre-snapshot log data is no longer needed to reconstruct current state (KRaft-
-    /// style log trimming). A segment is only removed if the NEXT segment's base_offset
+    /// the pre-snapshot log data is no longer needed to reconstruct current state
+    /// (snapshot-style log trimming). A segment is only removed if the NEXT segment's base_offset
     /// (or the active segment's base_offset, for the last historical segment) is `<=
     /// offset`, i.e. this segment contributes nothing at or after the snapshot point.
     pub fn trim_before(&mut self, offset: u64) -> IoResult<usize> {
@@ -1727,7 +1727,7 @@ impl SegmentManager {
     ///
     /// Unlike [`Self::fetch_by_timestamp`], records are **not** filtered to
     /// `timestamp >= target_timestamp` here: doing that would mean decoding, and
-    /// decompressing, every batch. The reader filters instead, exactly as a Kafka consumer
+    /// decompressing, every batch. The reader filters instead, exactly as a consumer
     /// does after resolving an offset through `ListOffsets`. The time index is sparse, so
     /// the returned range can begin slightly before the target.
     pub fn fetch_entries_by_timestamp(

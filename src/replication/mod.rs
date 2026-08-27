@@ -121,8 +121,8 @@ pub struct ReplicationManager {
     replica_watermarks: Arc<DashMap<(String, u32, String), u64>>,
     /// Wall-clock time of the most recent successful replication ACK per
     /// (topic, partition, peer_addr) — the ISR-membership signal: a replica that hasn't
-    /// acked recently is lagging and should be dropped from the ISR (Kafka
-    /// `replica.lag.time.max.ms`), independent of whether it happens to be caught up on
+    /// acked recently is lagging and should be dropped from the ISR
+    /// (`replica.lag.time.max.ms`), independent of whether it happens to be caught up on
     /// the specific offset that triggered the check.
     replica_ack_time: Arc<DashMap<(String, u32, String), std::time::Instant>>,
     /// Data partitions whose last replication push was rejected as stale, with when that

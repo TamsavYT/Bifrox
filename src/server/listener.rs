@@ -128,8 +128,8 @@ impl Server {
         // (or an operator-configured override) now that it's known, and start
         // broadcasting it if this node is the leader — see
         // `StorageEngine::finalize_advertised_addr` for why this can't happen any
-        // earlier. A wildcard/unusable resolved address is a hard failure here (matching
-        // Kafka's refusal to start in the equivalent case) rather than a degrade: binding
+        // earlier. A wildcard/unusable resolved address is a hard failure here — a
+        // refusal to start rather than a degrade: binding
         // is a one-time startup step, so there is no "keep running with the old identity"
         // to fall back to — the old identity was never valid in the first place.
         self.engine

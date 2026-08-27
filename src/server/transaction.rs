@@ -644,7 +644,7 @@ impl TransactionManager {
 
     /// Returns transaction IDs still in a non-terminal state (`Ongoing`, `PrepareCommit`,
     /// or `PrepareAbort`) whose age exceeds `max_age_ms` — both a producer that has simply
-    /// gone silent mid-transaction (Kafka `transaction.timeout.ms`) and, as a special case
+    /// gone silent mid-transaction (`transaction.timeout.ms`) and, as a special case
     /// of the same mechanism, a transaction restored from `__transaction_state` on startup
     /// that no reconnecting producer ever resumed (`created_at_ms` is reset to "now" by
     /// `restore_transaction`, so a restored transaction's clock starts fresh at restart —

@@ -4,7 +4,7 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A node's process role(s) — matches Kafka KRaft's `process.roles` (`controller`,
+/// A node's process role(s) — the `process.roles` setting (`controller`,
 /// `broker`, or `broker,controller`). A node with only `Controller` participates in the
 /// metadata Raft quorum but never hosts data-topic partitions; a node with only `Broker`
 /// hosts data partitions and replicates `__cluster_metadata` as a non-voting observer but
@@ -29,7 +29,7 @@ impl std::str::FromStr for ProcessRole {
 }
 
 /// Parses a comma-separated `process.roles` value (e.g. `"broker,controller"`,
-/// `"controller"`, `"broker"`) the way Kafka's own config does. An empty/unparseable
+/// `"controller"`, `"broker"`) as written in the properties file. An empty/unparseable
 /// value falls back to combined mode (both roles) — the historical Bifrox default,
 /// so existing configs that never set this keep working unchanged.
 pub fn parse_process_roles(s: &str) -> Vec<ProcessRole> {
@@ -122,7 +122,7 @@ impl Default for FlushPolicy {
 /// consumer offsets, transaction state, bootstrap) via `PartitionManager::produce_frame`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionCodec {
-    /// Keep whatever the producer sent, imposing nothing. Kafka's default for
+    /// Keep whatever the producer sent, imposing nothing. The default for
     /// `compression.type`, and the only setting that describes the produce path honestly —
     /// the broker has no codec of its own to apply to a client's batch.
     ///
@@ -176,7 +176,7 @@ impl std::str::FromStr for CompressionCodec {
     }
 }
 
-/// Topic and Server Log Cleanup Policy (Kafka cleanup.policy)
+/// Topic and Server Log Cleanup Policy (cleanup.policy)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CleanupPolicy {
     /// Time/size based retention (old log segments exceeding retention limit are unlinked)
@@ -228,7 +228,7 @@ impl CleanupPolicy {
     }
 }
 
-/// Kafka Security Protocol (Kafka security.protocol)
+/// Security Protocol (security.protocol)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityProtocol {
     #[default]
@@ -264,16 +264,16 @@ impl std::fmt::Display for SecurityProtocol {
     }
 }
 
-/// Engine Configuration Parameters (Kafka-style configuration support)
+/// Engine Configuration Parameters
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Cluster ID for cluster membership verification (Kafka cluster.id)
+    /// Cluster ID for cluster membership verification (cluster.id)
     pub cluster_id: String,
-    /// Cluster Node ID (Kafka broker.id)
+    /// Cluster Node ID (broker.id)
     pub node_id: u32,
     /// Node HA Cluster Role (leader or follower)
     pub role: NodeRole,
-    /// Base directory for storage data logs and indexes (Kafka log.dirs)
+    /// Base directory for storage data logs and indexes (log.dirs)
     pub data_dir: PathBuf,
     /// Maximum byte size for a single log segment file before rotation (default 10MB)
     pub max_segment_bytes: u64,
@@ -283,12 +283,12 @@ pub struct EngineConfig {
     pub flush_policy: FlushPolicy,
     /// Whether to pre-allocate segment files using `set_len` to prevent NTFS fragmentation
     pub preallocate_segments: bool,
-    /// Directory for server diagnostic log files (Kafka log.file.dir)
+    /// Directory for server diagnostic log files (log.file.dir)
     pub log_file_dir: PathBuf,
-    /// Server bind socket address (Kafka listeners)
+    /// Server bind socket address (listeners)
     pub bind_addr: String,
     /// Explicit override for the address this node advertises to peers and clients as
-    /// its own identity (Kafka `advertised.listeners`) — in inter-node heartbeats,
+    /// its own identity (`advertised.listeners`) — in inter-node heartbeats,
     /// heartbeat ACKs, and `BrokerRegister` metadata records. Takes precedence over the
     /// TCP listener's actual bound address when set, which is what makes an address
     /// expressible at all when `bind_addr` is a wildcard host (`0.0.0.0`) or sits behind
@@ -301,7 +301,7 @@ pub struct EngineConfig {
     pub peer_addrs: Vec<String>,
     /// Minimum In-Sync Replicas required for write commits
     pub min_insync_replicas: usize,
-    /// Default replication factor for newly created topics (Kafka default.replication.factor)
+    /// Default replication factor for newly created topics (default.replication.factor)
     pub default_replication_factor: u16,
     /// Log Retention threshold in total bytes per partition (optional)
     pub retention_bytes: Option<u64>,
@@ -309,9 +309,9 @@ pub struct EngineConfig {
     pub retention_millis: Option<u64>,
     /// Interval for running background retention garbage collector
     pub retention_check_interval: Duration,
-    /// Server-default Log Cleanup Policy (Kafka cleanup.policy / log.cleanup.policy)
+    /// Server-default Log Cleanup Policy (cleanup.policy / log.cleanup.policy)
     pub cleanup_policy: CleanupPolicy,
-    /// Kafka Security Protocol (PLAINTEXT, SASL_PLAINTEXT, SSL, SASL_SSL)
+    /// Security Protocol (PLAINTEXT, SASL_PLAINTEXT, SSL, SASL_SSL)
     pub security_protocol: SecurityProtocol,
     /// TLS/SSL X.509 Certificate file path (ssl.keystore.location / ssl.cert.path)
     pub ssl_cert_path: Option<PathBuf>,
@@ -334,15 +334,15 @@ pub struct EngineConfig {
     /// Shared-secret token required from client connections (None = no auth check).
     /// Inter-node peers identified by `peer_addrs` are exempt from this check.
     pub auth_token: Option<String>,
-    /// Default per-client produce byte-rate quota in bytes/sec (Kafka
-    /// `quota.producer.default.bytes.per.second`). `None` = unlimited (default).
+    /// Default per-client produce byte-rate quota in bytes/sec
+    /// (`quota.producer.default.bytes.per.second`). `None` = unlimited (default).
     /// Clients exceeding this rate have their produce response delayed rather than
-    /// rejected, matching Kafka's throttling behavior.
+    /// rejected.
     pub produce_quota_bytes_per_sec: Option<u64>,
-    /// Default per-client fetch byte-rate quota in bytes/sec (Kafka
-    /// `quota.consumer.default.bytes.per.second`). `None` = unlimited (default).
+    /// Default per-client fetch byte-rate quota in bytes/sec
+    /// (`quota.consumer.default.bytes.per.second`). `None` = unlimited (default).
     pub fetch_quota_bytes_per_sec: Option<u64>,
-    /// Compression Codec for Record Batch Storage (Kafka `compression.type`)
+    /// Compression Codec for Record Batch Storage (`compression.type`)
     pub compression_codec: CompressionCodec,
     /// Configurable bind address for Prometheus metrics endpoint (e.g. "0.0.0.0:9090")
     pub metrics_bind_addr: Option<String>,
@@ -351,7 +351,7 @@ pub struct EngineConfig {
     /// Optional network IP whitelist for Prometheus metrics scrape endpoint
     pub metrics_allowed_ips: Vec<String>,
     /// How long a replica may go without acknowledging a replicated write before the
-    /// partition leader drops it from the ISR (Kafka `replica.lag.time.max.ms`).
+    /// partition leader drops it from the ISR (`replica.lag.time.max.ms`).
     pub replica_lag_max_ms: u64,
     /// How often the ISR-membership and broker-liveness sweep runs.
     pub isr_check_interval_ms: u64,
@@ -360,44 +360,44 @@ pub struct EngineConfig {
     /// from the remaining ISR.
     pub broker_down_threshold_ms: u64,
     /// Whether a partition may fail over to a replica outside the last-known ISR when no
-    /// in-sync replica survives a leader's death (Kafka `unclean.leader.election.enable`).
+    /// in-sync replica survives a leader's death (`unclean.leader.election.enable`).
     /// Defaults to false: an unrecoverable partition is left leaderless rather than
     /// silently accepting data loss.
     pub allow_unclean_leader_election: bool,
-    /// This node's process role(s) — Kafka KRaft's `process.roles`. Defaults to both
+    /// This node's process role(s) — `process.roles`. Defaults to both
     /// (combined mode, today's historical behavior).
     pub roles: Vec<ProcessRole>,
     /// The subset of `peer_addrs` that are controller-eligible (participate in the
-    /// metadata Raft quorum) — Kafka's `controller.quorum.voters`. Only meaningful when
+    /// metadata Raft quorum) — `controller.quorum.voters`. Only meaningful when
     /// this node itself has the `Controller` role. Empty means "assume every peer is
     /// controller-eligible", which matches combined-mode clusters where every node votes.
     pub controller_peer_addrs: Vec<String>,
-    /// How long a tombstone (a compacted-topic record whose value is empty — Bifrox's
-    /// convention for a Kafka-style "delete marker") is kept as the latest record for its
-    /// key before log compaction erases the key entirely (Kafka `delete.retention.ms`).
+    /// How long a tombstone (a compacted-topic record whose value is *null* — Bifrox's
+    /// convention for a "delete marker") is kept as the latest record for its
+    /// key before log compaction erases the key entirely (`delete.retention.ms`).
     /// `None` disables tombstone expiry: tombstones are kept forever, same as any other
     /// record, once written (today's behavior).
     pub delete_retention_millis: Option<u64>,
     /// Minimum fraction of a historical segment's bytes that must be "dirty" (superseded
     /// by a newer record for the same key) before log compaction will rewrite that segment
-    /// (Kafka `min.cleanable.dirty.ratio`). Segments below this ratio are left untouched on
+    /// (`min.cleanable.dirty.ratio`). Segments below this ratio are left untouched on
     /// a given compaction pass, avoiding low-value rewrite I/O.
     pub min_cleanable_dirty_ratio: f64,
     /// Maximum number of partitions whose retention/compaction pass may run concurrently
-    /// within a single GC tick (Kafka `log.cleaner.threads`).
+    /// within a single GC tick (`log.cleaner.threads`).
     pub compaction_worker_threads: usize,
     /// Maximum age (ms) of the active segment before it's rolled purely due to time,
-    /// independent of `max_segment_bytes` (Kafka `segment.ms`). `None` disables time-based
+    /// independent of `max_segment_bytes` (`segment.ms`). `None` disables time-based
     /// rolling — a low-volume topic's active segment then only rotates once it hits the
     /// byte threshold, which may be never.
     pub segment_ms: Option<u64>,
-    /// Maximum accepted size (bytes) of a single record payload (Kafka
-    /// `message.max.bytes`). `None` means no explicit limit beyond what already applies
+    /// Maximum accepted size (bytes) of a single record payload
+    /// (`message.max.bytes`). `None` means no explicit limit beyond what already applies
     /// (segment size, wire framing limits).
     pub message_max_bytes: Option<u64>,
-    /// Worker threads dedicated to the Tokio runtime driving network I/O (Kafka
-    /// `num.network.threads`, approximately — Bifrox doesn't separate network/request-
-    /// handling threads the way Kafka does, so this sizes the whole async runtime).
+    /// Worker threads dedicated to the Tokio runtime driving network I/O
+    /// (`num.network.threads`, approximately — Bifrox doesn't separate network from
+    /// request-handling threads, so this sizes the whole async runtime).
     /// `None` uses Tokio's own default (one per logical CPU).
     pub num_network_threads: Option<usize>,
     /// Whether the controller publishes a replica assignment for partitions that don't
@@ -414,7 +414,7 @@ pub struct EngineConfig {
     pub auto_assign_partitions_enable: bool,
     /// How long a consumer group's join window stays open for further members to arrive
     /// before the coordinator forms the generation and replies to everyone waiting
-    /// (Kafka `group.initial.rebalance.delay.ms`).
+    /// (`group.initial.rebalance.delay.ms`).
     ///
     /// Raising it lets a larger group settle into a single generation at the cost of
     /// slower first assignment; 0 disables the barrier entirely and restores the old
@@ -423,15 +423,15 @@ pub struct EngineConfig {
     /// How long a consumer group member may go without making fetch progress — a `Fetch`
     /// attributed to it via the request envelope's `GROUP_MEMBER` tag — before the
     /// coordinator evicts it for stalling even though it keeps heartbeating on schedule
-    /// (Kafka `max.poll.interval.ms`; issue #54: a member deadlocked, stuck on a poisoned
+    /// (`max.poll.interval.ms`; issue #54: a member deadlocked, stuck on a poisoned
     /// record, or blocked on a downstream call still reports itself healthy through
     /// heartbeats alone).
     ///
-    /// Defaults to five minutes, matching Kafka's own default.
+    /// Defaults to five minutes.
     pub max_poll_interval_ms: u64,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
-    /// exist yet (Kafka `auto.create.topics.enable`). Defaults to **true**, matching both
-    /// Kafka's own default and Bifrox's long-standing behavior.
+    /// exist yet (`auto.create.topics.enable`). Defaults to **true**, matching Bifrox's
+    /// long-standing behavior.
     ///
     /// This is deliberately not the whole answer to unbounded topic creation, and is not
     /// the part doing the security work. The two changes that actually bound it are:
@@ -443,7 +443,7 @@ pub struct EngineConfig {
     /// every existing deployment for no remaining security benefit. Operators who want
     /// creation to be strictly explicit can still set this to false.
     pub auto_create_topics_enable: bool,
-    /// Maximum partitions accepted for a single topic (Kafka `num.partitions` upper
+    /// Maximum partitions accepted for a single topic (`num.partitions` upper
     /// bound). Requests asking for more are rejected rather than creating the directories.
     pub max_partitions_per_topic: u32,
     /// Maximum total partitions this broker will host across all topics. Once reached,
@@ -452,7 +452,7 @@ pub struct EngineConfig {
     /// How long a transaction restored from `__transaction_state` on startup (still
     /// `Ongoing`/`PrepareCommit`/`PrepareAbort` — i.e. never reached a terminal state
     /// before the last shutdown) is given before it's presumed abandoned and aborted to
-    /// release the partitions it was blocking (Kafka `transaction.max.timeout.ms`, applied
+    /// release the partitions it was blocking (`transaction.max.timeout.ms`, applied
     /// here at replay time since Bifrox has no live producer session to time out against
     /// across a restart).
     pub transaction_timeout_ms: u64,
@@ -468,7 +468,7 @@ impl Default for EngineConfig {
             max_segment_bytes: 10 * 1024 * 1024, // 10 MB per segment
             index_interval_bytes: 4096,          // 4 KB sparse index interval
             flush_policy: FlushPolicy::default(),
-            // Kafka's own `log.preallocate` defaults to `false`: pre-touching the full
+            // `log.preallocate` defaults to `false` here: pre-touching the full
             // segment size up front helps HDDs avoid fragmentation, but on SSDs (the
             // common case today) it just means writing (and later trimming) bytes nobody
             // asked for. Still fully configurable via `preallocate.segments` for anyone
@@ -487,13 +487,13 @@ impl Default for EngineConfig {
             num_network_threads: None,
             auto_assign_partitions_enable: true,
             group_initial_rebalance_delay_ms: 3_000,
-            max_poll_interval_ms: 300_000, // 5 minutes, matching Kafka's max.poll.interval.ms
+            max_poll_interval_ms: 300_000, // 5 minutes
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
-            transaction_timeout_ms: 60_000, // matches Kafka's transaction.timeout.ms default
+            transaction_timeout_ms: 60_000,           // 60 seconds
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
-            retention_millis: Some(86400 * 1000), // 24 hours retention
+            retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
             cleanup_policy: CleanupPolicy::Delete,
             security_protocol: SecurityProtocol::Plaintext,
@@ -522,8 +522,8 @@ impl Default for EngineConfig {
             allow_unclean_leader_election: false,
             roles: vec![ProcessRole::Controller, ProcessRole::Broker],
             controller_peer_addrs: Vec::new(),
-            delete_retention_millis: Some(24 * 60 * 60 * 1000), // 24 hours, matches Kafka's default
-            min_cleanable_dirty_ratio: 0.5,                     // matches Kafka's default
+            delete_retention_millis: Some(24 * 60 * 60 * 1000), // 24 hours
+            min_cleanable_dirty_ratio: 0.5,
             compaction_worker_threads: 4,
         }
     }
@@ -564,7 +564,7 @@ impl EngineConfig {
 }
 
 impl EngineConfig {
-    /// Loads configuration from a Kafka-style `server.properties` file
+    /// Loads configuration from a `server.properties` file
     pub fn from_properties_file(path: impl AsRef<Path>) -> IoResult<Self> {
         let content = fs::read_to_string(path)?;
         let mut config = Self::default();
@@ -739,7 +739,7 @@ impl EngineConfig {
                             config.preallocate_segments = v;
                         }
                     }
-                    // Kafka's `log.flush.interval.ms` / `log.flush.interval.messages`:
+                    // `log.flush.interval.ms` / `log.flush.interval.messages`:
                     // switches the flush policy to a periodic/byte-threshold flush timed
                     // by `flush.ms` (byte threshold left at its existing default unless
                     // `flush.messages` — interpreted here as an approximate byte budget,
@@ -786,14 +786,14 @@ impl EngineConfig {
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
-                    // Kafka KRaft's `process.roles`: "controller", "broker", or
+                    // `process.roles`: "controller", "broker", or
                     // "broker,controller" (order doesn't matter). Unset/unrecognized
                     // falls back to combined mode (both roles) — see
                     // `parse_process_roles`.
                     "process.roles" => {
                         config.roles = parse_process_roles(value);
                     }
-                    // Kafka KRaft's `controller.quorum.voters`: normally
+                    // `controller.quorum.voters`: normally
                     // `id1@host1:port1,id2@host2:port2,...`; Bifrox only needs the
                     // host:port half for peer targeting, so the optional `id@` prefix is
                     // accepted and discarded if present.
