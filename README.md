@@ -25,7 +25,6 @@ be implemented, not reverse-engineered.
 - [Quickstart](#quickstart)
 - [Design principles](#design-principles)
 - [Feature status](#feature-status)
-- [Anatomy of a partition](#anatomy-of-a-partition)
 - [Repository layout](#repository-layout)
 - [Configuration](#configuration)
 - [Operating Bifrox](#operating-bifrox)
@@ -281,43 +280,6 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 </details>
 
 ---
-
-## Anatomy of a partition
-
-A partition is a directory of segment files. A segment is a run of record batches. A
-batch is a plaintext header followed by an opaque, compressed payload — and that split
-is what the rest of the design rests on.
-
-```
-  topic "orders" · partition 1                              appends go ──▶
-  ════════════════════════════════════════════════════════════════════════
-
-   00000000000000000000.log            00000000000000000512.log
-  ┌───────┬───────┬───────┬───────┐   ┌───────┬───────┬────────────────┐
-  │ batch │ batch │ batch │ batch │   │ batch │ batch │                │
-  └───────┴───────┴───────┴───────┘   └───────┴───────┴────────────────┘
-    0-99   100-287 288-401 402-511      512-698 699-771
-  └─────────── sealed ─────────────┘   └───── active segment ─────────┘
-   immutable; compaction and             consumers read up to the high
-   retention rewrite whole files         watermark and never past it
-
-
-  a single batch — the bytes on disk and the bytes on the wire are the same
-  ┌──────────────────────────────────┬────────────────────────────────────┐
-  │ HEADER · 53 bytes · PLAINTEXT    │ RECORD DATA · producer's codec     │
-  │                                  │                                    │
-  │ magic 0xC0 · crc · base offset   │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
-  │ last delta · timestamp · attrs   │ ▓▓▓▓▓ compressed by the producer,  │
-  │ producer id / epoch · count      │ ▓▓▓▓▓ never opened by the broker   │
-  └──────────────────────────────────┴────────────────────────────────────┘
-    the broker reads only this — to     stored exactly as they arrived and
-    route, index, and frame a fetch     handed back unchanged on fetch
-```
-
-Everything the broker needs in order to route, index, fence and frame a fetch lives in
-the 53-byte header. Nothing it needs lives in the payload. That is why a fetch can be
-handed to `sendfile(2)`, why a follower's log ends up byte-identical to its leader's, and
-why produce and fetch cost no compression CPU at all.
 
 ## Repository layout
 
