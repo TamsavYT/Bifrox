@@ -4,7 +4,7 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A node's process role(s) — matches the `process.roles` (`controller`,
+/// A node's process role(s) — the `process.roles` setting (`controller`,
 /// `broker`, or `broker,controller`). A node with only `Controller` participates in the
 /// metadata Raft quorum but never hosts data-topic partitions; a node with only `Broker`
 /// hosts data partitions and replicates `__cluster_metadata` as a non-voting observer but
@@ -29,7 +29,7 @@ impl std::str::FromStr for ProcessRole {
 }
 
 /// Parses a comma-separated `process.roles` value (e.g. `"broker,controller"`,
-/// `"controller"`, `"broker"`) the way the config does. An empty/unparseable
+/// `"controller"`, `"broker"`) as written in the properties file. An empty/unparseable
 /// value falls back to combined mode (both roles) — the historical Bifrox default,
 /// so existing configs that never set this keep working unchanged.
 pub fn parse_process_roles(s: &str) -> Vec<ProcessRole> {
@@ -264,7 +264,7 @@ impl std::fmt::Display for SecurityProtocol {
     }
 }
 
-/// Engine Configuration Parameters (configuration support)
+/// Engine Configuration Parameters
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Cluster ID for cluster membership verification (cluster.id)
@@ -364,7 +364,7 @@ pub struct EngineConfig {
     /// Defaults to false: an unrecoverable partition is left leaderless rather than
     /// silently accepting data loss.
     pub allow_unclean_leader_election: bool,
-    /// This node's process role(s) — the `process.roles`. Defaults to both
+    /// This node's process role(s) — `process.roles`. Defaults to both
     /// (combined mode, today's historical behavior).
     pub roles: Vec<ProcessRole>,
     /// The subset of `peer_addrs` that are controller-eligible (participate in the
@@ -372,7 +372,7 @@ pub struct EngineConfig {
     /// this node itself has the `Controller` role. Empty means "assume every peer is
     /// controller-eligible", which matches combined-mode clusters where every node votes.
     pub controller_peer_addrs: Vec<String>,
-    /// How long a tombstone (a compacted-topic record whose value is empty — Bifrox's
+    /// How long a tombstone (a compacted-topic record whose value is *null* — Bifrox's
     /// convention for a "delete marker") is kept as the latest record for its
     /// key before log compaction erases the key entirely (`delete.retention.ms`).
     /// `None` disables tombstone expiry: tombstones are kept forever, same as any other
@@ -430,8 +430,8 @@ pub struct EngineConfig {
     /// Defaults to five minutes.
     pub max_poll_interval_ms: u64,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
-    /// exist yet (`auto.create.topics.enable`). Defaults to **true**, matching both
-    /// Bifrox's long-standing behavior.
+    /// exist yet (`auto.create.topics.enable`). Defaults to **true**, matching Bifrox's
+    /// long-standing behavior.
     ///
     /// This is deliberately not the whole answer to unbounded topic creation, and is not
     /// the part doing the security work. The two changes that actually bound it are:
@@ -468,7 +468,7 @@ impl Default for EngineConfig {
             max_segment_bytes: 10 * 1024 * 1024, // 10 MB per segment
             index_interval_bytes: 4096,          // 4 KB sparse index interval
             flush_policy: FlushPolicy::default(),
-            // `log.preallocate` defaults to `false`: pre-touching the full
+            // `log.preallocate` defaults to `false` here: pre-touching the full
             // segment size up front helps HDDs avoid fragmentation, but on SSDs (the
             // common case today) it just means writing (and later trimming) bytes nobody
             // asked for. Still fully configurable via `preallocate.segments` for anyone
@@ -491,7 +491,7 @@ impl Default for EngineConfig {
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
-            transaction_timeout_ms: 60_000,           //
+            transaction_timeout_ms: 60_000,           // 60 seconds
             retention_bytes: Some(100 * 1024 * 1024), // 100 MB retention limit
             retention_millis: Some(86400 * 1000),     // 24 hours retention
             retention_check_interval: Duration::from_secs(10),
@@ -523,7 +523,7 @@ impl Default for EngineConfig {
             roles: vec![ProcessRole::Controller, ProcessRole::Broker],
             controller_peer_addrs: Vec::new(),
             delete_retention_millis: Some(24 * 60 * 60 * 1000), // 24 hours
-            min_cleanable_dirty_ratio: 0.5,                     //
+            min_cleanable_dirty_ratio: 0.5,
             compaction_worker_threads: 4,
         }
     }
@@ -786,14 +786,14 @@ impl EngineConfig {
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
-                    // the `process.roles`: "controller", "broker", or
+                    // `process.roles`: "controller", "broker", or
                     // "broker,controller" (order doesn't matter). Unset/unrecognized
                     // falls back to combined mode (both roles) — see
                     // `parse_process_roles`.
                     "process.roles" => {
                         config.roles = parse_process_roles(value);
                     }
-                    // the `controller.quorum.voters`: normally
+                    // `controller.quorum.voters`: normally
                     // `id1@host1:port1,id2@host2:port2,...`; Bifrox only needs the
                     // host:port half for peer targeting, so the optional `id@` prefix is
                     // accepted and discarded if present.

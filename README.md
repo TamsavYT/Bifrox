@@ -234,6 +234,8 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 - **Long-polling fetch** (`fetch.max.wait.ms` / `fetch.min.bytes`) — an idle consumer parks
   on the broker instead of spinning
 - Consumer groups: join, sync, heartbeat, leave, offset commit and fetch
+- **Assignment strategies** — range, round-robin, sticky and cooperative-sticky,
+  negotiated across the group from each member's preference list
 - **Cooperative rebalancing** — a stale generation is a retryable signal,
   not an eviction, and members keep processing partitions they still own
 - **Static membership** — a restarting member reclaims its slot without
@@ -260,6 +262,8 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 
 - Raft leader election over a replicated `__cluster_metadata` log
 - Follower-pull replication for data partitions; leader-push for metadata
+- **Follower fetch** — any node holding a replica of a partition can serve a consumer's
+  fetch, not only its leader
 - ISR tracking with `min.insync.replicas` enforcement on write
 - High watermark propagation — consumers never see uncommitted data
 - Dynamic broker registration and discovery through the heartbeat round trip

@@ -23,8 +23,8 @@ pub const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default `max.poll.interval.ms` — how long a member may go without making fetch progress
-/// before it is evicted for stalling even though it keeps heartbeating (issue #54). Matches
-/// A default of five minutes.
+/// before it is evicted for stalling even though it keeps heartbeating (issue #54).
+/// Defaults to five minutes.
 pub const DEFAULT_MAX_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Why a member was pruned from its group. Kept distinct from a plain string so a caller
@@ -102,7 +102,7 @@ pub struct ConsumerGroup {
     /// future, the group is collecting joiners into a single generation instead of forming
     /// a new one per arrival — see `GroupCoordinator::join_group`.
     pub rebalance_deadline: Option<Instant>,
-    /// `group.instance.id` -> the member id that instance currently holds static
+    /// `group.instance.id` -> the member id that instance currently holds (static
     /// membership).
     ///
     /// A consumer that declares an instance id keeps its slot — and therefore its
@@ -162,7 +162,7 @@ impl ConsumerGroup {
     }
 
     /// True if the group negotiated a cooperative assignor (name containing
-    /// "cooperative", matching the `cooperative-sticky` convention) rather than an
+    /// "cooperative", such as `cooperative-sticky`) rather than an
     /// eager one (`range`, `roundrobin`, etc.).
     pub fn is_cooperative(&self) -> bool {
         self.protocol_name
@@ -533,7 +533,7 @@ impl GroupCoordinator {
             // get a free pass on the stalled-consumption check it hasn't earned.
             member.session_timeout = session_timeout;
 
-            // Incremental cooperative rebalancing, issue #66) needs a second
+            // Incremental cooperative rebalancing (issue #66) needs a second
             // rebalance round with no membership change at all: round one hands a
             // cooperative group's leader only the intersection of each member's current
             // and target partitions, and the partitions withheld from that intersection
@@ -561,8 +561,8 @@ impl GroupCoordinator {
         }
 
         // Negotiate the protocol when the group is (re)forming from Empty — the first
-        // member to (re)start the group picks it, matching the convention of clients
-        // listing their preferred assignor first.
+        // member to (re)start the group picks it, following the convention that clients
+        // list their preferred assignor first.
         if was_empty {
             group.protocol_name = protocols.into_iter().next();
         }
@@ -615,8 +615,8 @@ impl GroupCoordinator {
     /// Previously this only ever succeeded for the group leader and returned nothing
     /// useful even then (`Result<(), String>`) — every non-leader member's `SyncGroup`
     /// call hard-failed with "Only group leader can sync assignments", so there was no
-    /// wire-protocol path for a follower to ever learn its own assignment at all. Real
-    /// Every member calls `SyncGroup`; only the leader's call carries the
+    /// wire-protocol path for a follower to ever learn its own assignment at all. Now
+    /// every member calls `SyncGroup`; only the leader's call carries the
     /// computed assignment payload, but every member's call retrieves its own slice of
     /// it once the leader has submitted.
     ///
@@ -685,7 +685,7 @@ impl GroupCoordinator {
             if generation_id != group.generation_id {
                 // Both branches below signal the same underlying event — this member's
                 // generation is stale and it needs to call JoinGroup — via the same
-                // recognizable "REBALANCE_IN_PROGRESS" prefix clients key off
+                // recognizable "REBALANCE_IN_PROGRESS" prefix that clients key off
                 // of, so a client never has to guess from free-form text whether an error
                 // means "rejoin" versus something fatal. What differs is what the member
                 // may do in the meantime, which is the actual "stop the world" difference

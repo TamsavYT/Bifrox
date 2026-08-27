@@ -1683,8 +1683,8 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
     let _ = std::fs::remove_dir_all(&base_dir);
 }
 
-/// Scenario 22: Per-client produce/fetch byte-rate quotas throttle responses (
-/// "process the request, delay the response") instead of rejecting them outright.
+/// Scenario 22: Per-client produce/fetch byte-rate quotas throttle responses
+/// ("process the request, delay the response") instead of rejecting them outright.
 #[tokio::test]
 async fn test_scenario_22_per_client_quota_throttling() {
     // 1. Baseline: with no quota configured, a produce is not delayed.
@@ -2404,8 +2404,8 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
 
     // Verify on-disk log segment file directly: confirm 0xAC magic byte stored on disk
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
-    // (in the batch header), not a per-record frame magic — so the codec is asserted on the
-    // stored `RecordBatch`'s attributes, and the records must still decompress back to
+    // (in the batch header), not a per-record frame magic — so the codec is asserted on
+    // the stored `RecordBatch`'s attributes, and the records must still decompress back to
     // exactly what was produced.
     let log_file_path = dir_guard
         .path
@@ -2507,8 +2507,8 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
 
     // Verify on-disk log segment file directly: confirm 0xAE magic byte stored on disk.
     // Verify the on-disk log segment directly. Compression is a batch-level attribute
-    // (in the batch header), not a per-record frame magic — so the codec is asserted on the
-    // stored `RecordBatch`'s attributes, and the records must still decompress back to
+    // (in the batch header), not a per-record frame magic — so the codec is asserted on
+    // the stored `RecordBatch`'s attributes, and the records must still decompress back to
     // exactly what was produced.
     let log_file_path = dir_guard
         .path
@@ -6485,7 +6485,7 @@ async fn test_scenario_71_advertised_addr_override_takes_precedence() {
 /// Issue #62 / Commit 1: refusing to advertise a wildcard identity. A node bound to
 /// `0.0.0.0` (with no `advertised_addr` override) has no real address to fall back on —
 /// `local_addr()` after such a bind still reports the wildcard IP, since the OS never
-/// picks a concrete interface for it. Bifrox refuses to start;
+/// picks a concrete interface for it. Bifrox refuses to start in that case;
 /// here that surfaces as `Server::bind` returning `Err` (a hard failure — `main.rs`
 /// propagates it straight out of `run()` and the process exits without ever starting the
 /// listener loop).

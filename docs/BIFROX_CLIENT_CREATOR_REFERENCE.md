@@ -316,8 +316,8 @@ Behavior notes:
   (re)form the group from empty picks the group's protocol for that generation.
 - **Eager groups** (protocol name without "cooperative" in it): a `Heartbeat`/`SyncGroup`
   call at a stale `generation_id` is a hard failure — you must call `JoinGroup` again.
-- **Cooperative groups** (protocol name containing "cooperative", matching the
-  `cooperative-sticky` convention): a `Heartbeat`/`SyncGroup` call at a stale
+- **Cooperative groups** (protocol name containing "cooperative", such as
+  `cooperative-sticky`): a `Heartbeat`/`SyncGroup` call at a stale
   `generation_id` returns a distinguishable, retryable error containing the string
   `"REBALANCE_IN_PROGRESS"` instead of a hard failure — you were not kicked, you just
   haven't rejoined the current generation yet, and can keep processing the partitions you
@@ -406,8 +406,9 @@ authors for that topic. Your batches are still stored as you sent them.
   containing a record with a null key is **rejected** — a keyless record can never be
   superseded and can never be compacted away, so it would sit in the log forever and
   surface later as unexplained growth. Such a produce is rejected outright.
-- **Tombstones are null-valued records**: `value_len == -1` in the record encoding. A record with a **present but empty** value (`value_len == 0`) is an
-  ordinary record and does *not* delete anything.
+- **Tombstones are null-valued records**: `value_len == -1` in the record encoding. A
+  record with a **present but empty** value (`value_len == 0`) is an ordinary record and
+  does *not* delete anything.
 
   > If you are porting from an older Bifrox note: there is no string-parsing rule here.
   > The broker does not look inside a payload for `"key:"` or `"key="` separators, and an
@@ -418,7 +419,7 @@ authors for that topic. Your batches are still stored as you sent them.
 - **Keys are compared byte-for-byte.** The broker never parses a payload looking for a key
   — it uses the key field you wrote.
 - **`delete.retention.ms`** (default 24h) controls how long a tombstone is kept as the
-  latest record for its key —, this exists so slow/lagging consumers still
+  latest record for its key. It exists so slow or lagging consumers still
   get a chance to observe the delete before it's fully purged. Once a tombstone is older
   than this, the next compaction pass erases the key entirely, including the tombstone
   itself. `0` (or a very small value) purges tombstones on the next compaction tick.
@@ -435,7 +436,7 @@ authors for that topic. Your batches are still stored as you sent them.
 - `UpsertScramUser`
 - `DeleteScramUser`
 
-### Share groups (queue-style consumption-like)
+### Share groups (queue-style consumption)
 
 Share groups are Bifrox's cooperative "queue" consumption model: any member of the group
 can be handed any available record from a partition (no per-consumer partition ownership,

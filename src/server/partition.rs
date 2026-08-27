@@ -135,7 +135,7 @@ pub struct PartitionManager {
     /// Log-end-offset: the next offset to be assigned locally. Bumped synchronously on
     /// every local append (leader produce, replica verbatim-append, control marker).
     log_end_offset: AtomicU64,
-    /// The real high watermark: the highest offset guaranteed replicated to
+    /// The high watermark: the highest offset guaranteed replicated to
     /// a full ISR quorum. Only advanced explicitly (see `advance_committed_hw`) — never
     /// implicitly by an append — so fetch/describe can expose only what's actually
     /// durable across the ISR instead of whatever the leader happens to have on disk.
@@ -380,9 +380,9 @@ impl PartitionManager {
     /// a batch is atomic on disk (`SegmentManager::append_batch`), so a retried produce
     /// can only be recognized as "the whole batch was already durably written" (checked
     /// once, via `base_sequence`) or "the whole batch is new" — there's no such thing as
-    /// writing half of one. This is actually closer to the standard idempotent-
-    /// producer semantics, which dedups by `(baseSequence, lastSequence)` per batch, than
-    /// the frame path's per-record check is.
+    /// writing half of one. Batch-level dedup by `(base_sequence, last_sequence)` is a
+    /// closer fit for idempotent-producer semantics than the frame path's per-record
+    /// check is.
     #[allow(clippy::too_many_arguments)]
     pub fn produce_batch_eos(&self, batch: RecordBatch) -> IoResult<Result<RecordBatch, u64>> {
         let producer_id = batch.producer_id;

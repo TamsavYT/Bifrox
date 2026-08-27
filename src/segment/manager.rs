@@ -915,8 +915,8 @@ impl SegmentManager {
     ///
     /// An entry is atomic — there is no such thing as decoding "the first part" of a batch
     /// — so a caller whose `start_offset` lands in an entry longer than `max_bytes` must
-    /// still be served it, the "return at least one batch even if it exceeds
-    /// the requested budget" rule, rather than being handed nothing for that offset range
+    /// still be served it — the "return at least one batch even if it exceeds the
+    /// requested budget" rule — rather than being handed nothing for that offset range
     /// forever. (`plan_entries_range` applies the same rule to the byte-serving path; this
     /// is the record-decoding `fetch`'s copy of it, which reads into a buffer rather than
     /// planning a range.)
@@ -957,7 +957,7 @@ impl SegmentManager {
     /// Only whole entries are returned. An entry whose offset range *contains*
     /// `start_offset` is included in full — a batch is atomic on disk and cannot be cut in
     /// half — so a caller asking from the middle of a batch receives the whole batch and
-    /// filters it itself, exactly as the consumer does. Entries that end strictly
+    /// filters it itself. Entries that end strictly
     /// before `start_offset` are skipped.
     ///
     /// Offset ranges are read from each entry's plaintext header (`base_offset` plus
@@ -1022,8 +1022,8 @@ impl SegmentManager {
     /// decompresses one. (It deliberately does not verify batch CRCs either: a CRC
     /// covers the record data, which only the consumer decodes, and checking it here
     /// would mean reading and hashing every byte of every fetch purely to decide where
-    /// entries begin. Framing fetches from batch headers is the reason, and it
-    /// leaves the CRC to the consumer, which is where a corrupt batch actually surfaces.)
+    /// entries begin. Fetches are framed from batch headers for exactly this reason, and
+    /// the CRC is left to the consumer, which is where a corrupt batch actually surfaces.)
     ///
     /// The rules:
     /// - Only whole entries. An entry whose offset range *contains* `start_offset` is
@@ -1673,8 +1673,8 @@ impl SegmentManager {
 
     /// Deletes any historical segment whose entire offset range lies strictly below
     /// `offset` — used after a snapshot durably captures everything up to `offset`, so
-    /// the pre-snapshot log data is no longer needed to reconstruct current state (snapshot-
-    /// style log trimming). A segment is only removed if the NEXT segment's base_offset
+    /// the pre-snapshot log data is no longer needed to reconstruct current state
+    /// (snapshot-style log trimming). A segment is only removed if the NEXT segment's base_offset
     /// (or the active segment's base_offset, for the last historical segment) is `<=
     /// offset`, i.e. this segment contributes nothing at or after the snapshot point.
     pub fn trim_before(&mut self, offset: u64) -> IoResult<usize> {
@@ -1727,7 +1727,7 @@ impl SegmentManager {
     ///
     /// Unlike [`Self::fetch_by_timestamp`], records are **not** filtered to
     /// `timestamp >= target_timestamp` here: doing that would mean decoding, and
-    /// decompressing, every batch. The reader filters instead, exactly as the consumer
+    /// decompressing, every batch. The reader filters instead, exactly as a consumer
     /// does after resolving an offset through `ListOffsets`. The time index is sparse, so
     /// the returned range can begin slightly before the target.
     pub fn fetch_entries_by_timestamp(

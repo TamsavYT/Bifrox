@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 ///
 /// The bucket refills continuously at `rate` bytes/sec, up to a burst capacity of
 /// `rate` bytes (i.e. clients may burst up to one second's worth of quota before
-/// being throttled). This mirrors `client.quota.callback` byte-rate model,
-/// simplified to a single default quota (no per-user overrides).
+/// being throttled). Quotas are byte-rate based and simplified to a single default
+/// quota (no per-user or per-client overrides).
 #[derive(Debug)]
 struct TokenBucket {
     tokens: f64,
@@ -23,9 +23,9 @@ impl TokenBucket {
     }
 
     /// Consumes `amount` tokens, refilling first based on elapsed time.
-    /// Returns the delay the caller should wait before its response is released,
-    /// Throttling rather than rejecting: the request is still processed,
-    /// but its response is delayed to force the client to slow down.
+    /// Returns the delay the caller should wait before its response is released. A client
+    /// over quota is throttled rather than rejected: the request is still processed, but
+    /// its response is delayed to force the client to slow down.
     fn consume(&mut self, amount: f64, rate: f64, capacity: f64) -> Duration {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();

@@ -37,8 +37,8 @@ const RECORD_ENTRY_MIN_SIZE: usize = 20;
 
 const ATTR_COMPRESSION_MASK: u16 = 0x0007;
 const ATTR_TRANSACTIONAL_FLAG: u16 = 0x0008;
-/// Marks a batch whose records are transaction control markers rather than data. The format has
-/// the same flag for the same reason: a control record occupies a real offset, so consumers
+/// Marks a batch whose records are transaction control markers rather than data. The flag is
+/// part of the batch header because a control record occupies a real offset, so consumers
 /// must be able to recognise and skip it without interpreting its contents.
 const ATTR_CONTROL_FLAG: u16 = 0x0010;
 
@@ -133,7 +133,7 @@ pub struct BatchRecord {
 ///  [Value Len: 4b, signed] | [Value Bytes]`
 /// — `Offset Delta` added to `Base Offset` and `Timestamp Delta` added to `Base Timestamp`
 /// (as signed arithmetic) give the record's absolute offset and timestamp. `Key Len`/
-/// `Value Len` are `-1` for null (.), distinguishable from present-but-empty
+/// `Value Len` are `-1` for null, distinguishable from present-but-empty
 /// (`0`); key and value are opaque bytes the broker never decodes or interprets — only
 /// hashed (partitioning) or compared byte-for-byte (compaction).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,8 +268,8 @@ impl RecordBatch {
     ///
     /// The stored format has always supported this — every record carries its own
     /// `offset_delta`, and `decode_records` reads it back — only `create` could not express
-    /// it. `last_offset_delta` is taken from the highest offset present,
-    /// whose compacted batches likewise keep gaps.
+    /// it. `last_offset_delta` is taken from the highest offset present, so a compacted
+    /// batch keeps its gaps and still reports the right last offset.
     ///
     /// `records` must be sorted ascending by offset and every offset must be at or after
     /// `base_offset`; a record before the base is skipped rather than encoded as a
@@ -559,8 +559,8 @@ impl RecordBatch {
     }
 }
 
-/// Encodes a nullable opaque byte string as `[Len: 4b signed][Bytes]`, `-1` signaling null
-/// (.) so a null key/value stays distinguishable from a present-but-empty one.
+/// Encodes a nullable opaque byte string as `[Len: 4b signed][Bytes]`, `-1` signaling null,
+/// so a null key/value stays distinguishable from a present-but-empty one.
 fn encode_opt_bytes(buf: &mut impl BufMut, bytes: &Option<Bytes>) {
     match bytes {
         None => buf.put_i32(-1),

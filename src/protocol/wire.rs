@@ -179,7 +179,7 @@ pub mod tags {
     pub const GROUP_MEMBER: u8 = 0x04;
 
     /// How long a fetch may wait for data before answering empty, in milliseconds. Payload
-    /// is a big-endian `u32`. `fetch.max.wait.ms`.
+    /// is a big-endian `u32`. This is the `fetch.max.wait.ms` knob.
     ///
     /// Without it a fetch against an idle partition returns empty immediately and the
     /// consumer asks again, burning a round trip per poll tick for nothing. With it the
@@ -191,7 +191,7 @@ pub mod tags {
     pub const MAX_WAIT_MS: u8 = 0x05;
 
     /// How many bytes must accumulate before a waiting fetch is answered. Payload is a
-    /// big-endian `u32`. `fetch.min.bytes`.
+    /// big-endian `u32`. This is the `fetch.min.bytes` knob.
     ///
     /// Only meaningful alongside [`MAX_WAIT_MS`], which bounds the wait. An absent tag
     /// means 1: any data at all completes the fetch.

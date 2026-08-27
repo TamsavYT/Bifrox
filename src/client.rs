@@ -25,8 +25,8 @@ pub type PipelinedRequest = (CommandCode, Vec<(u8, Vec<u8>)>, Vec<u8>);
 /// response with the wrong request.
 ///
 /// The broker guarantees responses return in the same order requests were sent on a
-/// connection (protocol guide: "requests will be processed in the order they are
-/// sent and responses will return in that order as well"), so pipelined responses are
+/// connection — requests are processed in the order they are sent, and responses return
+/// in that order as well — so pipelined responses are
 /// matched to requests with a plain FIFO queue of expected ids ([`InFlightWindow`]) rather
 /// than a map keyed by id. This check still runs on every response: a mismatch means a
 /// protocol bug or wire corruption, which must surface loudly rather than pass silently.
@@ -407,9 +407,9 @@ impl TestClient {
     ///
     /// This is the client half of request pipelining (issue #20). The wire format and the
     /// broker's in-order response guarantee are unchanged; this only stops the client from
-    /// blocking on a full round trip per request, by design: "clients
-    /// can (and ideally should) use non-blocking IO to implement request pipelining ...
-    /// since the outstanding requests will be buffered in the underlying OS socket buffer."
+    /// blocking on a full round trip per request. Clients can (and ideally should) use
+    /// non-blocking IO to implement request pipelining: the outstanding requests are
+    /// buffered in the underlying OS socket buffer.
     ///
     /// Each element of `requests` is a [`PipelinedRequest`] — `(command, tagged_fields,
     /// inner_payload)`, exactly what [`Self::send_versioned`] takes for one request.

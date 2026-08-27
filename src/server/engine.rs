@@ -67,8 +67,7 @@ fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
     trimmed.parse::<u64>().ok().map(Some)
 }
 
-/// striped replica placement (`AdminUtils.assignReplicasToBrokers` /
-/// `StripedReplicaPlacer`).
+/// Striped replica placement.
 ///
 /// Plain round-robin — `replicas[i] = brokers[(partition + i) % n]`, which is what this
 /// used to do — makes broker *i*'s follower always broker *i+1*. Losing two adjacent
@@ -78,8 +77,9 @@ fn parse_optional_u64_config(value: &str) -> Option<Option<u64>> {
 /// followers on different brokers and the loss of any two brokers costs far fewer
 /// partitions.
 ///
-/// `seed` replaces a random start index. Randomizing so that every topic does
-/// not begin at broker 0; deriving the offset from the topic name instead gives the same
+/// `seed` replaces the random start index a naive placer would use. Randomizing keeps
+/// every topic from beginning at broker 0; deriving the offset from the topic name
+/// instead gives the same
 /// spread across topics while keeping a single topic's layout reproducible — which matters
 /// because assignment here can be recomputed by a sweep rather than only at creation.
 ///
@@ -518,7 +518,7 @@ impl StorageEngine {
     /// Returns `Err` (naming the config key to set) without changing anything, rather
     /// than advertising it, if the resolved address is unusable as an identity — an
     /// unspecified IP (`0.0.0.0`/`::`), port `0`, or simply not parseable as a
-    /// `host:port`. Refuses to start in this case; here
+    /// `host:port`. The node refuses to start in that case; here
     /// the caller (`Server::bind`) turns this into a startup-time `Err`, which is a hard
     /// failure in the real server entry point (`main.rs` propagates it and exits) without
     /// this function itself needing to reach for `std::process::exit`.
@@ -2121,8 +2121,8 @@ impl StorageEngine {
             }
         }
         // Enforce `message.max.bytes` before doing any disk work. This is measured on the
-        // batch as stored — its encoded, compressed size — which is both what is limited
-        // and the only size the broker can know without decompressing.
+        // batch as stored — its encoded, compressed size — which is both what the limit
+        // governs and the only size the broker can know without decompressing.
         let batch_encoded_size = batch.encoded_size() as u64;
         if let Some(max_bytes) = self.config.message_max_bytes {
             if batch_encoded_size > max_bytes {
@@ -2226,7 +2226,7 @@ impl StorageEngine {
         }
 
         // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
-        // Bifrox assigns an independent leader per partition; see
+        // Bifrox assigns an independent leader per partition (see
         // `is_partition_leader`/produce-forwarding in handler.rs), and the cluster Raft
         // leader is really the controller for `__cluster_metadata`, not necessarily the
         // leader of every data partition. Gating on cluster leadership here would silently
@@ -2421,8 +2421,8 @@ impl StorageEngine {
         // out from under every other in-flight request.
         //
         // This intentionally still returns control-marker frames (magic ==
-        // CONTROL_MAGIC_BYTE) alongside real records — — where the
-        // server exposes raw control batches at the wire level and it's the client
+        // CONTROL_MAGIC_BYTE) alongside real records: the server deliberately exposes
+        // raw control batches at the wire level and it's the client
         // library's job to recognize and skip them (see `Record::is_control`
         // and the client-authoring guidance in docs/BIFROX_CLIENT_CREATOR_REFERENCE.md).
         // `fetch_committed` is the path that hides them for callers that want that done
@@ -3530,8 +3530,8 @@ impl StorageEngine {
     ///
     /// Unlike `create_topic`, which treats the configured default as a preference and
     /// clamps it to the cluster size, an explicit factor is a durability contract: if the
-    /// cluster cannot satisfy it the topic is not created at all, and the caller is told
-    /// so with `INVALID_REPLICATION_FACTOR`. Silently returning fewer replicas than the caller
+    /// cluster cannot satisfy it the topic is not created at all, and the caller is told so
+    /// with `INVALID_REPLICATION_FACTOR`. Silently returning fewer replicas than the caller
     /// asked for would leave them believing data is replicated when it isn't — and because
     /// replication factor is fixed at creation and never raised automatically, that belief
     /// would persist for the life of the topic.
@@ -3591,10 +3591,10 @@ impl StorageEngine {
             ));
         }
         // Implicit (default) replication factor: clamp to what the cluster can satisfy,
-        // but say so. An alternative would reject the whole creation with
-        // INVALID_REPLICATION_FACTOR and never degrades silently — the right instinct, but
+        // but say so. A stricter alternative would reject the whole creation with
+        // INVALID_REPLICATION_FACTOR and never degrade silently — the right instinct, but
         // adopting it wholesale would leave a single-broker deployment unable to create any
-        // topic at all, since our default is 3 rather than 1.
+        // topic at all, since our default replication factor is 3 rather than 1.
         //
         // So the contract is split by intent: a *default* RF is a preference and gets
         // clamped loudly, while an explicitly requested one is a durability contract and
@@ -3653,7 +3653,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Dynamically update a topic's cleanup policy (topic config alteration)
+    /// Dynamically update a topic's cleanup policy (`cleanup.policy` via `AlterConfigs`)
     pub fn set_topic_cleanup_policy(&self, topic: &str, policy: crate::config::CleanupPolicy) {
         if let Some(mut cfg) = self.topic_registry.get_mut(topic) {
             cfg.cleanup_policy = policy;
@@ -3902,7 +3902,7 @@ impl StorageEngine {
     }
 
     /// Returns true if this broker node is a leader or registered replica hosting the
-    /// specified partition Follower Fetch). Non-creating, for the same reason as
+    /// specified partition (the follower-fetch path). Non-creating, for the same reason as
     /// `is_partition_leader` — this is on the `Fetch` path.
     pub fn is_partition_replica(&self, topic: &str, partition: u32) -> bool {
         if let Some(pm) = self.get_partition(topic, partition) {
