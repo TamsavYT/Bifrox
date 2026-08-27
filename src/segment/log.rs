@@ -677,7 +677,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_log_test_{}_{}_{}",
+                "bifrox_log_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique

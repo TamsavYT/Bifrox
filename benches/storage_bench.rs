@@ -1,4 +1,4 @@
-//! Criterion micro-benchmarks for Hermes's storage hot paths.
+//! Criterion micro-benchmarks for Bifrox's storage hot paths.
 //!
 //! These exist to catch performance *regressions* between changes, not to publish
 //! headline throughput numbers — absolute results depend heavily on the machine's disk.
@@ -13,11 +13,11 @@
 //! - `SegmentManager::compact_segments` (the retention GC's most expensive operation)
 //! - `hash_key` (partition routing, called once per keyed produce)
 
+use bifrox::config::CompressionCodec;
+use bifrox::protocol::{BatchCompression, RecordBatch};
+use bifrox::{hash_key, CleanupPolicy, EngineConfig, SegmentManager};
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use hermes::config::CompressionCodec;
-use hermes::protocol::{BatchCompression, RecordBatch};
-use hermes::{hash_key, CleanupPolicy, EngineConfig, SegmentManager};
 
 /// One record wrapped in a batch — the only record shape the log has.
 fn single_record_batch(payload: Vec<u8>) -> RecordBatch {
@@ -46,7 +46,7 @@ impl BenchDir {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "hermes_bench_{}_{}_{}",
+            "bifrox_bench_{}_{}_{}",
             label,
             std::process::id(),
             nanos
@@ -117,7 +117,7 @@ fn bench_segment_append(c: &mut Criterion) {
             let mut mgr = SegmentManager::open(&dir.0, bench_config(&dir)).unwrap();
             // Repetitive payload so the compressed codecs have something to actually
             // compress — an incompressible random payload would measure only overhead.
-            let payload = Bytes::from(b"hermes-benchmark-record-payload-".repeat(16));
+            let payload = Bytes::from(b"bifrox-benchmark-record-payload-".repeat(16));
             let mut ts = 1_700_000_000_000u64;
             b.iter(|| {
                 ts += 1;

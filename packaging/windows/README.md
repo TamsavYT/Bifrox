@@ -1,13 +1,13 @@
-# Hermes Windows Service Packaging & Deployment Guide
+# Bifrox Windows Service Packaging & Deployment Guide
 
-This directory contains the production Windows Service packaging tools for **Hermes Event Streaming Store**.
+This directory contains the production Windows Service packaging tools for **Bifrox Event Streaming Store**.
 
 ---
 
 ## Features & Capabilities
 
 - **Service Managers Supported**: Both [WinSW (Windows Service Wrapper)](https://github.com/winsw/winsw) and [NSSM (Non-Sucking Service Manager)](https://nssm.cc/).
-- **Graceful Shutdown Hooks**: Sends `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` / `SIGTERM` console signals to `hermes.exe`, giving the storage engine up to 30 seconds to flush dirty log segments and sync indexes before termination.
+- **Graceful Shutdown Hooks**: Sends `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` / `SIGTERM` console signals to `bifrox.exe`, giving the storage engine up to 30 seconds to flush dirty log segments and sync indexes before termination.
 - **Log Rotation & Retention**: Integrated log rotation via `tracing-appender` and service wrappers (`roll-by-size-time`, 20 MB size threshold, automatic ZIP archiving, 30 days history).
 - **Configurable Metrics Exporter**: Supports custom bind address (`metrics.bind.address=0.0.0.0:10092`), Bearer token authentication (`metrics.auth.token`), and IP whitelist restrictions (`metrics.allowed.ips`).
 - **Automated Firewall Rules**: Configures Windows Defender Firewall inbound rules for broker port (`9092`) and metrics port (`10092`).
@@ -27,13 +27,13 @@ This directory contains the production Windows Service packaging tools for **Her
 
 3. Run the automated PowerShell installer as Administrator:
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -InstallDir "C:\Program Files\Hermes" -ServiceType WinSW
+   powershell -ExecutionPolicy Bypass -File .\install-service.ps1 -InstallDir "C:\Program Files\Bifrox" -ServiceType WinSW
    ```
 
-4. Copy `WinSW-x64.exe` to `C:\Program Files\Hermes\HermesEventStore.exe` and register:
+4. Copy `WinSW-x64.exe` to `C:\Program Files\Bifrox\BifroxEventStore.exe` and register:
    ```cmd
-   "C:\Program Files\Hermes\HermesEventStore.exe" install
-   "C:\Program Files\Hermes\HermesEventStore.exe" start
+   "C:\Program Files\Bifrox\BifroxEventStore.exe" install
+   "C:\Program Files\Bifrox\BifroxEventStore.exe" start
    ```
 
 ---
@@ -63,8 +63,8 @@ Add or customize Prometheus metrics listener & security settings:
 node.id=1
 bind.addr=0.0.0.0:9092
 advertised.listeners=myhost.example.com:9092
-data.dir=C:\Program Files\Hermes\data
-log.file.dir=C:\Program Files\Hermes\logs
+data.dir=C:\Program Files\Bifrox\data
+log.file.dir=C:\Program Files\Bifrox\logs
 
 # Prometheus Metrics Exporter Configuration
 metrics.bind.address=0.0.0.0:10092
@@ -80,11 +80,11 @@ metrics.allowed.ips=127.0.0.1,10.0.0.0/8
 
 - **Check Service Status**:
   ```powershell
-  Get-Service -Name HermesEventStore
+  Get-Service -Name BifroxEventStore
   ```
 - **Stop Service Gracefully**:
   ```powershell
-  Stop-Service -Name HermesEventStore
+  Stop-Service -Name BifroxEventStore
   ```
 - **Uninstall Service**:
   ```powershell

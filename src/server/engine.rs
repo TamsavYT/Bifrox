@@ -26,7 +26,7 @@ pub fn hash_key(key: &[u8], num_partitions: usize) -> u32 {
 ///
 /// On Windows, deleting a file still held open by any handle fails with a sharing
 /// violation (`ERROR_SHARING_VIOLATION` / `AccessDenied`) rather than unlinking it the way
-/// POSIX does. Dropping the `Arc<PartitionManager>` closes Hermes's own handles, but that
+/// POSIX does. Dropping the `Arc<PartitionManager>` closes Bifrox's own handles, but that
 /// only takes effect once the *last* clone is gone — an in-flight fetch holding a clone,
 /// or a `plan_zero_copy_fetch` file handle still being transmitted, can keep the directory
 /// briefly undeletable. Retrying over a short window covers that, instead of failing a
@@ -2227,7 +2227,7 @@ impl StorageEngine {
         }
 
         // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
-        // Hermes assigns an independent leader per partition (KIP-392-style; see
+        // Bifrox assigns an independent leader per partition (KIP-392-style; see
         // `is_partition_leader`/produce-forwarding in handler.rs), and the cluster Raft
         // leader is really the controller for `__cluster_metadata`, not necessarily the
         // leader of every data partition. Gating on cluster leadership here would silently
@@ -2425,7 +2425,7 @@ impl StorageEngine {
         // CONTROL_MAGIC_BYTE) alongside real records — matching real Kafka, where the
         // server exposes raw control batches at the wire level and it's the client
         // library's job to recognize and skip them (see `Record::is_control`
-        // and the client-authoring guidance in docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
+        // and the client-authoring guidance in docs/BIFROX_CLIENT_CREATOR_REFERENCE.md).
         // `fetch_committed` is the path that hides them for callers that want that done
         // for them. Filtering here too would break raw log introspection (this is also
         // exactly what the transactional-recovery test suite relies on to verify control
@@ -4326,7 +4326,7 @@ mod discovery_warn_tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_engine_discovery_warn_test_{}_{}_{}",
+                "bifrox_engine_discovery_warn_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique

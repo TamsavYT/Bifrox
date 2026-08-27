@@ -1,10 +1,10 @@
 <service>
-  <id>HermesEventStore</id>
-  <name>Hermes Event Streaming Store</name>
+  <id>BifroxEventStore</id>
+  <name>Bifrox Event Streaming Store</name>
   <description>Production Event Streaming Storage Engine Server (Kafka-compatible)</description>
 
   <!-- Path to executable -->
-  <executable>%BASE%\hermes.exe</executable>
+  <executable>%BASE%\bifrox.exe</executable>
   <arguments>--config %BASE%\server.properties</arguments>
   <workingdirectory>%BASE%</workingdirectory>
 
@@ -36,5 +36,5 @@
 
   <!-- Environment Variables -->
   <env name="RUST_LOG" value="info" />
-  <env name="HERMES_LOG_DIR" value="%BASE%\logs" />
+  <env name="BIFROX_LOG_DIR" value="%BASE%\logs" />
 </service>

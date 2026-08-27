@@ -1,4 +1,4 @@
-use hermes::{wait_for_shutdown_signal, GroupConsumer, GroupConsumerConfig, TestClient};
+use bifrox::{wait_for_shutdown_signal, GroupConsumer, GroupConsumerConfig, TestClient};
 use std::net::ToSocketAddrs;
 use tokio::time::{sleep, Duration};
 
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "Error: Could not connect via TLS/SSL to Hermes server at {}: {}",
+                    "Error: Could not connect via TLS/SSL to Bifrox server at {}: {}",
                     server_addr, e
                 );
                 if !insecure {
@@ -139,10 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "Error: Could not connect to Hermes server at {}: {}",
+                    "Error: Could not connect to Bifrox server at {}: {}",
                     server_addr, e
                 );
-                eprintln!("Make sure the server is running on {} (run: cargo run --bin hermes -- config/server-node1.properties)", server_addr);
+                eprintln!("Make sure the server is running on {} (run: cargo run --bin bifrox -- config/server-node1.properties)", server_addr);
                 return Ok(());
             }
         }
@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
             let key = get_arg_val(&args, "--key").unwrap_or_default();
             let msg = get_arg_val(&args, "--message")
-                .unwrap_or_else(|| "Sample Hermes Event Payload".to_string());
+                .unwrap_or_else(|| "Sample Bifrox Event Payload".to_string());
             let num_partitions: u32 = get_arg_val(&args, "--partitions")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let payload: Vec<u8> = vec![b'x'; record_size.max(1)];
 
             println!("============================================================");
-            println!("   HERMES PRODUCER PERFORMANCE TEST");
+            println!("   BIFROX PRODUCER PERFORMANCE TEST");
             println!("============================================================");
             println!("  Server:        {}", server_addr);
             println!("  Topic:         {}", topic);
@@ -344,7 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(0);
 
             println!("============================================================");
-            println!("   HERMES CONSUMER PERFORMANCE TEST");
+            println!("   BIFROX CONSUMER PERFORMANCE TEST");
             println!("============================================================");
             println!("  Server:        {}", server_addr);
             println!("  Topic:         {}", topic);
@@ -537,7 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut consumer = GroupConsumer::join(client, config).await?;
 
             println!("============================================================");
-            println!("   HERMES CONSUMER GROUP POLLING LOOP: '{}'", group_id);
+            println!("   BIFROX CONSUMER GROUP POLLING LOOP: '{}'", group_id);
             println!("============================================================");
             println!("  Topic:               {}", topic);
             println!("  Member ID:           {}", consumer.member_id());
@@ -821,7 +821,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let perm_str =
                 get_arg_val(&args, "--permission").unwrap_or_else(|| "allow".to_string());
 
-            let binding = hermes::AclBinding {
+            let binding = bifrox::AclBinding {
                 resource_type: parse_resource_type(&res_type_str),
                 resource_name: res_name.clone(),
                 pattern_type: 3, // Literal
@@ -841,7 +841,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let res_name = get_arg_val(&args, "--resource-name").unwrap_or_else(|| "*".to_string());
             let principal = get_arg_val(&args, "--principal").unwrap_or_else(|| "*".to_string());
 
-            let filter = hermes::AclBinding {
+            let filter = bifrox::AclBinding {
                 resource_type: parse_resource_type(&res_type_str),
                 resource_name: res_name,
                 pattern_type: 3,
@@ -895,32 +895,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_resource_type(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
-        "topic" => hermes::ResourceType::Topic as u8,
-        "group" => hermes::ResourceType::Group as u8,
-        "cluster" => hermes::ResourceType::Cluster as u8,
-        "tx" | "transactional_id" => hermes::ResourceType::TransactionalId as u8,
-        "user" => hermes::ResourceType::User as u8,
-        _ => hermes::ResourceType::Any as u8,
+        "topic" => bifrox::ResourceType::Topic as u8,
+        "group" => bifrox::ResourceType::Group as u8,
+        "cluster" => bifrox::ResourceType::Cluster as u8,
+        "tx" | "transactional_id" => bifrox::ResourceType::TransactionalId as u8,
+        "user" => bifrox::ResourceType::User as u8,
+        _ => bifrox::ResourceType::Any as u8,
     }
 }
 
 fn parse_operation(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
-        "read" => hermes::AclOperation::Read as u8,
-        "write" => hermes::AclOperation::Write as u8,
-        "create" => hermes::AclOperation::Create as u8,
-        "delete" => hermes::AclOperation::Delete as u8,
-        "alter" => hermes::AclOperation::Alter as u8,
-        "describe" => hermes::AclOperation::Describe as u8,
-        "all" => hermes::AclOperation::All as u8,
-        _ => hermes::AclOperation::Any as u8,
+        "read" => bifrox::AclOperation::Read as u8,
+        "write" => bifrox::AclOperation::Write as u8,
+        "create" => bifrox::AclOperation::Create as u8,
+        "delete" => bifrox::AclOperation::Delete as u8,
+        "alter" => bifrox::AclOperation::Alter as u8,
+        "describe" => bifrox::AclOperation::Describe as u8,
+        "all" => bifrox::AclOperation::All as u8,
+        _ => bifrox::AclOperation::Any as u8,
     }
 }
 
 fn parse_permission(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
-        "deny" => hermes::AclPermissionType::Deny as u8,
-        _ => hermes::AclPermissionType::Allow as u8,
+        "deny" => bifrox::AclPermissionType::Deny as u8,
+        _ => bifrox::AclPermissionType::Allow as u8,
     }
 }
 
@@ -950,10 +950,10 @@ fn percentile(sorted_samples: &[f64], p: f64) -> f64 {
 
 fn print_usage() {
     println!("============================================================");
-    println!("               HERMES EVENT STREAMING CLI                   ");
+    println!("               BIFROX EVENT STREAMING CLI                   ");
     println!("============================================================");
     println!("Usage:");
-    println!("  cargo run --bin hermes_cli -- [--server <IP:PORT>] <COMMAND> [FLAGS]\n");
+    println!("  cargo run --bin bifrox_cli -- [--server <IP:PORT>] <COMMAND> [FLAGS]\n");
     println!("Commands:");
     println!("  produce         Produce an event payload to a topic");
     println!("                  --topic <NAME> --message <MSG> [--key <KEY>] [--partitions <N>]");

@@ -1,10 +1,10 @@
-# Hermes
+# Bifrox
 
-Hermes is a distributed event streaming broker written in Rust. It focuses on Kafka-like
+Bifrox is a distributed event streaming broker written in Rust. It focuses on Kafka-like
 broker semantics, Windows-friendly operation, and a custom binary protocol that you can
 build dedicated clients against.
 
-## What Hermes already has
+## What Bifrox already has
 
 ### Core broker features
 
@@ -57,17 +57,17 @@ build dedicated clients against.
 
 ## Important protocol note
 
-Hermes does **not** currently position itself as a drop-in Kafka wire-compatible broker.
-It exposes a custom TCP protocol and is designed to support purpose-built Hermes clients.
+Bifrox does **not** currently position itself as a drop-in Kafka wire-compatible broker.
+It exposes a custom TCP protocol and is designed to support purpose-built Bifrox clients.
 
 If you are building a client or agent, start with
-[docs/HERMES_CLIENT_CREATOR_REFERENCE.md](docs/HERMES_CLIENT_CREATOR_REFERENCE.md).
+[docs/BIFROX_CLIENT_CREATOR_REFERENCE.md](docs/BIFROX_CLIENT_CREATOR_REFERENCE.md).
 
 ## Architecture at a glance
 
 ```mermaid
 graph TD
-    Client[Hermes Client / CLI / Agent] -->|Custom TCP Protocol| Server[Hermes TCP Server]
+    Client[Bifrox Client / CLI / Agent] -->|Custom TCP Protocol| Server[Bifrox TCP Server]
     Server --> Handler[Request Handler]
     Handler --> Engine[Storage Engine]
     Engine --> Segments[Log Segments]
@@ -109,7 +109,7 @@ graph TD
 ### Example configuration
 
 ```properties
-cluster.id=hermes-prod-cluster-01
+cluster.id=bifrox-prod-cluster-01
 node.id=1
 role=leader
 listeners=PLAINTEXT://127.0.0.1:9092
@@ -133,20 +133,20 @@ sasl.user.admin=change-me
 ### Run the broker
 
 ```powershell
-cargo run --bin hermes -- .\config\server-node1.properties
+cargo run --bin bifrox -- .\config\server-node1.properties
 ```
 
 Or with environment variables:
 
 ```powershell
-$env:HERMES_BIND_ADDR="127.0.0.1:9092"
-$env:HERMES_DATA_DIR=".\data_store"
-cargo run --bin hermes
+$env:BIFROX_BIND_ADDR="127.0.0.1:9092"
+$env:BIFROX_DATA_DIR=".\data_store"
+cargo run --bin bifrox
 ```
 
 ## Security model
 
-Hermes supports multiple deployment styles:
+Bifrox supports multiple deployment styles:
 
 - `PLAINTEXT`
 - `SASL_PLAINTEXT`
@@ -165,7 +165,7 @@ ACLs can be enabled for topic, group, transactional-id, and cluster operations.
 
 ## Quotas and client identity
 
-Hermes supports Kafka-style throttling behavior: clients are delayed instead of being
+Bifrox supports Kafka-style throttling behavior: clients are delayed instead of being
 hard-rejected when they exceed byte-rate quotas.
 
 Quota identity precedence is:
@@ -180,7 +180,7 @@ more stable quota behavior.
 
 ## Transaction behavior
 
-Hermes supports both:
+Bifrox supports both:
 
 - legacy transaction commands (`BeginTx`, `CommitTx`, `AbortTx`)
 - producer-ID-based EOS flow (`InitProducerId`, `AddPartitionsToTxn`, `EndTxn`)
@@ -195,7 +195,7 @@ Recent hardening includes:
 
 ## Metrics and observability
 
-Hermes exposes Prometheus metrics through `/metrics`, including:
+Bifrox exposes Prometheus metrics through `/metrics`, including:
 
 - produce bytes and records
 - fetch bytes
@@ -207,7 +207,7 @@ Hermes exposes Prometheus metrics through `/metrics`, including:
 
 ## Windows notes
 
-Hermes is actively hardened for Windows:
+Bifrox is actively hardened for Windows:
 
 - Windows file-sharing safe segment handling
 - Windows CI coverage
@@ -230,4 +230,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Hermes is dual-licensed under MIT or Apache-2.0.
+Bifrox is dual-licensed under MIT or Apache-2.0.

@@ -1,8 +1,8 @@
-# Contributing to Hermes
+# Contributing to Bifrox
 
-Thank you for your interest in contributing to Hermes! As a high-performance event streaming engine written in Rust, we aim for the highest standards of safety, speed, and reliability.
+Thank you for your interest in contributing to Bifrox! As a high-performance event streaming engine written in Rust, we aim for the highest standards of safety, speed, and reliability.
 
-This guide outlines the process of contributing to Hermes and helps you get your development environment set up.
+This guide outlines the process of contributing to Bifrox and helps you get your development environment set up.
 
 ---
 
@@ -24,7 +24,7 @@ Before opening a bug report, please check existing issues to ensure it hasn't al
 3.  Include reproduction steps, OS details, Rust version, and log outputs.
 
 ### 💡 Suggesting Enhancements
-We welcome ideas to extend Hermes! To suggest an enhancement:
+We welcome ideas to extend Bifrox! To suggest an enhancement:
 1.  Open an **Issue** to discuss the feature request before writing code.
 2.  Explain the use case, desired behavior, and potential API design.
 
@@ -48,8 +48,8 @@ Ensure you have the Rust toolchain installed:
 ### 2. Working with the Code
 Clone your fork and navigate into the folder:
 ```bash
-git clone https://github.com/your-username/hermes.git
-cd hermes
+git clone https://github.com/your-username/bifrox.git
+cd bifrox
 ```
 
 Check that the project compiles and all integration tests pass on your machine:
@@ -78,7 +78,7 @@ cargo clippy --all-targets -- -D warnings
 
 ### 3. Testing
 *   **Unit Tests**: Put these in the source files under standard `mod tests` blocks.
-*   **Integration Tests**: Add new integration tests to [`tests/integration_tests.rs`](file:///C:/Users/vboxuser/CLionProjects/Hermes/tests/integration_tests.rs) for complex multi-node orchestration, crash recovery, transaction handling, or client network interfaces.
+*   **Integration Tests**: Add new integration tests to [`tests/integration_tests.rs`](file:///C:/Users/vboxuser/CLionProjects/Bifrox/tests/integration_tests.rs) for complex multi-node orchestration, crash recovery, transaction handling, or client network interfaces.
 *   Make sure all tests clean up their storage artifacts on completion using a `Drop` guard.
 
 ### 4. Git Commit Messages

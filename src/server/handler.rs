@@ -1309,7 +1309,7 @@ fn handle_heartbeat(engine: &StorageEngine, payload: &[u8]) -> Result<Vec<u8>, P
     // made broker discovery deadlock: a follower with no way to list its leader's address
     // rejected every heartbeat forever, so the leader never learned it existed and no
     // replica assignment was ever published. Kafka's answer here is that cluster
-    // membership is gated by authentication (Hermes has SCRAM/ACLs for that), not by a
+    // membership is gated by authentication (Bifrox has SCRAM/ACLs for that), not by a
     // static address allowlist — so once the CRIT-03 self-address check above and the
     // cluster_id check further above both pass, an empty allowlist accepts. A non-empty
     // allowlist keeps exactly its previous behavior: the leader's address must be one of
@@ -3098,7 +3098,7 @@ mod grpc_replication_fetch_tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_handler_grpc_fetch_test_{}_{}_{}",
+                "bifrox_handler_grpc_fetch_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique
@@ -3313,7 +3313,7 @@ mod cluster_metadata_durability_tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_handler_meta_durability_test_{}_{}_{}",
+                "bifrox_handler_meta_durability_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique
@@ -3648,7 +3648,7 @@ mod zero_copy_fetch_tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_zero_copy_fetch_{}_{}_{}",
+                "bifrox_zero_copy_fetch_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique

@@ -1,19 +1,19 @@
 # Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Uninstallation & Cleanup Script for Hermes Windows Service
+    Uninstallation & Cleanup Script for Bifrox Windows Service
 .DESCRIPTION
-    Stops and unregisters the Hermes background Windows Service and cleans up firewall rules.
+    Stops and unregisters the Bifrox background Windows Service and cleans up firewall rules.
 #>
 
 param(
-    [string]$ServiceName = "HermesEventStore"
+    [string]$ServiceName = "BifroxEventStore"
 )
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "    HERMES WINDOWS SERVICE UNINSTALLATION & CLEANUP        " -ForegroundColor Cyan
+Write-Host "    BIFROX WINDOWS SERVICE UNINSTALLATION & CLEANUP        " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Administrator Rights Check
@@ -42,6 +42,6 @@ if ($service) {
 }
 
 # 3. Clean up Firewall Rules
-Remove-NetFirewallRule -DisplayName "Hermes Event Store (Broker)" -ErrorAction SilentlyContinue
-Remove-NetFirewallRule -DisplayName "Hermes Metrics (Prometheus)" -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "Bifrox Event Store (Broker)" -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "Bifrox Metrics (Prometheus)" -ErrorAction SilentlyContinue
 Write-Host "Firewall rules cleaned up." -ForegroundColor Green

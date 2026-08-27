@@ -1,4 +1,4 @@
-use hermes::{
+use bifrox::{
     hash_key, EngineConfig, FlushPolicy, GroupConsumer, GroupConsumerConfig, Server, StorageEngine,
     TestClient,
 };
@@ -31,7 +31,7 @@ impl TestDataDirGuard {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "hermes_test_{}_{}_{}_{}",
+            "bifrox_test_{}_{}_{}_{}",
             prefix,
             std::process::id(),
             nanos,
@@ -174,7 +174,7 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
 ///
 /// A null value (tombstone) reads as empty here, so tests that care about the difference
 /// assert on `record.value` directly instead of using this.
-fn value_of(record: &hermes::segment::Record) -> &[u8] {
+fn value_of(record: &bifrox::segment::Record) -> &[u8] {
     record.value.as_deref().unwrap_or_default()
 }
 
@@ -182,8 +182,8 @@ fn value_of(record: &hermes::segment::Record) -> &[u8] {
 /// `None` value is a tombstone.
 fn producer_keyed_batch(
     records: &[(&[u8], Option<&[u8]>)],
-    codec: hermes::protocol::BatchCompression,
-) -> hermes::protocol::RecordBatch {
+    codec: bifrox::protocol::BatchCompression,
+) -> bifrox::protocol::RecordBatch {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -198,18 +198,18 @@ fn producer_keyed_batch(
             )
         })
         .collect();
-    hermes::protocol::RecordBatch::create(0, timestamp, 0, 0, 0, 0, false, codec, &triples)
+    bifrox::protocol::RecordBatch::create(0, timestamp, 0, 0, 0, 0, false, codec, &triples)
 }
 
 /// Appends one explicitly keyed record as a single-record batch, the way a producer writes
 /// to a compacted topic. `None` value is a tombstone.
 fn append_keyed_record(
-    seg_mgr: &mut hermes::segment::SegmentManager,
+    seg_mgr: &mut bifrox::segment::SegmentManager,
     key: &[u8],
     value: Option<&[u8]>,
     timestamp: u64,
-) -> hermes::protocol::RecordBatch {
-    let batch = hermes::protocol::RecordBatch::create(
+) -> bifrox::protocol::RecordBatch {
+    let batch = bifrox::protocol::RecordBatch::create(
         0,
         timestamp,
         0,
@@ -217,7 +217,7 @@ fn append_keyed_record(
         0,
         0,
         false,
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
         &[(
             timestamp,
             Some(bytes::Bytes::copy_from_slice(key)),
@@ -236,8 +236,8 @@ fn producer_batch(
     producer_epoch: i16,
     base_sequence: i32,
     transactional: bool,
-    codec: hermes::protocol::BatchCompression,
-) -> hermes::protocol::RecordBatch {
+    codec: bifrox::protocol::BatchCompression,
+) -> bifrox::protocol::RecordBatch {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -246,7 +246,7 @@ fn producer_batch(
         .iter()
         .map(|r| (timestamp, None, Some(r.clone())))
         .collect();
-    hermes::protocol::RecordBatch::create(
+    bifrox::protocol::RecordBatch::create(
         0,
         timestamp,
         0,
@@ -557,7 +557,7 @@ async fn test_scenario_7_milestone3_features() {
 
     // 1. Time-based Indexing (.timeindex) Test
     let time_idx_path = test_dir.join("00000000000000000000.timeindex");
-    let mut time_idx = hermes::TimeIndexSegment::open(&time_idx_path, 0).unwrap();
+    let mut time_idx = bifrox::TimeIndexSegment::open(&time_idx_path, 0).unwrap();
     time_idx.append(1000, 0).unwrap();
     time_idx.append(2000, 10).unwrap();
     time_idx.append(3000, 20).unwrap();
@@ -567,7 +567,7 @@ async fn test_scenario_7_milestone3_features() {
     assert_eq!(time_idx.find_offset_for_timestamp(3000), Some(20));
 
     // 2. Transaction Manager Test (Begin, Commit, Abort, Duplicate sequence check)
-    let tx_mgr = hermes::TransactionManager::new();
+    let tx_mgr = bifrox::TransactionManager::new();
     assert!(!tx_mgr.is_duplicate(101, 1));
     tx_mgr.record_sequence(101, 1);
     assert!(tx_mgr.is_duplicate(101, 1)); // Duplicate retry detected
@@ -580,29 +580,29 @@ async fn test_scenario_7_milestone3_features() {
     tx_mgr.complete_commit("tx_orders_99", &[]).unwrap();
 
     // 3. High Availability Replication Manager Test
-    let cluster_config = hermes::ClusterConfig {
+    let cluster_config = bifrox::ClusterConfig {
         cluster_id: "test-cluster".to_string(),
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         peer_addrs: Vec::new(),
         min_insync_replicas: 1,
         roles: vec![
-            hermes::config::ProcessRole::Controller,
-            hermes::config::ProcessRole::Broker,
+            bifrox::config::ProcessRole::Controller,
+            bifrox::config::ProcessRole::Broker,
         ],
         controller_peer_addrs: Vec::new(),
     };
-    let repl_mgr = hermes::ReplicationManager::new(
+    let repl_mgr = bifrox::ReplicationManager::new(
         cluster_config,
         "127.0.0.1:0".to_string(),
         std::sync::Arc::new(dashmap::DashMap::new()),
         std::sync::Arc::new(dashmap::DashMap::new()),
     );
-    assert_eq!(repl_mgr.role(), hermes::NodeRole::Leader);
+    assert_eq!(repl_mgr.role(), bifrox::NodeRole::Leader);
 
-    let entry = hermes::replication::EncodedEntry::from_batch(&producer_keyed_batch(
+    let entry = bifrox::replication::EncodedEntry::from_batch(&producer_keyed_batch(
         &[(b"k", Some(b"replicated_payload"))],
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
     ));
     let res = repl_mgr
         .replicate_batch("events", 0, 0, 0, &[], &[entry])
@@ -615,7 +615,7 @@ async fn test_scenario_7_milestone3_features() {
 #[tokio::test]
 async fn test_scenario_8_kraft_grpc_isr() {
     // 1. Priority 1 & 3: gRPC Pull Replication Codec Test
-    let fetch_req = hermes::ReplicationFetchRequest {
+    let fetch_req = bifrox::ReplicationFetchRequest {
         follower_node_id: 2,
         topic: "orders_stream".to_string(),
         partition: 1,
@@ -623,25 +623,25 @@ async fn test_scenario_8_kraft_grpc_isr() {
         max_bytes: 65536,
     };
     let encoded_req = fetch_req.encode();
-    let (decoded_req, _) = hermes::ReplicationFetchRequest::decode(&encoded_req).unwrap();
+    let (decoded_req, _) = bifrox::ReplicationFetchRequest::decode(&encoded_req).unwrap();
     assert_eq!(decoded_req.follower_node_id, 2);
     assert_eq!(decoded_req.topic, "orders_stream");
     assert_eq!(decoded_req.fetch_offset, 50);
 
     // 2. Priority 2: In-Sync Replicas (ISR) Quorum Gating Test
-    let cluster_config = hermes::ClusterConfig {
+    let cluster_config = bifrox::ClusterConfig {
         cluster_id: "test-cluster".to_string(),
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         peer_addrs: vec!["127.0.0.1:9093".to_string()],
         min_insync_replicas: 2,
         roles: vec![
-            hermes::config::ProcessRole::Controller,
-            hermes::config::ProcessRole::Broker,
+            bifrox::config::ProcessRole::Controller,
+            bifrox::config::ProcessRole::Broker,
         ],
         controller_peer_addrs: Vec::new(),
     };
-    let repl_mgr = hermes::ReplicationManager::new(
+    let repl_mgr = bifrox::ReplicationManager::new(
         cluster_config,
         "127.0.0.1:0".to_string(),
         std::sync::Arc::new(dashmap::DashMap::new()),
@@ -663,9 +663,9 @@ async fn test_scenario_8_kraft_grpc_isr() {
         "watermark must be recorded for the acking replica"
     );
 
-    // 3. Hermes Consensus Leader Election Test
-    let consensus = hermes::HermesConsensus::new(2, 3);
-    assert_eq!(consensus.state(), hermes::ConsensusState::Follower);
+    // 3. Bifrox Consensus Leader Election Test
+    let consensus = bifrox::BifroxConsensus::new(2, 3);
+    assert_eq!(consensus.state(), bifrox::ConsensusState::Follower);
 
     // Simulate leader heartbeat ping
     assert!(consensus.handle_leader_heartbeat(1, 1));
@@ -673,10 +673,10 @@ async fn test_scenario_8_kraft_grpc_isr() {
 
     // Simulate candidate election state & vote tallying
     consensus.force_candidate_state();
-    assert_eq!(consensus.state(), hermes::ConsensusState::Candidate);
+    assert_eq!(consensus.state(), bifrox::ConsensusState::Candidate);
 
     assert!(consensus.tally_election_votes(2)); // 2/3 votes = Quorum majority achieved
-    assert_eq!(consensus.state(), hermes::ConsensusState::Leader);
+    assert_eq!(consensus.state(), bifrox::ConsensusState::Leader);
 }
 
 #[tokio::test]
@@ -725,7 +725,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
     // 1. Start Follower (Node 2) on ephemeral port
     let config_node2 = EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -741,7 +741,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
     // 2. Start Leader (Node 1) with Node 2's address as peer
     let config_node1 = EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_node2.to_string()],
@@ -838,7 +838,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
     // 1. Start Follower (Node 2) on ephemeral port
     let config_node2 = EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -854,7 +854,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
     // 2. Start Leader (Node 1) with Node 2's address as peer
     let config_node1 = EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_node2.to_string()],
@@ -1137,7 +1137,7 @@ async fn test_scenario_15_admin_apis_and_consumer_groups() {
         .expect("Failed to join group");
 
     // Member 1 syncs (leader assigning partitions)
-    let assignments = vec![hermes::protocol::wire::MemberAssignment {
+    let assignments = vec![bifrox::protocol::wire::MemberAssignment {
         member_id: member_id_1.to_string(),
         topic: "admin_topic".to_string(),
         partitions: vec![0, 1, 2, 3],
@@ -1155,7 +1155,7 @@ async fn test_scenario_15_admin_apis_and_consumer_groups() {
 
     // 4. List Groups via Admin API
     let mut list_groups_req = Vec::new();
-    list_groups_req.push(hermes::protocol::wire::CommandCode::ListGroups as u8);
+    list_groups_req.push(bifrox::protocol::wire::CommandCode::ListGroups as u8);
     list_groups_req.extend_from_slice(&0u32.to_be_bytes());
     let resp = client.send_raw_bytes(&list_groups_req).await.unwrap();
     assert_eq!(resp.status, 0);
@@ -1299,7 +1299,7 @@ async fn test_scenario_16_eos_idempotence() {
 #[tokio::test]
 async fn test_scenario_17_durable_metadata_catalog() {
     let test_dir = std::env::temp_dir().join(format!(
-        "hermes_test_meta_catalog_{}",
+        "bifrox_test_meta_catalog_{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1308,13 +1308,13 @@ async fn test_scenario_17_durable_metadata_catalog() {
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
 
-    let config = hermes::EngineConfig {
+    let config = bifrox::EngineConfig {
         data_dir: test_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
-        ..hermes::EngineConfig::default()
+        ..bifrox::EngineConfig::default()
     };
 
-    let engine = std::sync::Arc::new(hermes::StorageEngine::new(config.clone()).unwrap());
+    let engine = std::sync::Arc::new(bifrox::StorageEngine::new(config.clone()).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1325,7 +1325,7 @@ async fn test_scenario_17_durable_metadata_catalog() {
                 let eng = engine_clone.clone();
                 tokio::spawn(async move {
                     let _ =
-                        hermes::server::handler::handle_connection(socket, (*eng).clone()).await;
+                        bifrox::server::handler::handle_connection(socket, (*eng).clone()).await;
                 });
             }
         }
@@ -1358,7 +1358,7 @@ async fn test_scenario_17_durable_metadata_catalog() {
 
     // 4. Simulate server restart and verify metadata log replay restores topic
     drop(engine);
-    let restarted_engine = hermes::StorageEngine::new(config.clone()).unwrap();
+    let restarted_engine = bifrox::StorageEngine::new(config.clone()).unwrap();
     let restarted_parts = restarted_engine
         .describe_topic("meta_topic")
         .expect("DescribeTopic after restart failed");
@@ -1425,7 +1425,7 @@ async fn test_scenario_18_durable_consumer_offsets() {
 #[tokio::test]
 async fn test_scenario_19_relative_index_and_txnindex() {
     let test_dir = std::env::temp_dir().join(format!(
-        "hermes_test_txn_index_{}",
+        "bifrox_test_txn_index_{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1434,13 +1434,13 @@ async fn test_scenario_19_relative_index_and_txnindex() {
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
 
-    let config = hermes::EngineConfig {
+    let config = bifrox::EngineConfig {
         data_dir: test_dir.clone(),
         index_interval_bytes: 10,
-        ..hermes::EngineConfig::default()
+        ..bifrox::EngineConfig::default()
     };
 
-    let engine = hermes::StorageEngine::new(config).unwrap();
+    let engine = bifrox::StorageEngine::new(config).unwrap();
     let topic = "txn_idx_topic";
 
     // 1. Produce 5 records in a transaction
@@ -1455,7 +1455,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
         bytes::Bytes::from("msg2"),
         bytes::Bytes::from("msg3"),
     ];
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: Some(tx_id),
@@ -1466,7 +1466,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     engine.produce_batch(params).await.unwrap();
@@ -1476,7 +1476,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
 
     // 3. Produce another non-transactional record
     let records_ok = vec![bytes::Bytes::from("good_msg")];
-    let params_ok = hermes::server::engine::ProduceBatchParams {
+    let params_ok = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -1487,7 +1487,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     engine.produce_batch(params_ok).await.unwrap();
@@ -1598,7 +1598,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
     // 1. Start Node 2 (Node ID: 2)
     let config_node2 = EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -1614,7 +1614,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
     // 2. Start Node 1 (Node ID: 1)
     let config_node1 = EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_node2.to_string()],
@@ -1637,7 +1637,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
     engine_node2.register_broker_address(2, addr_node2.to_string());
 
     // 3. Connect RoutedClient to Node 1 (Bootstrap) and register Node 2
-    let mut smart_client = hermes::RoutedClient::connect(addr_node1)
+    let mut smart_client = bifrox::RoutedClient::connect(addr_node1)
         .await
         .expect("RoutedClient connect failed");
     smart_client.register_broker(2, addr_node2);
@@ -1835,7 +1835,7 @@ async fn test_scenario_22_per_client_quota_throttling() {
 
 #[tokio::test]
 async fn test_scenario_23_cleanup_policy_log_compaction() {
-    use hermes::config::CleanupPolicy;
+    use bifrox::config::CleanupPolicy;
 
     // 1. Verify parsing cleanup.policy from server.properties
     let dir_guard = TestDataDirGuard::new("cleanup_policy_config_test");
@@ -1846,20 +1846,20 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
     )
     .unwrap();
 
-    let cfg = hermes::config::EngineConfig::from_properties_file(&props_path).unwrap();
+    let cfg = bifrox::config::EngineConfig::from_properties_file(&props_path).unwrap();
     assert_eq!(cfg.cleanup_policy, CleanupPolicy::Compact);
     assert!(cfg.cleanup_policy.is_compact());
     assert!(!cfg.cleanup_policy.is_delete());
 
     // 2. Test SegmentManager Log Compaction behavior
     let seg_dir_guard = TestDataDirGuard::new("log_compaction_segment_test");
-    let config = hermes::config::EngineConfig {
+    let config = bifrox::config::EngineConfig {
         cleanup_policy: CleanupPolicy::Compact,
         max_segment_bytes: 100, // Small max_segment_bytes to force segment rotations
         ..Default::default()
     };
 
-    let mut seg_mgr = hermes::segment::SegmentManager::open(&seg_dir_guard.path, config).unwrap();
+    let mut seg_mgr = bifrox::segment::SegmentManager::open(&seg_dir_guard.path, config).unwrap();
 
     // Append records with duplicate keys across multiple segment rotations
     // Format: "key:value" payload
@@ -1918,8 +1918,8 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
 
 #[tokio::test]
 async fn test_scenario_24_sasl_and_acls() {
-    use hermes::config::{EngineConfig, SecurityProtocol};
-    use hermes::server::acl::{AclBinding, AclOperation, AclPermissionType, ResourceType};
+    use bifrox::config::{EngineConfig, SecurityProtocol};
+    use bifrox::server::acl::{AclBinding, AclOperation, AclPermissionType, ResourceType};
 
     let dir_guard = TestDataDirGuard::new("sasl_acls_test");
     let props_path = dir_guard.path.join("server.properties");
@@ -1948,7 +1948,7 @@ async fn test_scenario_24_sasl_and_acls() {
     assert!(config.acls_enabled);
     assert_eq!(config.super_users, vec!["User:admin".to_string()]);
 
-    // 2. Start Hermes server with SASL and ACL enforcement enabled
+    // 2. Start Bifrox server with SASL and ACL enforcement enabled
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1956,8 +1956,8 @@ async fn test_scenario_24_sasl_and_acls() {
     engine_cfg.data_dir = dir_guard.path.clone();
     engine_cfg.bind_addr = addr.to_string();
 
-    let engine = hermes::server::StorageEngine::new(engine_cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(engine_cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -1966,7 +1966,7 @@ async fn test_scenario_24_sasl_and_acls() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // 3. Test SASL Handshake & Authenticate over TCP wire connection
-    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
 
     // SASL Handshake
     let (err_code, mechs) = client.sasl_handshake("PLAIN").await.unwrap();
@@ -1979,7 +1979,7 @@ async fn test_scenario_24_sasl_and_acls() {
     assert_eq!(auth_res, 0); // 0 = SUCCESS
 
     // SASL Authenticate with invalid credentials
-    let mut invalid_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut invalid_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let invalid_auth_res = invalid_client
         .sasl_authenticate(b"\0alice\0wrongpass")
         .await
@@ -1987,7 +1987,7 @@ async fn test_scenario_24_sasl_and_acls() {
     assert_eq!(invalid_auth_res, 58); // 58 = SASL_AUTHENTICATION_FAILED
 
     // SASL Handshake for SCRAM-SHA-256 mechanism
-    let mut scram_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut scram_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let (scram_err, scram_mechs) = scram_client.sasl_handshake("SCRAM-SHA-256").await.unwrap();
     assert_eq!(scram_err, 0);
     assert!(scram_mechs.contains(&"SCRAM-SHA-256".to_string()));
@@ -2000,7 +2000,7 @@ async fn test_scenario_24_sasl_and_acls() {
     assert_eq!(scram_auth_res, 0);
 
     // Invalid SCRAM authentication attempt with unknown user
-    let mut invalid_scram_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut invalid_scram_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let invalid_scram_res = invalid_scram_client
         .sasl_authenticate(b"n,,n=unknown_user,r=rOprNGfwEbeRWgbNEkqO")
         .await
@@ -2008,7 +2008,7 @@ async fn test_scenario_24_sasl_and_acls() {
     assert_eq!(invalid_scram_res, 58); // 58 = SASL_AUTHENTICATION_FAILED
 
     // Authenticate admin client with superuser privileges
-    let mut admin_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut admin_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let _ = admin_client.sasl_handshake("PLAIN").await.unwrap();
     let admin_auth_res = admin_client
         .sasl_authenticate(b"\0admin\0adminpass")
@@ -2021,14 +2021,14 @@ async fn test_scenario_24_sasl_and_acls() {
         .upsert_scram_user("service_a", "svc_secret_123")
         .await
         .unwrap();
-    let mut service_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut service_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let service_scram_auth = service_client
         .sasl_authenticate_scram_sha256("service_a", "svc_secret_123")
         .await
         .unwrap();
     assert_eq!(service_scram_auth, 0);
     admin_client.delete_scram_user("service_a").await.unwrap();
-    let mut deleted_service_client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut deleted_service_client = bifrox::client::TestClient::connect(addr).await.unwrap();
     let deleted_service_auth = deleted_service_client
         .sasl_authenticate_scram_sha256("service_a", "svc_secret_123")
         .await
@@ -2107,7 +2107,7 @@ async fn test_scenario_24_sasl_and_acls() {
 
 #[tokio::test]
 async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
-    use hermes::config::{EngineConfig, SecurityProtocol};
+    use bifrox::config::{EngineConfig, SecurityProtocol};
 
     // 1. Test SSL mode over encrypted TLS transport
     let dir_guard = TestDataDirGuard::new("ssl_transport_test");
@@ -2121,8 +2121,8 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(ssl_cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(ssl_cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -2131,7 +2131,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Connect TestClient over TLS (insecure mode for auto-generated self-signed test cert)
-    let mut tls_client = hermes::client::TestClient::connect_tls_full(addr, None, None, true)
+    let mut tls_client = bifrox::client::TestClient::connect_tls_full(addr, None, None, true)
         .await
         .unwrap();
 
@@ -2165,8 +2165,8 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
         ..Default::default()
     };
 
-    let engine2 = hermes::server::StorageEngine::new(sasl_ssl_cfg).unwrap();
-    let server2 = hermes::server::Server::new(engine2.clone());
+    let engine2 = bifrox::server::StorageEngine::new(sasl_ssl_cfg).unwrap();
+    let server2 = bifrox::server::Server::new(engine2.clone());
 
     tokio::spawn(async move {
         server2.run_with_listener(listener2).await.unwrap();
@@ -2175,7 +2175,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Connect TestClient over TLS for SASL_SSL
-    let mut unauth_client = hermes::client::TestClient::connect_tls_full(addr2, None, None, true)
+    let mut unauth_client = bifrox::client::TestClient::connect_tls_full(addr2, None, None, true)
         .await
         .unwrap();
     let unauth_res = unauth_client
@@ -2186,7 +2186,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
         "Unauthenticated produce on SASL_SSL port must be rejected!"
     );
 
-    let mut sasl_tls_client = hermes::client::TestClient::connect_tls_full(addr2, None, None, true)
+    let mut sasl_tls_client = bifrox::client::TestClient::connect_tls_full(addr2, None, None, true)
         .await
         .unwrap();
 
@@ -2217,7 +2217,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
 
 #[tokio::test]
 async fn test_scenario_26_pem_file_tls_key_and_mtls() {
-    use hermes::config::{EngineConfig, SecurityProtocol};
+    use bifrox::config::{EngineConfig, SecurityProtocol};
 
     let dir_guard = TestDataDirGuard::new("pem_tls_file_test");
 
@@ -2259,8 +2259,8 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(ssl_cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(ssl_cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -2270,7 +2270,7 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
 
     // 1. Client connecting WITHOUT client cert when mTLS is required MUST fail handshake or request
     let unauthenticated_client_res =
-        hermes::client::TestClient::connect_tls_with_ca(addr, &cert_path).await;
+        bifrox::client::TestClient::connect_tls_with_ca(addr, &cert_path).await;
     if let Ok(mut c) = unauthenticated_client_res {
         let res = c.ping().await;
         assert!(
@@ -2280,7 +2280,7 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
     }
 
     // 2. Client connecting WITH valid client cert over mTLS MUST succeed and verify server CA
-    let mut mtls_client = hermes::client::TestClient::connect_mtls(
+    let mut mtls_client = bifrox::client::TestClient::connect_mtls(
         addr,
         &cert_path,
         &client_cert_path,
@@ -2306,7 +2306,7 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
 
 #[tokio::test]
 async fn test_scenario_27_dynamic_broker_registration_and_membership() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir_guard = TestDataDirGuard::new("dynamic_broker_membership_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2319,8 +2319,8 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -2328,7 +2328,7 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
 
     // Initial DescribeCluster -> 1 node (node 1)
     let desc_initial = client.describe_cluster().await.unwrap();
@@ -2361,7 +2361,7 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
 
 #[tokio::test]
 async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir_guard = TestDataDirGuard::new("prometheus_and_lz4_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2371,12 +2371,12 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
-        compression_codec: hermes::config::CompressionCodec::Lz4,
+        compression_codec: bifrox::config::CompressionCodec::Lz4,
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -2385,10 +2385,10 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Test Real End-to-End Client Produce & Fetch over LZ4-compressed storage engine
-    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
     // Compression is the producer's job now: the client compresses, the broker
     // stores those bytes untouched and serves them back the same way.
-    client.set_compression(hermes::protocol::BatchCompression::Lz4);
+    client.set_compression(bifrox::protocol::BatchCompression::Lz4);
     let raw_payload_str = "end_to_end_lz4_wire_compressed_payload_0123456789_0123456789_0123456789";
     let recs = vec![bytes::Bytes::from(raw_payload_str)];
     let prod_res = client
@@ -2412,10 +2412,10 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
         .join("lz4_wire_topic-0")
         .join("00000000000000000000.log");
     let log_bytes = std::fs::read(&log_file_path).unwrap();
-    let (disk_batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+    let (disk_batch, _) = bifrox::protocol::RecordBatch::decode(&log_bytes).unwrap();
     assert_eq!(
         disk_batch.compression().unwrap(),
-        hermes::protocol::BatchCompression::Lz4,
+        bifrox::protocol::BatchCompression::Lz4,
         "records must be stored LZ4-compressed at the batch level"
     );
     let disk_records = disk_batch.records().unwrap();
@@ -2443,17 +2443,17 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     let resp_str = String::from_utf8_lossy(&resp_buf);
 
     assert!(resp_str.contains("200 OK"));
-    assert!(resp_str.contains("hermes_produce_bytes_total"));
-    assert!(resp_str.contains("hermes_produce_records_total"));
-    assert!(resp_str.contains("hermes_fetch_bytes_total"));
-    assert!(resp_str.contains("hermes_topics_count"));
-    assert!(resp_str.contains("hermes_active_brokers_count"));
-    assert!(resp_str.contains("hermes_active_connections"));
+    assert!(resp_str.contains("bifrox_produce_bytes_total"));
+    assert!(resp_str.contains("bifrox_produce_records_total"));
+    assert!(resp_str.contains("bifrox_fetch_bytes_total"));
+    assert!(resp_str.contains("bifrox_topics_count"));
+    assert!(resp_str.contains("bifrox_active_brokers_count"));
+    assert!(resp_str.contains("bifrox_active_connections"));
 }
 
 #[tokio::test]
 async fn test_scenario_37_zstd_compression_end_to_end() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir_guard = TestDataDirGuard::new("zstd_compression_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2463,12 +2463,12 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
-        compression_codec: hermes::config::CompressionCodec::Zstd,
+        compression_codec: bifrox::config::CompressionCodec::Zstd,
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
-    let server = hermes::server::Server::new(engine.clone());
+    let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -2476,10 +2476,10 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
     // Compression is the producer's job now: the client compresses, the broker
     // stores those bytes untouched and serves them back the same way.
-    client.set_compression(hermes::protocol::BatchCompression::Zstd);
+    client.set_compression(bifrox::protocol::BatchCompression::Zstd);
 
     // Also verify "zstd" parses correctly through the same dynamic-config path clients use.
     client.create_topic("zstd_wire_topic", 1).await.unwrap();
@@ -2515,10 +2515,10 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
         .join("zstd_wire_topic-0")
         .join("00000000000000000000.log");
     let log_bytes = std::fs::read(&log_file_path).unwrap();
-    let (disk_batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+    let (disk_batch, _) = bifrox::protocol::RecordBatch::decode(&log_bytes).unwrap();
     assert_eq!(
         disk_batch.compression().unwrap(),
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "records must be stored zstd-compressed at the batch level"
     );
     let disk_records = disk_batch.records().unwrap();
@@ -2532,7 +2532,7 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
 
 #[tokio::test]
 async fn test_scenario_29_scram_credentials_persist_across_restart() {
-    use hermes::config::{EngineConfig, SecurityProtocol};
+    use bifrox::config::{EngineConfig, SecurityProtocol};
 
     let dir_guard = TestDataDirGuard::new("scram_persist_restart");
     let bootstrap_cfg = EngineConfig {
@@ -2608,7 +2608,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
         .unwrap();
     let first_record = vec![bytes::Bytes::from_static(b"txn-recovery-record-1")];
     engine
-        .produce_batch(hermes::server::engine::ProduceBatchParams {
+        .produce_batch(bifrox::server::engine::ProduceBatchParams {
             topic,
             key: "",
             transaction_id: Some(transactional_id),
@@ -2619,7 +2619,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
                 producer_epoch,
                 0,
                 true,
-                hermes::protocol::BatchCompression::None,
+                bifrox::protocol::BatchCompression::None,
             ),
         })
         .await
@@ -2660,7 +2660,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
         .unwrap();
     let second_record = vec![bytes::Bytes::from_static(b"txn-recovery-record-2")];
     restarted
-        .produce_batch(hermes::server::engine::ProduceBatchParams {
+        .produce_batch(bifrox::server::engine::ProduceBatchParams {
             topic,
             key: "",
             transaction_id: Some(transactional_id),
@@ -2671,7 +2671,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
                 recovered_epoch,
                 0,
                 false,
-                hermes::protocol::BatchCompression::None,
+                bifrox::protocol::BatchCompression::None,
             ),
         })
         .await
@@ -2688,7 +2688,7 @@ async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
 
 #[tokio::test]
 async fn test_scenario_31_share_consumer_and_queue_semantics() {
-    use hermes::{AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest};
+    use bifrox::{AckBatch, AcknowledgeType, CommandCode, RequestPayload, WireRequest};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -2996,7 +2996,7 @@ async fn test_scenario_32_dynamic_topic_configs() {
     // The recognized keys must actually take effect on the live partition, not just be
     // stored — this is what distinguishes a real dynamic-config API from a no-op one.
     let pm = env.engine.get_or_create_partition(topic, 0).unwrap();
-    assert_eq!(pm.cleanup_policy(), hermes::config::CleanupPolicy::Compact);
+    assert_eq!(pm.cleanup_policy(), bifrox::config::CleanupPolicy::Compact);
 
     // 3. IncrementalAlterConfigs merges: upsert one key, delete another, leave the rest.
     client
@@ -3055,7 +3055,7 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
     assert_eq!(join_a.protocol_name, "cooperative-sticky");
 
     // 2. Leader A submits the initial assignment (all partitions to itself) and stabilizes.
-    let assignment_gen1 = vec![hermes::protocol::wire::MemberAssignment {
+    let assignment_gen1 = vec![bifrox::protocol::wire::MemberAssignment {
         member_id: "member-a".to_string(),
         topic: topic.to_string(),
         partitions: vec![0, 1],
@@ -3111,12 +3111,12 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
     assert!(rejoin_a.is_leader);
 
     let assignment_gen2 = vec![
-        hermes::protocol::wire::MemberAssignment {
+        bifrox::protocol::wire::MemberAssignment {
             member_id: "member-a".to_string(),
             topic: topic.to_string(),
             partitions: vec![0],
         },
-        hermes::protocol::wire::MemberAssignment {
+        bifrox::protocol::wire::MemberAssignment {
             member_id: "member-b".to_string(),
             topic: topic.to_string(),
             partitions: vec![1],
@@ -3184,7 +3184,7 @@ async fn test_scenario_33_cooperative_group_rebalancing() {
 
 #[tokio::test]
 async fn test_scenario_34_dedicated_controller_and_broker_roles() {
-    use hermes::config::ProcessRole;
+    use bifrox::config::ProcessRole;
 
     let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
@@ -3197,7 +3197,7 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
     // Node 2: broker-only — hosts data partitions, never contests the metadata quorum.
     let config_node2 = EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         roles: vec![ProcessRole::Broker],
@@ -3214,7 +3214,7 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
     // partition even though it's the (only) node available at topic-creation time.
     let config_node1 = EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_node2.to_string()],
@@ -3468,11 +3468,11 @@ async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
+fn encode_wire_request(req: &bifrox::WireRequest) -> Vec<u8> {
     use bytes::BufMut;
     let mut body = Vec::new();
     match &req.payload {
-        hermes::RequestPayload::ShareFetch {
+        bifrox::RequestPayload::ShareFetch {
             group_id,
             member_id,
             topic,
@@ -3482,9 +3482,9 @@ fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
             lock_timeout_ms,
             acknowledgements,
         } => {
-            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
-            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
-            hermes::protocol::wire::write_pascal_string(&mut body, topic);
+            bifrox::protocol::wire::write_pascal_string(&mut body, group_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, member_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, topic);
             body.put_u32(*partition);
             body.put_u32(*max_records);
             body.put_u32(*max_bytes);
@@ -3496,16 +3496,16 @@ fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
                 body.put_u8(ack.ack_type as u8);
             }
         }
-        hermes::RequestPayload::ShareAcknowledge {
+        bifrox::RequestPayload::ShareAcknowledge {
             group_id,
             member_id,
             topic,
             partition,
             acknowledgements,
         } => {
-            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
-            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
-            hermes::protocol::wire::write_pascal_string(&mut body, topic);
+            bifrox::protocol::wire::write_pascal_string(&mut body, group_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, member_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, topic);
             body.put_u32(*partition);
             body.put_u32(acknowledgements.len() as u32);
             for ack in acknowledgements {
@@ -3514,15 +3514,15 @@ fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
                 body.put_u8(ack.ack_type as u8);
             }
         }
-        hermes::RequestPayload::ShareGroupHeartbeat {
+        bifrox::RequestPayload::ShareGroupHeartbeat {
             group_id,
             member_id,
         } => {
-            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
-            hermes::protocol::wire::write_pascal_string(&mut body, member_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, group_id);
+            bifrox::protocol::wire::write_pascal_string(&mut body, member_id);
         }
-        hermes::RequestPayload::ShareGroupDescribe { group_id } => {
-            hermes::protocol::wire::write_pascal_string(&mut body, group_id);
+        bifrox::RequestPayload::ShareGroupDescribe { group_id } => {
+            bifrox::protocol::wire::write_pascal_string(&mut body, group_id);
         }
         _ => panic!("Unsupported in test encode"),
     }
@@ -3534,7 +3534,7 @@ fn encode_wire_request(req: &hermes::WireRequest) -> Vec<u8> {
     buf
 }
 
-async fn read_wire_response<S>(stream: &mut S) -> hermes::WireResponse
+async fn read_wire_response<S>(stream: &mut S) -> bifrox::WireResponse
 where
     S: tokio::io::AsyncReadExt + Unpin,
 {
@@ -3546,7 +3546,7 @@ where
     if len > 0 {
         stream.read_exact(&mut payload).await.unwrap();
     }
-    hermes::WireResponse { status, payload }
+    bifrox::WireResponse { status, payload }
 }
 
 /// A read must never bring a topic into existence. `Fetch` (and the offset/seek probes
@@ -3834,12 +3834,12 @@ async fn test_scenario_41_alter_configs_rejects_invalid_values() {
 /// `__cluster_metadata` has no pull fetcher and is push-only by design.
 #[tokio::test]
 async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes() {
-    use hermes::config::ProcessRole;
+    use bifrox::config::ProcessRole;
     use std::sync::atomic::AtomicBool;
     use tokio::io::AsyncReadExt;
 
     let test_dir = std::env::temp_dir().join(format!(
-        "hermes_test_no_dup_push_{}_{}",
+        "bifrox_test_no_dup_push_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3848,7 +3848,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     ));
     let _ = std::fs::remove_dir_all(&test_dir);
 
-    // A raw, non-Hermes TCP peer standing in for a replica: nothing but a leader-side
+    // A raw, non-Bifrox TCP peer standing in for a replica: nothing but a leader-side
     // wire call (replication push *or* the leader heartbeat, which shares the same
     // per-peer pooled connection) could ever make a connection land here. Only the
     // `ReplicationPush` frame type counts as proof of a push; the leader heartbeat shares
@@ -3874,10 +3874,10 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let mut header = [0u8; hermes::replication::ENVELOPE_HEADER_SIZE];
+            let mut header = [0u8; bifrox::replication::ENVELOPE_HEADER_SIZE];
             if stream.read_exact(&mut header).await.is_ok() {
-                if let Ok(decoded) = hermes::replication::decode_header(&header) {
-                    if decoded.frame_type == hermes::replication::FrameType::ReplicationPush {
+                if let Ok(decoded) = bifrox::replication::decode_header(&header) {
+                    if decoded.frame_type == bifrox::replication::FrameType::ReplicationPush {
                         magic_seen_task.store(true, Ordering::SeqCst);
                     }
                 }
@@ -3900,7 +3900,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     // runtime so that sweep can't fire and manufacture a false-positive push.
     let config = EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: test_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![peer_addr.clone()],
@@ -3930,7 +3930,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     // Produce to the assigned data partition. If push still fired here, the fake peer
     // would see a connection carrying a `ReplicationPush` frame.
     let records = vec![bytes::Bytes::from("no-push-payload")];
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -3941,7 +3941,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     engine.produce_batch(params).await.unwrap();
@@ -3960,7 +3960,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
         .upsert_scram_user_with_mechanism(
             "no_dup_push_test_user",
             "irrelevant-password",
-            hermes::scram::ScramMechanism::Sha256,
+            bifrox::scram::ScramMechanism::Sha256,
         )
         .await
         .unwrap();
@@ -3989,7 +3989,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
 /// mechanism silently replaced the first.
 #[tokio::test]
 async fn test_scenario_43_scram_credentials_are_per_mechanism() {
-    use hermes::scram::ScramMechanism;
+    use bifrox::scram::ScramMechanism;
 
     let env = start_test_server().await;
     let engine = env.engine.clone();
@@ -4108,7 +4108,7 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
     // Follower (node 2)
     let engine_node2 = StorageEngine::new(EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: base_dir.join("node2"),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -4123,7 +4123,7 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
     // Leader (node 1), with node 2 as its peer
     let engine_node1 = StorageEngine::new(EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("node1"),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_node2.to_string()],
@@ -4296,7 +4296,7 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
 
     let engine_follower = StorageEngine::new(EngineConfig {
         node_id: 2,
-        role: hermes::NodeRole::Follower,
+        role: bifrox::NodeRole::Follower,
         data_dir: base_dir.join("f"),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -4310,7 +4310,7 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
 
     let engine_leader = StorageEngine::new(EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("l"),
         bind_addr: "127.0.0.1:0".to_string(),
         peer_addrs: vec![addr_f.to_string()],
@@ -4476,7 +4476,7 @@ async fn test_scenario_48_controller_assigns_new_topics_before_first_write() {
 /// carry — an older broker skips the tag rather than misparsing the request.
 #[tokio::test]
 async fn test_scenario_51_fetch_honours_requested_isolation_level() {
-    use hermes::protocol::wire::IsolationLevel;
+    use bifrox::protocol::wire::IsolationLevel;
 
     let env = start_test_server().await;
     let mut client = TestClient::connect(env.addr).await.unwrap();
@@ -4567,7 +4567,7 @@ async fn test_scenario_49_metadata_requires_majority_before_taking_effect() {
     // metadata record can reach a majority.
     let engine = StorageEngine::new(EngineConfig {
         node_id: 1,
-        role: hermes::NodeRole::Leader,
+        role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("lonely"),
         bind_addr: "127.0.0.1:0".to_string(),
         // Port 1 is not listening; the peer is unreachable by construction.
@@ -4643,7 +4643,7 @@ async fn test_scenario_50_sole_controller_commits_immediately() {
 /// from the command failing for an ordinary reason.
 #[tokio::test]
 async fn test_scenario_53_clients_can_negotiate_protocol_support() {
-    use hermes::protocol::wire::{
+    use bifrox::protocol::wire::{
         CommandCode, IsolationLevel, PROTOCOL_VERSION_MAX, PROTOCOL_VERSION_MIN,
     };
 
@@ -4700,13 +4700,13 @@ async fn test_scenario_53_clients_can_negotiate_protocol_support() {
 /// at all.
 #[tokio::test]
 async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
-    use hermes::protocol::wire::{
+    use bifrox::protocol::wire::{
         strip_envelope, wrap_forwarded_request, RequestFraming, WireRequest,
     };
 
     // A plain client request carries no marker, so a broker is free to route it.
     let mut original = Vec::new();
-    original.push(hermes::protocol::wire::CommandCode::Ping as u8);
+    original.push(bifrox::protocol::wire::CommandCode::Ping as u8);
     original.extend_from_slice(&0u32.to_be_bytes());
     let (_req, framing, _) = WireRequest::decode_framed(&original).unwrap();
     assert!(
@@ -4721,7 +4721,7 @@ async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
         relayed_framing.is_forwarded(),
         "a relayed request must be marked so the receiver serves it"
     );
-    assert_eq!(req.cmd, hermes::protocol::wire::CommandCode::Ping);
+    assert_eq!(req.cmd, bifrox::protocol::wire::CommandCode::Ping);
     assert_eq!(used, relayed.len());
     let (inner, _) = strip_envelope(&relayed).unwrap();
     assert_eq!(inner, &original[..], "the inner request must be preserved");
@@ -4730,7 +4730,7 @@ async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
     // a nested envelope would leave the receiver reading 0xF1 where a command code belongs.
     let twice = wrap_forwarded_request(&relayed).unwrap();
     let (req2, framing2, used2) = WireRequest::decode_framed(&twice).unwrap();
-    assert_eq!(req2.cmd, hermes::protocol::wire::CommandCode::Ping);
+    assert_eq!(req2.cmd, bifrox::protocol::wire::CommandCode::Ping);
     assert!(framing2.is_forwarded());
     assert_eq!(
         used2,
@@ -4741,13 +4741,13 @@ async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
     // Recognised tags survive the relay, so a forwarded fetch keeps the isolation the
     // client asked for rather than silently reverting to the default.
     let mut enveloped = Vec::new();
-    enveloped.push(hermes::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
-    enveloped.extend_from_slice(&hermes::protocol::wire::PROTOCOL_VERSION_MAX.to_be_bytes());
+    enveloped.push(bifrox::protocol::wire::VERSIONED_ENVELOPE_MAGIC);
+    enveloped.extend_from_slice(&bifrox::protocol::wire::PROTOCOL_VERSION_MAX.to_be_bytes());
     enveloped.extend_from_slice(&99u32.to_be_bytes());
     enveloped.push(1);
-    enveloped.push(hermes::protocol::wire::tags::ISOLATION_LEVEL);
+    enveloped.push(bifrox::protocol::wire::tags::ISOLATION_LEVEL);
     enveloped.extend_from_slice(&1u16.to_be_bytes());
-    enveloped.push(hermes::protocol::wire::IsolationLevel::ReadCommitted.to_byte());
+    enveloped.push(bifrox::protocol::wire::IsolationLevel::ReadCommitted.to_byte());
     enveloped.extend_from_slice(&original);
 
     let relayed_iso = wrap_forwarded_request(&enveloped).unwrap();
@@ -4755,24 +4755,24 @@ async fn test_scenario_52_forwarded_requests_are_served_not_relayed_onward() {
     assert!(iso_framing.is_forwarded());
     assert_eq!(
         iso_framing.isolation_level(),
-        hermes::protocol::wire::IsolationLevel::ReadCommitted,
+        bifrox::protocol::wire::IsolationLevel::ReadCommitted,
         "relaying must carry the client's isolation level across the hop"
     );
 
     // A response from the relay hop is framed; re-framing it for a legacy client must strip
     // that envelope, or the client reads the magic byte as the response status.
-    let leader_reply = hermes::protocol::wire::WireResponse::ok(vec![7, 7]).encode_framed(
+    let leader_reply = bifrox::protocol::wire::WireResponse::ok(vec![7, 7]).encode_framed(
         &RequestFraming::Versioned {
-            api_version: hermes::protocol::wire::PROTOCOL_VERSION_MAX,
+            api_version: bifrox::protocol::wire::PROTOCOL_VERSION_MAX,
             correlation_id: 5,
             tags: Default::default(),
         },
     );
     let for_legacy_client =
-        hermes::protocol::wire::relay_response(&leader_reply, &RequestFraming::Legacy);
+        bifrox::protocol::wire::relay_response(&leader_reply, &RequestFraming::Legacy);
     assert_eq!(
         for_legacy_client,
-        hermes::protocol::wire::WireResponse::ok(vec![7, 7]).encode(),
+        bifrox::protocol::wire::WireResponse::ok(vec![7, 7]).encode(),
         "a legacy client must receive an unwrapped response"
     );
 }
@@ -4818,11 +4818,11 @@ async fn test_scenario_54_static_member_restart_does_not_rebalance() {
         .find(|m| m.2)
         .expect("one member must lead")
         .clone();
-    let assignments: Vec<hermes::protocol::wire::MemberAssignment> = members
+    let assignments: Vec<bifrox::protocol::wire::MemberAssignment> = members
         .iter()
         .enumerate()
         .map(
-            |(i, (member_id, _, _, _))| hermes::protocol::wire::MemberAssignment {
+            |(i, (member_id, _, _, _))| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: "static_topic".to_string(),
                 partitions: vec![i as u32],
@@ -5008,7 +5008,7 @@ async fn test_scenario_57_static_membership_survives_a_reconnect() {
             group_id,
             first.generation_id,
             &first.member_id,
-            &[hermes::protocol::wire::MemberAssignment {
+            &[bifrox::protocol::wire::MemberAssignment {
                 member_id: first.member_id.clone(),
                 topic: "wire_static_topic".to_string(),
                 partitions: vec![0, 1],
@@ -5540,7 +5540,7 @@ async fn test_scenario_61_a_consumer_resumes_from_its_committed_offsets() {
 /// this one proves nothing is born — on disk or in cluster metadata — when it isn't.
 #[tokio::test]
 async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_registering_it() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir_guard = TestDataDirGuard::new("auto_create_disabled_test");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5554,9 +5554,9 @@ async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_reg
         ..Default::default()
     };
 
-    let engine = hermes::server::StorageEngine::new(cfg).unwrap();
+    let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
     assert!(engine.is_leader(), "the test broker is its own controller");
-    let server = hermes::server::Server::new(engine.clone());
+    let server = bifrox::server::Server::new(engine.clone());
 
     tokio::spawn(async move {
         server.run_with_listener(listener).await.unwrap();
@@ -5984,7 +5984,7 @@ async fn test_scenario_66_a_heartbeating_but_non_consuming_member_is_evicted_and
         .expect("the stalled member's eviction must be recorded");
     assert_eq!(
         stalled_record.reason,
-        hermes::server::coordinator::EvictionReason::StalledConsumption,
+        bifrox::server::coordinator::EvictionReason::StalledConsumption,
         "a heartbeating-but-non-consuming member must be evicted as stalled, not as a \
          session timeout"
     );
@@ -6125,12 +6125,12 @@ async fn test_scenario_67_session_timeout_and_stalled_consumption_evictions_are_
 
     assert_eq!(
         dead_record.reason,
-        hermes::server::coordinator::EvictionReason::SessionTimeout,
+        bifrox::server::coordinator::EvictionReason::SessionTimeout,
         "a member that never heartbeats must be evicted as a session timeout"
     );
     assert_eq!(
         stalled_record.reason,
-        hermes::server::coordinator::EvictionReason::StalledConsumption,
+        bifrox::server::coordinator::EvictionReason::StalledConsumption,
         "a member that heartbeats but never fetches must be evicted as stalled \
          consumption"
     );
@@ -6215,7 +6215,7 @@ fn wait_for_child_with_deadline(
 /// -- silently skipping the consumer's final offset commit on every container restart, and
 /// reprocessing everything since the last periodic commit.
 ///
-/// This drives the real `hermes_cli` binary as a child process and sends it an actual
+/// This drives the real `bifrox_cli` binary as a child process and sends it an actual
 /// SIGTERM, rather than exercising the `select!` arm in-process, because the bug was
 /// specifically about which OS signal reaches that arm -- an in-process test would not have
 /// caught it. Unix-only: Windows has no SIGTERM to send.
@@ -6236,7 +6236,7 @@ async fn test_scenario_68_sigterm_triggers_the_same_graceful_shutdown_as_sigint(
             .unwrap();
     }
 
-    let cli_path = env!("CARGO_BIN_EXE_hermes_cli");
+    let cli_path = env!("CARGO_BIN_EXE_bifrox_cli");
     let child = std::process::Command::new(cli_path)
         .args([
             "group-consume",
@@ -6252,7 +6252,7 @@ async fn test_scenario_68_sigterm_triggers_the_same_graceful_shutdown_as_sigint(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("failed to spawn hermes_cli group-consume");
+        .expect("failed to spawn bifrox_cli group-consume");
     let pid = child.id();
 
     // Wait for the consumer to actually join, consume every produced record, and
@@ -6295,7 +6295,7 @@ async fn test_scenario_68_sigterm_triggers_the_same_graceful_shutdown_as_sigint(
 
     assert!(
         output.status.success(),
-        "hermes_cli must exit successfully after SIGTERM, proving it went through the \
+        "bifrox_cli must exit successfully after SIGTERM, proving it went through the \
          graceful-shutdown path instead of being killed outright by the OS default action; \
          status={:?} stderr={}",
         output.status,
@@ -6352,7 +6352,7 @@ async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
             .unwrap();
     }
 
-    let cli_path = env!("CARGO_BIN_EXE_hermes_cli");
+    let cli_path = env!("CARGO_BIN_EXE_bifrox_cli");
     let child = std::process::Command::new(cli_path)
         .args([
             "group-consume",
@@ -6368,7 +6368,7 @@ async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("failed to spawn hermes_cli group-consume");
+        .expect("failed to spawn bifrox_cli group-consume");
     let pid = child.id();
 
     // The first `sleep(50ms)` branch wins (no signal has been sent yet), which starts the
@@ -6400,7 +6400,7 @@ async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
 
     assert!(
         output.status.success(),
-        "hermes_cli must exit successfully after SIGTERM sent mid-poll, proving the \
+        "bifrox_cli must exit successfully after SIGTERM sent mid-poll, proving the \
          shutdown listener survives across select! iterations instead of being dropped and \
          losing the signal; status={:?} stderr={}",
         output.status,
@@ -6541,7 +6541,7 @@ async fn test_scenario_73_empty_peer_allowlist_accepts_heartbeat_from_any_distin
         let _ = server.run_with_listener(listener).await;
     });
 
-    let result = hermes::replication::send_leader_heartbeat(
+    let result = bifrox::replication::send_leader_heartbeat(
         &addr.to_string(),
         &cluster_id,
         42,                // a leader node_id distinct from this node's own (9)
@@ -6587,7 +6587,7 @@ async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader(
         let _ = server.run_with_listener(listener).await;
     });
 
-    let rejected = hermes::replication::send_leader_heartbeat(
+    let rejected = bifrox::replication::send_leader_heartbeat(
         &addr.to_string(),
         &cluster_id,
         42,
@@ -6601,7 +6601,7 @@ async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader(
          be rejected"
     );
 
-    let accepted = hermes::replication::send_leader_heartbeat(
+    let accepted = bifrox::replication::send_leader_heartbeat(
         &addr.to_string(),
         &cluster_id,
         42,
@@ -6644,7 +6644,7 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
         let _ = server.run_with_listener(listener).await;
     });
 
-    let result = hermes::replication::send_leader_heartbeat(
+    let result = bifrox::replication::send_leader_heartbeat(
         &addr.to_string(),
         &cluster_id,
         42,
@@ -6666,7 +6666,7 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
 //
 // The Kafka protocol guide is explicit that the broker does *not* answer out of order:
 // "The server guarantees that on a single TCP connection, requests will be processed in
-// the order they are sent and responses will return in that order as well." Hermes's
+// the order they are sent and responses will return in that order as well." Bifrox's
 // broker already relies on exactly that guarantee (`WireResponse::encode_framed_into`
 // echoes each request's correlation id, and the connection loop in `server/handler.rs`
 // drains and answers back-to-back requests off one read in order) — so pipelining is
@@ -6688,7 +6688,7 @@ async fn test_scenario_76_pipelined_requests_return_correlated_in_order_response
         .await
         .expect("Failed to connect");
 
-    // N > hermes::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS (5), so the pipeline must refill
+    // N > bifrox::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS (5), so the pipeline must refill
     // its window at least once mid-flight rather than emptying it in a single pass.
     const N: usize = 8;
     let mut expected_watermarks = Vec::with_capacity(N);
@@ -6717,14 +6717,14 @@ async fn test_scenario_76_pipelined_requests_return_correlated_in_order_response
         .map(|i| {
             let topic = format!("pipeline_topic_{}", i);
             let mut inner = Vec::new();
-            hermes::protocol::wire::write_pascal_string(&mut inner, &topic);
+            bifrox::protocol::wire::write_pascal_string(&mut inner, &topic);
             inner.put_u32(0); // partition
-            (hermes::CommandCode::LatestOffset, Vec::new(), inner)
+            (bifrox::CommandCode::LatestOffset, Vec::new(), inner)
         })
         .collect();
 
     let responses = client
-        .send_pipelined(requests, hermes::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS)
+        .send_pipelined(requests, bifrox::client::DEFAULT_MAX_IN_FLIGHT_REQUESTS)
         .await
         .expect("pipelined send failed");
 
@@ -6759,7 +6759,7 @@ async fn test_scenario_76_pipelined_requests_return_correlated_in_order_response
 /// to exceed its bound, in FIFO order, rather than growing unboundedly.
 #[test]
 fn test_scenario_77_in_flight_window_enforces_max_bound() {
-    let mut window = hermes::client::InFlightWindow::new(3);
+    let mut window = bifrox::client::InFlightWindow::new(3);
 
     assert!(window.try_push(1));
     assert!(window.try_push(2));
@@ -6790,16 +6790,16 @@ fn test_scenario_77_in_flight_window_enforces_max_bound() {
 }
 
 /// A correlation id mismatch means a protocol bug or wire corruption and must be a loud
-/// error, never a silently mismatched result. Hermes's broker always echoes the correct id
+/// error, never a silently mismatched result. Bifrox's broker always echoes the correct id
 /// (this is the guarantee issue #20 depends on), so a real mismatch cannot be provoked by
 /// talking to a well-behaved broker — this instead tests the matching logic itself, the
 /// same `verify_correlation_id` both `send_versioned` and `send_pipelined` check every
 /// response against.
 #[test]
 fn test_scenario_78_correlation_id_mismatch_is_reported_as_error() {
-    hermes::client::verify_correlation_id(42, 42).expect("matching ids must be accepted");
+    bifrox::client::verify_correlation_id(42, 42).expect("matching ids must be accepted");
 
-    let err = hermes::client::verify_correlation_id(42, 43)
+    let err = bifrox::client::verify_correlation_id(42, 43)
         .expect_err("a mismatched correlation id must be reported as an error, not accepted");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(
@@ -7170,7 +7170,7 @@ async fn test_scenario_80_cooperative_round_one_revokes_only_the_moving_partitio
         .expect("A must be able to join");
     assert_eq!(join_a.generation_id, 1);
     assert!(join_a.is_leader);
-    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+    let a_full = vec![bifrox::protocol::wire::MemberAssignment {
         member_id: "member-a".to_string(),
         topic: topic.to_string(),
         partitions: vec![0, 1],
@@ -7204,9 +7204,9 @@ async fn test_scenario_80_cooperative_round_one_revokes_only_the_moving_partitio
         ("member-b".to_string(), vec![]),
     ]);
     let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
-    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
+    let target = bifrox::consumer::assign_sticky(2, &member_ids, &previous);
     let (round_one, needs_second_round) =
-        hermes::consumer::cooperative_round_one(&target, &previous);
+        bifrox::consumer::cooperative_round_one(&target, &previous);
     assert!(
         needs_second_round,
         "one partition must be moving from A to B, so a second round is required"
@@ -7239,10 +7239,10 @@ async fn test_scenario_80_cooperative_round_one_revokes_only_the_moving_partitio
         "exactly one partition must be revoked from A, not both"
     );
 
-    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+    let round_one_assignments: Vec<bifrox::protocol::wire::MemberAssignment> = round_one
         .iter()
         .map(
-            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: topic.to_string(),
                 partitions: partitions.clone(),
@@ -7319,7 +7319,7 @@ async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds(
         .await
         .unwrap();
     assert_eq!(join_a.generation_id, 1);
-    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+    let a_full = vec![bifrox::protocol::wire::MemberAssignment {
         member_id: "member-a".to_string(),
         topic: topic.to_string(),
         partitions: vec![0, 1],
@@ -7349,15 +7349,15 @@ async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds(
         ("member-b".to_string(), vec![]),
     ]);
     let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
-    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
+    let target = bifrox::consumer::assign_sticky(2, &member_ids, &previous);
     let (round_one, needs_second_round) =
-        hermes::consumer::cooperative_round_one(&target, &previous);
+        bifrox::consumer::cooperative_round_one(&target, &previous);
     assert!(needs_second_round);
 
-    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+    let round_one_assignments: Vec<bifrox::protocol::wire::MemberAssignment> = round_one
         .iter()
         .map(
-            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: topic.to_string(),
                 partitions: partitions.clone(),
@@ -7386,10 +7386,10 @@ async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds(
 
     // Round two reuses `target` as-is (see `GroupConsumer::rejoin`'s reasoning) rather
     // than recomputing it.
-    let target_assignments: Vec<hermes::protocol::wire::MemberAssignment> = target
+    let target_assignments: Vec<bifrox::protocol::wire::MemberAssignment> = target
         .iter()
         .map(
-            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: topic.to_string(),
                 partitions: partitions.clone(),
@@ -7446,7 +7446,7 @@ async fn test_scenario_81_cooperative_rebalance_converges_in_exactly_two_rounds(
         "the group must land exactly on the sticky target"
     );
 
-    let (_, no_third_round) = hermes::consumer::cooperative_round_one(&target, &final_ownership);
+    let (_, no_third_round) = bifrox::consumer::cooperative_round_one(&target, &final_ownership);
     assert!(
         !no_third_round,
         "the final state already matches the target, so nothing more should ever be \
@@ -7557,7 +7557,7 @@ async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two
         .join_group(group_id, "member-a", &["cooperative-sticky"])
         .await
         .unwrap();
-    let a_full = vec![hermes::protocol::wire::MemberAssignment {
+    let a_full = vec![bifrox::protocol::wire::MemberAssignment {
         member_id: "member-a".to_string(),
         topic: topic.to_string(),
         partitions: vec![0, 1],
@@ -7584,12 +7584,12 @@ async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two
         ("member-b".to_string(), vec![]),
     ]);
     let member_ids = vec!["member-a".to_string(), "member-b".to_string()];
-    let target = hermes::consumer::assign_sticky(2, &member_ids, &previous);
-    let (round_one, _) = hermes::consumer::cooperative_round_one(&target, &previous);
-    let round_one_assignments: Vec<hermes::protocol::wire::MemberAssignment> = round_one
+    let target = bifrox::consumer::assign_sticky(2, &member_ids, &previous);
+    let (round_one, _) = bifrox::consumer::cooperative_round_one(&target, &previous);
+    let round_one_assignments: Vec<bifrox::protocol::wire::MemberAssignment> = round_one
         .iter()
         .map(
-            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: topic.to_string(),
                 partitions: partitions.clone(),
@@ -7616,10 +7616,10 @@ async fn test_scenario_83_stale_round_one_generation_is_rejected_after_round_two
         round_two_generation, round_one_generation,
         "round two must be a genuinely new generation"
     );
-    let target_assignments: Vec<hermes::protocol::wire::MemberAssignment> = target
+    let target_assignments: Vec<bifrox::protocol::wire::MemberAssignment> = target
         .iter()
         .map(
-            |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+            |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                 member_id: member_id.clone(),
                 topic: topic.to_string(),
                 partitions: partitions.clone(),
@@ -7794,7 +7794,7 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
     let records: Vec<bytes::Bytes> = (0..6)
         .map(|i| bytes::Bytes::from(format!("rec-{i}")))
         .collect();
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -7805,7 +7805,7 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
@@ -7857,7 +7857,7 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
         bytes::Bytes::from_static(b"b"),
         bytes::Bytes::from_static(b"c"),
     ];
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -7868,7 +7868,7 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
             5,
             3,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     engine.produce_batch(params).await.unwrap();
@@ -7878,13 +7878,13 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
         .join(format!("{}-0", topic))
         .join(format!("{:020}.log", 0u64));
     let raw = std::fs::read(&log_path).unwrap();
-    let (entry, consumed) = hermes::segment::decode_entry(&raw).unwrap();
+    let (entry, consumed) = bifrox::segment::decode_entry(&raw).unwrap();
     assert_eq!(
         consumed,
         raw.len(),
         "exactly one entry — the whole batch — should be on disk"
     );
-    let hermes::segment::LogEntry::Batch(batch) = entry;
+    let bifrox::segment::LogEntry::Batch(batch) = entry;
 
     assert_eq!(batch.producer_id, 777_888);
     assert_eq!(batch.producer_epoch, 5);
@@ -7905,14 +7905,14 @@ async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metada
 /// does one or the other.
 #[tokio::test]
 async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
-    use hermes::config::{CompressionCodec, EngineConfig};
+    use bifrox::config::{CompressionCodec, EngineConfig};
 
     async fn stored_codec(
         dir_name: &str,
         topic: &str,
         broker_codec: CompressionCodec,
-        client_codec: hermes::protocol::BatchCompression,
-    ) -> hermes::protocol::BatchCompression {
+        client_codec: bifrox::protocol::BatchCompression,
+    ) -> bifrox::protocol::BatchCompression {
         let dir_guard = TestDataDirGuard::new(dir_name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7923,14 +7923,14 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
             compression_codec: broker_codec,
             ..Default::default()
         };
-        let engine = hermes::server::StorageEngine::new(cfg).unwrap();
-        let server = hermes::server::Server::new(engine.clone());
+        let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
+        let server = bifrox::server::Server::new(engine.clone());
         tokio::spawn(async move {
             server.run_with_listener(listener).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+        let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
         client.set_compression(client_codec);
         let payload = bytes::Bytes::from(
             "compressible_payload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -7947,7 +7947,7 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
                 .join("00000000000000000000.log"),
         )
         .unwrap();
-        let (batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+        let (batch, _) = bifrox::protocol::RecordBatch::decode(&log_bytes).unwrap();
         assert_eq!(
             batch.records().unwrap()[0].value.as_deref(),
             Some(payload.as_ref()),
@@ -7964,10 +7964,10 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
             "codec_producer_explicit_zstd",
             "codec_producer_explicit_zstd_topic",
             CompressionCodec::Producer,
-            hermes::protocol::BatchCompression::Zstd,
+            bifrox::protocol::BatchCompression::Zstd,
         )
         .await,
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "compression.type=producer must keep the producer's zstd"
     );
 
@@ -7976,10 +7976,10 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
             "codec_producer_explicit_none",
             "codec_producer_explicit_none_topic",
             CompressionCodec::Producer,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         )
         .await,
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
         "compression.type=producer must not compress what the producer left uncompressed"
     );
 
@@ -7990,10 +7990,10 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
             "codec_broker_lz4_client_zstd",
             "codec_broker_lz4_client_zstd_topic",
             CompressionCodec::Lz4,
-            hermes::protocol::BatchCompression::Zstd,
+            bifrox::protocol::BatchCompression::Zstd,
         )
         .await,
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "an explicit broker codec must not re-compress a producer's batch"
     );
 }
@@ -8007,7 +8007,7 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
 #[tokio::test]
 async fn test_scenario_96_compacted_topic_rejects_records_without_a_key() {
     let env = start_test_server().await;
-    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(env.addr).await.unwrap();
 
     let compacted = "compacted_needs_keys_topic";
     client.create_topic(compacted, 1).await.unwrap();
@@ -8089,14 +8089,14 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
     // Bring the partition into existence first: a fetch against a topic the broker has
     // never seen has no partition to wait on and answers immediately by design, which is
     // not what is under test here.
-    let mut producer = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut producer = bifrox::client::TestClient::connect(env.addr).await.unwrap();
     producer
         .produce_batch(topic, "", None, 1, &[bytes::Bytes::from_static(b"seed")])
         .await
         .unwrap();
 
     // 1. Caught up at the log end: the fetch is held for about the full wait, then empty.
-    let mut idle_client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut idle_client = bifrox::client::TestClient::connect(env.addr).await.unwrap();
     let started = std::time::Instant::now();
     let idle = idle_client
         .fetch_records_waiting(topic, 0, 1, 64 * 1024, Duration::from_millis(600), 1)
@@ -8113,7 +8113,7 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
     );
 
     // 2. A record produced mid-wait must wake the parked fetch well before its deadline.
-    let mut consumer = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut consumer = bifrox::client::TestClient::connect(env.addr).await.unwrap();
     let waiter = tokio::spawn(async move {
         let started = std::time::Instant::now();
         let records = consumer
@@ -8145,7 +8145,7 @@ async fn test_scenario_95_long_poll_fetch_waits_and_wakes_on_arrival() {
     // host slowness has no upper bound, so an absolute "must be fast" check fails on a
     // loaded runner for reasons unrelated to long polling. Both measurements come from the
     // same machine in the same test, so its speed cancels out.
-    let mut plain = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut plain = bifrox::client::TestClient::connect(env.addr).await.unwrap();
     let started = std::time::Instant::now();
     let empty = plain.fetch_records(topic, 0, 99, 64 * 1024).await.unwrap();
     let no_wait_elapsed = started.elapsed();
@@ -8183,11 +8183,11 @@ async fn test_scenario_101_cooperative_leader_rejoin_does_not_open_a_round() {
     let stable_generation = join_b.generation_id;
 
     // Close the round so the group is Stable — the state the old inference keyed on.
-    let assignments: Vec<hermes::protocol::wire::MemberAssignment> =
+    let assignments: Vec<bifrox::protocol::wire::MemberAssignment> =
         [("member-a", vec![0u32]), ("member-b", vec![1u32])]
             .into_iter()
             .map(
-                |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+                |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
                     member_id: member_id.to_string(),
                     topic: "coop_leader_rejoin_topic".to_string(),
                     partitions,
@@ -8259,13 +8259,13 @@ async fn test_scenario_102_static_cooperative_leader_can_request_round_two() {
         .unwrap();
     let stable_generation = join_follower.generation_id;
 
-    let assignments: Vec<hermes::protocol::wire::MemberAssignment> = [
+    let assignments: Vec<bifrox::protocol::wire::MemberAssignment> = [
         (leader_member_id.clone(), vec![0u32]),
         ("member-follower".to_string(), vec![1u32]),
     ]
     .into_iter()
     .map(
-        |(member_id, partitions)| hermes::protocol::wire::MemberAssignment {
+        |(member_id, partitions)| bifrox::protocol::wire::MemberAssignment {
             member_id,
             topic: "static_coop_leader_topic".to_string(),
             partitions,
@@ -8323,7 +8323,7 @@ async fn test_scenario_102_static_cooperative_leader_can_request_round_two() {
 /// what lets read-committed filter markers and a consumer skip them.
 #[tokio::test]
 async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir = TestDataDirGuard::new("one_entry_format");
     let engine = StorageEngine::new(EngineConfig {
@@ -8337,7 +8337,7 @@ async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers(
     let pm = engine.get_or_create_partition(topic, 0).unwrap();
     pm.produce_batch_eos(producer_keyed_batch(
         &[(b"k", Some(b"v"))],
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
     ))
     .unwrap()
     .unwrap();
@@ -8358,9 +8358,9 @@ async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers(
     let mut entries = 0usize;
     let mut control_batches = 0usize;
     while cursor < raw.len() {
-        let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..])
+        let (entry, consumed) = bifrox::segment::decode_entry(&raw[cursor..])
             .unwrap_or_else(|e| panic!("every entry must be a batch, got {e}"));
-        let hermes::segment::LogEntry::Batch(batch) = entry;
+        let bifrox::segment::LogEntry::Batch(batch) = entry;
         if batch.is_control() {
             control_batches += 1;
         }
@@ -8395,7 +8395,7 @@ async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers(
 #[tokio::test]
 async fn test_scenario_98_tombstone_stays_distinct_from_empty_value_for_consumers() {
     let env = start_test_server().await;
-    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
+    let mut client = bifrox::client::TestClient::connect(env.addr).await.unwrap();
     let topic = "tombstone_vs_empty_topic";
 
     client
@@ -8441,7 +8441,7 @@ async fn test_scenario_98_tombstone_stays_distinct_from_empty_value_for_consumer
 /// replay loop skips a record whose decode fails. Only the default codec hid it.
 #[tokio::test]
 async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() {
-    use hermes::config::{CompressionCodec, EngineConfig};
+    use bifrox::config::{CompressionCodec, EngineConfig};
 
     for codec in [
         CompressionCodec::Lz4,
@@ -8490,14 +8490,14 @@ async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() 
 #[tokio::test]
 async fn test_scenario_94_per_record_keys_round_trip_produce_to_consumer() {
     let env = start_test_server().await;
-    let mut client = hermes::client::TestClient::connect(env.addr).await.unwrap();
-    client.set_compression(hermes::protocol::BatchCompression::Zstd);
+    let mut client = bifrox::client::TestClient::connect(env.addr).await.unwrap();
+    client.set_compression(bifrox::protocol::BatchCompression::Zstd);
 
     // Not valid UTF-8 — clippy verifies this statically, so no runtime assert is needed.
     let binary_key: &[u8] = &[0xFF, 0x00, 0xFE, 0x01, 0x80];
     let json_value: &[u8] = br#"{"a":1,"b":"x:y"}"#;
 
-    let records: Vec<hermes::client::KeyedRecord<'_>> = vec![
+    let records: Vec<bifrox::client::KeyedRecord<'_>> = vec![
         (Some(b"user-1"), Some(b"first")),
         (Some(b"user-2"), None),              // tombstone
         (Some(b"user-3"), Some(b"")),         // present but empty — NOT a tombstone
@@ -8546,7 +8546,7 @@ async fn test_scenario_94_per_record_keys_round_trip_produce_to_consumer() {
 /// so what comes off the fetch path has to be byte-for-byte what is on disk.
 #[tokio::test]
 async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let dir = TestDataDirGuard::new("fetch_serves_stored_bytes");
     let engine = StorageEngine::new(EngineConfig {
@@ -8576,7 +8576,7 @@ async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::Zstd,
+            bifrox::protocol::BatchCompression::Zstd,
         ))
         .unwrap()
         .unwrap();
@@ -8598,10 +8598,10 @@ async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
         "a fetch must return the stored bytes, not a re-encoding of them"
     );
 
-    let (batch, _) = hermes::protocol::RecordBatch::decode(&served).unwrap();
+    let (batch, _) = bifrox::protocol::RecordBatch::decode(&served).unwrap();
     assert_eq!(
         batch.compression().unwrap(),
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "the served batch must still be compressed — the broker must not decompress to serve"
     );
 
@@ -8630,7 +8630,7 @@ async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
 /// for the same offsets.
 #[tokio::test]
 async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     let leader_dir = TestDataDirGuard::new("replica_identical_leader");
     let follower_dir = TestDataDirGuard::new("replica_identical_follower");
@@ -8664,7 +8664,7 @@ async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::Zstd,
+            bifrox::protocol::BatchCompression::Zstd,
         ))
         .unwrap()
         .unwrap();
@@ -8699,10 +8699,10 @@ async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
     );
 
     // And it is still a compressed batch on the follower, not flattened frames.
-    let (follower_batch, _) = hermes::protocol::RecordBatch::decode(&follower_bytes).unwrap();
+    let (follower_batch, _) = bifrox::protocol::RecordBatch::decode(&follower_bytes).unwrap();
     assert_eq!(
         follower_batch.compression().unwrap(),
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "the follower must store the producer's codec, not an uncompressed re-encoding"
     );
     assert_eq!(follower_batch.base_offset, produced.base_offset);
@@ -8723,14 +8723,14 @@ async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
 /// compressed would pass the "producer chose none" case.
 #[tokio::test]
 async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
-    use hermes::config::EngineConfig;
+    use bifrox::config::EngineConfig;
 
     async fn stored_codec(
         dir_name: &str,
         topic: &str,
-        broker_codec: hermes::config::CompressionCodec,
-        client_codec: hermes::protocol::BatchCompression,
-    ) -> hermes::protocol::BatchCompression {
+        broker_codec: bifrox::config::CompressionCodec,
+        client_codec: bifrox::protocol::BatchCompression,
+    ) -> bifrox::protocol::BatchCompression {
         let dir_guard = TestDataDirGuard::new(dir_name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -8741,14 +8741,14 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
             compression_codec: broker_codec,
             ..Default::default()
         };
-        let engine = hermes::server::StorageEngine::new(cfg).unwrap();
-        let server = hermes::server::Server::new(engine.clone());
+        let engine = bifrox::server::StorageEngine::new(cfg).unwrap();
+        let server = bifrox::server::Server::new(engine.clone());
         tokio::spawn(async move {
             server.run_with_listener(listener).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        let mut client = hermes::client::TestClient::connect(addr).await.unwrap();
+        let mut client = bifrox::client::TestClient::connect(addr).await.unwrap();
         client.set_compression(client_codec);
 
         let payload = bytes::Bytes::from(
@@ -8766,7 +8766,7 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
                 .join("00000000000000000000.log"),
         )
         .unwrap();
-        let (batch, _) = hermes::protocol::RecordBatch::decode(&log_bytes).unwrap();
+        let (batch, _) = bifrox::protocol::RecordBatch::decode(&log_bytes).unwrap();
         assert_eq!(
             batch.records().unwrap()[0].value.as_deref(),
             Some(payload.as_ref()),
@@ -8780,11 +8780,11 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
         stored_codec(
             "codec_broker_zstd_client_none",
             "codec_broker_zstd_client_none_topic",
-            hermes::config::CompressionCodec::Zstd,
-            hermes::protocol::BatchCompression::None,
+            bifrox::config::CompressionCodec::Zstd,
+            bifrox::protocol::BatchCompression::None,
         )
         .await,
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
         "the broker must not compress a batch the producer left uncompressed"
     );
 
@@ -8793,11 +8793,11 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
         stored_codec(
             "codec_broker_none_client_zstd",
             "codec_broker_none_client_zstd_topic",
-            hermes::config::CompressionCodec::None,
-            hermes::protocol::BatchCompression::Zstd,
+            bifrox::config::CompressionCodec::None,
+            bifrox::protocol::BatchCompression::Zstd,
         )
         .await,
-        hermes::protocol::BatchCompression::Zstd,
+        bifrox::protocol::BatchCompression::Zstd,
         "the broker must store the producer's codec, not strip or change it"
     );
 }
@@ -8820,7 +8820,7 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
     let records: Vec<bytes::Bytes> = (0..4)
         .map(|i| bytes::Bytes::from(format!("r{i}")))
         .collect();
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -8831,7 +8831,7 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
@@ -8847,11 +8847,11 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
     let mut batch_count = 0usize;
     let mut decoded_offsets = Vec::new();
     while cursor < raw.len() {
-        let (entry, consumed) = hermes::segment::decode_entry(&raw[cursor..]).unwrap();
+        let (entry, consumed) = bifrox::segment::decode_entry(&raw[cursor..]).unwrap();
         // `LogEntry` has one variant: the log holds batches and nothing else. A stray
         // per-record entry would not decode at all, which `decode_entry` reports as
         // corruption rather than as another entry kind.
-        let hermes::segment::LogEntry::Batch(b) = entry;
+        let bifrox::segment::LogEntry::Batch(b) = entry;
         batch_count += 1;
         for record in b.records().unwrap() {
             decoded_offsets.push(record.offset);
@@ -8883,7 +8883,7 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
     let records: Vec<bytes::Bytes> = (0..5)
         .map(|i| bytes::Bytes::from(format!("v{i}")))
         .collect();
-    let params = hermes::server::engine::ProduceBatchParams {
+    let params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -8894,7 +8894,7 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     let (partition, first_offset, last_offset) = engine.produce_batch(params).await.unwrap();
@@ -8919,7 +8919,7 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
 
     // The freed range is reusable and the log is genuinely empty of the old batch.
     let refill: Vec<bytes::Bytes> = vec![bytes::Bytes::from_static(b"replacement")];
-    let refill_params = hermes::server::engine::ProduceBatchParams {
+    let refill_params = bifrox::server::engine::ProduceBatchParams {
         topic,
         key: "",
         transaction_id: None,
@@ -8930,7 +8930,7 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
             0,
             0,
             false,
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ),
     };
     let (_, refill_first, refill_last) = engine.produce_batch(refill_params).await.unwrap();
@@ -8969,7 +8969,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
 
     let topic = "compact_keeps_batch_records_topic";
     let pm = engine.get_or_create_partition(topic, 0).unwrap();
-    pm.set_cleanup_policy(hermes::config::CleanupPolicy::Compact);
+    pm.set_cleanup_policy(bifrox::config::CleanupPolicy::Compact);
     pm.set_min_cleanable_dirty_ratio(0.0);
 
     // A plain frame that is never superseded — ensures the historical segment below ends
@@ -8978,7 +8978,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     // record at all.
     pm.produce_batch_eos(producer_keyed_batch(
         &[(b"zzz", Some(b"keep"))],
-        hermes::protocol::BatchCompression::None,
+        bifrox::protocol::BatchCompression::None,
     ))
     .unwrap()
     .unwrap(); // offset 0
@@ -8992,7 +8992,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
                 (b"k2", Some(b"v2")),
                 (b"k3", Some(b"v3")),
             ],
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ))
         .unwrap()
         .unwrap();
@@ -9005,7 +9005,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     let stale_www = pm
         .produce_batch_eos(producer_keyed_batch(
             &[(b"www", Some(b"stale"))],
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ))
         .unwrap()
         .unwrap(); // offset 4 — superseded below
@@ -9021,7 +9021,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     let fresh_www = pm
         .produce_batch_eos(producer_keyed_batch(
             &[(b"www", Some(b"fresh"))],
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ))
         .unwrap()
         .unwrap(); // offset 5
@@ -9029,7 +9029,7 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     let fresh_k1 = pm
         .produce_batch_eos(producer_keyed_batch(
             &[(b"k1", Some(b"v2"))],
-            hermes::protocol::BatchCompression::None,
+            bifrox::protocol::BatchCompression::None,
         ))
         .unwrap()
         .unwrap(); // offset 6 — supersedes the batch's k1

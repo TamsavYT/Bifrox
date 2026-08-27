@@ -1,4 +1,4 @@
-//! Checks that `docs/HERMES_CLIENT_CREATOR_REFERENCE.md` still describes the real wire.
+//! Checks that `docs/BIFROX_CLIENT_CREATOR_REFERENCE.md` still describes the real wire.
 //!
 //! The doc is the contract a third-party client is built against, and it had drifted badly
 //! — it documented a `RecordFrame` type that no longer exists, and a tombstone rule (empty
@@ -9,8 +9,8 @@
 //! statement the doc makes, so a change that invalidates the doc fails here rather than
 //! silently misleading whoever implements against it.
 
+use bifrox::protocol::{BatchCompression, RecordBatch, BATCH_HEADER_SIZE};
 use bytes::Bytes;
-use hermes::protocol::{BatchCompression, RecordBatch, BATCH_HEADER_SIZE};
 use std::str::FromStr;
 
 fn encode(batch: &RecordBatch) -> Vec<u8> {
@@ -254,7 +254,7 @@ fn offsets_and_timestamps_reconstruct_the_way_the_doc_says() {
 /// being whether the broker imposes a codec on records it did not author.
 #[test]
 fn compression_type_producer_is_the_default_and_not_an_alias_for_none() {
-    use hermes::config::CompressionCodec;
+    use bifrox::config::CompressionCodec;
 
     assert_eq!(
         CompressionCodec::default(),

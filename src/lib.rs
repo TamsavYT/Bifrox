@@ -18,7 +18,7 @@ pub use protocol::{
     RequestPayload, WireError, WireRequest, WireResponse,
 };
 pub use replication::{
-    send_grpc_replication_fetch, ClusterConfig, ConsensusState, HermesConsensus, MetadataRecord,
+    send_grpc_replication_fetch, BifroxConsensus, ClusterConfig, ConsensusState, MetadataRecord,
     NodeRole, ReplicationFetchRequest, ReplicationFetchResponse, ReplicationManager,
 };
 pub use segment::{
