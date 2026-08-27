@@ -9,9 +9,9 @@ pub enum ConsensusState {
     Leader,
 }
 
-/// Caduceus Consensus Controller (Raft-based quorum state machine for Hermes nodes)
+/// Caduceus Consensus Controller (Raft-based quorum state machine for Bifrox nodes)
 #[derive(Debug, Clone)]
-pub struct HermesConsensus {
+pub struct BifroxConsensus {
     inner: Arc<Mutex<ControllerInner>>,
 }
 
@@ -30,7 +30,7 @@ struct ControllerInner {
     election_timeout: Duration,
 }
 
-impl HermesConsensus {
+impl BifroxConsensus {
     pub fn new(node_id: u32, cluster_size: usize) -> Self {
         Self::new_with_state(node_id, cluster_size, ConsensusState::Follower)
     }
@@ -92,7 +92,7 @@ impl HermesConsensus {
         }
     }
 
-    /// Checks heartbeat expiry and triggers automated Hermes consensus election if Leader missed heartbeat
+    /// Checks heartbeat expiry and triggers automated Bifrox consensus election if Leader missed heartbeat
     pub fn check_election_timeout(&self) -> bool {
         let mut lock = self.inner.lock();
         if lock.state != ConsensusState::Leader
@@ -106,7 +106,7 @@ impl HermesConsensus {
             lock.voted_for = Some((term, self_id));
             lock.last_heartbeat = Instant::now();
             tracing::info!(
-                "Hermes Consensus: Node {} missed leader heartbeat. Starting election for term {}.",
+                "Bifrox Consensus: Node {} missed leader heartbeat. Starting election for term {}.",
                 self_id,
                 lock.current_term
             );
@@ -122,7 +122,7 @@ impl HermesConsensus {
         if lock.state == ConsensusState::Candidate && votes >= quorum {
             lock.state = ConsensusState::Leader;
             tracing::info!(
-                "Hermes Consensus: Node {} achieved quorum ({}/{} votes). Promoted to Leader for term {}.",
+                "Bifrox Consensus: Node {} achieved quorum ({}/{} votes). Promoted to Leader for term {}.",
                 lock.node_id,
                 votes,
                 quorum,
@@ -173,7 +173,7 @@ impl HermesConsensus {
         let mut lock = self.inner.lock();
         if observed_epoch > lock.current_term {
             tracing::warn!(
-                "Hermes Consensus: Node {} stepping down to Follower. Observed epoch {} > current term {}.",
+                "Bifrox Consensus: Node {} stepping down to Follower. Observed epoch {} > current term {}.",
                 lock.node_id,
                 observed_epoch,
                 lock.current_term
@@ -192,13 +192,13 @@ mod tests {
 
     #[test]
     fn try_record_vote_grants_first_vote_in_term() {
-        let c = HermesConsensus::new(1, 3);
+        let c = BifroxConsensus::new(1, 3);
         assert!(c.try_record_vote(2, 5));
     }
 
     #[test]
     fn try_record_vote_denies_second_candidate_same_term() {
-        let c = HermesConsensus::new(1, 3);
+        let c = BifroxConsensus::new(1, 3);
         assert!(c.try_record_vote(2, 5));
         // A different candidate asking for the same term must be denied — this is the
         // core Raft "at most one vote per term" safety property.
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn try_record_vote_is_idempotent_for_the_same_candidate_and_term() {
-        let c = HermesConsensus::new(1, 3);
+        let c = BifroxConsensus::new(1, 3);
         assert!(c.try_record_vote(2, 5));
         // A retried VoteRequest from the same candidate in the same term (e.g. after a
         // dropped response) must still be granted, not denied as "already voted".
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn try_record_vote_denies_stale_term() {
-        let c = HermesConsensus::new(1, 3);
+        let c = BifroxConsensus::new(1, 3);
         assert!(c.try_record_vote(2, 5));
         // A candidate campaigning for an old term (this node has since moved on) must
         // never win a vote — the term monotonicity invariant Raft safety depends on.
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn try_record_vote_higher_term_resets_prior_vote() {
-        let c = HermesConsensus::new(1, 3);
+        let c = BifroxConsensus::new(1, 3);
         assert!(c.try_record_vote(2, 5));
         // A candidate campaigning for a strictly higher term is a fresh election this
         // node hasn't voted in yet, even though it already voted for someone in term 5.

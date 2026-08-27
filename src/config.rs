@@ -8,7 +8,7 @@ use std::time::Duration;
 /// `broker`, or `broker,controller`). A node with only `Controller` participates in the
 /// metadata Raft quorum but never hosts data-topic partitions; a node with only `Broker`
 /// hosts data partitions and replicates `__cluster_metadata` as a non-voting observer but
-/// never contests leadership of it; a node with both (the historical Hermes default)
+/// never contests leadership of it; a node with both (the historical Bifrox default)
 /// does everything, same as today's combined-mode behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessRole {
@@ -30,7 +30,7 @@ impl std::str::FromStr for ProcessRole {
 
 /// Parses a comma-separated `process.roles` value (e.g. `"broker,controller"`,
 /// `"controller"`, `"broker"`) the way Kafka's own config does. An empty/unparseable
-/// value falls back to combined mode (both roles) — the historical Hermes default,
+/// value falls back to combined mode (both roles) — the historical Bifrox default,
 /// so existing configs that never set this keep working unchanged.
 pub fn parse_process_roles(s: &str) -> Vec<ProcessRole> {
     let roles: Vec<ProcessRole> = s
@@ -323,7 +323,7 @@ pub struct EngineConfig {
     pub ssl_client_auth: String,
     /// Enabled SASL mechanisms (e.g. PLAIN, SCRAM-SHA-256)
     pub sasl_mechanisms: Vec<String>,
-    /// Legacy bootstrap SASL user accounts (username -> password). At startup Hermes
+    /// Legacy bootstrap SASL user accounts (username -> password). At startup Bifrox
     /// imports these into the persistent SCRAM credential store if that user does not
     /// already exist there.
     pub sasl_users: std::collections::HashMap<String, String>,
@@ -372,7 +372,7 @@ pub struct EngineConfig {
     /// this node itself has the `Controller` role. Empty means "assume every peer is
     /// controller-eligible", which matches combined-mode clusters where every node votes.
     pub controller_peer_addrs: Vec<String>,
-    /// How long a tombstone (a compacted-topic record whose value is empty — Hermes's
+    /// How long a tombstone (a compacted-topic record whose value is empty — Bifrox's
     /// convention for a Kafka-style "delete marker") is kept as the latest record for its
     /// key before log compaction erases the key entirely (Kafka `delete.retention.ms`).
     /// `None` disables tombstone expiry: tombstones are kept forever, same as any other
@@ -396,7 +396,7 @@ pub struct EngineConfig {
     /// (segment size, wire framing limits).
     pub message_max_bytes: Option<u64>,
     /// Worker threads dedicated to the Tokio runtime driving network I/O (Kafka
-    /// `num.network.threads`, approximately — Hermes doesn't separate network/request-
+    /// `num.network.threads`, approximately — Bifrox doesn't separate network/request-
     /// handling threads the way Kafka does, so this sizes the whole async runtime).
     /// `None` uses Tokio's own default (one per logical CPU).
     pub num_network_threads: Option<usize>,
@@ -431,7 +431,7 @@ pub struct EngineConfig {
     pub max_poll_interval_ms: u64,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
     /// exist yet (Kafka `auto.create.topics.enable`). Defaults to **true**, matching both
-    /// Kafka's own default and Hermes's long-standing behavior.
+    /// Kafka's own default and Bifrox's long-standing behavior.
     ///
     /// This is deliberately not the whole answer to unbounded topic creation, and is not
     /// the part doing the security work. The two changes that actually bound it are:
@@ -453,7 +453,7 @@ pub struct EngineConfig {
     /// `Ongoing`/`PrepareCommit`/`PrepareAbort` — i.e. never reached a terminal state
     /// before the last shutdown) is given before it's presumed abandoned and aborted to
     /// release the partitions it was blocking (Kafka `transaction.max.timeout.ms`, applied
-    /// here at replay time since Hermes has no live producer session to time out against
+    /// here at replay time since Bifrox has no live producer session to time out against
     /// across a restart).
     pub transaction_timeout_ms: u64,
 }
@@ -461,7 +461,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            cluster_id: "hermes-prod-cluster-01".to_string(),
+            cluster_id: "bifrox-prod-cluster-01".to_string(),
             node_id: 1,
             role: NodeRole::Leader,
             data_dir: PathBuf::from("./data"),
@@ -743,7 +743,7 @@ impl EngineConfig {
                     // switches the flush policy to a periodic/byte-threshold flush timed
                     // by `flush.ms` (byte threshold left at its existing default unless
                     // `flush.messages` — interpreted here as an approximate byte budget,
-                    // since Hermes's flush threshold is byte- not message-count-based —
+                    // since Bifrox's flush threshold is byte- not message-count-based —
                     // is also given).
                     "flush.ms" | "log.flush.interval.ms" => {
                         if let Ok(ms) = value.parse::<u64>() {
@@ -794,7 +794,7 @@ impl EngineConfig {
                         config.roles = parse_process_roles(value);
                     }
                     // Kafka KRaft's `controller.quorum.voters`: normally
-                    // `id1@host1:port1,id2@host2:port2,...`; Hermes only needs the
+                    // `id1@host1:port1,id2@host2:port2,...`; Bifrox only needs the
                     // host:port half for peer targeting, so the optional `id@` prefix is
                     // accepted and discarded if present.
                     "controller.quorum.voters" => {

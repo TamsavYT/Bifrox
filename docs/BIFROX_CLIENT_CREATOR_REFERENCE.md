@@ -1,12 +1,12 @@
-# Hermes Client Creator Reference
+# Bifrox Client Creator Reference
 
-This document is for anyone building a Hermes client, SDK, automation agent, or test
+This document is for anyone building a Bifrox client, SDK, automation agent, or test
 harness.
 
-## 1. First rule: Hermes uses a custom protocol
+## 1. First rule: Bifrox uses a custom protocol
 
-Hermes is **not** a Kafka wire-compatible broker. Build against Hermes behavior and
-Hermes commands directly.
+Bifrox is **not** a Kafka wire-compatible broker. Build against Bifrox behavior and
+Bifrox commands directly.
 
 Start from:
 
@@ -119,7 +119,7 @@ for an ordinary reason.
 
 ### SASL SCRAM-SHA-256
 
-Hermes supports the SCRAM flow:
+Bifrox supports the SCRAM flow:
 
 1. `SaslHandshake("SCRAM-SHA-256")`
 2. client-first message
@@ -163,7 +163,7 @@ batch, compresses it, and sends the bytes; the broker stores them exactly as the
 and hands those same bytes back on fetch. Decompressing and decoding is the *consumer's*
 job.
 
-That means a Hermes client owns both halves of the record batch format below. It is not
+That means a Bifrox client owns both halves of the record batch format below. It is not
 optional — there is no server-side mode that hands you pre-decoded records.
 
 (The one exception is a compacted topic, where the broker must decompress on produce to
@@ -324,7 +324,7 @@ Behavior notes:
   already own (they're never revoked out from under you server-side) until you get around
   to calling `JoinGroup` again. This is the actual behavioral difference KIP-429
   cooperative rebalancing is about; computing a minimal reassignment diff (rather than
-  Hermes forcing one) is still the client-side assignor's job.
+  Bifrox forcing one) is still the client-side assignor's job.
 - **Static membership** (KIP-345): pass a stable `group_instance_id` on `JoinGroup` and a
   restarting member reclaims its own slot instead of triggering a rebalance — it keeps its
   existing member id and the group's generation does not advance. Use it for consumers with
@@ -389,7 +389,7 @@ Recognized keys with real runtime effect: `cleanup.policy` (`delete`/`compact`/
 `retention.bytes`, `min.insync.replicas`, `delete.retention.ms`,
 `min.cleanable.dirty.ratio`. Unrecognized keys are stored and returned by
 `DescribeConfigs` but have no effect — useful for client-side metadata, but don't rely on
-Hermes enforcing config keys it doesn't recognize.
+Bifrox enforcing config keys it doesn't recognize.
 
 #### `compression.type`
 
@@ -411,7 +411,7 @@ authors for that topic. Your batches are still stored as you sent them.
   record encoding. A record with a **present but empty** value (`value_len == 0`) is an
   ordinary record and does *not* delete anything.
 
-  > If you are porting from an older Hermes note: there is no string-parsing rule here.
+  > If you are porting from an older Bifrox note: there is no string-parsing rule here.
   > The broker does not look inside a payload for `"key:"` or `"key="` separators, and an
   > empty value is not a delete marker. Only a genuine null value is a tombstone.
 
@@ -439,7 +439,7 @@ authors for that topic. Your batches are still stored as you sent them.
 
 ### Share groups (queue-style consumption, KIP-932-like)
 
-Share groups are Hermes's cooperative "queue" consumption model: any member of the group
+Share groups are Bifrox's cooperative "queue" consumption model: any member of the group
 can be handed any available record from a partition (no per-consumer partition ownership,
 unlike classic consumer groups), and delivery is lease-based rather than offset-commit-based.
 
@@ -471,7 +471,7 @@ Behavior notes:
 
 ## 7. Quotas and throttling
 
-Hermes throttles instead of hard-failing when quotas are exceeded.
+Bifrox throttles instead of hard-failing when quotas are exceeded.
 
 A client should:
 
@@ -481,7 +481,7 @@ A client should:
 
 ## 8. Error-handling expectations
 
-A good Hermes client should:
+A good Bifrox client should:
 
 - surface server error payloads directly
 - retry transient network failures
@@ -491,7 +491,7 @@ A good Hermes client should:
 
 ## 9. Suggested client features
 
-If you are building a production Hermes client, prioritize:
+If you are building a production Bifrox client, prioritize:
 
 1. connection + reconnect handling
 2. SASL PLAIN and SCRAM-SHA-256
@@ -507,7 +507,7 @@ If you are building a production Hermes client, prioritize:
 
 ## 10. Windows-specific guidance
 
-If your users run Hermes on Windows:
+If your users run Bifrox on Windows:
 
 - use conservative socket timeouts
 - assume service restarts can happen during upgrades

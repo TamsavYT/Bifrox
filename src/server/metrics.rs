@@ -85,7 +85,7 @@ struct TopicMetrics {
     fetch_bytes_total: AtomicU64,
 }
 
-/// Prometheus Metrics Collector for Hermes Broker Engine
+/// Prometheus Metrics Collector for Bifrox Broker Engine
 #[derive(Debug, Default)]
 pub struct MetricsCollector {
     pub produce_bytes_total: AtomicU64,
@@ -167,30 +167,30 @@ impl MetricsCollector {
         let acl_denied = self.acl_denied_requests_total.load(Ordering::Relaxed);
 
         let mut out = format!(
-            "# HELP hermes_produce_bytes_total Total bytes produced to Hermes brokers.\n\
-             # TYPE hermes_produce_bytes_total counter\n\
-             hermes_produce_bytes_total {}\n\n\
-             # HELP hermes_fetch_bytes_total Total bytes fetched from Hermes brokers.\n\
-             # TYPE hermes_fetch_bytes_total counter\n\
-             hermes_fetch_bytes_total {}\n\n\
-             # HELP hermes_produce_records_total Total record count produced.\n\
-             # TYPE hermes_produce_records_total counter\n\
-             hermes_produce_records_total {}\n\n\
-             # HELP hermes_active_connections Current active TCP client connections.\n\
-             # TYPE hermes_active_connections gauge\n\
-             hermes_active_connections {}\n\n\
-             # HELP hermes_topics_count Current active topic count in storage catalog.\n\
-             # TYPE hermes_topics_count gauge\n\
-             hermes_topics_count {}\n\n\
-             # HELP hermes_active_brokers_count Current active registered broker count.\n\
-             # TYPE hermes_active_brokers_count gauge\n\
-             hermes_active_brokers_count {}\n\n\
-             # HELP hermes_quota_throttled_clients_total Count of requests throttled by byte-rate quotas.\n\
-             # TYPE hermes_quota_throttled_clients_total counter\n\
-             hermes_quota_throttled_clients_total {}\n\n\
-             # HELP hermes_acl_denied_requests_total Count of requests denied by ACL authorization rules.\n\
-             # TYPE hermes_acl_denied_requests_total counter\n\
-             hermes_acl_denied_requests_total {}\n\n",
+            "# HELP bifrox_produce_bytes_total Total bytes produced to Bifrox brokers.\n\
+             # TYPE bifrox_produce_bytes_total counter\n\
+             bifrox_produce_bytes_total {}\n\n\
+             # HELP bifrox_fetch_bytes_total Total bytes fetched from Bifrox brokers.\n\
+             # TYPE bifrox_fetch_bytes_total counter\n\
+             bifrox_fetch_bytes_total {}\n\n\
+             # HELP bifrox_produce_records_total Total record count produced.\n\
+             # TYPE bifrox_produce_records_total counter\n\
+             bifrox_produce_records_total {}\n\n\
+             # HELP bifrox_active_connections Current active TCP client connections.\n\
+             # TYPE bifrox_active_connections gauge\n\
+             bifrox_active_connections {}\n\n\
+             # HELP bifrox_topics_count Current active topic count in storage catalog.\n\
+             # TYPE bifrox_topics_count gauge\n\
+             bifrox_topics_count {}\n\n\
+             # HELP bifrox_active_brokers_count Current active registered broker count.\n\
+             # TYPE bifrox_active_brokers_count gauge\n\
+             bifrox_active_brokers_count {}\n\n\
+             # HELP bifrox_quota_throttled_clients_total Count of requests throttled by byte-rate quotas.\n\
+             # TYPE bifrox_quota_throttled_clients_total counter\n\
+             bifrox_quota_throttled_clients_total {}\n\n\
+             # HELP bifrox_acl_denied_requests_total Count of requests denied by ACL authorization rules.\n\
+             # TYPE bifrox_acl_denied_requests_total counter\n\
+             bifrox_acl_denied_requests_total {}\n\n",
             produce_bytes,
             fetch_bytes,
             produce_recs,
@@ -202,51 +202,51 @@ impl MetricsCollector {
         );
 
         out.push_str(
-            "# HELP hermes_topic_produce_bytes_total Bytes produced, broken down by topic.\n\
-             # TYPE hermes_topic_produce_bytes_total counter\n",
+            "# HELP bifrox_topic_produce_bytes_total Bytes produced, broken down by topic.\n\
+             # TYPE bifrox_topic_produce_bytes_total counter\n",
         );
         for entry in self.per_topic.iter() {
             out.push_str(&format!(
-                "hermes_topic_produce_bytes_total{{topic=\"{}\"}} {}\n",
+                "bifrox_topic_produce_bytes_total{{topic=\"{}\"}} {}\n",
                 entry.key(),
                 entry.value().produce_bytes_total.load(Ordering::Relaxed)
             ));
         }
         out.push_str(
-            "\n# HELP hermes_topic_produce_records_total Records produced, broken down by topic.\n\
-             # TYPE hermes_topic_produce_records_total counter\n",
+            "\n# HELP bifrox_topic_produce_records_total Records produced, broken down by topic.\n\
+             # TYPE bifrox_topic_produce_records_total counter\n",
         );
         for entry in self.per_topic.iter() {
             out.push_str(&format!(
-                "hermes_topic_produce_records_total{{topic=\"{}\"}} {}\n",
+                "bifrox_topic_produce_records_total{{topic=\"{}\"}} {}\n",
                 entry.key(),
                 entry.value().produce_records_total.load(Ordering::Relaxed)
             ));
         }
         out.push_str(
-            "\n# HELP hermes_topic_fetch_bytes_total Bytes fetched, broken down by topic.\n\
-             # TYPE hermes_topic_fetch_bytes_total counter\n",
+            "\n# HELP bifrox_topic_fetch_bytes_total Bytes fetched, broken down by topic.\n\
+             # TYPE bifrox_topic_fetch_bytes_total counter\n",
         );
         for entry in self.per_topic.iter() {
             out.push_str(&format!(
-                "hermes_topic_fetch_bytes_total{{topic=\"{}\"}} {}\n",
+                "bifrox_topic_fetch_bytes_total{{topic=\"{}\"}} {}\n",
                 entry.key(),
                 entry.value().fetch_bytes_total.load(Ordering::Relaxed)
             ));
         }
 
         out.push_str(
-            "\n# HELP hermes_produce_latency_ms Produce request latency in milliseconds.\n\
-             # TYPE hermes_produce_latency_ms histogram\n",
+            "\n# HELP bifrox_produce_latency_ms Produce request latency in milliseconds.\n\
+             # TYPE bifrox_produce_latency_ms histogram\n",
         );
         self.produce_latency_ms
-            .render("hermes_produce_latency_ms", "", &mut out);
+            .render("bifrox_produce_latency_ms", "", &mut out);
         out.push_str(
-            "\n# HELP hermes_fetch_latency_ms Fetch request latency in milliseconds.\n\
-             # TYPE hermes_fetch_latency_ms histogram\n",
+            "\n# HELP bifrox_fetch_latency_ms Fetch request latency in milliseconds.\n\
+             # TYPE bifrox_fetch_latency_ms histogram\n",
         );
         self.fetch_latency_ms
-            .render("hermes_fetch_latency_ms", "", &mut out);
+            .render("bifrox_fetch_latency_ms", "", &mut out);
 
         out
     }
@@ -267,8 +267,8 @@ mod tests {
         assert_eq!(m.produce_records_total.load(Ordering::Relaxed), 4);
 
         let rendered = m.render_prometheus(0, 0);
-        assert!(rendered.contains("hermes_topic_produce_bytes_total{topic=\"orders\"} 125"));
-        assert!(rendered.contains("hermes_topic_produce_bytes_total{topic=\"payments\"} 50"));
+        assert!(rendered.contains("bifrox_topic_produce_bytes_total{topic=\"orders\"} 125"));
+        assert!(rendered.contains("bifrox_topic_produce_bytes_total{topic=\"payments\"} 50"));
     }
 
     #[test]

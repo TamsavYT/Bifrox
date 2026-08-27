@@ -1,4 +1,4 @@
-use hermes::{EngineConfig, Server, StorageEngine};
+use bifrox::{EngineConfig, Server, StorageEngine};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ fn load_config() -> Result<EngineConfig, Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let config_path_opt = if args.len() > 1 && !args[1].starts_with('-') {
         Some(args[1].clone())
-    } else if let Ok(path) = env::var("HERMES_CONFIG") {
+    } else if let Ok(path) = env::var("BIFROX_CONFIG") {
         Some(path)
     } else if std::path::Path::new("server.properties").exists() {
         Some("server.properties".to_string())
@@ -41,10 +41,10 @@ fn load_config() -> Result<EngineConfig, Box<dyn std::error::Error>> {
         EngineConfig::from_properties_file(config_path)?
     } else {
         let bind_addr =
-            env::var("HERMES_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+            env::var("BIFROX_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
         let data_dir_path =
-            env::var("HERMES_DATA_DIR").unwrap_or_else(|_| "./data_store".to_string());
-        let log_file_dir_path = env::var("HERMES_LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
+            env::var("BIFROX_DATA_DIR").unwrap_or_else(|_| "./data_store".to_string());
+        let log_file_dir_path = env::var("BIFROX_LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
         EngineConfig {
             data_dir: PathBuf::from(data_dir_path),
             log_file_dir: PathBuf::from(log_file_dir_path),
@@ -60,10 +60,10 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Configure non-blocking daily rolling log file appender using config.log_file_dir
     let log_dir = config.log_file_dir.clone();
     fs::create_dir_all(&log_dir)?;
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "hermes-server.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "bifrox-server.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Set up dual subscriber: Log to both stdout (console) and log file (log_file_dir/hermes-server.log)
+    // Set up dual subscriber: Log to both stdout (console) and log file (log_file_dir/bifrox-server.log)
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
         .with(
@@ -74,7 +74,7 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
         .try_init();
 
     tracing::info!("============================================================");
-    tracing::info!("  HERMES: Production Event Streaming Storage Engine Server  ");
+    tracing::info!("  BIFROX: Production Event Streaming Storage Engine Server  ");
     tracing::info!("============================================================");
 
     tracing::info!("Configuration Details:");
@@ -131,7 +131,7 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::info!("  Deployment Mode:    Combined (controller + broker, historical default)");
     }
-    if config.role == hermes::NodeRole::Leader {
+    if config.role == bifrox::NodeRole::Leader {
         tracing::info!("  Behavior:           Handles produces, replicates to followers");
     } else {
         tracing::info!("  Behavior:           Forwards produces to Leader, serves local fetches");

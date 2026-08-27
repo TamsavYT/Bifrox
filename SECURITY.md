@@ -1,6 +1,6 @@
 # Security Policy
 
-The Hermes maintainers take the security and integrity of the project seriously. This document outlines our policy for reporting and handling security vulnerabilities.
+The Bifrox maintainers take the security and integrity of the project seriously. This document outlines our policy for reporting and handling security vulnerabilities.
 
 ---
 
@@ -19,7 +19,7 @@ Security updates and critical patches are actively applied to the following vers
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-If you believe you have discovered a security vulnerability in Hermes (such as protocol bypass, memory corruption, authentication flaw in SASL/SCRAM, unauthorized data access, or denial of service), please report it responsibly:
+If you believe you have discovered a security vulnerability in Bifrox (such as protocol bypass, memory corruption, authentication flaw in SASL/SCRAM, unauthorized data access, or denial of service), please report it responsibly:
 
 1. **GitHub Security Advisory (Preferred)**:
    Navigate to the **Security** tab of the repository and click **"Report a vulnerability"** to submit a private report.
@@ -31,7 +31,7 @@ If you believe you have discovered a security vulnerability in Hermes (such as p
 To help us triage and resolve the issue quickly, please include:
 - A clear description of the vulnerability and its potential impact.
 - Step-by-step instructions or proof-of-concept (PoC) code to reproduce the issue.
-- Details regarding your environment (OS, Rust version, Hermes configuration, broker architecture).
+- Details regarding your environment (OS, Rust version, Bifrox configuration, broker architecture).
 - Any proposed remediation or patch, if available.
 
 ---

@@ -3,7 +3,7 @@ pub mod envelope;
 pub mod grpc;
 pub mod metadata;
 
-pub use consensus::{ConsensusState, HermesConsensus};
+pub use consensus::{BifroxConsensus, ConsensusState};
 pub use envelope::{
     decode_frame, decode_header, encode_frame, encode_frame_into, exchange_frame, read_extensions,
     read_frame, write_extensions, write_no_extensions, EnvelopeError, FrameHeader, FrameType,
@@ -134,7 +134,7 @@ pub struct ReplicationManager {
     /// each peer broker — used to detect a dead broker so any partition it leads can be
     /// failed over to a surviving in-sync replica.
     broker_last_seen: Arc<DashMap<u32, std::time::Instant>>,
-    consensus: HermesConsensus,
+    consensus: BifroxConsensus,
     /// Dynamically tracked leader address (set by followers from heartbeat)
     leader_addr: Arc<RwLock<Option<String>>>,
     /// Last time a heartbeat was received (used for election timeout)
@@ -188,7 +188,7 @@ impl ReplicationManager {
             ConsensusState::Follower
         };
         let consensus =
-            HermesConsensus::new_with_state(config.node_id, cluster_size, initial_consensus_state);
+            BifroxConsensus::new_with_state(config.node_id, cluster_size, initial_consensus_state);
 
         let leader_addr = if initial_consensus_state == ConsensusState::Leader {
             // Leader knows its own address
@@ -317,7 +317,7 @@ impl ReplicationManager {
         self.consensus.state() == ConsensusState::Leader
     }
 
-    pub fn consensus(&self) -> &HermesConsensus {
+    pub fn consensus(&self) -> &BifroxConsensus {
         &self.consensus
     }
 
@@ -784,7 +784,7 @@ impl ReplicationManager {
                 epoch.fetch_max(new_term, std::sync::atomic::Ordering::AcqRel);
 
                 tracing::info!(
-                    "Hermes Election: Node {} became Candidate for term {}. Broadcasting VoteRequest to {} controller peer(s).",
+                    "Bifrox Election: Node {} became Candidate for term {}. Broadcasting VoteRequest to {} controller peer(s).",
                     node_id, new_term, controller_peer_addrs.len()
                 );
 
@@ -809,21 +809,21 @@ impl ReplicationManager {
                         Ok(true) => {
                             votes_granted += 1;
                             tracing::info!(
-                                "Hermes Election: Vote GRANTED by {} (term {})",
+                                "Bifrox Election: Vote GRANTED by {} (term {})",
                                 peer,
                                 new_term
                             );
                         }
                         Ok(false) => {
                             tracing::info!(
-                                "Hermes Election: Vote DENIED by {} (term {})",
+                                "Bifrox Election: Vote DENIED by {} (term {})",
                                 peer,
                                 new_term
                             );
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Hermes Election: No response from {} (term {}): {}",
+                                "Bifrox Election: No response from {} (term {}): {}",
                                 peer,
                                 new_term,
                                 e
@@ -841,7 +841,7 @@ impl ReplicationManager {
                         *la = Some(advertised_addr.read().clone());
                     }
                     tracing::info!(
-                        "Hermes Election: Node {} is now LEADER for term {} with {}/{} votes.",
+                        "Bifrox Election: Node {} is now LEADER for term {} with {}/{} votes.",
                         node_id,
                         new_term,
                         votes_granted,
@@ -903,7 +903,7 @@ impl ReplicationManager {
                     }
                 } else {
                     tracing::warn!(
-                        "Hermes Election: Node {} failed to reach quorum ({} votes) for term {}.",
+                        "Bifrox Election: Node {} failed to reach quorum ({} votes) for term {}.",
                         node_id,
                         votes_granted,
                         new_term
@@ -1607,7 +1607,7 @@ pub async fn send_vote_request(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::warn!(
-                "Hermes Election: Cannot connect to {} for VoteRequest: {}",
+                "Bifrox Election: Cannot connect to {} for VoteRequest: {}",
                 peer_addr,
                 e
             );

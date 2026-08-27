@@ -34,7 +34,7 @@
 //! the previous attempt at this (the parked `inter-node-versioning` branch) concluded that
 //! adopting a version was a one-time flag day rather than a rolling upgrade.
 //!
-//! Hermes has no deployed clusters, so that flag day costs nothing today and is worth
+//! Bifrox has no deployed clusters, so that flag day costs nothing today and is worth
 //! spending exactly once, here, to make it the last one.
 //!
 //! # Adding a field later

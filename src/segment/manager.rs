@@ -149,7 +149,7 @@ impl SegmentPair {
 /// sidesteps that: each surviving record stands on its own, with no batch-level metadata
 /// left half-true. The cost is that a compacted segment loses batching entirely — no more
 /// batch-level compression or producer/base-sequence metadata for what remains — but nothing
-/// in Hermes reconstructs idempotent-producer dedup state by reading `base_sequence`/
+/// in Bifrox reconstructs idempotent-producer dedup state by reading `base_sequence`/
 /// `producer_id` back off disk (that state is tracked in memory, at produce time —
 /// `PartitionManager::validate_sequence`), so no correctness behavior depends on retaining
 /// it.
@@ -1395,7 +1395,7 @@ impl SegmentManager {
                         // format expresses that, `create_with_offsets` builds it.
                         //
                         // `base_sequence`/`producer_id` are carried over even though they
-                        // no longer describe the batch's exact contents. Nothing in Hermes
+                        // no longer describe the batch's exact contents. Nothing in Bifrox
                         // reconstructs idempotent-producer dedup state by reading them back
                         // off disk — that state lives in memory, written at produce time by
                         // `ProducerStateManager` — so preserving them costs nothing and
@@ -1854,7 +1854,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_segment_manager_test_{}_{}_{}",
+                "bifrox_segment_manager_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique

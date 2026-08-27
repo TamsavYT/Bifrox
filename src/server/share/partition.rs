@@ -550,7 +550,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "hermes_share_partition_test_{}_{}_{}",
+                "bifrox_share_partition_test_{}_{}_{}",
                 label,
                 std::process::id(),
                 unique

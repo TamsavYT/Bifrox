@@ -1,16 +1,16 @@
 # Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Automated Installation & Packaging Script for Hermes Windows Service
+    Automated Installation & Packaging Script for Bifrox Windows Service
 .DESCRIPTION
-    Deploys Hermes as a production background Windows Service using WinSW or NSSM.
+    Deploys Bifrox as a production background Windows Service using WinSW or NSSM.
     Configures log rotation, graceful shutdown hooks, and Windows Defender Firewall rules.
 .EXAMPLE
-    .\install-service.ps1 -InstallDir "C:\Program Files\Hermes" -ServiceType WinSW
+    .\install-service.ps1 -InstallDir "C:\Program Files\Bifrox" -ServiceType WinSW
 #>
 
 param(
-    [string]$InstallDir = "C:\Program Files\Hermes",
+    [string]$InstallDir = "C:\Program Files\Bifrox",
     [ValidateSet("WinSW", "NSSM")]
     [string]$ServiceType = "WinSW",
     [int]$BrokerPort = 9092,
@@ -21,7 +21,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "    HERMES WINDOWS SERVICE INSTALLATION & PACKAGING        " -ForegroundColor Cyan
+Write-Host "    BIFROX WINDOWS SERVICE INSTALLATION & PACKAGING        " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Administrator Rights Check
@@ -40,16 +40,16 @@ New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 # 3. Copy Binary and Configuration
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectRoot = Resolve-Path "$ScriptDir\..\.."
-$BinPath = "$ProjectRoot\target\release\hermes.exe"
+$BinPath = "$ProjectRoot\target\release\bifrox.exe"
 if (-not (Test-Path $BinPath)) {
-    $BinPath = "$ProjectRoot\target\debug\hermes.exe"
+    $BinPath = "$ProjectRoot\target\debug\bifrox.exe"
 }
 
 if (Test-Path $BinPath) {
     Write-Host "[2/5] Copying binary from '$BinPath'..." -ForegroundColor Yellow
-    Copy-Item -Path $BinPath -Destination "$InstallDir\hermes.exe" -Force
+    Copy-Item -Path $BinPath -Destination "$InstallDir\bifrox.exe" -Force
 } else {
-    Write-Warning "Hermes binary not found at target build path. Please compile with 'cargo build --release' first."
+    Write-Warning "Bifrox binary not found at target build path. Please compile with 'cargo build --release' first."
 }
 
 $PropertiesPath = "$ProjectRoot\server.properties"
@@ -74,37 +74,37 @@ retention.bytes=10737418240
 
 # 4. Windows Defender Firewall Configuration
 Write-Host "[4/5] Configuring Windows Defender Firewall rules..." -ForegroundColor Yellow
-Remove-NetFirewallRule -DisplayName "Hermes Event Store (Broker)" -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Hermes Event Store (Broker)" -Direction Inbound -Protocol TCP -LocalPort $BrokerPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
+Remove-NetFirewallRule -DisplayName "Bifrox Event Store (Broker)" -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "Bifrox Event Store (Broker)" -Direction Inbound -Protocol TCP -LocalPort $BrokerPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
-Remove-NetFirewallRule -DisplayName "Hermes Metrics (Prometheus)" -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Hermes Metrics (Prometheus)" -Direction Inbound -Protocol TCP -LocalPort $MetricsPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
+Remove-NetFirewallRule -DisplayName "Bifrox Metrics (Prometheus)" -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "Bifrox Metrics (Prometheus)" -Direction Inbound -Protocol TCP -LocalPort $MetricsPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
 # 5. Service Installation (WinSW or NSSM)
 Write-Host "[5/5] Installing Service '$ServiceType'..." -ForegroundColor Yellow
 
 if ($ServiceType -eq "WinSW") {
-    Copy-Item -Path "$ScriptDir\winsw.xml" -Destination "$InstallDir\HermesEventStore.xml" -Force
-    Write-Host "WinSW configuration manifest copied to '$InstallDir\HermesEventStore.xml'." -ForegroundColor Green
+    Copy-Item -Path "$ScriptDir\winsw.xml" -Destination "$InstallDir\BifroxEventStore.xml" -Force
+    Write-Host "WinSW configuration manifest copied to '$InstallDir\BifroxEventStore.xml'." -ForegroundColor Green
     Write-Host "To register WinSW wrapper service:" -ForegroundColor Green
-    Write-Host "  Download WinSW.exe, rename to HermesEventStore.exe in '$InstallDir', and run:" -ForegroundColor White
-    Write-Host "  '$InstallDir\HermesEventStore.exe install'" -ForegroundColor White
-    Write-Host "  '$InstallDir\HermesEventStore.exe start'" -ForegroundColor White
+    Write-Host "  Download WinSW.exe, rename to BifroxEventStore.exe in '$InstallDir', and run:" -ForegroundColor White
+    Write-Host "  '$InstallDir\BifroxEventStore.exe install'" -ForegroundColor White
+    Write-Host "  '$InstallDir\BifroxEventStore.exe start'" -ForegroundColor White
 } elseif ($ServiceType -eq "NSSM") {
     $nssm = Get-Command "nssm.exe" -ErrorAction SilentlyContinue
     if ($nssm) {
-        nssm stop HermesEventStore 2>$null
-        nssm remove HermesEventStore confirm 2>$null
-        nssm install HermesEventStore "$InstallDir\hermes.exe" "--config $InstallDir\server.properties"
-        nssm set HermesEventStore AppDirectory "$InstallDir"
-        nssm set HermesEventStore AppStdout "$InstallDir\logs\hermes-service.log"
-        nssm set HermesEventStore AppStderr "$InstallDir\logs\hermes-service-err.log"
-        nssm set HermesEventStore AppRotateFiles 1
-        nssm set HermesEventStore AppRotateBytes 20971520
-        nssm set HermesEventStore AppStopMethodSkip 0
-        nssm set HermesEventStore AppStopMethodConsole 1500
-        nssm start HermesEventStore
-        Write-Host "Hermes service successfully registered and started via NSSM." -ForegroundColor Green
+        nssm stop BifroxEventStore 2>$null
+        nssm remove BifroxEventStore confirm 2>$null
+        nssm install BifroxEventStore "$InstallDir\bifrox.exe" "--config $InstallDir\server.properties"
+        nssm set BifroxEventStore AppDirectory "$InstallDir"
+        nssm set BifroxEventStore AppStdout "$InstallDir\logs\bifrox-service.log"
+        nssm set BifroxEventStore AppStderr "$InstallDir\logs\bifrox-service-err.log"
+        nssm set BifroxEventStore AppRotateFiles 1
+        nssm set BifroxEventStore AppRotateBytes 20971520
+        nssm set BifroxEventStore AppStopMethodSkip 0
+        nssm set BifroxEventStore AppStopMethodConsole 1500
+        nssm start BifroxEventStore
+        Write-Host "Bifrox service successfully registered and started via NSSM." -ForegroundColor Green
     } else {
         Write-Warning "NSSM is not installed in PATH. Download nssm.exe or use WinSW."
     }
