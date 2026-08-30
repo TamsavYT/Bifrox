@@ -33,8 +33,16 @@ pub struct ShareGroupManager {
 }
 
 impl ShareGroupManager {
-    /// Opens or creates the `__share_group_state.log` persistent file and recovers watermarks
-    pub fn open(data_dir: impl AsRef<Path>) -> IoResult<Self> {
+    /// Opens or creates the `__share_group_state.log` persistent file and recovers
+    /// watermarks. `default_lock_timeout` and `max_delivery_attempts` are supplied by the
+    /// caller from `EngineConfig` (`share_group_lock_timeout_ms` /
+    /// `share_group_max_delivery_attempts`) — every recovered and newly created
+    /// `SharePartition` is seeded with these two values.
+    pub fn open(
+        data_dir: impl AsRef<Path>,
+        default_lock_timeout: Duration,
+        max_delivery_attempts: u16,
+    ) -> IoResult<Self> {
         let dir = data_dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let state_path = dir.join("__share_group_state.log");
@@ -153,8 +161,6 @@ impl ShareGroupManager {
 
         let partitions = DashMap::new();
         let persisted_watermarks = DashMap::new();
-        let default_lock_timeout = Duration::from_secs(30);
-        let max_delivery_attempts = 5;
 
         for entry in recovered_offsets.into_iter() {
             let ((group_id, topic, partition), start_offset) = entry;

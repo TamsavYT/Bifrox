@@ -429,6 +429,33 @@ pub struct EngineConfig {
     ///
     /// Defaults to five minutes.
     pub max_poll_interval_ms: u64,
+    /// How long the broker leases an acquired record to a share-group member before it
+    /// becomes eligible for redelivery to someone else (`share.group.lock.timeout.ms`).
+    ///
+    /// A member may override this per request via `ShareFetch`'s own `lock_timeout_ms`;
+    /// this value is only what a member gets when it sends `0` there, declining to pick a
+    /// duration itself (see `StorageEngine::share_fetch`). Too low and a record gets
+    /// redelivered to someone else while the original member is still legitimately working
+    /// it — duplicate processing; too high and a crashed or stuck member's records stay
+    /// stuck with it for that long before anyone else can pick them up.
+    pub share_group_lock_timeout_ms: u64,
+    /// How many times a share-group record may have its *lease expire* before it is
+    /// archived and routed to `<topic>-dlq` instead of being offered again
+    /// (`share.group.max.delivery.attempts`). `delivery_count` starts at 1 on first
+    /// delivery, so a value of `1` means no second chance: the first expired lease sends
+    /// the record straight to the DLQ.
+    ///
+    /// This governs the lease-expiry path only — `SharePartition::check_lock_timeouts` is
+    /// the sole place the count is compared. An explicit `Reject` bypasses it and archives
+    /// on the spot, which is the point of rejecting rather than letting a lease lapse: the
+    /// member is asserting the record is bad, not that it failed to finish in time. An
+    /// explicit `Release` does not consult it either — a released record simply returns to
+    /// `Available`, so a member that keeps releasing the same record keeps getting it back.
+    ///
+    /// Too low and a member that merely crashed mid-record sidelines it after one lapse;
+    /// too high and a record no one can finish is redelivered many times before the DLQ
+    /// ever sees it.
+    pub share_group_max_delivery_attempts: u16,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
     /// exist yet (`auto.create.topics.enable`). Defaults to **true**, matching Bifrox's
     /// long-standing behavior.
@@ -487,7 +514,9 @@ impl Default for EngineConfig {
             num_network_threads: None,
             auto_assign_partitions_enable: true,
             group_initial_rebalance_delay_ms: 3_000,
-            max_poll_interval_ms: 300_000, // 5 minutes
+            max_poll_interval_ms: 300_000,        // 5 minutes
+            share_group_lock_timeout_ms: 30_000,  // 30 seconds
+            share_group_max_delivery_attempts: 5, // attempts
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
@@ -707,6 +736,24 @@ impl EngineConfig {
                     "max.poll.interval.ms" => {
                         if let Ok(v) = value.parse::<u64>() {
                             config.max_poll_interval_ms = v;
+                        }
+                    }
+                    "share.group.lock.timeout.ms" => {
+                        if let Ok(v) = value.parse::<u64>() {
+                            // A 0ms lease would expire the instant it's granted, so an
+                            // operator-supplied 0 is a typo, not an intent — clamp to the
+                            // floor rather than reject the file (same convention as
+                            // `log.cleaner.threads` below).
+                            config.share_group_lock_timeout_ms = v.max(1);
+                        }
+                    }
+                    "share.group.max.delivery.attempts" => {
+                        if let Ok(v) = value.parse::<u16>() {
+                            // `check_lock_timeouts` compares with `>=`, so 0 and 1 both
+                            // still deliver once — 0 would just be a dishonest way to spell
+                            // 1. Clamp to the real floor instead of accepting a value that
+                            // doesn't mean what it says.
+                            config.share_group_max_delivery_attempts = v.max(1);
                         }
                     }
                     "auto.assign.partitions.enable" => {
@@ -954,5 +1001,85 @@ mod compression_type_tests {
         ] {
             assert_eq!(codec.for_broker_authored_frame(), codec);
         }
+    }
+}
+
+#[cfg(test)]
+mod share_group_config_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Writes `contents` to a fresh, uniquely-named temp file and returns its path —
+    /// nanosecond timestamp plus a counter (not just the timestamp) so two calls in the
+    /// same test process never collide even when the clock's resolution is coarser than a
+    /// nanosecond on some platforms.
+    fn write_temp_properties(contents: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bifrox_config_test_{}_{}_{}.properties",
+            std::process::id(),
+            nanos,
+            count
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn defaults_are_thirty_seconds_and_five_attempts() {
+        let config = EngineConfig::default();
+        assert_eq!(config.share_group_lock_timeout_ms, 30_000);
+        assert_eq!(config.share_group_max_delivery_attempts, 5);
+    }
+
+    #[test]
+    fn parses_both_keys_from_properties_file() {
+        let path = write_temp_properties(
+            "share.group.lock.timeout.ms=45000\n\
+             share.group.max.delivery.attempts=3\n",
+        );
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.share_group_lock_timeout_ms, 45_000);
+        assert_eq!(config.share_group_max_delivery_attempts, 3);
+    }
+
+    #[test]
+    fn zero_clamps_to_one_for_both_keys() {
+        let path = write_temp_properties(
+            "share.group.lock.timeout.ms=0\n\
+             share.group.max.delivery.attempts=0\n",
+        );
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            config.share_group_lock_timeout_ms, 1,
+            "a 0ms lease expires the instant it's granted — must clamp to the floor, not \
+             accept it literally"
+        );
+        assert_eq!(
+            config.share_group_max_delivery_attempts, 1,
+            "check_lock_timeouts compares with >=, so 0 and 1 both still deliver once — \
+             must clamp to the honest floor"
+        );
+    }
+
+    #[test]
+    fn unparseable_value_leaves_default_intact() {
+        let path = write_temp_properties("share.group.max.delivery.attempts=banana\n");
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            config.share_group_max_delivery_attempts, 5,
+            "an unparseable value must be ignored, not panic, leaving the default in place"
+        );
     }
 }

@@ -170,6 +170,64 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
     }
 }
 
+/// Same as `start_test_server` but with configurable share-group settings
+/// (`share.group.lock.timeout.ms` / `share.group.max.delivery.attempts`) — needed to
+/// exercise lease-expiry and DLQ-routing thresholds in bounded time instead of the
+/// production defaults (30s / 5 attempts).
+async fn start_test_server_with_share_group_config(
+    share_group_lock_timeout_ms: u64,
+    share_group_max_delivery_attempts: u16,
+) -> TestEnv {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "storage_test_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        count
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let config = EngineConfig {
+        data_dir: data_dir.clone(),
+        max_segment_bytes: 64 * 1024,
+        index_interval_bytes: 256,
+        flush_policy: FlushPolicy::AsyncPeriodic {
+            interval: Duration::from_millis(5),
+            max_bytes: 4 * 1024,
+        },
+        preallocate_segments: false,
+        bind_addr: "127.0.0.1:0".to_string(), // Rule B: Dynamic Ephemeral Port
+        retention_bytes: None,
+        retention_millis: None,
+        retention_check_interval: Duration::from_secs(60),
+        // Same reasoning as `start_test_server_with_quota`: keep the join barrier short
+        // so it doesn't add latency to every JoinGroup in tests using this helper.
+        group_initial_rebalance_delay_ms: 60,
+        share_group_lock_timeout_ms,
+        share_group_max_delivery_attempts,
+        ..EngineConfig::default()
+    };
+
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+
+    tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    TestEnv {
+        addr,
+        data_dir,
+        engine,
+    }
+}
+
 /// The value bytes of a record, for assertions written before values became nullable.
 ///
 /// A null value (tombstone) reads as empty here, so tests that care about the difference
@@ -9777,4 +9835,126 @@ async fn test_scenario_111_renew_extends_lease_past_original_expiry() {
 
     consumer_a.leave().await.unwrap();
     consumer_b.leave().await.unwrap();
+}
+
+/// A configured `share_group_max_delivery_attempts` actually changes when a record gets
+/// routed to `<topic>-dlq` — not merely parsed into `EngineConfig` and then ignored (the
+/// same bug class recently found in `share_group_describe`, which returned hardcoded
+/// zeros while the underlying data was tracked correctly all along).
+///
+/// Drives delivery attempts via lock-lease expiry, not `AcknowledgeType::Reject`:
+/// `SharePartition::acknowledge`'s `Reject` arm pushes every offset in range straight into
+/// `dlq_offsets` unconditionally on the very first rejection — it never reads
+/// `max_delivery_attempts` at all — so the scenario would pass identically no matter what
+/// the config said, and would not be discriminating. Only
+/// `SharePartition::check_lock_timeouts` compares `delivery_count` against
+/// `max_delivery_attempts` (`>=`), archiving — and DLQing — a batch only once its delivery
+/// count has caught up to the configured ceiling, so that is the path this test exercises.
+///
+/// The lease itself still has to expire in real wall-clock time (sleeps past the
+/// configured 80ms lock timeout), but the sweep that turns an expired lease into a DLQ
+/// write is triggered by calling `StorageEngine::sweep_share_lock_timeouts` directly rather
+/// than waiting on the server's own background reaper task (which polls every 500ms) —
+/// keeping the DLQ write itself on the test's own schedule instead of an arbitrary
+/// polling interval.
+#[tokio::test]
+async fn test_scenario_112_configured_max_delivery_attempts_gates_dlq_routing() {
+    use bifrox::{CommandCode, RequestPayload, WireRequest};
+    use bytes::Buf;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let env = start_test_server_with_share_group_config(80, 2).await;
+    let topic = "scenario_112_max_delivery_attempts_topic";
+    let group_id = "scenario-112-group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"poison-pill")],
+        )
+        .await
+        .unwrap();
+
+    let fetch_req = |member: &str| WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: member.to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 1,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 0, // use the configured server default (80ms)
+            acknowledgements: vec![],
+        },
+    };
+
+    // Delivery attempt 1: acquire the record and never resolve it.
+    let mut stream1 = TcpStream::connect(env.addr).await.unwrap();
+    stream1
+        .write_all(&encode_wire_request(&fetch_req("member-1")))
+        .await
+        .unwrap();
+    let resp1 = read_wire_response(&mut stream1).await;
+    assert_eq!(resp1.status, 0);
+    let mut buf1 = &resp1.payload[..];
+    assert_eq!(buf1.get_u32(), 1, "expected one batch on first delivery");
+    assert_eq!(buf1.get_u64(), 0); // first_offset
+    assert_eq!(buf1.get_u64(), 0); // last_offset
+    assert_eq!(
+        buf1.get_u16(),
+        1,
+        "first delivery must show delivery_count 1"
+    );
+
+    // Let the 80ms lease actually expire, then sweep explicitly rather than waiting on the
+    // background reaper's own cadence.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.engine.sweep_share_lock_timeouts();
+
+    // One failed delivery is not enough at max_delivery_attempts=2 — released for
+    // redelivery, not archived to the DLQ. This is the assertion that would catch a test
+    // that "passes just as well against the old hardcoded 5": at 5 attempts this would
+    // also still be empty, but so would it be after attempt 2 below, which is where the
+    // two configured values are supposed to diverge.
+    let dlq_after_one = env.engine.fetch(&dlq_topic, 0, 0, 1024).await.unwrap();
+    assert!(
+        dlq_after_one.is_empty(),
+        "must not be DLQ'd after only 1 delivery attempt when max_delivery_attempts=2, got \
+         {dlq_after_one:?}"
+    );
+
+    // Delivery attempt 2: a different member re-acquires the now-released record.
+    let mut stream2 = TcpStream::connect(env.addr).await.unwrap();
+    stream2
+        .write_all(&encode_wire_request(&fetch_req("member-2")))
+        .await
+        .unwrap();
+    let resp2 = read_wire_response(&mut stream2).await;
+    assert_eq!(resp2.status, 0);
+    let mut buf2 = &resp2.payload[..];
+    assert_eq!(buf2.get_u32(), 1, "expected one batch on redelivery");
+    assert_eq!(buf2.get_u64(), 0);
+    assert_eq!(buf2.get_u64(), 0);
+    assert_eq!(buf2.get_u16(), 2, "redelivery must show delivery_count 2");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.engine.sweep_share_lock_timeouts();
+
+    // Now delivery_count (2) has caught up to max_delivery_attempts (2): archived and
+    // routed to the DLQ.
+    let dlq_after_two = env.engine.fetch(&dlq_topic, 0, 0, 1024).await.unwrap();
+    assert_eq!(
+        dlq_after_two.len(),
+        1,
+        "must be DLQ'd once delivery_count reaches max_delivery_attempts=2, got \
+         {dlq_after_two:?}"
+    );
+    assert_eq!(value_of(&dlq_after_two[0]), b"poison-pill");
 }
