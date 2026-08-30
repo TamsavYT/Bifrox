@@ -4173,7 +4173,8 @@ impl StorageEngine {
         } else {
             "Stable".to_string()
         };
-        (state, members, 0, 0)
+        let (inflight_count, start_offset) = self.share_groups.group_stats(group_id);
+        (state, members, inflight_count, start_offset)
     }
 
     /// Sweeps expired acquisition locks and routes poison pills to DLQ

@@ -426,4 +426,27 @@ impl ShareGroupManager {
             .map(|entry| entry.key().1.clone())
             .collect()
     }
+
+    /// Aggregates in-flight record count and the low-water start offset across every
+    /// (topic, partition) this group has ever fetched from — used by `ShareGroupDescribe`
+    /// to report the group's real state. Each `SharePartition` already tracks both
+    /// correctly (`inflight_count` and the `start_offset` watermark); this just sums the
+    /// former and takes the minimum of the latter across every partition keyed under
+    /// `group_id`, so a caller filtering to `group_id` alone (a group can span more than
+    /// one topic) sees one aggregate answer instead of having to know every partition by
+    /// name up front.
+    pub fn group_stats(&self, group_id: &str) -> (usize, u64) {
+        let mut inflight = 0usize;
+        let mut start_offset: Option<u64> = None;
+        for entry in self.partitions.iter() {
+            if entry.key().0 != group_id {
+                continue;
+            }
+            let sp = entry.value();
+            inflight += sp.inflight_count();
+            let sp_start = sp.start_offset.load(Ordering::SeqCst);
+            start_offset = Some(start_offset.map_or(sp_start, |current| current.min(sp_start)));
+        }
+        (inflight, start_offset.unwrap_or(0))
+    }
 }
