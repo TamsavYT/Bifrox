@@ -7,9 +7,10 @@ pub mod replication;
 pub mod scram;
 pub mod segment;
 pub mod server;
+pub mod share_consumer;
 pub mod shutdown;
 
-pub use client::{ProduceResult, RoutedClient, SeekResult, TestClient};
+pub use client::{ProduceResult, RoutedClient, SeekResult, ShareGroupDescription, TestClient};
 pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
 pub use consumer::{assign_range, GroupConsumer, GroupConsumerConfig};
 pub use consumer_group::ConsumerGroupManager;
@@ -30,4 +31,5 @@ pub use server::{
     PartitionManager, QuotaManager, ResourceType, Server, ShareGroupManager, SharePartition,
     ShareRecordState, StorageEngine, TransactionManager, TransactionState, TxStatus,
 };
+pub use share_consumer::{ShareConsumer, ShareConsumerConfig, ShareRecord};
 pub use shutdown::wait_for_shutdown_signal;

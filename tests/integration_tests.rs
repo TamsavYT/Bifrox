@@ -170,6 +170,64 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
     }
 }
 
+/// Same as `start_test_server` but with configurable share-group settings
+/// (`share.group.lock.timeout.ms` / `share.group.max.delivery.attempts`) — needed to
+/// exercise lease-expiry and DLQ-routing thresholds in bounded time instead of the
+/// production defaults (30s / 5 attempts).
+async fn start_test_server_with_share_group_config(
+    share_group_lock_timeout_ms: u64,
+    share_group_max_delivery_attempts: u16,
+) -> TestEnv {
+    let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "storage_test_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        count
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let config = EngineConfig {
+        data_dir: data_dir.clone(),
+        max_segment_bytes: 64 * 1024,
+        index_interval_bytes: 256,
+        flush_policy: FlushPolicy::AsyncPeriodic {
+            interval: Duration::from_millis(5),
+            max_bytes: 4 * 1024,
+        },
+        preallocate_segments: false,
+        bind_addr: "127.0.0.1:0".to_string(), // Rule B: Dynamic Ephemeral Port
+        retention_bytes: None,
+        retention_millis: None,
+        retention_check_interval: Duration::from_secs(60),
+        // Same reasoning as `start_test_server_with_quota`: keep the join barrier short
+        // so it doesn't add latency to every JoinGroup in tests using this helper.
+        group_initial_rebalance_delay_ms: 60,
+        share_group_lock_timeout_ms,
+        share_group_max_delivery_attempts,
+        ..EngineConfig::default()
+    };
+
+    let engine = StorageEngine::new(config).unwrap();
+    let server = Server::new(engine.clone());
+    let (listener, addr) = server.bind().unwrap();
+
+    tokio::spawn(async move {
+        let _ = server.run_with_listener(listener).await;
+    });
+
+    TestEnv {
+        addr,
+        data_dir,
+        engine,
+    }
+}
+
 /// The value bytes of a record, for assertions written before values became nullable.
 ///
 /// A null value (tombstone) reads as empty here, so tests that care about the difference
@@ -9074,5 +9132,1068 @@ async fn test_scenario_90_compaction_keeps_records_inside_batches() {
         ],
         "k2/k3 came from inside the batch and were never superseded — compaction must not \
          drop them just because they arrived batched"
+    );
+}
+
+/// Two share-group members polling the same partition concurrently must receive disjoint
+/// offset ranges — the core parallel-consumption claim of a share group, and nothing at
+/// the `ShareConsumer` API level currently asserts it.
+#[tokio::test]
+async fn test_scenario_103_two_consumers_receive_disjoint_offsets() {
+    let env = start_test_server().await;
+    let topic = "scenario_103_disjoint_topic";
+    let group_id = "scenario_103_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    let payloads: Vec<bytes::Bytes> = (0..6)
+        .map(|i| bytes::Bytes::from(format!("rec-{i}")))
+        .collect();
+    producer
+        .produce_batch(topic, "", None, 1, &payloads)
+        .await
+        .unwrap();
+
+    let mut consumer_a = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut consumer_b = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-b".to_string(),
+            max_records: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_a = consumer_a.poll().await.unwrap();
+    let records_b = consumer_b.poll().await.unwrap();
+
+    assert_eq!(
+        records_a.len(),
+        2,
+        "consumer A must receive exactly max_records, got {records_a:?}"
+    );
+    assert_eq!(
+        records_b.len(),
+        2,
+        "consumer B must receive exactly max_records, got {records_b:?}"
+    );
+
+    let offsets_a: std::collections::HashSet<u64> = records_a.iter().map(|r| r.offset).collect();
+    let offsets_b: std::collections::HashSet<u64> = records_b.iter().map(|r| r.offset).collect();
+    assert!(
+        offsets_a.is_disjoint(&offsets_b),
+        "consumers received overlapping offsets: {offsets_a:?} vs {offsets_b:?}"
+    );
+    let union: std::collections::HashSet<u64> = offsets_a.union(&offsets_b).copied().collect();
+    let expected: std::collections::HashSet<u64> = [0u64, 1, 2, 3].into_iter().collect();
+    assert_eq!(
+        union, expected,
+        "the union of what both consumers received must be exactly the first four offsets, \
+         got {union:?}"
+    );
+    for record in records_a.iter().chain(records_b.iter()) {
+        assert_eq!(
+            record.delivery_count, 1,
+            "a record's first delivery must report delivery_count 1, got {} for offset {}",
+            record.delivery_count, record.offset
+        );
+    }
+
+    consumer_a.leave().await.unwrap();
+    consumer_b.leave().await.unwrap();
+}
+
+/// Accept resolves a record for good; release makes it immediately eligible for
+/// redelivery to any member, with `delivery_count` bumped, instead of waiting out the
+/// lease.
+#[tokio::test]
+async fn test_scenario_104_accept_resolves_release_redelivers_immediately() {
+    let env = start_test_server().await;
+    let topic = "scenario_104_accept_release_topic";
+    let group_id = "scenario_104_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    let payloads: Vec<bytes::Bytes> = (0..2)
+        .map(|i| bytes::Bytes::from(format!("rec-{i}")))
+        .collect();
+    producer
+        .produce_batch(topic, "", None, 1, &payloads)
+        .await
+        .unwrap();
+
+    let mut consumer_a = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records = consumer_a.poll().await.unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "expected both records on the first poll, got {records:?}"
+    );
+    let accepted_offset = records[0].offset;
+    let released_offset = records[1].offset;
+    consumer_a
+        .accept(records[0].partition, accepted_offset)
+        .unwrap();
+    consumer_a
+        .release(records[1].partition, released_offset)
+        .unwrap();
+    consumer_a.flush_acks().await.unwrap();
+
+    let mut consumer_b = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-b".to_string(),
+            max_records: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_b = consumer_b.poll().await.unwrap();
+    assert_eq!(
+        records_b.len(),
+        1,
+        "only the released offset should be redeliverable, got {records_b:?}"
+    );
+    assert_eq!(
+        records_b[0].offset, released_offset,
+        "the released offset must be what comes back, got {}",
+        records_b[0].offset
+    );
+    assert_eq!(
+        records_b[0].delivery_count, 2,
+        "a released record's second delivery must report delivery_count 2, got {}",
+        records_b[0].delivery_count
+    );
+    assert!(
+        records_b.iter().all(|r| r.offset != accepted_offset),
+        "the accepted offset must never be redelivered, got {records_b:?}"
+    );
+
+    consumer_a.leave().await.unwrap();
+    consumer_b.leave().await.unwrap();
+}
+
+/// A rejected record must be routed to the topic's dead-letter-queue partition rather than
+/// simply discarded, and the DLQ entry must carry the original record's value.
+#[tokio::test]
+async fn test_scenario_105_reject_routes_to_dead_letter_queue() {
+    let env = start_test_server().await;
+    let topic = "scenario_105_reject_dlq_topic";
+    let group_id = "scenario_105_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"poison-pill")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records = consumer.poll().await.unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected exactly one record, got {records:?}"
+    );
+    let partition = records[0].partition;
+    let offset = records[0].offset;
+    consumer.reject(partition, offset).unwrap();
+    consumer.flush_acks().await.unwrap();
+
+    let dlq_topic = format!("{topic}-dlq");
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+    let dlq_records = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        dlq_records.len(),
+        1,
+        "the rejected record must land in the DLQ partition, got {dlq_records:?}"
+    );
+    assert_eq!(
+        dlq_records[0].value.as_deref(),
+        Some(b"poison-pill".as_ref()),
+        "the DLQ entry must carry the original record's value"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// An unacknowledged lease must expire on its own and become redeliverable to another
+/// member — a consumer that never resolves a record must not be able to hold it forever.
+#[tokio::test]
+async fn test_scenario_106_expired_lease_is_redelivered() {
+    let env = start_test_server().await;
+    let topic = "scenario_106_lease_expiry_topic";
+    let group_id = "scenario_106_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"expires-me")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer_a = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            lock_timeout: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(50),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_a = consumer_a.poll().await.unwrap();
+    assert_eq!(
+        records_a.len(),
+        1,
+        "expected one record acquired by A, got {records_a:?}"
+    );
+    // Deliberately never acknowledged — the lease must expire on its own.
+
+    let mut consumer_b = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-b".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Poll in a loop against a generous deadline rather than sleeping for a fixed
+    // duration and asserting once — host slowness has no upper bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut redelivered = None;
+    while std::time::Instant::now() < deadline {
+        let records_b = consumer_b.poll().await.unwrap();
+        if let Some(record) = records_b.into_iter().next() {
+            redelivered = Some(record);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let record = redelivered
+        .expect("the expired lease must eventually be redelivered to B within the 10s deadline");
+    assert_eq!(record.offset, 0, "the redelivered record must be offset 0");
+    assert_eq!(
+        record.delivery_count, 2,
+        "the redelivered record must report delivery_count 2, got {}",
+        record.delivery_count
+    );
+
+    consumer_a.leave().await.unwrap();
+    consumer_b.leave().await.unwrap();
+}
+
+/// `poll()` must rotate its starting partition on every call, so a partition that happens
+/// to be first in the config cannot permanently starve the others when `max_records`
+/// limits each poll to draining only one partition at a time.
+#[tokio::test]
+async fn test_scenario_107_poll_rotates_starting_partition() {
+    let env = start_test_server().await;
+    let topic = "scenario_107_rotation_topic";
+    let group_id = "scenario_107_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer.create_topic(topic, 3).await.unwrap();
+    for partition in 0..3u32 {
+        let key = key_for_partition(partition, 3);
+        producer
+            .produce_batch(
+                topic,
+                &key,
+                None,
+                3,
+                &[bytes::Bytes::from(format!("rec-p{partition}"))],
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0, 1, 2],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut seen_partitions = std::collections::HashSet::new();
+    for round in 0..3 {
+        let records = consumer.poll().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "round {round}: expected exactly one record per poll with max_records=1, got \
+             {records:?}"
+        );
+        seen_partitions.insert(records[0].partition);
+    }
+    assert_eq!(
+        seen_partitions.len(),
+        3,
+        "three polls of max_records=1 must visit three distinct partitions if the cursor \
+         rotates rather than always starting at partition 0, got {seen_partitions:?}"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `leave()` must hand back everything still in flight immediately, instead of leaving it
+/// locked until the lease itself expires — this is the entire reason to call it explicitly
+/// rather than just dropping the consumer. `leave()` stages `Yield`, not `Release` — a
+/// handoff, not a failure — so it also undoes A's own delivery-count increment; B's
+/// acquisition is a net-neutral first-ever attempt, reporting `delivery_count` 1 rather than
+/// 2, even though this is technically the record's second delivery.
+#[tokio::test]
+async fn test_scenario_108_leave_releases_in_flight_records_immediately() {
+    let env = start_test_server().await;
+    let topic = "scenario_108_leave_releases_topic";
+    let group_id = "scenario_108_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    let payloads: Vec<bytes::Bytes> = (0..2)
+        .map(|i| bytes::Bytes::from(format!("rec-{i}")))
+        .collect();
+    producer
+        .produce_batch(topic, "", None, 1, &payloads)
+        .await
+        .unwrap();
+
+    let mut consumer_a = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 2,
+            // Deliberately long: if B receives these records it can only be because
+            // leave() released them, not because the lease happened to run out.
+            lock_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_a = consumer_a.poll().await.unwrap();
+    assert_eq!(
+        records_a.len(),
+        2,
+        "expected both records acquired by A, got {records_a:?}"
+    );
+    // Never acknowledged — leave() alone must free them.
+    consumer_a.leave().await.unwrap();
+
+    let mut consumer_b = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-b".to_string(),
+            max_records: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_b = consumer_b.poll().await.unwrap();
+    assert_eq!(
+        records_b.len(),
+        2,
+        "with 30s left on A's lease, B can only receive both records if leave() released \
+         them; got {records_b:?}"
+    );
+    let offsets_b: std::collections::HashSet<u64> = records_b.iter().map(|r| r.offset).collect();
+    let expected: std::collections::HashSet<u64> = [0u64, 1].into_iter().collect();
+    assert_eq!(
+        offsets_b, expected,
+        "B must receive exactly the two offsets A held, got {offsets_b:?}"
+    );
+    for record in &records_b {
+        assert_eq!(
+            record.delivery_count, 1,
+            "leave() yields rather than releases, undoing A's own delivery-count increment \
+             — B's acquisition must be net-neutral (delivery_count 1), not counted as a \
+             second attempt, got {} for offset {}",
+            record.delivery_count, record.offset
+        );
+    }
+
+    consumer_b.leave().await.unwrap();
+}
+
+/// Acknowledging an offset this consumer never leased — or already resolved — must be
+/// rejected synchronously and client-side. `accept`/`release`/`reject` are plain (non-
+/// `async`) functions precisely so that no request can reach the broker for a lease this
+/// side has no record of acquiring.
+#[tokio::test]
+async fn test_scenario_109_acknowledging_unleased_offset_is_rejected_client_side() {
+    let env = start_test_server().await;
+    let topic = "scenario_109_unleased_ack_topic";
+    let group_id = "scenario_109_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"only-record")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // `accept` is a plain function, not `async fn` — it cannot itself perform I/O, so this
+    // `Err` coming back is proof the broker was never contacted about an offset this
+    // consumer was never leased.
+    let err = consumer
+        .accept(0, 999)
+        .expect_err("acknowledging an offset never leased to this consumer must be rejected");
+    assert!(
+        err.to_string().contains("999"),
+        "the error should name the offending offset, got: {err}"
+    );
+
+    let records = consumer.poll().await.unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected the one record to be leased, got {records:?}"
+    );
+    let partition = records[0].partition;
+    let offset = records[0].offset;
+    consumer.accept(partition, offset).unwrap();
+
+    // Now already resolved — acknowledging it again must also fail, and just as
+    // synchronously.
+    let second_err = consumer
+        .accept(partition, offset)
+        .expect_err("acknowledging an already-resolved offset a second time must be rejected");
+    assert!(
+        second_err.to_string().contains(&offset.to_string()),
+        "the error should name the offending offset, got: {second_err}"
+    );
+
+    consumer.flush_acks().await.unwrap();
+    consumer.leave().await.unwrap();
+}
+
+/// Acknowledgements staged via `accept`/`release`/`reject` must ride the *next* poll's
+/// fetch automatically — a caller does not have to call `flush_acks()` at all as long as it
+/// keeps polling.
+#[tokio::test]
+async fn test_scenario_110_staged_acks_ride_the_next_poll() {
+    let env = start_test_server().await;
+    let topic = "scenario_110_piggyback_topic";
+    let group_id = "scenario_110_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    let payloads: Vec<bytes::Bytes> = (0..6)
+        .map(|i| bytes::Bytes::from(format!("rec-{i}")))
+        .collect();
+    producer
+        .produce_batch(topic, "", None, 1, &payloads)
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let first_batch = consumer.poll().await.unwrap();
+    assert_eq!(
+        first_batch.len(),
+        3,
+        "expected the first three records, got {first_batch:?}"
+    );
+    for record in &first_batch {
+        consumer.accept(record.partition, record.offset).unwrap();
+    }
+
+    // Deliberately no `flush_acks()` call — the accepts above are staged, not sent yet.
+    let second_batch = consumer.poll().await.unwrap();
+    assert_eq!(
+        second_batch.len(),
+        3,
+        "expected the second three records, got {second_batch:?}"
+    );
+
+    // Direct, broker-side assertion: if the first batch's accepts had never reached the
+    // broker, its three offsets would still count as in flight alongside the second
+    // batch's three, for a total of six. `share_group_describe` is the more direct check
+    // here than spinning up a third consumer and hoping it never sees the accepted
+    // offsets — it reads the broker's own bookkeeping in one round trip instead of
+    // inferring the state from an absence of records.
+    let mut describe_client = TestClient::connect(env.addr).await.unwrap();
+    let description = describe_client
+        .share_group_describe(group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        description.inflight_count, 3,
+        "the piggybacked accepts on the second poll must have resolved the first batch, \
+         leaving only the second batch's three records in flight; got {}",
+        description.inflight_count
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `renew()` must extend a lease past its originally granted expiry — the lease staying
+/// alive is a direct consequence of calling it, not something that would happen anyway.
+#[tokio::test]
+async fn test_scenario_111_renew_extends_lease_past_original_expiry() {
+    let env = start_test_server().await;
+    let topic = "scenario_111_renew_topic";
+    let group_id = "scenario_111_group";
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"renewed-record")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer_a = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            lock_timeout: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(50),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut consumer_b = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-b".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let records_a = consumer_a.poll().await.unwrap();
+    assert_eq!(
+        records_a.len(),
+        1,
+        "expected A to acquire the one record, got {records_a:?}"
+    );
+
+    // Renew faster than the 300ms lease, for well over one full lease period, while B
+    // keeps polling and must never receive the record.
+    let renew_deadline = std::time::Instant::now() + Duration::from_millis(900);
+    while std::time::Instant::now() < renew_deadline {
+        consumer_a.renew(0).await.unwrap();
+        let records_b = consumer_b.poll().await.unwrap();
+        assert!(
+            records_b.is_empty(),
+            "B must not receive the record while A is actively renewing its lease, got \
+             {records_b:?}"
+        );
+        sleep(Duration::from_millis(40)).await;
+    }
+
+    // Stop renewing. The lease must now be free to expire, and B must eventually get it.
+    // Polled in a loop against a generous deadline rather than sleeping a fixed duration
+    // and asserting once — host slowness has no upper bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut redelivered = None;
+    while std::time::Instant::now() < deadline {
+        let records_b = consumer_b.poll().await.unwrap();
+        if let Some(record) = records_b.into_iter().next() {
+            redelivered = Some(record);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let record = redelivered.expect(
+        "once renewals stop, the lease must eventually expire and B must receive the record",
+    );
+    assert_eq!(record.offset, 0, "the redelivered record must be offset 0");
+    assert_eq!(
+        record.delivery_count, 2,
+        "the record must show delivery_count 2 once redelivered — proving the renewal loop \
+         above, not something else, is what held the lease alive; got {}",
+        record.delivery_count
+    );
+
+    consumer_a.leave().await.unwrap();
+    consumer_b.leave().await.unwrap();
+}
+
+/// A configured `share_group_max_delivery_attempts` actually changes when a record gets
+/// routed to `<topic>-dlq` — not merely parsed into `EngineConfig` and then ignored (the
+/// same bug class recently found in `share_group_describe`, which returned hardcoded
+/// zeros while the underlying data was tracked correctly all along).
+///
+/// Drives delivery attempts via lock-lease expiry, not `AcknowledgeType::Reject`:
+/// `SharePartition::acknowledge`'s `Reject` arm pushes every offset in range straight into
+/// `dlq_offsets` unconditionally on the very first rejection — it never reads
+/// `max_delivery_attempts` at all — so the scenario would pass identically no matter what
+/// the config said, and would not be discriminating. Only
+/// `SharePartition::check_lock_timeouts` compares `delivery_count` against
+/// `max_delivery_attempts` (`>=`), archiving — and DLQing — a batch only once its delivery
+/// count has caught up to the configured ceiling, so that is the path this test exercises.
+///
+/// The lease itself still has to expire in real wall-clock time (sleeps past the
+/// configured 80ms lock timeout), but the sweep that turns an expired lease into a DLQ
+/// write is triggered by calling `StorageEngine::sweep_share_lock_timeouts` directly rather
+/// than waiting on the server's own background reaper task (which polls every 500ms) —
+/// keeping the DLQ write itself on the test's own schedule instead of an arbitrary
+/// polling interval.
+#[tokio::test]
+async fn test_scenario_112_configured_max_delivery_attempts_gates_dlq_routing() {
+    use bifrox::{CommandCode, RequestPayload, WireRequest};
+    use bytes::Buf;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let env = start_test_server_with_share_group_config(80, 2).await;
+    let topic = "scenario_112_max_delivery_attempts_topic";
+    let group_id = "scenario-112-group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"poison-pill")],
+        )
+        .await
+        .unwrap();
+
+    let fetch_req = |member: &str| WireRequest {
+        cmd: CommandCode::ShareFetch,
+        payload: RequestPayload::ShareFetch {
+            group_id: group_id.to_string(),
+            member_id: member.to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            max_records: 1,
+            max_bytes: 1024 * 1024,
+            lock_timeout_ms: 0, // use the configured server default (80ms)
+            acknowledgements: vec![],
+        },
+    };
+
+    // Delivery attempt 1: acquire the record and never resolve it.
+    let mut stream1 = TcpStream::connect(env.addr).await.unwrap();
+    stream1
+        .write_all(&encode_wire_request(&fetch_req("member-1")))
+        .await
+        .unwrap();
+    let resp1 = read_wire_response(&mut stream1).await;
+    assert_eq!(resp1.status, 0);
+    let mut buf1 = &resp1.payload[..];
+    assert_eq!(buf1.get_u32(), 1, "expected one batch on first delivery");
+    assert_eq!(buf1.get_u64(), 0); // first_offset
+    assert_eq!(buf1.get_u64(), 0); // last_offset
+    assert_eq!(
+        buf1.get_u16(),
+        1,
+        "first delivery must show delivery_count 1"
+    );
+
+    // Let the 80ms lease actually expire, then sweep explicitly rather than waiting on the
+    // background reaper's own cadence.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.engine.sweep_share_lock_timeouts();
+
+    // One failed delivery is not enough at max_delivery_attempts=2 — released for
+    // redelivery, not archived to the DLQ. This is the assertion that would catch a test
+    // that "passes just as well against the old hardcoded 5": at 5 attempts this would
+    // also still be empty, but so would it be after attempt 2 below, which is where the
+    // two configured values are supposed to diverge.
+    let dlq_after_one = env.engine.fetch(&dlq_topic, 0, 0, 1024).await.unwrap();
+    assert!(
+        dlq_after_one.is_empty(),
+        "must not be DLQ'd after only 1 delivery attempt when max_delivery_attempts=2, got \
+         {dlq_after_one:?}"
+    );
+
+    // Delivery attempt 2: a different member re-acquires the now-released record.
+    let mut stream2 = TcpStream::connect(env.addr).await.unwrap();
+    stream2
+        .write_all(&encode_wire_request(&fetch_req("member-2")))
+        .await
+        .unwrap();
+    let resp2 = read_wire_response(&mut stream2).await;
+    assert_eq!(resp2.status, 0);
+    let mut buf2 = &resp2.payload[..];
+    assert_eq!(buf2.get_u32(), 1, "expected one batch on redelivery");
+    assert_eq!(buf2.get_u64(), 0);
+    assert_eq!(buf2.get_u64(), 0);
+    assert_eq!(buf2.get_u16(), 2, "redelivery must show delivery_count 2");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.engine.sweep_share_lock_timeouts();
+
+    // Now delivery_count (2) has caught up to max_delivery_attempts (2): archived and
+    // routed to the DLQ.
+    let dlq_after_two = env.engine.fetch(&dlq_topic, 0, 0, 1024).await.unwrap();
+    assert_eq!(
+        dlq_after_two.len(),
+        1,
+        "must be DLQ'd once delivery_count reaches max_delivery_attempts=2, got \
+         {dlq_after_two:?}"
+    );
+    assert_eq!(value_of(&dlq_after_two[0]), b"poison-pill");
+}
+
+/// A record that is repeatedly *released* — not rejected, not merely left to time out —
+/// must still be routed to the DLQ once it has been delivered `max_delivery_attempts`
+/// times. Before this fix, `Release` never consulted the delivery-attempt count at all: a
+/// member that failed and politely released could loop a record forever, while one that
+/// crashed and let the lease expire got DLQ protection from `check_lock_timeouts` — the
+/// well-behaved client was the one being punished. This scenario is that well-behaved
+/// client, and it must fail against the old behavior.
+#[tokio::test]
+async fn test_scenario_113_repeatedly_released_record_reaches_dlq() {
+    let env = start_test_server_with_share_group_config(30_000, 2).await;
+    let topic = "scenario_113_release_ceiling_topic";
+    let group_id = "scenario_113_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"stubborn-record")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+
+    // Delivery attempt 1: acquire and release.
+    let records = consumer.poll().await.unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected the record on first poll, got {records:?}"
+    );
+    assert_eq!(records[0].delivery_count, 1);
+    consumer
+        .release(records[0].partition, records[0].offset)
+        .unwrap();
+    consumer.flush_acks().await.unwrap();
+
+    // One release is not enough at max_delivery_attempts=2 — this is the assertion that
+    // would catch a test that "passes just as well against a ceiling of 1", the same
+    // reasoning scenario 112 documents for lease expiry.
+    let dlq_after_one = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_after_one.is_empty(),
+        "must not be DLQ'd after only one release when max_delivery_attempts=2, got \
+         {dlq_after_one:?}"
+    );
+
+    // Delivery attempt 2: released records are redeliverable, so the same member polls
+    // again and gets it back with delivery_count bumped to 2.
+    let records2 = consumer.poll().await.unwrap();
+    assert_eq!(
+        records2.len(),
+        1,
+        "expected the record redelivered after release, got {records2:?}"
+    );
+    assert_eq!(records2[0].delivery_count, 2);
+    consumer
+        .release(records2[0].partition, records2[0].offset)
+        .unwrap();
+    consumer.flush_acks().await.unwrap();
+
+    // Now delivery_count (2) has caught up to max_delivery_attempts (2): archived and
+    // routed to the DLQ, exactly as an expired lease would be.
+    let dlq_after_two = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        dlq_after_two.len(),
+        1,
+        "the repeatedly released record must land in the DLQ once delivery_count reaches \
+         max_delivery_attempts, got {dlq_after_two:?}"
+    );
+    assert_eq!(
+        dlq_after_two[0].value.as_deref(),
+        Some(b"stubborn-record".as_ref()),
+        "the DLQ entry must carry the original record's value"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `hand_back` (`Yield`) must never spend any of the retry budget: handing a record back
+/// far more times than `max_delivery_attempts` must never route it to the DLQ, and the
+/// record must still be deliverable afterward. This is what makes `Yield` safe for a
+/// no-fault handoff (shutting down, scaling in) where `Release` would not be.
+#[tokio::test]
+async fn test_scenario_114_hand_back_does_not_count_against_delivery_ceiling() {
+    let env = start_test_server_with_share_group_config(30_000, 1).await;
+    let topic = "scenario_114_hand_back_topic";
+    let group_id = "scenario_114_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"still-alive")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Hand the record back well past max_delivery_attempts=1 — if hand_back ever counted,
+    // this would already be archived to the DLQ by round 2.
+    for round in 0..5 {
+        let records = consumer.poll().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "record must still be deliverable on round {round}, got {records:?}"
+        );
+        consumer
+            .hand_back(records[0].partition, records[0].offset)
+            .unwrap();
+        consumer.flush_acks().await.unwrap();
+    }
+
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+    let dlq_records = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_records.is_empty(),
+        "hand_back must never count against max_delivery_attempts, no matter how many \
+         times it is called, got {dlq_records:?}"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `leave()` is a handoff, not a failure: a member that joins, acquires a record, and
+/// leaves again without ever resolving it — the shape of a rolling restart — must never
+/// push that record toward the DLQ, no matter how many times it happens. This is the
+/// scenario that justifies the `Release`/`Yield` split existing at all: before this fix,
+/// `leave()` staged `Release`, which counts, so enough restarts alone — with nothing having
+/// actually failed to process — would eventually archive the record.
+#[tokio::test]
+async fn test_scenario_115_leave_is_a_handoff_not_a_failure() {
+    let env = start_test_server_with_share_group_config(30_000, 2).await;
+    let topic = "scenario_115_leave_handoff_topic";
+    let group_id = "scenario_115_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"restart-safe")],
+        )
+        .await
+        .unwrap();
+
+    // More rounds than max_delivery_attempts=2 — if leave() ever counted (staging Release
+    // instead of Yield), the record would have been archived to the DLQ well before the
+    // last round.
+    for round in 0..5 {
+        let mut consumer = bifrox::ShareConsumer::join(
+            TestClient::connect(env.addr).await.unwrap(),
+            bifrox::ShareConsumerConfig {
+                group_id: group_id.to_string(),
+                topic: topic.to_string(),
+                partitions: vec![0],
+                member_id: format!("rolling-member-{round}"),
+                max_records: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let records = consumer.poll().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "record must still be deliverable on round {round}, got {records:?}"
+        );
+
+        // Never acknowledged — simulate a member shutting down mid-processing, the same
+        // way a rolling restart would.
+        consumer.leave().await.unwrap();
+    }
+
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+    let dlq_records = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_records.is_empty(),
+        "a rolling restart must never push a record toward the DLQ just because members \
+         keep leaving, got {dlq_records:?}"
     );
 }

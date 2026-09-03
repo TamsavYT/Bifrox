@@ -1,4 +1,7 @@
-use bifrox::{wait_for_shutdown_signal, GroupConsumer, GroupConsumerConfig, TestClient};
+use bifrox::{
+    wait_for_shutdown_signal, GroupConsumer, GroupConsumerConfig, ShareConsumer,
+    ShareConsumerConfig, TestClient,
+};
 use std::net::ToSocketAddrs;
 use tokio::time::{sleep, Duration};
 
@@ -66,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--tx-id",
         "--instance-id",
         "--protocol",
+        "--max-records",
+        "--lock-timeout-ms",
     ];
 
     let mut command_opt = None;
@@ -607,6 +612,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "share-consume" => {
+            let group_id =
+                get_arg_val(&args, "--group").unwrap_or_else(|| "my_share_group".to_string());
+            let topic =
+                get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
+            let partitions: Vec<u32> = get_arg_val(&args, "--partitions")
+                .unwrap_or_else(|| "0".to_string())
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            let poll_interval_ms: u64 = get_arg_val(&args, "--interval")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500);
+            let max_records: u32 = get_arg_val(&args, "--max-records")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            let lock_timeout_ms: u64 = get_arg_val(&args, "--lock-timeout-ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30000);
+
+            if partitions.is_empty() {
+                eprintln!(
+                    "Error: no valid partitions in --partitions (expected a comma-separated \
+                     list of numbers, e.g. 0,1,2)."
+                );
+                return Ok(());
+            }
+
+            let config = ShareConsumerConfig {
+                group_id: group_id.clone(),
+                topic: topic.clone(),
+                partitions: partitions.clone(),
+                lock_timeout: Duration::from_millis(lock_timeout_ms),
+                max_records,
+                ..ShareConsumerConfig::default()
+            };
+            let mut consumer = ShareConsumer::join(client, config).await?;
+
+            println!("============================================================");
+            println!("   BIFROX SHARE GROUP POLLING LOOP: '{}'", group_id);
+            println!("============================================================");
+            println!("  Topic:               {}", topic);
+            println!("  Member ID:           {}", consumer.member_id());
+            println!("  Partitions:          {:?}", partitions);
+            println!("  Poll Interval:       {} ms", poll_interval_ms);
+            println!("  Lock Timeout:        {} ms", lock_timeout_ms);
+            println!("Polling for messages. Press Ctrl+C (or send SIGTERM) to stop.\n");
+
+            // Construct the shutdown future once, before the loop, and poll the same
+            // instance every iteration. Constructing it fresh inside the loop would drop
+            // the underlying signal listener whenever the other `select!` branch won,
+            // silently swallowing a signal that arrives mid-iteration (e.g. during
+            // `consumer.poll().await`) — see the matching comment on `group-consume` above.
+            let shutdown = wait_for_shutdown_signal();
+            tokio::pin!(shutdown);
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        println!("\n🛑 Graceful shutdown signal received. Exiting share group loop.");
+                        // A no-fault handoff: leave() now stages Yield rather than
+                        // Release, so shutting down does not spend any of the
+                        // record's retry budget.
+                        let _ = consumer.leave().await;
+                        break;
+                    }
+                    _ = sleep(Duration::from_millis(poll_interval_ms)) => {
+                        match consumer.poll().await {
+                            Ok(records) => {
+                                for record in &records {
+                                    let payload_str = String::from_utf8_lossy(
+                                        record.value.as_deref().unwrap_or_default(),
+                                    );
+                                    println!(
+                                        "📥 Share group '{}' consumed Partition {} Offset {:<6} | Delivery Count: {} | Payload: '{}'",
+                                        group_id, record.partition, record.offset, record.delivery_count, payload_str
+                                    );
+                                    // This is an ops/demo tool, not a real workload — always
+                                    // accept what it prints.
+                                    if let Err(e) = consumer.accept(record.partition, record.offset) {
+                                        eprintln!("Failed to stage accept: {}", e);
+                                    }
+                                }
+                                if let Err(e) = consumer.flush_acks().await {
+                                    eprintln!("Failed to flush acknowledgements: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error polling server: {}", e);
+                                let _ = consumer.client_mut().reconnect().await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         "latest-offset" | "watermark" => {
             let topic =
                 get_arg_val(&args, "--topic").unwrap_or_else(|| "default_topic".to_string());
@@ -979,6 +1080,13 @@ consumes its assigned partitions, auto-commits)"
     );
     println!(
         "                  --group <GROUP> --topic <NAME> [--instance-id <ID>] [--protocol <NAME>] [--interval <MS>]"
+    );
+    println!(
+        "  share-consume   Share group continuous loop (queue-style: acquires leased \
+records, accepts, hands back on shutdown)"
+    );
+    println!(
+        "                  --group <GROUP> --topic <NAME> [--partitions <N,N,...>] [--interval <MS>] [--max-records <N>] [--lock-timeout-ms <MS>]"
     );
     println!("  latest-offset   Get partition high watermark offset");
     println!("                  --topic <NAME> [--partition <ID>]");

@@ -303,7 +303,11 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn new(config: EngineConfig) -> IoResult<Self> {
         let consumer_groups = ConsumerGroupManager::open(&config.data_dir)?;
-        let share_groups = crate::server::share::ShareGroupManager::open(&config.data_dir)?;
+        let share_groups = crate::server::share::ShareGroupManager::open(
+            &config.data_dir,
+            std::time::Duration::from_millis(config.share_group_lock_timeout_ms),
+            config.share_group_max_delivery_attempts,
+        )?;
         let transactions = TransactionManager::new();
         let cluster_config = ClusterConfig {
             cluster_id: config.cluster_id.clone(),
@@ -4173,7 +4177,8 @@ impl StorageEngine {
         } else {
             "Stable".to_string()
         };
-        (state, members, 0, 0)
+        let (inflight_count, start_offset) = self.share_groups.group_stats(group_id);
+        (state, members, inflight_count, start_offset)
     }
 
     /// Sweeps expired acquisition locks and routes poison pills to DLQ

@@ -33,8 +33,16 @@ pub struct ShareGroupManager {
 }
 
 impl ShareGroupManager {
-    /// Opens or creates the `__share_group_state.log` persistent file and recovers watermarks
-    pub fn open(data_dir: impl AsRef<Path>) -> IoResult<Self> {
+    /// Opens or creates the `__share_group_state.log` persistent file and recovers
+    /// watermarks. `default_lock_timeout` and `max_delivery_attempts` are supplied by the
+    /// caller from `EngineConfig` (`share_group_lock_timeout_ms` /
+    /// `share_group_max_delivery_attempts`) — every recovered and newly created
+    /// `SharePartition` is seeded with these two values.
+    pub fn open(
+        data_dir: impl AsRef<Path>,
+        default_lock_timeout: Duration,
+        max_delivery_attempts: u16,
+    ) -> IoResult<Self> {
         let dir = data_dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let state_path = dir.join("__share_group_state.log");
@@ -153,8 +161,6 @@ impl ShareGroupManager {
 
         let partitions = DashMap::new();
         let persisted_watermarks = DashMap::new();
-        let default_lock_timeout = Duration::from_secs(30);
-        let max_delivery_attempts = 5;
 
         for entry in recovered_offsets.into_iter() {
             let ((group_id, topic, partition), start_offset) = entry;
@@ -425,5 +431,28 @@ impl ShareGroupManager {
             })
             .map(|entry| entry.key().1.clone())
             .collect()
+    }
+
+    /// Aggregates in-flight record count and the low-water start offset across every
+    /// (topic, partition) this group has ever fetched from — used by `ShareGroupDescribe`
+    /// to report the group's real state. Each `SharePartition` already tracks both
+    /// correctly (`inflight_count` and the `start_offset` watermark); this just sums the
+    /// former and takes the minimum of the latter across every partition keyed under
+    /// `group_id`, so a caller filtering to `group_id` alone (a group can span more than
+    /// one topic) sees one aggregate answer instead of having to know every partition by
+    /// name up front.
+    pub fn group_stats(&self, group_id: &str) -> (usize, u64) {
+        let mut inflight = 0usize;
+        let mut start_offset: Option<u64> = None;
+        for entry in self.partitions.iter() {
+            if entry.key().0 != group_id {
+                continue;
+            }
+            let sp = entry.value();
+            inflight += sp.inflight_count();
+            let sp_start = sp.start_offset.load(Ordering::SeqCst);
+            start_offset = Some(start_offset.map_or(sp_start, |current| current.min(sp_start)));
+        }
+        (inflight, start_offset.unwrap_or(0))
     }
 }

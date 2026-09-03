@@ -1,4 +1,6 @@
-use crate::protocol::{BatchCompression, CommandCode, RecordBatch, WireResponse};
+use crate::protocol::{
+    AckBatch, AcquiredRecordBatch, BatchCompression, CommandCode, RecordBatch, WireResponse,
+};
 use crate::scram;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::{Buf, BufMut, Bytes};
@@ -185,6 +187,15 @@ pub struct ClusterDescription {
     pub node_id: u32,
     pub is_leader: bool,
     pub brokers: Vec<(u32, String)>,
+}
+
+/// Result of [`TestClient::share_group_describe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareGroupDescription {
+    pub state: String,
+    pub members: Vec<String>,
+    pub inflight_count: u64,
+    pub start_offset: u64,
 }
 
 #[derive(Debug)]
@@ -1090,6 +1101,295 @@ impl TestClient {
         }
         // No isolation tag on this request, so the broker answers read-uncommitted.
         Self::decode_fetch_entries_records(&resp.payload, offset, false)
+    }
+
+    /// Fetches (acquires) records for a share-group member — the lease-based, queue-style
+    /// counterpart to [`Self::fetch_as_member`]'s offset-based consumption. See
+    /// `crate::server::share` for what "acquire" means: the returned ranges are leased to
+    /// `member_id` for `lock_timeout_ms` and must be resolved with
+    /// [`Self::share_acknowledge`] (Accept/Release/Reject) or renewed, not committed.
+    ///
+    /// `acknowledgements` piggybacks resolutions for previously acquired records onto this
+    /// fetch instead of a separate `share_acknowledge` round trip — the broker applies them
+    /// before acquiring anything new (see `RequestPayload::ShareFetch` handling).
+    ///
+    /// This takes eight arguments because the wire format has eight fields, in this exact
+    /// order, with no room for a builder to silently reorder or drop one — collapsing them
+    /// into a struct would only move that risk from "wrong argument order" to "wrong struct
+    /// field", not remove it. Same reasoning as `produce_batch_eos`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn share_fetch(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        topic: &str,
+        partition: u32,
+        max_records: u32,
+        max_bytes: u32,
+        lock_timeout_ms: u32,
+        acknowledgements: &[AckBatch],
+    ) -> IoResult<Vec<AcquiredRecordBatch>> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, group_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, member_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u32(max_records);
+        inner.put_u32(max_bytes);
+        inner.put_u32(lock_timeout_ms);
+        inner.put_u32(acknowledgements.len() as u32);
+        for ack in acknowledgements {
+            inner.put_u64(ack.first_offset);
+            inner.put_u64(ack.last_offset);
+            inner.put_u8(ack.ack_type as u8);
+        }
+
+        let resp = self
+            .send_versioned(CommandCode::ShareFetch, &[], inner)
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Self::decode_share_fetch_response(&resp.payload)
+    }
+
+    /// Decodes a `ShareFetch` response payload: `[num_batches: u32] { [first_offset: u64]
+    /// [last_offset: u64][delivery_count: u16][record_count: u32] { record }* }*`.
+    ///
+    /// Defensive the same way [`Self::decode_fetch_entries_records`] is: this reads bytes
+    /// the broker sent over a socket, so a truncated or malformed payload must come back as
+    /// an `io::Error`, never a panic from an unchecked `Buf::get_*` past the end of the
+    /// slice.
+    fn decode_share_fetch_response(payload: &[u8]) -> IoResult<Vec<AcquiredRecordBatch>> {
+        let short = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ShareFetch response too short",
+            )
+        };
+        let mut cursor = payload;
+        if cursor.len() < 4 {
+            return Err(short());
+        }
+        let batch_count = cursor.get_u32() as usize;
+        let mut batches = Vec::with_capacity(batch_count);
+        for _ in 0..batch_count {
+            // first_offset(8) + last_offset(8) + delivery_count(2) + record_count(4)
+            if cursor.len() < 22 {
+                return Err(short());
+            }
+            let first_offset = cursor.get_u64();
+            let last_offset = cursor.get_u64();
+            let delivery_count = cursor.get_u16();
+            let record_count = cursor.get_u32() as usize;
+
+            let mut records = Vec::with_capacity(record_count);
+            for _ in 0..record_count {
+                // offset(8) + timestamp(8) + key_len(4)
+                if cursor.len() < 20 {
+                    return Err(short());
+                }
+                let offset = cursor.get_u64();
+                let timestamp = cursor.get_u64();
+                let key_len = cursor.get_i32();
+                let key = if key_len < 0 {
+                    None
+                } else {
+                    let key_len = key_len as usize;
+                    if cursor.len() < key_len {
+                        return Err(short());
+                    }
+                    let k = Bytes::copy_from_slice(&cursor[..key_len]);
+                    cursor.advance(key_len);
+                    Some(k)
+                };
+                if cursor.len() < 4 {
+                    return Err(short());
+                }
+                let value_len = cursor.get_i32();
+                let value = if value_len < 0 {
+                    None
+                } else {
+                    let value_len = value_len as usize;
+                    if cursor.len() < value_len {
+                        return Err(short());
+                    }
+                    let v = Bytes::copy_from_slice(&cursor[..value_len]);
+                    cursor.advance(value_len);
+                    Some(v)
+                };
+                records.push(crate::segment::Record {
+                    offset,
+                    timestamp,
+                    key,
+                    value,
+                    // The share path never surfaces control markers to a caller.
+                    is_control: false,
+                });
+            }
+
+            batches.push(AcquiredRecordBatch {
+                first_offset,
+                last_offset,
+                delivery_count,
+                records,
+            });
+        }
+        Ok(batches)
+    }
+
+    /// Resolves previously acquired records for a share-group member: Accept commits them
+    /// done, Release makes them immediately available for redelivery (to this or any other
+    /// member), Reject routes them to the topic's DLQ, Renew extends their lease without
+    /// resolving them. See `AcknowledgeType` and `SharePartition::acknowledge`.
+    ///
+    /// Unlike every other status-carrying call in this file, a non-zero `resp.status` is
+    /// not the only failure signal here: the broker always answers `ShareAcknowledge` with
+    /// `status == 0` and encodes the real outcome as `[error_code: i16][error_msg: pascal]`
+    /// in the payload (see the handler for `RequestPayload::ShareAcknowledge`), so both
+    /// have to be checked.
+    pub async fn share_acknowledge(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+        topic: &str,
+        partition: u32,
+        acknowledgements: &[AckBatch],
+    ) -> IoResult<()> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, group_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, member_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, topic);
+        inner.put_u32(partition);
+        inner.put_u32(acknowledgements.len() as u32);
+        for ack in acknowledgements {
+            inner.put_u64(ack.first_offset);
+            inner.put_u64(ack.last_offset);
+            inner.put_u8(ack.ack_type as u8);
+        }
+
+        let resp = self
+            .send_versioned(CommandCode::ShareAcknowledge, &[], inner)
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+
+        let mut cursor = &resp.payload[..];
+        if cursor.len() < 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ShareAcknowledge response too short",
+            ));
+        }
+        let error_code = cursor.get_i16();
+        let error_msg = Self::decode_pascal_string_lossy(&mut cursor)?;
+        if error_code != 0 {
+            return Err(std::io::Error::other(if error_msg.is_empty() {
+                format!("ShareAcknowledge failed with error code {}", error_code)
+            } else {
+                error_msg
+            }));
+        }
+        Ok(())
+    }
+
+    /// Sends a liveness heartbeat for a share-group member. There is no generation to be
+    /// fenced against here — see [`crate::share_consumer::ShareConsumer`] for why share
+    /// groups have no join/sync handshake at all — so this either succeeds or the transport
+    /// call itself fails; there is no rejection payload to interpret.
+    pub async fn share_group_heartbeat(&mut self, group_id: &str, member_id: &str) -> IoResult<()> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, group_id);
+        crate::protocol::wire::write_pascal_string(&mut inner, member_id);
+
+        let resp = self
+            .send_versioned(CommandCode::ShareGroupHeartbeat, &[], inner)
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Describes a share group's current state: which members the broker has seen, how
+    /// many records are in flight (acquired but not yet resolved), and the partition's
+    /// start offset (the low-water mark past which acknowledged/archived records have been
+    /// trimmed).
+    pub async fn share_group_describe(
+        &mut self,
+        group_id: &str,
+    ) -> IoResult<ShareGroupDescription> {
+        let mut inner = Vec::new();
+        crate::protocol::wire::write_pascal_string(&mut inner, group_id);
+
+        let resp = self
+            .send_versioned(CommandCode::ShareGroupDescribe, &[], inner)
+            .await?;
+        if resp.status != 0 {
+            return Err(std::io::Error::other(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            ));
+        }
+
+        let short = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ShareGroupDescribe response too short",
+            )
+        };
+        let mut cursor = &resp.payload[..];
+        let state = Self::decode_pascal_string_lossy(&mut cursor)?;
+        if cursor.len() < 4 {
+            return Err(short());
+        }
+        let member_count = cursor.get_u32() as usize;
+        let mut members = Vec::with_capacity(member_count);
+        for _ in 0..member_count {
+            members.push(Self::decode_pascal_string_lossy(&mut cursor)?);
+        }
+        if cursor.len() < 16 {
+            return Err(short());
+        }
+        let inflight_count = cursor.get_u64();
+        let start_offset = cursor.get_u64();
+
+        Ok(ShareGroupDescription {
+            state,
+            members,
+            inflight_count,
+            start_offset,
+        })
+    }
+
+    /// Reads one `[len: u16 BE][bytes]` pascal string off the front of `cursor`, lossily
+    /// (invalid UTF-8 becomes replacement characters rather than an error — the broker only
+    /// ever writes valid UTF-8 here, so this is about not panicking on a corrupt or
+    /// truncated buffer, not about tolerating bad encoding). Advances `cursor` past what it
+    /// read.
+    fn decode_pascal_string_lossy(cursor: &mut &[u8]) -> IoResult<String> {
+        if cursor.len() < 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pascal string: missing length prefix",
+            ));
+        }
+        let len = cursor.get_u16() as usize;
+        if cursor.len() < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pascal string: truncated body",
+            ));
+        }
+        let s = String::from_utf8_lossy(&cursor[..len]).to_string();
+        cursor.advance(len);
+        Ok(s)
     }
 
     /// Asks the broker which protocol versions and commands it supports.
