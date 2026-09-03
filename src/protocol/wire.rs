@@ -768,13 +768,50 @@ pub enum RequestPayload {
     },
 }
 
+/// How a share-group member resolves (or defers) an acquired record.
+///
+/// `delivery_count` increments on every acquisition. Three of these variants
+/// resolve a record without ever consulting `max_delivery_attempts` — `Accept`
+/// because it is done, `Reject` because the member is asserting the record
+/// itself is unprocessable, and `Renew` because it resolves nothing. The
+/// other two, `Release` and `Yield`, both return the record to `Available`
+/// but disagree on whether that return counts as a failed attempt:
+///
+/// - `Release` means "I tried and could not" — it counts, and once
+///   `delivery_count` reaches `max_delivery_attempts` the record is archived
+///   to the DLQ instead, exactly as an expired lease would be.
+/// - `Yield` means "handing this back, no failure implied" — used when a
+///   member gives up work it simply is not going to get to (shutdown, scale
+///   in), it does not count and even undoes the increment its own
+///   acquisition caused.
+///
+/// They are kept separate on purpose: `release` is the obvious name a client
+/// reaches for without thinking, so it is the one that gets DLQ protection.
+/// A client that instead needs the no-fault handoff has to reach for `yield`
+/// deliberately — nobody accidentally loops a record forever, and nobody
+/// accidentally marches a record toward the DLQ on every rolling restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AcknowledgeType {
+    /// Done, resolved successfully. Never consults `max_delivery_attempts`.
     Accept = 1,
+    /// "I tried and could not." Returns to `Available`, or is archived to
+    /// the DLQ once `delivery_count` reaches `max_delivery_attempts` — the
+    /// same ceiling rule an expired lease applies. This is the ack for a
+    /// genuine processing failure.
     Release = 2,
+    /// "This record is bad." Archived to the DLQ immediately, without
+    /// consulting `delivery_count`. That is what separates rejecting from
+    /// letting a lease lapse: the member is asserting the record is
+    /// unprocessable, not that it merely ran out of time.
     Reject = 3,
+    /// Extend the lease. Resolves nothing.
     Renew = 4,
+    /// "Handing this back, no failure implied." Returns to `Available` and
+    /// does **not** count against `max_delivery_attempts` — used when a
+    /// member gives up work it simply is not going to get to, such as on
+    /// shutdown, so repeated handoffs never drift a record toward the DLQ.
+    Yield = 5,
 }
 
 impl TryFrom<u8> for AcknowledgeType {
@@ -786,6 +823,7 @@ impl TryFrom<u8> for AcknowledgeType {
             2 => Ok(AcknowledgeType::Release),
             3 => Ok(AcknowledgeType::Reject),
             4 => Ok(AcknowledgeType::Renew),
+            5 => Ok(AcknowledgeType::Yield),
             _ => Err(WireError::InvalidProtocol(format!(
                 "Unknown acknowledge type: {}",
                 value
@@ -2275,6 +2313,16 @@ mod envelope_tests {
     #[test]
     fn envelope_magic_is_not_a_command_code() {
         assert!(CommandCode::try_from(VERSIONED_ENVELOPE_MAGIC).is_err());
+    }
+
+    /// `Yield` (5) decodes correctly and the range still stops right past it.
+    #[test]
+    fn acknowledge_type_yield_decodes_and_range_still_stops_at_five() {
+        assert_eq!(
+            AcknowledgeType::try_from(5).unwrap(),
+            AcknowledgeType::Yield
+        );
+        assert!(AcknowledgeType::try_from(6).is_err());
     }
 
     fn join_group_request(protocols: &[&str], trailing: Option<&str>) -> Vec<u8> {

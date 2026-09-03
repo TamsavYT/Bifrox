@@ -9514,9 +9514,12 @@ async fn test_scenario_107_poll_rotates_starting_partition() {
     consumer.leave().await.unwrap();
 }
 
-/// `leave()` must release everything still in flight immediately, instead of leaving it
+/// `leave()` must hand back everything still in flight immediately, instead of leaving it
 /// locked until the lease itself expires — this is the entire reason to call it explicitly
-/// rather than just dropping the consumer.
+/// rather than just dropping the consumer. `leave()` stages `Yield`, not `Release` — a
+/// handoff, not a failure — so it also undoes A's own delivery-count increment; B's
+/// acquisition is a net-neutral first-ever attempt, reporting `delivery_count` 1 rather than
+/// 2, even though this is technically the record's second delivery.
 #[tokio::test]
 async fn test_scenario_108_leave_releases_in_flight_records_immediately() {
     let env = start_test_server().await;
@@ -9587,9 +9590,10 @@ async fn test_scenario_108_leave_releases_in_flight_records_immediately() {
     );
     for record in &records_b {
         assert_eq!(
-            record.delivery_count, 2,
-            "each record must show delivery_count 2 (once to A, once to B), got {} for \
-             offset {}",
+            record.delivery_count, 1,
+            "leave() yields rather than releases, undoing A's own delivery-count increment \
+             — B's acquisition must be net-neutral (delivery_count 1), not counted as a \
+             second attempt, got {} for offset {}",
             record.delivery_count, record.offset
         );
     }
@@ -9957,4 +9961,239 @@ async fn test_scenario_112_configured_max_delivery_attempts_gates_dlq_routing() 
          {dlq_after_two:?}"
     );
     assert_eq!(value_of(&dlq_after_two[0]), b"poison-pill");
+}
+
+/// A record that is repeatedly *released* — not rejected, not merely left to time out —
+/// must still be routed to the DLQ once it has been delivered `max_delivery_attempts`
+/// times. Before this fix, `Release` never consulted the delivery-attempt count at all: a
+/// member that failed and politely released could loop a record forever, while one that
+/// crashed and let the lease expire got DLQ protection from `check_lock_timeouts` — the
+/// well-behaved client was the one being punished. This scenario is that well-behaved
+/// client, and it must fail against the old behavior.
+#[tokio::test]
+async fn test_scenario_113_repeatedly_released_record_reaches_dlq() {
+    let env = start_test_server_with_share_group_config(30_000, 2).await;
+    let topic = "scenario_113_release_ceiling_topic";
+    let group_id = "scenario_113_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"stubborn-record")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+
+    // Delivery attempt 1: acquire and release.
+    let records = consumer.poll().await.unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected the record on first poll, got {records:?}"
+    );
+    assert_eq!(records[0].delivery_count, 1);
+    consumer
+        .release(records[0].partition, records[0].offset)
+        .unwrap();
+    consumer.flush_acks().await.unwrap();
+
+    // One release is not enough at max_delivery_attempts=2 — this is the assertion that
+    // would catch a test that "passes just as well against a ceiling of 1", the same
+    // reasoning scenario 112 documents for lease expiry.
+    let dlq_after_one = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_after_one.is_empty(),
+        "must not be DLQ'd after only one release when max_delivery_attempts=2, got \
+         {dlq_after_one:?}"
+    );
+
+    // Delivery attempt 2: released records are redeliverable, so the same member polls
+    // again and gets it back with delivery_count bumped to 2.
+    let records2 = consumer.poll().await.unwrap();
+    assert_eq!(
+        records2.len(),
+        1,
+        "expected the record redelivered after release, got {records2:?}"
+    );
+    assert_eq!(records2[0].delivery_count, 2);
+    consumer
+        .release(records2[0].partition, records2[0].offset)
+        .unwrap();
+    consumer.flush_acks().await.unwrap();
+
+    // Now delivery_count (2) has caught up to max_delivery_attempts (2): archived and
+    // routed to the DLQ, exactly as an expired lease would be.
+    let dlq_after_two = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        dlq_after_two.len(),
+        1,
+        "the repeatedly released record must land in the DLQ once delivery_count reaches \
+         max_delivery_attempts, got {dlq_after_two:?}"
+    );
+    assert_eq!(
+        dlq_after_two[0].value.as_deref(),
+        Some(b"stubborn-record".as_ref()),
+        "the DLQ entry must carry the original record's value"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `hand_back` (`Yield`) must never spend any of the retry budget: handing a record back
+/// far more times than `max_delivery_attempts` must never route it to the DLQ, and the
+/// record must still be deliverable afterward. This is what makes `Yield` safe for a
+/// no-fault handoff (shutting down, scaling in) where `Release` would not be.
+#[tokio::test]
+async fn test_scenario_114_hand_back_does_not_count_against_delivery_ceiling() {
+    let env = start_test_server_with_share_group_config(30_000, 1).await;
+    let topic = "scenario_114_hand_back_topic";
+    let group_id = "scenario_114_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"still-alive")],
+        )
+        .await
+        .unwrap();
+
+    let mut consumer = bifrox::ShareConsumer::join(
+        TestClient::connect(env.addr).await.unwrap(),
+        bifrox::ShareConsumerConfig {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: vec![0],
+            member_id: "consumer-a".to_string(),
+            max_records: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Hand the record back well past max_delivery_attempts=1 — if hand_back ever counted,
+    // this would already be archived to the DLQ by round 2.
+    for round in 0..5 {
+        let records = consumer.poll().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "record must still be deliverable on round {round}, got {records:?}"
+        );
+        consumer
+            .hand_back(records[0].partition, records[0].offset)
+            .unwrap();
+        consumer.flush_acks().await.unwrap();
+    }
+
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+    let dlq_records = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_records.is_empty(),
+        "hand_back must never count against max_delivery_attempts, no matter how many \
+         times it is called, got {dlq_records:?}"
+    );
+
+    consumer.leave().await.unwrap();
+}
+
+/// `leave()` is a handoff, not a failure: a member that joins, acquires a record, and
+/// leaves again without ever resolving it — the shape of a rolling restart — must never
+/// push that record toward the DLQ, no matter how many times it happens. This is the
+/// scenario that justifies the `Release`/`Yield` split existing at all: before this fix,
+/// `leave()` staged `Release`, which counts, so enough restarts alone — with nothing having
+/// actually failed to process — would eventually archive the record.
+#[tokio::test]
+async fn test_scenario_115_leave_is_a_handoff_not_a_failure() {
+    let env = start_test_server_with_share_group_config(30_000, 2).await;
+    let topic = "scenario_115_leave_handoff_topic";
+    let group_id = "scenario_115_group";
+    let dlq_topic = format!("{topic}-dlq");
+
+    let mut producer = TestClient::connect(env.addr).await.unwrap();
+    producer
+        .produce_batch(
+            topic,
+            "",
+            None,
+            1,
+            &[bytes::Bytes::from_static(b"restart-safe")],
+        )
+        .await
+        .unwrap();
+
+    // More rounds than max_delivery_attempts=2 — if leave() ever counted (staging Release
+    // instead of Yield), the record would have been archived to the DLQ well before the
+    // last round.
+    for round in 0..5 {
+        let mut consumer = bifrox::ShareConsumer::join(
+            TestClient::connect(env.addr).await.unwrap(),
+            bifrox::ShareConsumerConfig {
+                group_id: group_id.to_string(),
+                topic: topic.to_string(),
+                partitions: vec![0],
+                member_id: format!("rolling-member-{round}"),
+                max_records: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let records = consumer.poll().await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "record must still be deliverable on round {round}, got {records:?}"
+        );
+
+        // Never acknowledged — simulate a member shutting down mid-processing, the same
+        // way a rolling restart would.
+        consumer.leave().await.unwrap();
+    }
+
+    let mut dlq_client = TestClient::connect(env.addr).await.unwrap();
+    let dlq_records = dlq_client
+        .fetch_records(&dlq_topic, 0, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        dlq_records.is_empty(),
+        "a rolling restart must never push a record toward the DLQ just because members \
+         keep leaving, got {dlq_records:?}"
+    );
 }

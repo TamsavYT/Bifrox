@@ -241,7 +241,7 @@ Everything listed is implemented and covered by the test suite. Nothing here is 
 - **Static membership** — a restarting member reclaims its slot without
   triggering a rebalance
 - Stalled-consumer detection: a member that heartbeats but stops consuming is evicted
-- **Share groups** — queue-style consumption with lease-based delivery, four
+- **Share groups** — queue-style consumption with lease-based delivery, five
   acknowledgement types, automatic redelivery and dead-letter routing
 
 </details>

@@ -447,12 +447,29 @@ unlike classic consumer groups), and delivery is lease-based rather than offset-
   `acknowledgements` from the previous batch so a client can ack-and-fetch in one round
   trip. Response is a list of `AcquiredRecordBatch { first_offset, last_offset,
   delivery_count, records }`.
-- `ShareAcknowledge` — resolves previously-acquired offset ranges with one of four
-  `AcknowledgeType`s per `AckBatch { first_offset, last_offset, ack_type }`:
+- `ShareAcknowledge` — resolves previously-acquired offset ranges with one of five
+  `AcknowledgeType`s per `AckBatch { first_offset, last_offset, ack_type }`. The one thing
+  a client author must get right is which of these **count** against
+  `max_delivery_attempts` (the retry budget) and which do not:
   - `Accept` (1) — done, advances the group's watermark once the range is contiguous.
-  - `Release` (2) — put it back as available immediately for redelivery to any member.
-  - `Reject` (3) — permanently failed; routed to that topic's `-dlq` topic.
+    Does not consult the delivery-attempt count.
+  - `Release` (2) — **counts as a delivery attempt.** "I tried and could not": put back
+    as available immediately for redelivery, or archived to that topic's `-dlq` topic once
+    `delivery_count` reaches `max_delivery_attempts` — the same ceiling an expired,
+    unacknowledged lease is subject to. This is the ack for a genuine processing failure.
+  - `Reject` (3) — archived to the DLQ immediately, **without** consulting the
+    delivery-attempt count. "This record is bad": the client is asserting the record
+    itself is unprocessable, not merely that it ran out of time — that is what
+    distinguishes rejecting from letting a lease lapse.
   - `Renew` (4) — extend the lock lease without resolving it yet (long-processing records).
+    Resolves nothing, so the count is untouched.
+  - `Yield` (5) — **does not count.** "Handing this back, no failure implied": put back as
+    available immediately, same as `Release`, but the delivery-attempt count is left
+    exactly as it was (an acquire-then-yield pair is net-neutral). Use this for a no-fault
+    handoff — a member shutting down or scaling in and simply not going to get to the
+    work — so that a rolling restart never marches records toward the DLQ. Reach for
+    `Release` only when something actually went wrong; `Yield` is the deliberate,
+    differently-named choice for everything else.
 - `ShareGroupHeartbeat` — keeps `member_id` registered as active in the group; members
   silent for 60s are dropped from `ShareGroupDescribe`'s membership list.
 - `ShareGroupDescribe` — returns current group membership/state.
@@ -461,7 +478,10 @@ Behavior notes:
 
 - Unacknowledged leases expire automatically (server-side sweep, ~500ms resolution) and
   are redelivered to any available member; after enough failed delivery attempts a record
-  is archived to the DLQ automatically, same as an explicit `Reject`.
+  is archived to the DLQ automatically, same as an explicit `Reject` — and the same ceiling
+  applies uniformly to expired leases and to explicit `Release`s, so a client that always
+  releases on failure gets the same DLQ protection as one that crashes and lets the lease
+  lapse.
 - Because delivery is not partition-ownership-based, don't assume ordering across members
   the way a classic consumer group guarantees per-partition ordering to a single owner.
 - A client should always send `ShareAcknowledge` (or piggyback acks on the next

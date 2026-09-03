@@ -283,7 +283,7 @@ impl SharePartition {
         Ok(acquired_infos)
     }
 
-    /// Applies acknowledgements across offset ranges (ACCEPT, RELEASE, REJECT, RENEW).
+    /// Applies acknowledgements across offset ranges (ACCEPT, RELEASE, REJECT, RENEW, YIELD).
     /// Uses interval range splitting and merging for O(log B) efficiency.
     pub fn acknowledge(
         &self,
@@ -366,9 +366,25 @@ impl SharePartition {
                     }
 
                     // 2. Middle overlapping slice (apply ACK)
+                    // Defaults to the batch's existing count; only `Yield` adjusts it.
+                    let mut middle_delivery_count = batch.delivery_count;
                     let new_state = match ack.ack_type {
                         AcknowledgeType::Accept => ShareRecordState::Acknowledged,
-                        AcknowledgeType::Release => ShareRecordState::Available,
+                        AcknowledgeType::Release => {
+                            // "I tried and could not" — this counts as a delivery
+                            // attempt, same ceiling rule as an expired lease
+                            // (`check_lock_timeouts`): once the record has been
+                            // delivered `max_delivery_attempts` times, stop handing
+                            // it out again and archive it to the DLQ instead.
+                            if batch.delivery_count >= self.max_delivery_attempts {
+                                for off in overlap_start..=overlap_end {
+                                    dlq_offsets.push(off);
+                                }
+                                ShareRecordState::Archived
+                            } else {
+                                ShareRecordState::Available
+                            }
+                        }
                         AcknowledgeType::Reject => {
                             for off in overlap_start..=overlap_end {
                                 dlq_offsets.push(off);
@@ -383,6 +399,15 @@ impl SharePartition {
                                 member_id: member_id.to_string(),
                             });
                             ShareRecordState::Acquired
+                        }
+                        AcknowledgeType::Yield => {
+                            // No-fault handoff (e.g. a member shutting down): undo
+                            // the delivery_count increment that this member's own
+                            // acquisition caused, so a handoff is net-neutral and
+                            // repeated shutdown handoffs never drift a record
+                            // toward the DLQ the way repeated failures would.
+                            middle_delivery_count = middle_delivery_count.saturating_sub(1);
+                            ShareRecordState::Available
                         }
                     };
 
@@ -403,7 +428,7 @@ impl SharePartition {
                                 None
                             },
                             lock_timeout: batch.lock_timeout,
-                            delivery_count: batch.delivery_count,
+                            delivery_count: middle_delivery_count,
                         },
                     );
 
@@ -686,5 +711,118 @@ mod tests {
             "delivery limit exceeded — should route to DLQ"
         );
         assert_eq!(sp.timers.read().len(), 0);
+    }
+
+    #[test]
+    fn release_at_ceiling_archives_to_dlq() {
+        let (_dir, pm) = partition_with_records("release_ceiling", 1);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-d".to_string(),
+            Duration::from_secs(30),
+            1, // max_delivery_attempts
+            0,
+        );
+
+        sp.acquire_records("member-1", 1, None, &pm).unwrap();
+        let dlq = sp
+            .acknowledge(
+                "member-1",
+                &[AckBatch {
+                    first_offset: 0,
+                    last_offset: 0,
+                    ack_type: AcknowledgeType::Release,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            dlq,
+            vec![0],
+            "delivery_count has reached max_delivery_attempts — release must archive to the \
+             DLQ, exactly as an expired lease would"
+        );
+    }
+
+    #[test]
+    fn release_below_ceiling_returns_to_available() {
+        let (_dir, pm) = partition_with_records("release_below_ceiling", 1);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-e".to_string(),
+            Duration::from_secs(30),
+            5, // max_delivery_attempts
+            0,
+        );
+
+        sp.acquire_records("member-1", 1, None, &pm).unwrap();
+        let dlq = sp
+            .acknowledge(
+                "member-1",
+                &[AckBatch {
+                    first_offset: 0,
+                    last_offset: 0,
+                    ack_type: AcknowledgeType::Release,
+                }],
+            )
+            .unwrap();
+        assert!(
+            dlq.is_empty(),
+            "well below the ceiling — must not be archived yet"
+        );
+
+        let reacquired = sp.acquire_records("member-2", 1, None, &pm).unwrap();
+        assert_eq!(
+            reacquired.len(),
+            1,
+            "released record must be available for redelivery"
+        );
+        assert_eq!(reacquired[0].delivery_count, 2);
+    }
+
+    #[test]
+    fn yield_decrements_delivery_count_and_never_archives_past_ceiling() {
+        let (_dir, pm) = partition_with_records("yield_ceiling", 1);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-f".to_string(),
+            Duration::from_secs(30),
+            1, // lowest possible ceiling — any counted attempt would archive
+            0,
+        );
+
+        // Repeated well past the ceiling: if yield ever counted, this would archive
+        // to the DLQ on the very first round.
+        for round in 0..5 {
+            let member = format!("member-{round}");
+            let acquired = sp.acquire_records(&member, 1, None, &pm).unwrap();
+            assert_eq!(
+                acquired.len(),
+                1,
+                "record must still be deliverable on round {round}"
+            );
+            assert_eq!(
+                acquired[0].delivery_count, 1,
+                "yield must undo its own acquisition's increment, keeping the count \
+                 net-neutral across repeated handoffs, round {round}"
+            );
+
+            let dlq = sp
+                .acknowledge(
+                    &member,
+                    &[AckBatch {
+                        first_offset: 0,
+                        last_offset: 0,
+                        ack_type: AcknowledgeType::Yield,
+                    }],
+                )
+                .unwrap();
+            assert!(
+                dlq.is_empty(),
+                "yield never counts against max_delivery_attempts, round {round}"
+            );
+        }
     }
 }

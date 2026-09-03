@@ -1,7 +1,7 @@
 //! Client-side API for share groups: broker-side, lease-based, queue-style consumption
 //! from a partition — multiple members acquire disjoint offset ranges from the *same*
-//! partition concurrently, resolving each one (Accept/Release/Reject) instead of committing
-//! an offset. See `crate::server::share` for the broker half this wraps.
+//! partition concurrently, resolving each one (Accept/Release/Reject/Yield) instead of
+//! committing an offset. See `crate::server::share` for the broker half this wraps.
 //!
 //! [`ShareConsumer`] mirrors [`crate::consumer::GroupConsumer`]'s shape — construct with
 //! [`ShareConsumer::join`], loop on [`ShareConsumer::poll`], resolve what you read, call
@@ -437,9 +437,24 @@ impl ShareConsumer {
     }
 
     /// Stages `partition`/`offset` as `Release`, making it immediately eligible for
-    /// redelivery to any member instead of waiting out the lease.
+    /// redelivery to any member instead of waiting out the lease. This is the ack for "I
+    /// tried and failed": it now counts against the retry budget exactly like an expired
+    /// lease does, and the record is routed to the topic's DLQ once it has been delivered
+    /// `max_delivery_attempts` times. For a no-fault handoff — giving up work this member
+    /// simply is not going to get to, rather than reporting a failure — use
+    /// [`Self::hand_back`] instead, which does not spend any of that budget.
     pub fn release(&mut self, partition: u32, offset: u64) -> IoResult<()> {
         self.stage_ack(partition, offset, AcknowledgeType::Release)
+    }
+
+    /// Stages `partition`/`offset` as `Yield`: hands it back to the group with no failure
+    /// implied, for work this member simply is not going to get to (shutting down, scaling
+    /// in). Unlike [`Self::release`], this does **not** count against
+    /// `max_delivery_attempts` — it even undoes the delivery-count increment this member's
+    /// own acquisition caused, so repeated handoffs (a rolling restart, say) never drift a
+    /// record toward the DLQ the way repeated failures would.
+    pub fn hand_back(&mut self, partition: u32, offset: u64) -> IoResult<()> {
+        self.stage_ack(partition, offset, AcknowledgeType::Yield)
     }
 
     /// Stages `partition`/`offset` as `Reject`, routing it to the topic's DLQ.
@@ -534,11 +549,16 @@ impl ShareConsumer {
             .await
     }
 
-    /// Releases everything still in flight, then stops heartbeating. Releasing first is the
-    /// entire point of leaving explicitly rather than just dropping this value: it hands
-    /// every still-leased record back to the group immediately, instead of leaving it
-    /// locked to a member id no one holds anymore until `lock_timeout` eventually expires
-    /// it — see the note on [`Drop`] below.
+    /// Hands everything still in flight back to the group, then stops heartbeating. Doing
+    /// this first is the entire point of leaving explicitly rather than just dropping this
+    /// value: it returns every still-leased record to the group immediately, instead of
+    /// leaving it locked to a member id no one holds anymore until `lock_timeout` eventually
+    /// expires it — see the note on [`Drop`] below.
+    ///
+    /// This stages `Yield`, not `Release`: leaving is a handoff, not a failure, and must not
+    /// count against `max_delivery_attempts`. A rolling restart that cycles members through
+    /// `join`/`leave` should never march records toward the DLQ just because nothing has
+    /// actually gone wrong.
     pub async fn leave(&mut self) -> IoResult<()> {
         for (&partition, offsets) in self.in_flight.iter() {
             if offsets.is_empty() {
@@ -546,7 +566,7 @@ impl ShareConsumer {
             }
             let staged = self.staged_acks.entry(partition).or_default();
             for &offset in offsets.keys() {
-                staged.insert(offset, AcknowledgeType::Release);
+                staged.insert(offset, AcknowledgeType::Yield);
             }
         }
         self.in_flight.clear();
