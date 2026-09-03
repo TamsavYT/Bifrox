@@ -1,6 +1,8 @@
 use crate::protocol::wire::{AckBatch, AcquiredRecordBatch};
 use crate::server::partition::PartitionManager;
-use crate::server::share::partition::SharePartition;
+use crate::server::share::partition::{
+    state_from_byte, state_to_byte, PersistedBatch, SharePartition,
+};
 use bytes::BufMut;
 use crc32fast::Hasher;
 use dashmap::DashMap;
@@ -15,7 +17,16 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-pub const SHARE_GROUP_STATE_MAGIC: u8 = 0xCE;
+/// Version 2: adds the per-batch in-flight array (`delivery_count` and `ShareRecordState`)
+/// after `start_offset`. Bumping the magic byte means an old `0xCE` file is rejected
+/// outright on the very first byte instead of being half-parsed into garbage by luck of the
+/// CRC — the intended behavior, since nobody is running Bifrox yet and there is no
+/// version-1 deployment to migrate.
+pub const SHARE_GROUP_STATE_MAGIC: u8 = 0xCF;
+
+/// Fixed on-disk size of one `PersistedBatch` entry: `first_offset:8 + last_offset:8 +
+/// state:1 + delivery_count:2`.
+const PERSISTED_BATCH_LEN: usize = 19;
 
 #[derive(Debug, Clone)]
 pub struct ShareGroupManager {
@@ -23,9 +34,13 @@ pub struct ShareGroupManager {
     partitions: Arc<DashMap<(String, String, u32), Arc<SharePartition>>>,
     /// Heartbeat tracker: (group_id, member_id) -> last_heartbeat
     heartbeats: Arc<DashMap<(String, String), Instant>>,
-    /// Tracks last persisted watermark to prevent redundant disk I/O
-    persisted_watermarks: Arc<DashMap<(String, String, u32), u64>>,
-    /// Disk persistence for share group watermarks
+    /// Tracks each partition's last-persisted `SharePartition::state_version` to prevent
+    /// redundant disk I/O. Version comparison replaces the old watermark comparison because
+    /// `delivery_count` (and `ShareRecordState`) can change with `start_offset` sitting
+    /// still — an acquisition, a release, a re-delivery — so "did the watermark move" is no
+    /// longer a sufficient dirty check.
+    persisted_versions: Arc<DashMap<(String, String, u32), u64>>,
+    /// Disk persistence for share group state
     state_file: Arc<Mutex<File>>,
     state_path: Arc<std::path::PathBuf>,
     default_lock_timeout: Duration,
@@ -53,127 +68,46 @@ impl ShareGroupManager {
         options.share_mode(7); // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
 
         let mut file = options.open(&state_path)?;
-        let recovered_offsets = DashMap::new();
 
-        // Recover state from existing system log.
-        //
-        // Genuinely streaming: each parsed prefix is drained out of `buf` at the end of
-        // every chunk (see the `buf.drain(..cursor)` below), so peak memory stays bounded
-        // by the chunk size plus one partially-parsed record — not by the file size. It
-        // also keeps parsing linear: without the drain, `cursor` restarting at 0 on each
-        // chunk meant every already-parsed record was re-parsed once per subsequent
-        // chunk, making recovery O(file_size²).
+        // Recover state from the existing log.
         file.seek(SeekFrom::Start(0))?;
         let raw_len = file.metadata()?.len();
-        if raw_len > 0 {
-            let mut buf = Vec::new();
-            let mut chunk = vec![0u8; 64 * 1024];
-            let mut is_corrupt = false;
-
-            loop {
-                let n = file.read(&mut chunk)?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-
-                let mut cursor = 0usize;
-                while cursor < buf.len() {
-                    let mut temp = cursor;
-                    if buf[temp] != SHARE_GROUP_STATE_MAGIC {
-                        is_corrupt = true;
-                        break;
-                    }
-                    temp += 1;
-
-                    if temp + 2 > buf.len() {
-                        break;
-                    }
-                    let group_len =
-                        u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
-                    temp += 2;
-
-                    if temp + group_len > buf.len() {
-                        break;
-                    }
-                    let group_id = match String::from_utf8(buf[temp..temp + group_len].to_vec()) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            is_corrupt = true;
-                            break;
-                        }
-                    };
-                    temp += group_len;
-
-                    if temp + 2 > buf.len() {
-                        break;
-                    }
-                    let topic_len =
-                        u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
-                    temp += 2;
-
-                    if temp + topic_len > buf.len() {
-                        break;
-                    }
-                    let topic = match String::from_utf8(buf[temp..temp + topic_len].to_vec()) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            is_corrupt = true;
-                            break;
-                        }
-                    };
-                    temp += topic_len;
-
-                    if temp + 4 + 8 + 4 > buf.len() {
-                        break;
-                    }
-                    let partition = u32::from_be_bytes(buf[temp..temp + 4].try_into().unwrap());
-                    temp += 4;
-                    let start_offset = u64::from_be_bytes(buf[temp..temp + 8].try_into().unwrap());
-                    temp += 8;
-                    let expected_crc = u32::from_be_bytes(buf[temp..temp + 4].try_into().unwrap());
-                    temp += 4;
-
-                    // Verify CRC
-                    let mut hasher = Hasher::new();
-                    hasher.update(&buf[cursor..temp - 4]);
-                    if hasher.finalize() != expected_crc {
-                        is_corrupt = true;
-                        break;
-                    }
-
-                    recovered_offsets.insert((group_id, topic, partition), start_offset);
-                    cursor = temp;
-                }
-
-                if cursor > 0 {
-                    buf.drain(..cursor);
-                }
-
-                if is_corrupt {
-                    break;
-                }
-            }
+        let (recovered, is_corrupt) = if raw_len > 0 {
+            Self::decode_stream(&mut file)?
+        } else {
+            (DashMap::new(), false)
+        };
+        if is_corrupt {
+            tracing::warn!(
+                "share group state file {} is corrupt: recovery stopped early and any \
+                 later share-group state (delivery counts, archived records) in this file \
+                 was dropped",
+                state_path.display()
+            );
         }
 
         // Seek to end for future append writes
         file.seek(SeekFrom::End(0))?;
 
         let partitions = DashMap::new();
-        let persisted_watermarks = DashMap::new();
+        let persisted_versions = DashMap::new();
 
-        for entry in recovered_offsets.into_iter() {
-            let ((group_id, topic, partition), start_offset) = entry;
-            persisted_watermarks.insert((group_id.clone(), topic.clone(), partition), start_offset);
+        for entry in recovered.into_iter() {
+            let ((group_id, topic, partition), (start_offset, batches)) = entry;
+            // The freshly reconstructed `SharePartition` starts at `state_version() == 0`
+            // (see `SharePartition::restore`), so recording that same value here means "no
+            // change since what's on disk" — matching what was actually just read back.
+            persisted_versions.insert((group_id.clone(), topic.clone(), partition), 0u64);
             partitions.insert(
                 (group_id.clone(), topic.clone(), partition),
-                Arc::new(SharePartition::new(
+                Arc::new(SharePartition::restore(
                     topic,
                     partition,
                     group_id,
                     default_lock_timeout,
                     max_delivery_attempts,
                     start_offset,
+                    batches,
                 )),
             );
         }
@@ -181,12 +115,170 @@ impl ShareGroupManager {
         Ok(Self {
             partitions: Arc::new(partitions),
             heartbeats: Arc::new(DashMap::new()),
-            persisted_watermarks: Arc::new(persisted_watermarks),
+            persisted_versions: Arc::new(persisted_versions),
             state_file: Arc::new(Mutex::new(file)),
             state_path: Arc::new(state_path),
             default_lock_timeout,
             max_delivery_attempts,
         })
+    }
+
+    /// Streams and decodes every well-formed record from `reader`, returning the recovered
+    /// `(group_id, topic, partition) -> (start_offset, batches)` map and whether corruption
+    /// (bad magic, bad CRC, bad UTF-8, or an unrecognized state byte) was hit before the
+    /// input ran out. Factored out of `open` so the parser used to recover the real state
+    /// file is the exact same code exercised by the round-trip and corruption unit tests
+    /// below — the two can never quietly drift apart.
+    ///
+    /// Genuinely streaming: each parsed prefix is drained out of `buf` at the end of every
+    /// chunk (see the `buf.drain(..cursor)` below), so peak memory stays bounded by the
+    /// chunk size plus one partially-parsed record — not by the input size. It also keeps
+    /// parsing linear: without the drain, `cursor` restarting at 0 on each chunk meant every
+    /// already-parsed record was re-parsed once per subsequent chunk, making recovery
+    /// O(input_size²). A record is variable-length in a second dimension (its batch array),
+    /// so every "not enough bytes yet" check below has to account for that array's length
+    /// too, not just the fixed-size header.
+    #[allow(clippy::type_complexity)]
+    fn decode_stream<R: Read>(
+        mut reader: R,
+    ) -> IoResult<(
+        DashMap<(String, String, u32), (u64, Vec<PersistedBatch>)>,
+        bool,
+    )> {
+        let recovered: DashMap<(String, String, u32), (u64, Vec<PersistedBatch>)> = DashMap::new();
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut is_corrupt = false;
+
+        'outer: loop {
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+
+            let mut cursor = 0usize;
+            while cursor < buf.len() {
+                let mut temp = cursor;
+                if buf[temp] != SHARE_GROUP_STATE_MAGIC {
+                    is_corrupt = true;
+                    break;
+                }
+                temp += 1;
+
+                if temp + 2 > buf.len() {
+                    break;
+                }
+                let group_len =
+                    u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
+                temp += 2;
+
+                if temp + group_len > buf.len() {
+                    break;
+                }
+                let group_id = match String::from_utf8(buf[temp..temp + group_len].to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        is_corrupt = true;
+                        break;
+                    }
+                };
+                temp += group_len;
+
+                if temp + 2 > buf.len() {
+                    break;
+                }
+                let topic_len =
+                    u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap()) as usize;
+                temp += 2;
+
+                if temp + topic_len > buf.len() {
+                    break;
+                }
+                let topic = match String::from_utf8(buf[temp..temp + topic_len].to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        is_corrupt = true;
+                        break;
+                    }
+                };
+                temp += topic_len;
+
+                if temp + 4 + 8 + 4 > buf.len() {
+                    break;
+                }
+                let partition = u32::from_be_bytes(buf[temp..temp + 4].try_into().unwrap());
+                temp += 4;
+                let start_offset = u64::from_be_bytes(buf[temp..temp + 8].try_into().unwrap());
+                temp += 8;
+                let batch_count = u32::from_be_bytes(buf[temp..temp + 4].try_into().unwrap());
+                temp += 4;
+
+                // Computed as u64 so a corrupt (huge) `batch_count` can never overflow
+                // `usize` arithmetic while we're only checking "do we have enough bytes yet"
+                // — it just keeps waiting for more input, same as any other truncated-length
+                // case above, and the CRC still catches it once the whole record is in hand.
+                let batch_array_len = batch_count as u64 * PERSISTED_BATCH_LEN as u64;
+                let needed = temp as u64 + batch_array_len + 4;
+                if needed > buf.len() as u64 {
+                    break;
+                }
+
+                let mut batches = Vec::with_capacity(batch_count as usize);
+                for _ in 0..batch_count {
+                    let first_offset = u64::from_be_bytes(buf[temp..temp + 8].try_into().unwrap());
+                    temp += 8;
+                    let last_offset = u64::from_be_bytes(buf[temp..temp + 8].try_into().unwrap());
+                    temp += 8;
+                    let state_byte = buf[temp];
+                    temp += 1;
+                    let delivery_count =
+                        u16::from_be_bytes(buf[temp..temp + 2].try_into().unwrap());
+                    temp += 2;
+
+                    let state = match state_from_byte(state_byte) {
+                        Some(s) => s,
+                        None => {
+                            is_corrupt = true;
+                            break;
+                        }
+                    };
+                    batches.push(PersistedBatch {
+                        first_offset,
+                        last_offset,
+                        state,
+                        delivery_count,
+                    });
+                }
+                if is_corrupt {
+                    break;
+                }
+
+                let expected_crc = u32::from_be_bytes(buf[temp..temp + 4].try_into().unwrap());
+                temp += 4;
+
+                // Verify CRC
+                let mut hasher = Hasher::new();
+                hasher.update(&buf[cursor..temp - 4]);
+                if hasher.finalize() != expected_crc {
+                    is_corrupt = true;
+                    break;
+                }
+
+                recovered.insert((group_id, topic, partition), (start_offset, batches));
+                cursor = temp;
+            }
+
+            if cursor > 0 {
+                buf.drain(..cursor);
+            }
+
+            if is_corrupt {
+                break 'outer;
+            }
+        }
+
+        Ok((recovered, is_corrupt))
     }
 
     /// Gets or creates a SharePartition instance for (group_id, topic, partition)
@@ -237,6 +329,12 @@ impl ShareGroupManager {
         let sp = self.get_or_create_partition(group_id, topic, partition);
         let acquired =
             sp.acquire_records(member_id, max_records, lock_timeout, partition_manager)?;
+
+        // Acquisition bumps `delivery_count` on every batch it touches, and unlike
+        // acknowledgement this path never moves `start_offset` — so without this call
+        // nothing here was ever persisted at all, and a restart mid-delivery would forget
+        // every attempt this fetch just counted.
+        self.maybe_persist(group_id, topic, partition, &sp);
 
         if acquired.is_empty() {
             return Ok(Vec::new());
@@ -291,33 +389,59 @@ impl ShareGroupManager {
             }
         }
 
-        // Check if watermark advanced beyond last persisted value
-        let current_start = sp.start_offset.load(Ordering::SeqCst);
-        let key = (group_id.to_string(), topic.to_string(), partition);
-        let last_persisted = self.persisted_watermarks.get(&key).map(|v| *v).unwrap_or(0);
-
-        if current_start > last_persisted {
-            self.persisted_watermarks.insert(key, current_start);
-            let _ = self.persist_offset(group_id, topic, partition, current_start);
-        }
+        self.maybe_persist(group_id, topic, partition, &sp);
 
         Ok(())
     }
 
-    /// Appends state watermark snapshot to disk log with CRC32. Every acknowledgement that
-    /// advances a partition's watermark appends a brand new record rather than updating one
-    /// in place — the log is otherwise strictly append-only, so its size is unbounded by
-    /// the number of *events*, not the number of (group, topic, partition) keys it actually
-    /// needs to remember. `maybe_compact_log` below bounds that growth the same way
+    /// Persists `sp` if (and only if) its `state_version` has moved since the last time
+    /// this manager wrote it to disk — the dirty check that replaces the old
+    /// watermark-comparison (see the `persisted_versions` field doc for why).
+    ///
+    /// Reads `state_version()` *before* snapshotting rather than after: a concurrent
+    /// mutation landing between the two calls means the snapshot can reflect a newer
+    /// version than the one recorded here, so at worst a later call redundantly re-persists
+    /// data that was already durable — never the reverse, where a real change gets recorded
+    /// as already-persisted and silently skipped.
+    fn maybe_persist(&self, group_id: &str, topic: &str, partition: u32, sp: &SharePartition) {
+        let key = (group_id.to_string(), topic.to_string(), partition);
+        let version = sp.state_version();
+        let last_persisted = self.persisted_versions.get(&key).map(|v| *v).unwrap_or(0);
+        if version == last_persisted {
+            return;
+        }
+
+        let (start_offset, batches) = sp.snapshot();
+        if self
+            .persist_partition_state(group_id, topic, partition, start_offset, &batches)
+            .is_ok()
+        {
+            self.persisted_versions.insert(key, version);
+        }
+    }
+
+    /// Appends one partition's full state snapshot to disk log with CRC32. Every persisted
+    /// change appends a brand new record rather than updating one in place — the log is
+    /// otherwise strictly append-only, so its size is unbounded by the number of *events*,
+    /// not the number of (group, topic, partition) keys it actually needs to remember.
+    /// `compact_log` below bounds that growth the same way
     /// `ConsumerGroupManager::compact_log` already does for `__consumer_offsets.log`.
-    fn persist_offset(
+    ///
+    /// Durability note: this only calls `file.flush()`, not an `fsync` per record, so
+    /// persistence here is best-effort against a process restart, not against a hard
+    /// machine crash — bytes handed to the OS but not yet on platter can still be lost.
+    /// The failure mode if that happens is that the most recent delivery counts reset,
+    /// which is exactly today's behavior for *every* record before this change, so this is
+    /// strictly better and never worse; it is not a claim of true crash durability.
+    fn persist_partition_state(
         &self,
         group_id: &str,
         topic: &str,
         partition: u32,
         start_offset: u64,
+        batches: &[PersistedBatch],
     ) -> IoResult<()> {
-        let entry = Self::encode_entry(group_id, topic, partition, start_offset);
+        let entry = Self::encode_entry(group_id, topic, partition, start_offset, batches);
         {
             let mut file = self.state_file.lock();
             file.write_all(&entry)?;
@@ -332,16 +456,39 @@ impl ShareGroupManager {
 
     const COMPACT_THRESHOLD_BYTES: u64 = 1024 * 1024; // matches __consumer_offsets.log's threshold
 
-    /// Encodes one `[magic][group][topic][partition][offset][crc32]` record — the shared
-    /// wire format used both for a single incremental append (`persist_offset`) and for
-    /// every retained key when rewriting the whole log (`compact_log`).
-    fn encode_entry(group_id: &str, topic: &str, partition: u32, start_offset: u64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + group_id.len() + topic.len());
+    /// Encodes one `[magic][group][topic][partition][start_offset][batch_count][batches...]
+    /// [crc32]` record — the shared wire format used both for a single incremental append
+    /// (`persist_partition_state`) and for every partition snapshotted when rewriting the
+    /// whole log (`compact_log`). The CRC covers everything from the magic byte up to (not
+    /// including) itself.
+    ///
+    /// `acquired_by`/`acquired_at`/`lock_timeout` are deliberately not part of
+    /// `PersistedBatch` and so never appear here — a lease belongs to a member whose
+    /// connection and process are gone once the broker restarts, so there is nothing about
+    /// it worth making durable; the record must become available to whoever is running now
+    /// (see `SharePartition::restore`).
+    fn encode_entry(
+        group_id: &str,
+        topic: &str,
+        partition: u32,
+        start_offset: u64,
+        batches: &[PersistedBatch],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            32 + group_id.len() + topic.len() + batches.len() * PERSISTED_BATCH_LEN,
+        );
         buf.put_u8(SHARE_GROUP_STATE_MAGIC);
         crate::protocol::wire::write_pascal_string(&mut buf, group_id);
         crate::protocol::wire::write_pascal_string(&mut buf, topic);
         buf.put_u32(partition);
         buf.put_u64(start_offset);
+        buf.put_u32(batches.len() as u32);
+        for b in batches {
+            buf.put_u64(b.first_offset);
+            buf.put_u64(b.last_offset);
+            buf.put_u8(state_to_byte(b.state));
+            buf.put_u16(b.delivery_count);
+        }
 
         let mut hasher = Hasher::new();
         hasher.update(&buf);
@@ -349,20 +496,33 @@ impl ShareGroupManager {
         buf
     }
 
-    /// Rewrites `__share_group_state.log` keeping only the latest persisted watermark per
-    /// (group, topic, partition) — same strategy and same Windows-safe
-    /// remove-then-rename swap as `ConsumerGroupManager::compact_log`.
+    /// Rewrites `__share_group_state.log` keeping only the latest state per (group, topic,
+    /// partition) — same strategy and same Windows-safe remove-then-rename swap as
+    /// `ConsumerGroupManager::compact_log`.
+    ///
+    /// Rewrites from the live `self.partitions` map — the authoritative current state —
+    /// rather than from `persisted_versions`: the latter only tracks *versions*, not the
+    /// data itself, so it cannot be the source rewritten from. Each partition is
+    /// snapshotted the same way an incremental persist would (read lock taken once, no
+    /// lock held across the I/O below), and `persisted_versions` is refreshed to the
+    /// versions actually written afterward, or the very next persist would see a version
+    /// mismatch and pointlessly rewrite everything all over again.
     fn compact_log(&self) -> IoResult<()> {
         let mut entry_bytes = Vec::new();
-        for item in self.persisted_watermarks.iter() {
+        let mut written_versions = Vec::new();
+        for item in self.partitions.iter() {
             let (group_id, topic, partition) = item.key();
-            let start_offset = *item.value();
+            let sp = item.value();
+            let version = sp.state_version();
+            let (start_offset, batches) = sp.snapshot();
             entry_bytes.extend_from_slice(&Self::encode_entry(
                 group_id,
                 topic,
                 *partition,
                 start_offset,
+                &batches,
             ));
+            written_versions.push(((group_id.clone(), topic.clone(), *partition), version));
         }
 
         let tmp_path = self.state_path.with_extension("log.tmp");
@@ -394,6 +554,15 @@ impl ShareGroupManager {
         new_file.seek(SeekFrom::End(0))?;
         *file = new_file;
 
+        // The rewrite above is now durable, so every version snapshotted into it is the
+        // last-persisted version for its key — refresh `persisted_versions` to match, or
+        // the very next `maybe_persist` call would see a version mismatch (this rewrite
+        // happened without going through `maybe_persist`'s own bookkeeping) and immediately
+        // trigger another full rewrite for no reason.
+        for (key, version) in written_versions {
+            self.persisted_versions.insert(key, version);
+        }
+
         Ok(())
     }
 
@@ -409,14 +578,7 @@ impl ShareGroupManager {
                 }
             }
 
-            // Flush dirty watermark to disk if advanced
-            let current_start = sp.start_offset.load(Ordering::SeqCst);
-            let key = (sp.group_id.clone(), sp.topic.clone(), sp.partition);
-            let last_persisted = self.persisted_watermarks.get(&key).map(|v| *v).unwrap_or(0);
-            if current_start > last_persisted {
-                self.persisted_watermarks.insert(key, current_start);
-                let _ = self.persist_offset(&sp.group_id, &sp.topic, sp.partition, current_start);
-            }
+            self.maybe_persist(&sp.group_id, &sp.topic, sp.partition, sp);
         }
     }
 
@@ -454,5 +616,125 @@ impl ShareGroupManager {
             start_offset = Some(start_offset.map_or(sp_start, |current| current.min(sp_start)));
         }
         (inflight, start_offset.unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::share::partition::ShareRecordState;
+
+    /// Every batch, encoded then decoded through `decode_stream` (the exact parser `open`
+    /// runs against the real state file), must come back byte-for-byte identical — this is
+    /// the wire-level round trip, independent of the `Acquired` → `Available` transform
+    /// `SharePartition::restore` applies afterward.
+    #[test]
+    fn round_trip_preserves_mixed_batch_states() {
+        let batches = vec![
+            PersistedBatch {
+                first_offset: 0,
+                last_offset: 2,
+                state: ShareRecordState::Available,
+                delivery_count: 0,
+            },
+            PersistedBatch {
+                first_offset: 3,
+                last_offset: 3,
+                state: ShareRecordState::Acquired,
+                delivery_count: 4,
+            },
+            PersistedBatch {
+                first_offset: 4,
+                last_offset: 9,
+                state: ShareRecordState::Acknowledged,
+                delivery_count: 1,
+            },
+            PersistedBatch {
+                first_offset: 10,
+                last_offset: 10,
+                state: ShareRecordState::Archived,
+                delivery_count: 5,
+            },
+        ];
+
+        let entry =
+            ShareGroupManager::encode_entry("round-trip-group", "round-trip-topic", 7, 4, &batches);
+
+        let (recovered, is_corrupt) = ShareGroupManager::decode_stream(&entry[..]).unwrap();
+        assert!(
+            !is_corrupt,
+            "a well-formed record must not be flagged corrupt"
+        );
+        let (start_offset, decoded) = recovered
+            .get(&(
+                "round-trip-group".to_string(),
+                "round-trip-topic".to_string(),
+                7u32,
+            ))
+            .map(|v| v.clone())
+            .expect("record must be recovered");
+        assert_eq!(start_offset, 4);
+        assert_eq!(
+            decoded, batches,
+            "decoded batches must exactly match what was encoded"
+        );
+    }
+
+    /// A partition with an empty in-flight window (`batch_count == 0`, the common case
+    /// right after every batch has been acknowledged) must still round-trip — the array
+    /// being empty is not itself a form of corruption.
+    #[test]
+    fn round_trip_empty_batch_array() {
+        let entry = ShareGroupManager::encode_entry("g", "t", 0, 42, &[]);
+        let (recovered, is_corrupt) = ShareGroupManager::decode_stream(&entry[..]).unwrap();
+        assert!(!is_corrupt);
+        let (start_offset, decoded) = recovered
+            .get(&("g".to_string(), "t".to_string(), 0u32))
+            .map(|v| v.clone())
+            .expect("record must be recovered");
+        assert_eq!(start_offset, 42);
+        assert!(decoded.is_empty());
+    }
+
+    /// A state byte outside `state_from_byte`'s known range (0-3) must be treated as
+    /// corruption and reject the whole record — never silently defaulted to some state,
+    /// which would quietly resurrect a record with the wrong lifecycle state.
+    #[test]
+    fn unknown_state_byte_is_corruption_not_a_default() {
+        let batches = vec![PersistedBatch {
+            first_offset: 0,
+            last_offset: 0,
+            state: ShareRecordState::Available,
+            delivery_count: 1,
+        }];
+        let mut entry = ShareGroupManager::encode_entry("g", "t", 0, 0, &batches);
+
+        // Layout: magic(1) group_len(2) "g"(1) topic_len(2) "t"(1) partition(4)
+        // start_offset(8) batch_count(4) [first_offset(8) last_offset(8) state(1) ...].
+        // Locate the state byte by walking the same fixed-size fields decode_stream does.
+        let state_byte_index = 1 + 2 + 1 + 2 + 1 + 4 + 8 + 4 + 8 + 8;
+        assert_eq!(
+            entry[state_byte_index], 0,
+            "sanity check: this must be the Available (0) state byte before corrupting it"
+        );
+        entry[state_byte_index] = 0xFF; // not a valid ShareRecordState encoding
+
+        // Recompute the CRC over the corrupted bytes so the failure is specifically the
+        // unknown-state-byte check, not an incidental CRC mismatch masking it.
+        let crc_start = entry.len() - 4;
+        let mut hasher = Hasher::new();
+        hasher.update(&entry[..crc_start]);
+        let recomputed = hasher.finalize().to_be_bytes();
+        entry[crc_start..].copy_from_slice(&recomputed);
+
+        let (recovered, is_corrupt) = ShareGroupManager::decode_stream(&entry[..]).unwrap();
+        assert!(
+            is_corrupt,
+            "an unrecognized state byte must be reported as corruption"
+        );
+        assert!(
+            recovered.is_empty(),
+            "the record carrying the bad state byte must not be recovered at all"
+        );
     }
 }
