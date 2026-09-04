@@ -1,3 +1,4 @@
+use crate::config::ShareStateSyncPolicy;
 use crate::protocol::wire::{AckBatch, AcquiredRecordBatch};
 use crate::server::partition::PartitionManager;
 use crate::server::share::partition::{
@@ -10,7 +11,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,20 @@ pub struct ShareGroupManager {
     state_path: Arc<std::path::PathBuf>,
     default_lock_timeout: Duration,
     max_delivery_attempts: u16,
+    /// How hard `persist_partition_state` pushes each write toward disk before returning —
+    /// see [`ShareStateSyncPolicy`] for what each level costs and guarantees.
+    sync_policy: ShareStateSyncPolicy,
+    /// Wall-clock time of the last `sync_data()` call made under `Interval`, checked on
+    /// every persist to decide whether the configured window has elapsed yet. Untouched by
+    /// `Buffered` and `EveryWrite`, which don't need it.
+    last_sync: Arc<Mutex<Instant>>,
+    /// Counts every `sync_data()` call this manager has actually issued against the state
+    /// file — incremented at each of the (at most) two call sites that can make one:
+    /// `persist_partition_state`'s policy check and the forced call in `sync()`. This exists
+    /// so tests can prove the configured policy actually *drives* behavior rather than being
+    /// parsed and then quietly ignored — a stat that looks wired in but isn't is exactly the
+    /// kind of bug that hides until someone asks a test to depend on it.
+    sync_count: Arc<AtomicU64>,
 }
 
 impl ShareGroupManager {
@@ -52,11 +67,14 @@ impl ShareGroupManager {
     /// watermarks. `default_lock_timeout` and `max_delivery_attempts` are supplied by the
     /// caller from `EngineConfig` (`share_group_lock_timeout_ms` /
     /// `share_group_max_delivery_attempts`) — every recovered and newly created
-    /// `SharePartition` is seeded with these two values.
+    /// `SharePartition` is seeded with these two values. `sync_policy` comes from the same
+    /// config (`share_state_sync_policy`) and governs how hard every later persist pushes
+    /// toward disk — see [`ShareStateSyncPolicy`].
     pub fn open(
         data_dir: impl AsRef<Path>,
         default_lock_timeout: Duration,
         max_delivery_attempts: u16,
+        sync_policy: ShareStateSyncPolicy,
     ) -> IoResult<Self> {
         let dir = data_dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -120,7 +138,35 @@ impl ShareGroupManager {
             state_path: Arc::new(state_path),
             default_lock_timeout,
             max_delivery_attempts,
+            sync_policy,
+            last_sync: Arc::new(Mutex::new(Instant::now())),
+            sync_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Total number of `sync_data()` calls this manager has actually issued against the
+    /// state file so far. Exists to let tests prove the configured `sync_policy` drives real
+    /// syscalls rather than sitting parsed-but-unused — see the `sync_count` field doc.
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::Relaxed)
+    }
+
+    /// Forces a `sync_data()` on the state file regardless of `sync_policy`, and resets the
+    /// `Interval` clock so its next window starts counting from here.
+    ///
+    /// Under `Buffered` and `Interval`, the most recent persist(s) can still be sitting in
+    /// the OS page cache, unsynced, at any given moment — that is the whole point of those
+    /// policies. A graceful shutdown is the one place that gap must be closed regardless of
+    /// policy: without forcing a sync here, a clean restart of a broker configured for
+    /// anything but `EveryWrite` could still lose the tail of share-group state, which would
+    /// defeat the purpose of shutting down cleanly in the first place. Called from
+    /// `StorageEngine::flush_all`, the existing graceful-shutdown hook.
+    pub fn sync(&self) -> IoResult<()> {
+        let file = self.state_file.lock();
+        file.sync_data()?;
+        self.sync_count.fetch_add(1, Ordering::Relaxed);
+        *self.last_sync.lock() = Instant::now();
+        Ok(())
     }
 
     /// Streams and decodes every well-formed record from `reader`, returning the recovered
@@ -427,12 +473,20 @@ impl ShareGroupManager {
     /// `compact_log` below bounds that growth the same way
     /// `ConsumerGroupManager::compact_log` already does for `__consumer_offsets.log`.
     ///
-    /// Durability note: this only calls `file.flush()`, not an `fsync` per record, so
-    /// persistence here is best-effort against a process restart, not against a hard
-    /// machine crash — bytes handed to the OS but not yet on platter can still be lost.
-    /// The failure mode if that happens is that the most recent delivery counts reset,
-    /// which is exactly today's behavior for *every* record before this change, so this is
-    /// strictly better and never worse; it is not a claim of true crash durability.
+    /// Durability note: every persist calls `file.flush()` unconditionally, then applies
+    /// `sync_policy` on top (see [`ShareStateSyncPolicy`]):
+    ///   - `Buffered` (the default): nothing further. The write reaches the OS page cache
+    ///     and survives a process restart, but a hard machine crash can still lose it —
+    ///     bytes handed to the OS but not yet on platter can be lost. This is the same
+    ///     best-effort behavior this file had before the policy existed.
+    ///   - `EveryWrite`: `sync_data()` after this record, unconditionally. True crash
+    ///     durability, paid on every acquire/acknowledge/lock-timeout sweep.
+    ///   - `Interval(d)`: `sync_data()` only if at least `d` has elapsed since the last one,
+    ///     bounding the crash-loss window without a sync on every write.
+    ///
+    /// Whichever policy is in force, an unsynced loss resets the most recent delivery counts
+    /// rather than corrupting anything — the same failure mode this file already tolerated
+    /// for every record before any of this existed.
     fn persist_partition_state(
         &self,
         group_id: &str,
@@ -446,6 +500,22 @@ impl ShareGroupManager {
             let mut file = self.state_file.lock();
             file.write_all(&entry)?;
             file.flush()?;
+
+            match self.sync_policy {
+                ShareStateSyncPolicy::Buffered => {}
+                ShareStateSyncPolicy::EveryWrite => {
+                    file.sync_data()?;
+                    self.sync_count.fetch_add(1, Ordering::Relaxed);
+                }
+                ShareStateSyncPolicy::Interval(interval) => {
+                    let mut last_sync = self.last_sync.lock();
+                    if last_sync.elapsed() >= interval {
+                        file.sync_data()?;
+                        self.sync_count.fetch_add(1, Ordering::Relaxed);
+                        *last_sync = Instant::now();
+                    }
+                }
+            }
 
             if file.metadata()?.len() <= Self::COMPACT_THRESHOLD_BYTES {
                 return Ok(());
@@ -624,6 +694,26 @@ mod tests {
     use super::*;
     use crate::server::share::partition::ShareRecordState;
 
+    /// Opens a fresh `ShareGroupManager` under a uniquely-named temp directory. Returns the
+    /// manager and the directory so the caller can remove it afterward — every test below
+    /// does, via `let _ = std::fs::remove_dir_all(&dir);`.
+    fn open_manager(policy: ShareStateSyncPolicy) -> (ShareGroupManager, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bifrox_share_sync_policy_test_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            count
+        ));
+        let manager = ShareGroupManager::open(&dir, Duration::from_secs(30), 5, policy).unwrap();
+        (manager, dir)
+    }
+
     /// Every batch, encoded then decoded through `decode_stream` (the exact parser `open`
     /// runs against the real state file), must come back byte-for-byte identical — this is
     /// the wire-level round trip, independent of the `Acquired` → `Available` transform
@@ -736,5 +826,103 @@ mod tests {
             recovered.is_empty(),
             "the record carrying the bad state byte must not be recovered at all"
         );
+    }
+
+    // The tests below prove the configured `sync_policy` actually drives the `sync_data()`
+    // syscall — not that the resulting bytes survive a real machine crash, which nothing in
+    // a test process can simulate. What they establish: `sync_count()` moves (or doesn't)
+    // exactly the way each policy documents it should.
+
+    /// Under `Buffered`, no number of persists ever calls `sync_data()` — the write reaches
+    /// only the OS page cache, by design.
+    #[test]
+    fn buffered_never_syncs_on_persist() {
+        let (manager, dir) = open_manager(ShareStateSyncPolicy::Buffered);
+        for i in 0..5u64 {
+            manager
+                .persist_partition_state("g", "t", 0, i, &[])
+                .unwrap();
+        }
+        assert_eq!(
+            manager.sync_count(),
+            0,
+            "Buffered must never call sync_data() from a persist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under `EveryWrite`, `sync_count()` tracks the number of persists one-for-one — the
+    /// policy that pays for true crash durability on every write.
+    #[test]
+    fn every_write_syncs_once_per_persist() {
+        let (manager, dir) = open_manager(ShareStateSyncPolicy::EveryWrite);
+        const PERSISTS: u64 = 5;
+        for i in 0..PERSISTS {
+            manager
+                .persist_partition_state("g", "t", 0, i, &[])
+                .unwrap();
+        }
+        assert_eq!(
+            manager.sync_count(),
+            PERSISTS,
+            "EveryWrite must call sync_data() exactly once per persist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under `Interval`, a burst of persists inside one window must sync at most once, and a
+    /// persist after the window has genuinely elapsed must add exactly one more sync. An
+    /// exact count for the burst isn't asserted — only the bound `Interval` actually
+    /// promises — since real scheduling could legitimately let it land at 0 or 1.
+    #[test]
+    fn interval_syncs_at_most_once_per_window() {
+        let interval = Duration::from_millis(20);
+        let (manager, dir) = open_manager(ShareStateSyncPolicy::Interval(interval));
+
+        for i in 0..5u64 {
+            manager
+                .persist_partition_state("g", "t", 0, i, &[])
+                .unwrap();
+        }
+        let after_burst = manager.sync_count();
+        assert!(
+            after_burst <= 1,
+            "a burst of persists within one interval must sync at most once, got {after_burst}"
+        );
+
+        std::thread::sleep(interval + Duration::from_millis(50));
+        manager
+            .persist_partition_state("g", "t", 0, 99, &[])
+            .unwrap();
+        assert_eq!(
+            manager.sync_count(),
+            after_burst + 1,
+            "once the interval has genuinely elapsed, the next persist must sync exactly once \
+             more"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sync()` forces a sync regardless of policy — proven here specifically under
+    /// `Buffered`, the one policy that otherwise never calls `sync_data()` on its own. This
+    /// is the call `StorageEngine::flush_all` relies on so a graceful shutdown doesn't leave
+    /// the most recent writes stranded in the page cache.
+    #[test]
+    fn sync_forces_a_sync_even_under_buffered() {
+        let (manager, dir) = open_manager(ShareStateSyncPolicy::Buffered);
+        manager
+            .persist_partition_state("g", "t", 0, 1, &[])
+            .unwrap();
+        assert_eq!(manager.sync_count(), 0);
+
+        manager.sync().unwrap();
+        assert_eq!(
+            manager.sync_count(),
+            1,
+            "sync() must call sync_data() even though Buffered never would on its own"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

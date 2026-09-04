@@ -10633,3 +10633,143 @@ async fn test_scenario_119_compaction_preserves_in_flight_state() {
     assert_eq!(dlq_after_restart.len(), 1);
     assert_eq!(value_of(&dlq_after_restart[0]), b"archived-offset");
 }
+
+/// `share.group.state.sync` governs *when* persisted bytes reach the platter, never *what*
+/// gets recorded — this runs the identical acquire/acknowledge/restart sequence once under
+/// each of `Buffered`, `EveryWrite`, and `Interval`, and asserts the state recovered after
+/// restart (the resumed `delivery_count` and the archived record's continued exclusion from
+/// redelivery) comes back exactly the same every time. A policy that accidentally skipped or
+/// corrupted a write on its way to disk would show up here as a mismatch against the other
+/// two.
+///
+/// This does not, and cannot, prove crash durability — no test process can simulate a real
+/// machine crash. What it establishes is narrower and fully checkable: the configured policy
+/// changes only the syscalls made along the way, not the content that survives a restart.
+#[tokio::test]
+async fn test_scenario_120_every_sync_policy_recovers_identical_state() {
+    async fn run_under_policy(
+        label: &str,
+        policy: bifrox::ShareStateSyncPolicy,
+    ) -> (u16, Vec<u64>, usize, Vec<u8>) {
+        let dir_guard = TestDataDirGuard::new(&format!("scenario_120_sync_policy_{label}"));
+        let topic = format!("scenario_120_sync_policy_topic_{label}");
+        let group_id = format!("scenario-120-group-{label}");
+        let dlq_topic = format!("{topic}-dlq");
+        let cfg = EngineConfig {
+            data_dir: dir_guard.path.clone(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            share_group_lock_timeout_ms: 30_000,
+            share_group_max_delivery_attempts: 2,
+            share_state_sync_policy: policy,
+            ..Default::default()
+        };
+
+        let engine = StorageEngine::new(cfg.clone()).unwrap();
+        for value in [b"keep-flowing".as_ref(), b"go-to-dlq".as_ref()] {
+            engine
+                .produce_batch(bifrox::server::engine::ProduceBatchParams {
+                    topic: &topic,
+                    key: "",
+                    transaction_id: None,
+                    num_partitions: 1,
+                    batch: producer_batch(
+                        &[bytes::Bytes::copy_from_slice(value)],
+                        0,
+                        0,
+                        0,
+                        false,
+                        bifrox::protocol::BatchCompression::None,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        let acquired = engine
+            .share_fetch(&group_id, "member-1", &topic, 0, 2, 0)
+            .unwrap();
+        assert_eq!(acquired.len(), 1, "[{label}] expected one coalesced batch");
+        assert_eq!(acquired[0].first_offset, 0);
+        assert_eq!(acquired[0].last_offset, 1);
+
+        // Offset 0: released once (attempt 1, under the 2-attempt ceiling) — carries
+        // forward, available for redelivery. Offset 1: rejected outright — archived
+        // straight to the DLQ, bypassing the ceiling entirely.
+        engine
+            .share_acknowledge(
+                &group_id,
+                "member-1",
+                &topic,
+                0,
+                &[
+                    bifrox::protocol::AckBatch {
+                        first_offset: 0,
+                        last_offset: 0,
+                        ack_type: bifrox::protocol::AcknowledgeType::Release,
+                    },
+                    bifrox::protocol::AckBatch {
+                        first_offset: 1,
+                        last_offset: 1,
+                        ack_type: bifrox::protocol::AcknowledgeType::Reject,
+                    },
+                ],
+            )
+            .unwrap();
+
+        drop(engine);
+        let restarted = StorageEngine::new(cfg).unwrap();
+
+        let after_restart = restarted
+            .share_fetch(&group_id, "member-2", &topic, 0, 10, 0)
+            .unwrap();
+        let offsets: Vec<u64> = after_restart
+            .iter()
+            .flat_map(|b| b.first_offset..=b.last_offset)
+            .collect();
+        let delivery_count = after_restart.first().map(|b| b.delivery_count).unwrap_or(0);
+
+        let dlq_after_restart = restarted.fetch(&dlq_topic, 0, 0, 1024).await.unwrap();
+        let dlq_len = dlq_after_restart.len();
+        let dlq_value = dlq_after_restart
+            .first()
+            .map(|f| value_of(f).to_vec())
+            .unwrap_or_default();
+
+        (delivery_count, offsets, dlq_len, dlq_value)
+    }
+
+    let buffered = run_under_policy("buffered", bifrox::ShareStateSyncPolicy::Buffered).await;
+    let every_write =
+        run_under_policy("every_write", bifrox::ShareStateSyncPolicy::EveryWrite).await;
+    let interval = run_under_policy(
+        "interval",
+        bifrox::ShareStateSyncPolicy::Interval(Duration::from_millis(5)),
+    )
+    .await;
+
+    assert_eq!(
+        buffered.1,
+        vec![0],
+        "the archived offset 1 must never be redelivered after restart"
+    );
+    assert_eq!(
+        buffered.0, 2,
+        "delivery_count must resume at exactly 2 after restart"
+    );
+    assert_eq!(
+        buffered.2, 1,
+        "exactly one record must have reached the DLQ"
+    );
+    assert_eq!(buffered.3, b"go-to-dlq");
+
+    assert_eq!(
+        every_write, buffered,
+        "EveryWrite must recover identical state to Buffered — the policy changes only when \
+         bytes reach disk, never what gets recorded"
+    );
+    assert_eq!(
+        interval, buffered,
+        "Interval must recover identical state to Buffered — the policy changes only when \
+         bytes reach disk, never what gets recorded"
+    );
+}
