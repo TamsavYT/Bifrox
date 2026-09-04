@@ -14,6 +14,43 @@ pub enum ShareRecordState {
     Archived,
 }
 
+/// The on-disk encoding of `ShareRecordState`, kept in exactly one place so the write side
+/// (`state_to_byte`) and the read side (`state_from_byte`) can never drift apart into two
+/// open-coded matches that quietly disagree about what a byte means.
+pub fn state_to_byte(state: ShareRecordState) -> u8 {
+    match state {
+        ShareRecordState::Available => 0,
+        ShareRecordState::Acquired => 1,
+        ShareRecordState::Acknowledged => 2,
+        ShareRecordState::Archived => 3,
+    }
+}
+
+/// `None` for anything but the four bytes `state_to_byte` can produce — an unrecognized
+/// state byte means the record is corrupt, not that it should silently default to some
+/// state. The caller (`ShareGroupManager::open`) is responsible for treating `None` as
+/// corruption rather than substituting a guess.
+pub fn state_from_byte(byte: u8) -> Option<ShareRecordState> {
+    match byte {
+        0 => Some(ShareRecordState::Available),
+        1 => Some(ShareRecordState::Acquired),
+        2 => Some(ShareRecordState::Acknowledged),
+        3 => Some(ShareRecordState::Archived),
+        _ => None,
+    }
+}
+
+/// One batch's durable footprint: exactly the fields that matter after a restart.
+/// `acquired_by`/`acquired_at`/`lock_timeout` are deliberately excluded — see the comment
+/// on `SharePartition::snapshot` for why a lease is never worth persisting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedBatch {
+    pub first_offset: u64,
+    pub last_offset: u64,
+    pub state: ShareRecordState,
+    pub delivery_count: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct InFlightBatch {
     pub first_offset: u64,
@@ -73,6 +110,14 @@ pub struct SharePartition {
     /// lingering in the structure as dead weight until its `expire_at` eventually passes
     /// and `sweep_timers_internal` discards it as a no-op.
     timers: RwLock<BTreeSet<ExpiryTimer>>,
+    /// Bumped once per call that actually mutates `batches` (`acquire_records`,
+    /// `acknowledge`, `check_lock_timeouts`) — never once per batch touched within a call.
+    /// `ShareGroupManager` compares this against the version it last wrote to disk to
+    /// decide whether a partition needs persisting, replacing the old
+    /// watermark-comparison: `delivery_count` can change with `start_offset` sitting still
+    /// (an acquisition, a release, a re-delivery), so "did the watermark move" is no longer
+    /// a sufficient dirty check.
+    state_version: AtomicU64,
 }
 
 pub struct AcquiredRecordInfo {
@@ -90,17 +135,101 @@ impl SharePartition {
         max_delivery_attempts: u16,
         initial_start_offset: u64,
     ) -> Self {
+        Self::restore(
+            topic,
+            partition,
+            group_id,
+            default_lock_timeout,
+            max_delivery_attempts,
+            initial_start_offset,
+            Vec::new(),
+        )
+    }
+
+    /// Rebuilds a partition from what `ShareGroupManager::open` recovered from disk.
+    ///
+    /// `acquired_by`/`acquired_at`/`lock_timeout` are not part of `PersistedBatch` and so
+    /// cannot be restored — deliberately: a lease belongs to a member whose connection and
+    /// process are gone once the broker restarts, so there is nothing to preserve. Any
+    /// batch still `Acquired` is downgraded to `Available` here, releasing it to whoever is
+    /// running now, while its `delivery_count` carries forward untouched — that count, not
+    /// the dead lease, is the whole point of persisting this state.
+    pub fn restore(
+        topic: String,
+        partition: u32,
+        group_id: String,
+        default_lock_timeout: Duration,
+        max_delivery_attempts: u16,
+        start_offset: u64,
+        persisted_batches: Vec<PersistedBatch>,
+    ) -> Self {
+        let mut batches = BTreeMap::new();
+        // `next_fetch_offset` must sit past every offset already accounted for in
+        // `batches`, or the next `acquire_records` fresh-fetch step would re-read and
+        // re-track offsets that are already tracked here.
+        let mut next_fetch_offset = start_offset;
+        for pb in persisted_batches {
+            next_fetch_offset = next_fetch_offset.max(pb.last_offset + 1);
+            let state = if pb.state == ShareRecordState::Acquired {
+                ShareRecordState::Available
+            } else {
+                pb.state
+            };
+            batches.insert(
+                pb.first_offset,
+                InFlightBatch {
+                    first_offset: pb.first_offset,
+                    last_offset: pb.last_offset,
+                    state,
+                    acquired_by: None,
+                    acquired_at: None,
+                    lock_timeout: default_lock_timeout,
+                    delivery_count: pb.delivery_count,
+                },
+            );
+        }
+
         Self {
             topic,
             partition,
             group_id,
             default_lock_timeout,
             max_delivery_attempts,
-            start_offset: AtomicU64::new(initial_start_offset),
-            next_fetch_offset: AtomicU64::new(initial_start_offset),
-            batches: RwLock::new(BTreeMap::new()),
+            start_offset: AtomicU64::new(start_offset),
+            next_fetch_offset: AtomicU64::new(next_fetch_offset),
+            batches: RwLock::new(batches),
             timers: RwLock::new(BTreeSet::new()),
+            state_version: AtomicU64::new(0),
         }
+    }
+
+    /// Current dirty-tracking version — compared against `ShareGroupManager`'s
+    /// last-persisted version to decide whether this partition needs writing to disk.
+    pub fn state_version(&self) -> u64 {
+        self.state_version.load(Ordering::Relaxed)
+    }
+
+    /// Snapshots `start_offset` plus every currently outstanding batch, taking the
+    /// `batches` read lock once and copying out owned data — the caller persists from the
+    /// returned tuple without holding any lock across file I/O.
+    ///
+    /// This is a full per-partition snapshot rather than an incremental diff because
+    /// `advance_watermark` already pops off every batch that is `Acknowledged`/`Archived`
+    /// and contiguous with `start_offset`: `batches` only ever holds the live outstanding
+    /// window, never the whole log, so snapshotting it in full is bounded by the same
+    /// window already held in memory, not by history.
+    pub fn snapshot(&self) -> (u64, Vec<PersistedBatch>) {
+        let batches = self.batches.read();
+        let persisted = batches
+            .values()
+            .map(|b| PersistedBatch {
+                first_offset: b.first_offset,
+                last_offset: b.last_offset,
+                state: b.state,
+                delivery_count: b.delivery_count,
+            })
+            .collect();
+        (self.start_offset.load(Ordering::SeqCst), persisted)
     }
 
     /// Fetches and acquires up to `max_records` from the partition for `member_id`.
@@ -271,6 +400,7 @@ impl SharePartition {
         }
 
         // Register timers for newly acquired ranges
+        let mutated = !new_acquired_ranges.is_empty();
         for (f, l) in new_acquired_ranges {
             timers.insert(ExpiryTimer {
                 expire_at,
@@ -278,6 +408,14 @@ impl SharePartition {
                 last_offset: l,
                 member_id: member_id.to_string(),
             });
+        }
+
+        // Every entry in `new_acquired_ranges` corresponds to a batch that was inserted or
+        // split in `batches` above (full acquire, split acquire, or a fresh fetch) — so
+        // this is exactly "did this call change `batches`", bumped once regardless of how
+        // many ranges were touched.
+        if mutated {
+            self.state_version.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(acquired_infos)
@@ -294,6 +432,7 @@ impl SharePartition {
         let mut timers = self.timers.write();
         let now = Instant::now();
         let mut dlq_offsets = Vec::new();
+        let mut mutated = false;
 
         for ack in ack_batches {
             let target_first = ack.first_offset;
@@ -315,6 +454,7 @@ impl SharePartition {
                         batches.insert(key, batch);
                         continue;
                     }
+                    mutated = true;
 
                     // Range intersection
                     let overlap_start = batch.first_offset.max(target_first);
@@ -462,6 +602,9 @@ impl SharePartition {
         }
 
         self.advance_watermark(&mut batches);
+        if mutated {
+            self.state_version.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(dlq_offsets)
     }
 
@@ -486,6 +629,7 @@ impl SharePartition {
         let mut timers = self.timers.write();
         let mut batches = self.batches.write();
         let mut dlq_offsets = Vec::new();
+        let mut mutated = false;
 
         while let Some(timer) = timers.first() {
             if timer.expire_at > now {
@@ -509,6 +653,7 @@ impl SharePartition {
                     {
                         if let Some(acquired_at) = batch.acquired_at {
                             if now.duration_since(acquired_at) >= batch.lock_timeout {
+                                mutated = true;
                                 if batch.delivery_count >= self.max_delivery_attempts {
                                     batch.state = ShareRecordState::Archived;
                                     batch.acquired_by = None;
@@ -530,6 +675,9 @@ impl SharePartition {
         }
 
         self.advance_watermark(&mut batches);
+        if mutated {
+            self.state_version.fetch_add(1, Ordering::Relaxed);
+        }
         dlq_offsets
     }
 
@@ -824,5 +972,94 @@ mod tests {
                 "yield never counts against max_delivery_attempts, round {round}"
             );
         }
+    }
+
+    #[test]
+    fn restore_releases_acquired_leases_but_keeps_delivery_count() {
+        let persisted = vec![
+            PersistedBatch {
+                first_offset: 0,
+                last_offset: 0,
+                state: ShareRecordState::Acquired,
+                delivery_count: 3,
+            },
+            PersistedBatch {
+                first_offset: 1,
+                last_offset: 1,
+                state: ShareRecordState::Archived,
+                delivery_count: 5,
+            },
+        ];
+        let sp = SharePartition::restore(
+            "share-test-topic".to_string(),
+            0,
+            "group-restore".to_string(),
+            Duration::from_secs(30),
+            5,
+            0,
+            persisted,
+        );
+
+        let (start_offset, snapshot) = sp.snapshot();
+        assert_eq!(start_offset, 0);
+        assert_eq!(snapshot.len(), 2);
+
+        let restored_acquired = snapshot.iter().find(|b| b.first_offset == 0).unwrap();
+        assert_eq!(
+            restored_acquired.state,
+            ShareRecordState::Available,
+            "a dead lease from before the restart must release to Available"
+        );
+        assert_eq!(
+            restored_acquired.delivery_count, 3,
+            "delivery_count must survive the restart even though the lease does not"
+        );
+
+        let restored_archived = snapshot.iter().find(|b| b.first_offset == 1).unwrap();
+        assert_eq!(
+            restored_archived.state,
+            ShareRecordState::Archived,
+            "an already-archived record must stay archived, not come back available"
+        );
+    }
+
+    #[test]
+    fn state_version_bumps_once_per_mutating_call_not_per_batch() {
+        let (_dir, pm) = partition_with_records("state_version", 4);
+        let sp = SharePartition::new(
+            "share-test-topic".to_string(),
+            0,
+            "group-version".to_string(),
+            Duration::from_secs(30),
+            5,
+            0,
+        );
+        assert_eq!(sp.state_version(), 0);
+
+        // One call acquiring 4 records (potentially several batches) must bump the version
+        // exactly once, not once per record/batch touched.
+        let acquired = sp.acquire_records("member-1", 4, None, &pm).unwrap();
+        assert_eq!(acquired.len(), 4);
+        assert_eq!(sp.state_version(), 1);
+
+        // A no-op acquire (nothing left to hand out) must not bump the version at all.
+        let empty = sp.acquire_records("member-2", 4, None, &pm).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            sp.state_version(),
+            1,
+            "a call that changes nothing must not be treated as dirty"
+        );
+
+        sp.acknowledge(
+            "member-1",
+            &[AckBatch {
+                first_offset: 0,
+                last_offset: 3,
+                ack_type: AcknowledgeType::Accept,
+            }],
+        )
+        .unwrap();
+        assert_eq!(sp.state_version(), 2);
     }
 }

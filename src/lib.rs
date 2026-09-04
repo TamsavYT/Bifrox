@@ -11,7 +11,9 @@ pub mod share_consumer;
 pub mod shutdown;
 
 pub use client::{ProduceResult, RoutedClient, SeekResult, ShareGroupDescription, TestClient};
-pub use config::{CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol};
+pub use config::{
+    CleanupPolicy, EngineConfig, FlushPolicy, SecurityProtocol, ShareStateSyncPolicy,
+};
 pub use consumer::{assign_range, GroupConsumer, GroupConsumerConfig};
 pub use consumer_group::ConsumerGroupManager;
 pub use protocol::{

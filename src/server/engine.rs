@@ -307,6 +307,7 @@ impl StorageEngine {
             &config.data_dir,
             std::time::Duration::from_millis(config.share_group_lock_timeout_ms),
             config.share_group_max_delivery_attempts,
+            config.share_state_sync_policy.clone(),
         )?;
         let transactions = TransactionManager::new();
         let cluster_config = ClusterConfig {
@@ -2939,6 +2940,13 @@ impl StorageEngine {
         for entry in self.partitions.iter() {
             entry.value().flush()?;
         }
+        // Forces the share-group state file's tail to disk regardless of
+        // `share_state_sync_policy`: under `Buffered` and `Interval`, the most recent
+        // persists can still be unsynced in the page cache at any given moment, and a
+        // graceful shutdown is the one guaranteed chance to close that gap — without it, a
+        // clean restart of a broker configured for anything but `EveryWrite` could still
+        // lose the tail of share-group state.
+        self.share_groups.sync()?;
         Ok(())
     }
 
