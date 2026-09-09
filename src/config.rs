@@ -108,6 +108,33 @@ impl Default for FlushPolicy {
     }
 }
 
+/// Share-group state durability knob (`share.group.state.sync`) —
+/// `ShareGroupManager::persist_partition_state` runs on every acquire, acknowledge, and
+/// lock-timeout sweep, so how hard each of those pushes its write toward the platter before
+/// returning is a direct trade against share-group throughput, not a free safety upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShareStateSyncPolicy {
+    /// `flush()` only — the write reaches the OS page cache and nothing further. A process
+    /// restart sees everything that was flushed; a machine crash (power loss, kernel panic,
+    /// the whole host disappearing) can still lose whatever the OS had not written back to
+    /// disk yet. **This is not crash-durable.** It remains the default because it is the
+    /// behavior this manager already had before this option existed, not because it is safe
+    /// against a hard crash — do not read "default" as "durable" here.
+    #[default]
+    Buffered,
+    /// Calls `sync_data()` after every persisted record. True crash durability for each
+    /// acquire, acknowledge, and lock-timeout sweep — but this file is written on every one
+    /// of those, so an unconditional sync on each is a hard ceiling on share-group
+    /// throughput. That cost, not an oversight, is why this is not the default; pick it when
+    /// losing any record's tail state is unacceptable and the throughput cost is affordable.
+    EveryWrite,
+    /// Calls `sync_data()` at most once per `Duration`, no matter how many persists land in
+    /// between. Bounds the crash-loss window to roughly one interval without paying a sync
+    /// on every write — the same bounded-risk-for-throughput trade `FlushPolicy::
+    /// AsyncPeriodic` already makes for the WAL, applied here to share-group state instead.
+    Interval(Duration),
+}
+
 /// `compression.type`.
 ///
 /// Read this alongside how compression actually works here: **the broker never compresses
@@ -456,6 +483,11 @@ pub struct EngineConfig {
     /// too high and a record no one can finish is redelivered many times before the DLQ
     /// ever sees it.
     pub share_group_max_delivery_attempts: u16,
+    /// How hard `ShareGroupManager` pushes its state file toward disk on every acquire,
+    /// acknowledge, and lock-timeout sweep (`share.group.state.sync`). See
+    /// [`ShareStateSyncPolicy`] for what each level actually buys — the default,
+    /// `Buffered`, survives a process restart but **not** a machine crash.
+    pub share_state_sync_policy: ShareStateSyncPolicy,
     /// Whether a topic may be created implicitly by a *produce* to a topic that doesn't
     /// exist yet (`auto.create.topics.enable`). Defaults to **true**, matching Bifrox's
     /// long-standing behavior.
@@ -517,6 +549,7 @@ impl Default for EngineConfig {
             max_poll_interval_ms: 300_000,        // 5 minutes
             share_group_lock_timeout_ms: 30_000,  // 30 seconds
             share_group_max_delivery_attempts: 5, // attempts
+            share_state_sync_policy: ShareStateSyncPolicy::default(),
             auto_create_topics_enable: true,
             max_partitions_per_topic: 10_000,
             max_partitions_per_broker: 200_000,
@@ -754,6 +787,59 @@ impl EngineConfig {
                             // 1. Clamp to the real floor instead of accepting a value that
                             // doesn't mean what it says.
                             config.share_group_max_delivery_attempts = v.max(1);
+                        }
+                    }
+                    // `share.group.state.sync`: "buffered" (the default) leaves the write in
+                    // the OS page cache — a process restart survives it, a machine crash can
+                    // still lose the tail. "always" forces `sync_data()` after every persist —
+                    // real crash durability, paid on every acquire/acknowledge/sweep.
+                    // "interval" bounds that cost to at most one sync per window; if
+                    // `share.group.state.sync.interval.ms` elsewhere in this same file already
+                    // set a window, that value is kept rather than clobbered back to the
+                    // 1000ms default — same idiom as `flush.ms` / `flush.messages` below
+                    // preserving each other's field of `FlushPolicy::AsyncPeriodic`.
+                    "share.group.state.sync" => match value.trim().to_lowercase().as_str() {
+                        "buffered" => {
+                            config.share_state_sync_policy = ShareStateSyncPolicy::Buffered;
+                        }
+                        "always" => {
+                            config.share_state_sync_policy = ShareStateSyncPolicy::EveryWrite;
+                        }
+                        "interval" => {
+                            let interval = match config.share_state_sync_policy {
+                                ShareStateSyncPolicy::Interval(d) => d,
+                                _ => Duration::from_millis(1000),
+                            };
+                            config.share_state_sync_policy =
+                                ShareStateSyncPolicy::Interval(interval);
+                        }
+                        // Unrecognized: leave whatever's already set (the default, unless an
+                        // earlier line already changed it) rather than panic — matches every
+                        // other arm in this function.
+                        _ => {}
+                    },
+                    // Setting an interval is an unambiguous statement of intent, so — same as
+                    // `log.flush.interval.ms` switching `FlushPolicy` to `AsyncPeriodic` —
+                    // this switches the policy to `Interval` outright, whether or not
+                    // `share.group.state.sync=interval` is also present in the file.
+                    //
+                    // The one thing it will not do is *downgrade* an explicit
+                    // `share.group.state.sync=always`. Both keys writing the policy would
+                    // otherwise make the outcome depend on which line came last in the file,
+                    // and a stray interval line silently costing an operator the durability
+                    // they asked for is the wrong direction to fail on a durability setting.
+                    // `EveryWrite` is the strictest level, so it wins regardless of order.
+                    "share.group.state.sync.interval.ms" => {
+                        if let Ok(ms) = value.parse::<u64>() {
+                            if config.share_state_sync_policy != ShareStateSyncPolicy::EveryWrite {
+                                // A 0ms window would sync on literally every write, silently
+                                // reproducing `EveryWrite` under a different name — clamp to
+                                // the floor rather than accept a value that doesn't mean what
+                                // it says.
+                                config.share_state_sync_policy = ShareStateSyncPolicy::Interval(
+                                    Duration::from_millis(ms.max(1)),
+                                );
+                            }
                         }
                     }
                     "auto.assign.partitions.enable" => {
@@ -1080,6 +1166,124 @@ mod share_group_config_tests {
         assert_eq!(
             config.share_group_max_delivery_attempts, 5,
             "an unparseable value must be ignored, not panic, leaving the default in place"
+        );
+    }
+}
+
+#[cfg(test)]
+mod share_state_sync_policy_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Same unique-temp-file helper as `share_group_config_tests::write_temp_properties`,
+    /// duplicated locally rather than shared across `#[cfg(test)]` modules.
+    fn write_temp_properties(contents: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bifrox_config_sync_policy_test_{}_{}_{}.properties",
+            std::process::id(),
+            nanos,
+            count
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn default_is_buffered() {
+        assert_eq!(
+            EngineConfig::default().share_state_sync_policy,
+            ShareStateSyncPolicy::Buffered
+        );
+    }
+
+    #[test]
+    fn parses_each_named_level() {
+        for (value, expected) in [
+            ("buffered", ShareStateSyncPolicy::Buffered),
+            ("always", ShareStateSyncPolicy::EveryWrite),
+            (
+                "interval",
+                ShareStateSyncPolicy::Interval(Duration::from_millis(1000)),
+            ),
+        ] {
+            let path = write_temp_properties(&format!("share.group.state.sync={value}\n"));
+            let config = EngineConfig::from_properties_file(&path).unwrap();
+            let _ = fs::remove_file(&path);
+            assert_eq!(
+                config.share_state_sync_policy, expected,
+                "share.group.state.sync={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_ms_key_alone_switches_the_policy() {
+        let path = write_temp_properties("share.group.state.sync.interval.ms=250\n");
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            config.share_state_sync_policy,
+            ShareStateSyncPolicy::Interval(Duration::from_millis(250)),
+            "setting the interval key alone must switch the policy to Interval, with no \
+             share.group.state.sync key needed"
+        );
+    }
+
+    /// An explicit `always` must not be silently downgraded by a stray interval line, in
+    /// either file order. Both keys write the same field, so without an explicit precedence
+    /// rule the outcome would depend on which line came last — and an operator who asked for
+    /// per-write durability would quietly get less of it. Asserted in both orders because
+    /// only testing one would pass on a plain last-write-wins implementation.
+    #[test]
+    fn explicit_always_is_not_downgraded_by_an_interval_line() {
+        for body in [
+            "share.group.state.sync=always\nshare.group.state.sync.interval.ms=1000\n",
+            "share.group.state.sync.interval.ms=1000\nshare.group.state.sync=always\n",
+        ] {
+            let path = write_temp_properties(body);
+            let config = EngineConfig::from_properties_file(&path).unwrap();
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(
+                config.share_state_sync_policy,
+                ShareStateSyncPolicy::EveryWrite,
+                "an explicit share.group.state.sync=always must win over an interval line \
+                 regardless of order; config body was: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_ms_zero_clamps_to_one() {
+        let path = write_temp_properties("share.group.state.sync.interval.ms=0\n");
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            config.share_state_sync_policy,
+            ShareStateSyncPolicy::Interval(Duration::from_millis(1)),
+            "a 0ms window would sync on every write, silently reproducing EveryWrite under a \
+             different name — must clamp to the floor instead"
+        );
+    }
+
+    #[test]
+    fn unrecognized_value_leaves_default_intact() {
+        let path = write_temp_properties("share.group.state.sync=eventually\n");
+        let config = EngineConfig::from_properties_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            config.share_state_sync_policy,
+            ShareStateSyncPolicy::Buffered,
+            "an unrecognized value must be ignored, not panic, leaving the default in place"
         );
     }
 }
