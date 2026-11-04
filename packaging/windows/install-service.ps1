@@ -63,7 +63,7 @@ node.id=1
 # Bind to all interfaces, but advertise a specific dialable address to peers
 # (the broker requires an explicit advertised address, not a wildcard)
 listeners=PLAINTEXT://0.0.0.0:$BrokerPort
-advertised.listeners=$AdvertisedHost:$BrokerPort
+advertised.listeners=${AdvertisedHost}:$BrokerPort
 metrics.listeners=PLAINTEXT://0.0.0.0:$MetricsPort
 data.dir=$InstallDir\data
 log.file.dir=$InstallDir\logs
