@@ -365,7 +365,8 @@ where
                     // partition.
                     let is_controller_mutation = matches!(
                         &req.payload,
-                        RequestPayload::CreateTopic { .. }
+                        RequestPayload::InitProducerId { .. }
+                            | RequestPayload::CreateTopic { .. }
                             | RequestPayload::DeleteTopic { .. }
                             | RequestPayload::RegisterBroker { .. }
                             | RequestPayload::UnregisterBroker { .. }
@@ -2391,7 +2392,7 @@ async fn process_request(
             {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            match engine.init_producer_id(&transactional_id) {
+            match engine.init_producer_id_coordinated(&transactional_id).await {
                 Ok((pid, epoch)) => {
                     let mut buf = Vec::with_capacity(10);
                     buf.put_u64(pid);

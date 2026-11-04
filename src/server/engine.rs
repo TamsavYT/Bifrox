@@ -281,6 +281,7 @@ pub struct StorageEngine {
     topic_registry: Arc<TopicRegistry>,
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
+    transaction_gate: Arc<tokio::sync::Mutex<()>>,
     share_groups: crate::server::share::ShareGroupManager,
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
@@ -362,6 +363,7 @@ impl StorageEngine {
             topic_registry: Arc::new(DashMap::new()),
             consumer_groups,
             transactions,
+            transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
             share_groups,
             replication,
             group_coordinator,
@@ -2031,7 +2033,8 @@ impl StorageEngine {
             return Ok(());
         }
 
-        if let Ok(pm) = self.get_or_create_partition("__transaction_state", 0) {
+        {
+            let pm = self.get_or_create_partition("__transaction_state", 0)?;
             let mut offset = 0u64;
             let mut latest_states: std::collections::HashMap<
                 String,
@@ -2043,10 +2046,13 @@ impl StorageEngine {
             > = std::collections::HashMap::new();
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
-                if frames.is_empty() {
+                if frames.is_empty() || offset >= pm.high_watermark() {
                     break;
                 }
                 for frame in &frames {
+                    if frame.offset >= pm.high_watermark() {
+                        break;
+                    }
                     if let Some((status, producer_id, tx_id, partitions)) =
                         decode_tx_state_record(&frame.value.clone().unwrap_or_default())
                     {
@@ -2101,7 +2107,12 @@ impl StorageEngine {
                 tx_id,
                 self.config.transaction_timeout_ms
             );
-            if let Err(e) = self.abort_transaction(&tx_id) {
+            let result = if self.transactions.get_status(&tx_id) == Some(TxStatus::PrepareCommit) {
+                self.commit_transaction(&tx_id)
+            } else {
+                self.abort_transaction(&tx_id)
+            };
+            if let Err(e) = result {
                 tracing::error!(
                     "TxTimeout: failed to abort expired transaction '{}': {}",
                     tx_id,
@@ -2113,6 +2124,11 @@ impl StorageEngine {
 
     /// Produce a batch of records to a routed partition (PARTIAL-03 async).
     pub async fn produce_batch(&self, params: ProduceBatchParams<'_>) -> IoResult<(u32, u64, u64)> {
+        let _tx_guard = if params.transaction_id.is_some() {
+            Some(self.transaction_gate.lock().await)
+        } else {
+            None
+        };
         let topic = params.topic;
         let key = params.key;
         let transaction_id = params.transaction_id;
@@ -2205,6 +2221,22 @@ impl StorageEngine {
             }
         }
 
+        if let Some(tx_id) = transaction_id {
+            let state = self
+                .transactions
+                .state(tx_id)
+                .ok_or_else(|| std::io::Error::other("Transaction not found"))?;
+            if state.status != TxStatus::Ongoing
+                || (batch.producer_id != 0 && state.producer_id != batch.producer_id)
+            {
+                return Err(std::io::Error::other(
+                    "Transaction is not active or producer mismatch",
+                ));
+            }
+            self.register_tx_partition_inner(tx_id, topic, partition_id, pm.latest_offset())
+                .map_err(std::io::Error::other)?;
+        }
+
         // The actual disk work (segment append per record, plus the batch's group-commit
         // fsync) is synchronous, lock-and-syscall-heavy I/O. Running it inline in this
         // `async fn` would block whichever Tokio worker thread picked up this task for the
@@ -2243,7 +2275,8 @@ impl StorageEngine {
             .map_err(|e| std::io::Error::other(format!("produce_batch join error: {}", e)))??;
 
         if let Some(tx_id) = transaction_id {
-            self.register_tx_partition(tx_id, topic, partition_id, first_offset);
+            self.register_tx_partition_inner(tx_id, topic, partition_id, first_offset)
+                .map_err(std::io::Error::other)?;
         }
 
         // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
@@ -2614,90 +2647,121 @@ impl StorageEngine {
             .fetch_offset_with_metadata(group_id, topic, partition)
     }
 
-    pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
-        let result = self
-            .transactions
-            .begin_transaction(transaction_id, producer_id);
-        if result.is_ok() {
-            let parts = self.transactions.get_partitions(transaction_id);
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-                let _ = tx_pm.produce(&record);
-            }
-        }
-        result
+    fn persist_transaction(
+        &self,
+        state: &crate::server::transaction::TransactionState,
+    ) -> Result<(), String> {
+        let pm = self
+            .get_or_create_partition("__transaction_state", 0)
+            .map_err(|e| e.to_string())?;
+        let record = encode_tx_state_record(
+            state.status,
+            state.producer_id,
+            &state.transaction_id,
+            &state.partitions,
+        );
+        pm.produce(&record).map_err(|e| e.to_string())?;
+        pm.flush_durable().map_err(|e| e.to_string())
     }
-
+    pub fn begin_transaction(&self, id: &str, pid: u64) -> Result<(), String> {
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.transactions
+            .begin_transaction_durable(id, pid, |s| self.persist_transaction(s))
+    }
     pub fn add_partitions_to_txn(
         &self,
-        transaction_id: &str,
-        producer_id: u64,
-        producer_epoch: i16,
+        id: &str,
+        pid: u64,
+        epoch: i16,
         topics: &[(String, Vec<u32>)],
     ) -> Result<(), String> {
-        if self.transactions.has_transactional_producer(transaction_id) {
-            self.transactions.validate_transactional_producer(
-                transaction_id,
-                producer_id,
-                producer_epoch,
-            )?;
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        if self.transactions.has_transactional_producer(id) {
+            self.transactions
+                .validate_transactional_producer(id, pid, epoch)?;
         }
-        let result = self.transactions.add_partitions_to_txn(
-            transaction_id,
-            producer_id,
-            producer_epoch,
-            topics,
-        );
-        if result.is_ok() {
-            let parts = self.transactions.get_partitions(transaction_id);
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-                let _ = tx_pm.produce(&record);
-            }
+        for (topic, _) in topics {
+            validate_client_topic_name(topic).map_err(|e| e.to_string())?;
         }
-        result
+        self.transactions
+            .add_partitions_durable(id, pid, epoch, topics, |s| self.persist_transaction(s))
     }
-
-    pub fn init_producer_id(&self, transactional_id: &str) -> Result<(u64, i16), String> {
-        if transactional_id.is_empty() {
+    /// Synchronous embedded API is restricted to a sole controller; network callers use the quorum API.
+    pub fn init_producer_id(&self, id: &str) -> Result<(u64, i16), String> {
+        if !self.is_leader() || !self.config.peer_addrs.is_empty() {
+            return Err("Use the async controller-coordinated InitProducerId API".into());
+        }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        if id.is_empty() {
             return Ok((self.transactions.generate_producer_id(), 0));
         }
-        if self.transactions.is_ongoing(transactional_id) {
-            self.abort_transaction(transactional_id)?;
-        }
-        let (producer_id, producer_epoch) = self
-            .transactions
-            .init_transactional_producer(transactional_id)?;
+        self.finish_previous_transaction(id)?;
+        let (pid, epoch) = self.transactions.next_transactional_producer(id)?;
         let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
-            transactional_id: transactional_id.to_string(),
-            producer_id,
-            producer_epoch,
+            transactional_id: id.into(),
+            producer_id: pid,
+            producer_epoch: epoch,
         };
-        let meta_pm = self
+        let pm = self
             .get_or_create_partition("__cluster_metadata", 0)
-            .map_err(|e| format!("Failed to open metadata partition: {}", e))?;
-        meta_pm
-            .produce(&record.encode())
-            .map_err(|e| format!("Failed to persist transactional producer state: {}", e))?;
-        Ok((producer_id, producer_epoch))
+            .map_err(|e| e.to_string())?;
+        pm.produce(&record.encode()).map_err(|e| e.to_string())?;
+        pm.flush_durable().map_err(|e| e.to_string())?;
+        self.transactions
+            .restore_transactional_producer(id, pid, epoch);
+        Ok((pid, epoch))
+    }
+    fn finish_previous_transaction(&self, id: &str) -> Result<(), String> {
+        match self.transactions.get_status(id) {
+            Some(TxStatus::PrepareCommit) => self.commit_transaction_inner(id),
+            Some(TxStatus::Ongoing | TxStatus::PrepareAbort) => self.abort_transaction_inner(id),
+            _ => Ok(()),
+        }
+    }
+    pub async fn init_producer_id_coordinated(&self, id: &str) -> Result<(u64, i16), String> {
+        let _gate = self.transaction_gate.lock().await;
+        if !self.is_leader() {
+            return Err("NOT_CONTROLLER".into());
+        }
+        if id.is_empty() {
+            return Ok((self.transactions.generate_producer_id(), 0));
+        }
+        self.finish_previous_transaction(id)?;
+        let (pid, epoch) = self.transactions.next_transactional_producer(id)?;
+        self.propose_metadata(
+            crate::replication::MetadataRecord::TransactionalProducerRegistration {
+                transactional_id: id.into(),
+                producer_id: pid,
+                producer_epoch: epoch,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok((pid, epoch))
     }
 
     pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        // Step 1: Transition memory state to PrepareCommit
-        let (producer_id, partitions) = self.transactions.prepare_commit(transaction_id)?;
-
-        // Step 2: Write PrepareCommit record to __transaction_state
-        let prep_record = encode_tx_state_record(
-            TxStatus::PrepareCommit,
-            producer_id,
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.commit_transaction_inner(transaction_id)
+    }
+    fn commit_transaction_inner(&self, transaction_id: &str) -> Result<(), String> {
+        let (producer_id, partitions) = self.transactions.prepare_durable(
             transaction_id,
-            &partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&prep_record);
-        }
+            TxStatus::PrepareCommit,
+            |state| self.persist_transaction(state),
+        )?;
 
         // Step 3: Write CTRL_COMMIT control markers to all involved data partitions,
         // recording where each partition's transactional range ends — the same bookkeeping
@@ -2724,6 +2788,7 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
+            pm.flush_durable().map_err(|e| e.to_string())?;
             end_offsets.push((topic.clone(), *partition, marker_frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Commit marker written to '{}' partition {}",
@@ -2768,7 +2833,7 @@ impl StorageEngine {
                 transaction_id, e
             )
         })?;
-        tx_pm.flush().map_err(|e| {
+        tx_pm.flush_durable().map_err(|e| {
             format!(
                 "Failed to flush commit of '{}' to __transaction_state: {}",
                 transaction_id, e
@@ -2786,19 +2851,18 @@ impl StorageEngine {
     }
 
     pub fn abort_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        // Step 1: Transition memory state to PrepareAbort
-        let (producer_id, partitions) = self.transactions.prepare_abort(transaction_id)?;
-
-        // Step 2: Write PrepareAbort record to __transaction_state
-        let prep_record = encode_tx_state_record(
-            TxStatus::PrepareAbort,
-            producer_id,
-            transaction_id,
-            &partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&prep_record);
-        }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.abort_transaction_inner(transaction_id)
+    }
+    fn abort_transaction_inner(&self, transaction_id: &str) -> Result<(), String> {
+        let (producer_id, partitions) =
+            self.transactions
+                .prepare_durable(transaction_id, TxStatus::PrepareAbort, |state| {
+                    self.persist_transaction(state)
+                })?;
 
         // Step 3: Write CTRL_ABORT control markers to all involved data partitions
         let mut end_offsets = Vec::new();
@@ -2823,7 +2887,9 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset);
+            pm.flush_durable().map_err(|e| e.to_string())?;
+            pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset)
+                .map_err(|e| e.to_string())?;
             end_offsets.push((topic.clone(), *partition, frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Abort marker written to '{}' partition {}",
@@ -2832,19 +2898,30 @@ impl StorageEngine {
             );
         }
 
-        // Step 4: Transition memory state to Aborted & write CompleteAbort to __transaction_state
+        let updated_partitions = partitions
+            .iter()
+            .map(|(topic, part, start, end)| {
+                (
+                    topic.clone(),
+                    *part,
+                    *start,
+                    end_offsets
+                        .iter()
+                        .find(|(t, p, _)| t == topic && p == part)
+                        .map(|(_, _, o)| *o)
+                        .unwrap_or(*end),
+                )
+            })
+            .collect();
+        self.persist_transaction(&crate::server::transaction::TransactionState {
+            transaction_id: transaction_id.into(),
+            producer_id,
+            status: TxStatus::Aborted,
+            partitions: updated_partitions,
+            created_at_ms: 0,
+        })?;
         self.transactions
             .complete_abort(transaction_id, &end_offsets)?;
-        let updated_partitions = self.transactions.get_partitions(transaction_id);
-        let abort_record = encode_tx_state_record(
-            TxStatus::Aborted,
-            producer_id,
-            transaction_id,
-            &updated_partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&abort_record);
-        }
 
         // Step 5: Clean up memory
         self.transactions
@@ -2854,36 +2931,27 @@ impl StorageEngine {
 
     pub fn register_tx_partition(
         &self,
-        transaction_id: &str,
+        id: &str,
         topic: &str,
-        partition: u32,
-        start_offset: u64,
-    ) {
-        if let Some((producer_id, parts)) =
-            self.transactions
-                .register_partition(transaction_id, topic, partition, start_offset)
-        {
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            match self.get_or_create_partition("__transaction_state", 0) {
-                Ok(tx_pm) => {
-                    if let Err(err) = tx_pm.produce(&record) {
-                        tracing::error!(
-                            "Failed to persist transaction partition registration for '{}': {}",
-                            transaction_id,
-                            err
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        "Failed to open __transaction_state for '{}': {}",
-                        transaction_id,
-                        err
-                    );
-                }
-            }
-        }
+        part: u32,
+        start: u64,
+    ) -> Result<(), String> {
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.register_tx_partition_inner(id, topic, part, start)
+    }
+    fn register_tx_partition_inner(
+        &self,
+        id: &str,
+        topic: &str,
+        part: u32,
+        start: u64,
+    ) -> Result<(), String> {
+        self.transactions
+            .register_partition_durable(id, topic, part, start, |s| self.persist_transaction(s))
+            .map(|_| ())
     }
 
     pub fn end_transaction(
@@ -2893,15 +2961,19 @@ impl StorageEngine {
         producer_epoch: i16,
         committed: bool,
     ) -> Result<(), String> {
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
         self.transactions.validate_transactional_producer(
             transactional_id,
             producer_id,
             producer_epoch,
         )?;
         if committed {
-            self.commit_transaction(transactional_id)
+            self.commit_transaction_inner(transactional_id)
         } else {
-            self.abort_transaction(transactional_id)
+            self.abort_transaction_inner(transactional_id)
         }
     }
 
