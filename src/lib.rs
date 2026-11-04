@@ -2,6 +2,7 @@ pub mod client;
 pub mod config;
 pub mod consumer;
 pub mod consumer_group;
+mod durable;
 pub mod protocol;
 pub mod replication;
 pub mod scram;

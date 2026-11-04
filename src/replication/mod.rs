@@ -240,7 +240,7 @@ impl ReplicationManager {
         // started for nodes that booted as Follower, so a stepped-down static Leader
         // could never recontest an election. The loop itself only lets a *controller*
         // node actually contest — see `start_election_timeout_loop`.
-        mgr.start_election_timeout_loop();
+        // StorageEngine starts this after restoring durable consensus state.
 
         // Leader: additionally start the heartbeat broadcaster to all followers.
         //
@@ -649,7 +649,14 @@ impl ReplicationManager {
                                                         let local_leo = pm.latest_offset();
                                                         let follower_hw =
                                                             resp.leader_watermark.min(local_leo);
-                                                        pm.advance_committed_hw(follower_hw);
+                                                        if let Err(e) =
+                                                            pm.advance_committed_hw(follower_hw)
+                                                        {
+                                                            tracing::error!(
+                                                                "commit checkpoint failed: {}",
+                                                                e
+                                                            );
+                                                        }
                                                         made_progress = applied_any;
                                                     }
                                                 }
@@ -703,7 +710,7 @@ impl ReplicationManager {
     /// Election timeout task: monitors heartbeat arrivals and triggers elections.
     ///
     /// Uses node_id-derived jitter to avoid split-vote storms (no `rand` crate needed).
-    fn start_election_timeout_loop(&self) {
+    pub(crate) fn start_election_timeout_loop(&self) {
         let last_heartbeat = self.last_heartbeat.clone();
         let consensus = self.consensus.clone();
         // Only controller-eligible peers are sent VoteRequests — a broker-only peer never

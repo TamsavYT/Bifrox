@@ -8432,7 +8432,7 @@ async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers(
     );
 
     // And the flag reaches a reader as `is_control`, which is what filtering depends on.
-    pm.advance_committed_hw(3);
+    pm.advance_committed_hw(3).unwrap();
     let records = pm.fetch(0, 65536).unwrap();
     assert_eq!(records.len(), 3);
     assert!(!records[0].is_control);
@@ -8523,7 +8523,7 @@ async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() 
         // The engine writes its own bootstrap records to this partition, so target the one
         // written here by offset rather than assuming an empty log.
         let written = pm.produce_frame(original).unwrap();
-        pm.advance_committed_hw(written.base_offset + 1);
+        pm.advance_committed_hw(written.base_offset + 1).unwrap();
 
         let records = pm.fetch(written.base_offset, 65536).unwrap();
         let mine = records
@@ -8638,7 +8638,8 @@ async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
         ))
         .unwrap()
         .unwrap();
-    pm.advance_committed_hw(produced.base_offset + produced.last_offset_delta as u64 + 1);
+    pm.advance_committed_hw(produced.base_offset + produced.last_offset_delta as u64 + 1)
+        .unwrap();
 
     let served = engine
         .fetch_entries(topic, 0, 0, 1024 * 1024)
