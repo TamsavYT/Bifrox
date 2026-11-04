@@ -49,10 +49,11 @@ pub fn build_tls_acceptor(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client_auth_enabled = matches!(
-        config.ssl_client_auth.to_lowercase().as_str(),
-        "required" | "requested" | "true"
-    );
+    let client_auth_enabled = !config.replication_peer_certificates.is_empty()
+        || matches!(
+            config.ssl_client_auth.to_lowercase().as_str(),
+            "required" | "requested" | "true"
+        );
 
     let server_config = if client_auth_enabled {
         let mut root_store = rustls::RootCertStore::empty();
@@ -71,7 +72,15 @@ pub fn build_tls_acceptor(
                 let _ = root_store.add(c.clone());
             }
         }
-        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        let verifier = if config.ssl_client_auth.eq_ignore_ascii_case("required")
+            || config.ssl_client_auth.eq_ignore_ascii_case("true")
+        {
+            verifier
+        } else {
+            verifier.allow_unauthenticated()
+        };
+        let client_verifier = verifier
             .build()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 

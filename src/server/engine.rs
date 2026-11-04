@@ -335,11 +335,13 @@ impl StorageEngine {
 
         let broker_addrs = Arc::new(DashMap::new());
         let broker_roles = Arc::new(DashMap::new());
-        let replication = ReplicationManager::new(
+        let transport = crate::replication::transport::PeerTransport::from_config(&config)?;
+        let replication = ReplicationManager::new_with_transport(
             cluster_config,
             config.bind_addr.clone(),
             broker_addrs.clone(),
             broker_roles.clone(),
+            transport,
         );
         std::fs::create_dir_all(&config.data_dir)?;
         replication
