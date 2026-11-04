@@ -64,7 +64,7 @@ jobs:
         print(result.stdout)
         if result.returncode:
             # Keep the failing assertion visible through the Checks API as well as logs.
-            detail = result.stdout[-16000:]
+            detail = result.stdout[-3500:]
             detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
             print("::error title=Rust test failure::" + detail)
         sys.exit(result.returncode)
