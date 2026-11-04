@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::io::Read;
+pub const MAX_DECOMPRESSED_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 use bytes::{Buf, BufMut, Bytes};
 use crc32fast::Hasher;
@@ -399,9 +401,26 @@ impl RecordBatch {
     /// Decompresses (if needed) and decodes this batch's records, yielding each record's
     /// absolute offset, absolute timestamp, and opaque payload.
     pub fn records(&self) -> Result<Vec<BatchRecord>, BatchError> {
+        if self.record_data.len() > MAX_DECOMPRESSED_BATCH_BYTES {
+            return Err(BatchError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "batch exceeds decoded record or byte limit",
+            )));
+        }
         let raw: Cow<'_, [u8]> = match self.compression()? {
             BatchCompression::None => Cow::Borrowed(&self.record_data[..]),
             BatchCompression::Lz4 => {
+                let declared = self
+                    .record_data
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+                    .ok_or(BatchError::TruncatedRecord)?;
+                if declared > MAX_DECOMPRESSED_BATCH_BYTES {
+                    return Err(BatchError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "decompressed batch limit exceeded",
+                    )));
+                }
                 let decompressed =
                     lz4_flex::decompress_size_prepended(&self.record_data).map_err(|e| {
                         BatchError::Io(std::io::Error::new(
@@ -412,17 +431,31 @@ impl RecordBatch {
                 Cow::Owned(decompressed)
             }
             BatchCompression::Zstd => {
-                let decompressed =
-                    zstd::stream::decode_all(self.record_data.as_ref()).map_err(|e| {
-                        BatchError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            e.to_string(),
-                        ))
-                    })?;
+                let mut decoder = zstd::stream::read::Decoder::new(self.record_data.as_ref())?;
+                decoder.window_log_max(26)?;
+                let mut decompressed = Vec::new();
+                decoder
+                    .take(MAX_DECOMPRESSED_BATCH_BYTES as u64 + 1)
+                    .read_to_end(&mut decompressed)?;
+                if decompressed.len() > MAX_DECOMPRESSED_BATCH_BYTES {
+                    return Err(BatchError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "decompressed batch limit exceeded",
+                    )));
+                }
                 Cow::Owned(decompressed)
             }
         };
 
+        if self.record_count as usize > raw.len() / RECORD_ENTRY_MIN_SIZE {
+            return Err(BatchError::TruncatedRecord);
+        }
+        if self.record_count > 100_000 {
+            return Err(BatchError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded record count exceeds limit",
+            )));
+        }
         decode_records(
             self.record_count,
             self.base_offset,

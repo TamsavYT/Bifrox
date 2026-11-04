@@ -534,6 +534,32 @@ pub enum WireError {
     InvalidProtocol(String),
 }
 
+// Bound both wire expansion and the number of decoded objects per collection.
+const MAX_DECODED_COLLECTION_ITEMS: usize = 100_000;
+
+fn validate_collection_count(
+    count: usize,
+    remaining: usize,
+    minimum: usize,
+    budget: &mut usize,
+) -> Result<(), WireError> {
+    if count > remaining / minimum || count > *budget {
+        return Err(WireError::InvalidProtocol(
+            "collection count exceeds frame or decoded-item limit".into(),
+        ));
+    }
+    *budget -= count;
+    Ok(())
+}
+
+fn allocate_collection<T>(count: usize) -> Result<Vec<T>, WireError> {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(count)
+        .map_err(|_| WireError::InvalidProtocol("collection allocation failed".into()))?;
+    Ok(items)
+}
+
 /// Request payloads received from clients over TCP
 #[derive(Debug, Clone)]
 pub enum RequestPayload {
@@ -1002,6 +1028,7 @@ impl WireRequest {
         }
 
         let mut payload_buf = &src[..payload_len];
+        let mut collection_budget = MAX_DECODED_COLLECTION_ITEMS;
         let req_payload = match cmd {
             CommandCode::ProduceBatch => {
                 let topic = read_pascal_string(&mut payload_buf)?;
@@ -1187,7 +1214,13 @@ impl WireRequest {
                     });
                 }
                 let proto_count = payload_buf.get_u32() as usize;
-                let mut protocols = Vec::with_capacity(proto_count);
+                validate_collection_count(
+                    proto_count,
+                    payload_buf.len(),
+                    2,
+                    &mut collection_budget,
+                )?;
+                let mut protocols = allocate_collection(proto_count)?;
                 for _ in 0..proto_count {
                     protocols.push(read_pascal_string(&mut payload_buf)?);
                 }
@@ -1217,7 +1250,13 @@ impl WireRequest {
                     });
                 }
                 let assign_count = payload_buf.get_u32() as usize;
-                let mut assignments = Vec::with_capacity(assign_count);
+                validate_collection_count(
+                    assign_count,
+                    payload_buf.len(),
+                    8,
+                    &mut collection_budget,
+                )?;
+                let mut assignments = allocate_collection(assign_count)?;
                 for _ in 0..assign_count {
                     let a_member_id = read_pascal_string(&mut payload_buf)?;
                     let a_topic = read_pascal_string(&mut payload_buf)?;
@@ -1228,13 +1267,19 @@ impl WireRequest {
                         });
                     }
                     let p_count = payload_buf.get_u32() as usize;
+                    validate_collection_count(
+                        p_count,
+                        payload_buf.len(),
+                        4,
+                        &mut collection_budget,
+                    )?;
                     if payload_buf.len() < p_count * 4 {
                         return Err(WireError::Incomplete {
                             needed: p_count * 4,
                             available: payload_buf.len(),
                         });
                     }
-                    let mut partitions = Vec::with_capacity(p_count);
+                    let mut partitions = allocate_collection(p_count)?;
                     for _ in 0..p_count {
                         partitions.push(payload_buf.get_u32());
                     }
@@ -1319,7 +1364,13 @@ impl WireRequest {
                     });
                 }
                 let topic_count = payload_buf.get_u32() as usize;
-                let mut topics = Vec::with_capacity(topic_count);
+                validate_collection_count(
+                    topic_count,
+                    payload_buf.len(),
+                    6,
+                    &mut collection_budget,
+                )?;
+                let mut topics = allocate_collection(topic_count)?;
 
                 for _ in 0..topic_count {
                     let t_name = read_pascal_string(&mut payload_buf)?;
@@ -1330,13 +1381,19 @@ impl WireRequest {
                         });
                     }
                     let p_count = payload_buf.get_u32() as usize;
+                    validate_collection_count(
+                        p_count,
+                        payload_buf.len(),
+                        4,
+                        &mut collection_budget,
+                    )?;
                     if payload_buf.len() < p_count * 4 {
                         return Err(WireError::Incomplete {
                             needed: p_count * 4,
                             available: payload_buf.len(),
                         });
                     }
-                    let mut parts = Vec::with_capacity(p_count);
+                    let mut parts = allocate_collection(p_count)?;
                     for _ in 0..p_count {
                         parts.push(payload_buf.get_u32());
                     }
@@ -1594,13 +1651,19 @@ impl WireRequest {
                     });
                 }
                 let ack_count = payload_buf.get_u32() as usize;
+                validate_collection_count(
+                    ack_count,
+                    payload_buf.len(),
+                    17,
+                    &mut collection_budget,
+                )?;
                 if payload_buf.len() < ack_count * 17 {
                     return Err(WireError::Incomplete {
                         needed: ack_count * 17,
                         available: payload_buf.len(),
                     });
                 }
-                let mut acknowledgements = Vec::with_capacity(ack_count);
+                let mut acknowledgements = allocate_collection(ack_count)?;
                 for _ in 0..ack_count {
                     let first_offset = payload_buf.get_u64();
                     let last_offset = payload_buf.get_u64();
@@ -1636,13 +1699,19 @@ impl WireRequest {
                 }
                 let partition = payload_buf.get_u32();
                 let ack_count = payload_buf.get_u32() as usize;
+                validate_collection_count(
+                    ack_count,
+                    payload_buf.len(),
+                    17,
+                    &mut collection_budget,
+                )?;
                 if payload_buf.len() < ack_count * 17 {
                     return Err(WireError::Incomplete {
                         needed: ack_count * 17,
                         available: payload_buf.len(),
                     });
                 }
-                let mut acknowledgements = Vec::with_capacity(ack_count);
+                let mut acknowledgements = allocate_collection(ack_count)?;
                 for _ in 0..ack_count {
                     let first_offset = payload_buf.get_u64();
                     let last_offset = payload_buf.get_u64();
@@ -1688,7 +1757,8 @@ impl WireRequest {
                     });
                 }
                 let count = payload_buf.get_u32() as usize;
-                let mut configs = Vec::with_capacity(count);
+                validate_collection_count(count, payload_buf.len(), 4, &mut collection_budget)?;
+                let mut configs = allocate_collection(count)?;
                 for _ in 0..count {
                     let key = read_pascal_string(&mut payload_buf)?;
                     let value = read_pascal_string(&mut payload_buf)?;
@@ -1705,7 +1775,13 @@ impl WireRequest {
                     });
                 }
                 let upsert_count = payload_buf.get_u32() as usize;
-                let mut upserts = Vec::with_capacity(upsert_count);
+                validate_collection_count(
+                    upsert_count,
+                    payload_buf.len(),
+                    4,
+                    &mut collection_budget,
+                )?;
+                let mut upserts = allocate_collection(upsert_count)?;
                 for _ in 0..upsert_count {
                     let key = read_pascal_string(&mut payload_buf)?;
                     let value = read_pascal_string(&mut payload_buf)?;
@@ -1718,7 +1794,13 @@ impl WireRequest {
                     });
                 }
                 let delete_count = payload_buf.get_u32() as usize;
-                let mut deletes = Vec::with_capacity(delete_count);
+                validate_collection_count(
+                    delete_count,
+                    payload_buf.len(),
+                    2,
+                    &mut collection_budget,
+                )?;
+                let mut deletes = allocate_collection(delete_count)?;
                 for _ in 0..delete_count {
                     deletes.push(read_pascal_string(&mut payload_buf)?);
                 }
