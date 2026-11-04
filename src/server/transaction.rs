@@ -279,15 +279,8 @@ impl TransactionManager {
 
     pub fn observe_producer_id(&self, producer_id: u64) {
         let next_candidate = producer_id.saturating_add(1);
-        let _ = self
-            .next_producer_id
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                if current < next_candidate {
-                    Some(next_candidate)
-                } else {
-                    None
-                }
-            });
+        self.next_producer_id
+            .fetch_max(next_candidate, Ordering::SeqCst);
     }
 
     pub fn add_partitions_to_txn(
