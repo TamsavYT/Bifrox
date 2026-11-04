@@ -22,6 +22,18 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
+    - name: Validate Windows packaging syntax
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        Get-ChildItem packaging/windows/*.ps1 | ForEach-Object {
+          $parseErrors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+        }
+        [xml](Get-Content packaging/windows/winsw.xml -Raw) | Out-Null
+
     - name: Set up Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
       with:

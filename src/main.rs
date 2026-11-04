@@ -25,10 +25,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(run(config))
 }
 
+fn config_argument(args: &[String]) -> std::io::Result<Option<String>> {
+    match args {
+        [] => Ok(None),
+        [path] if !path.starts_with('-') => Ok(Some(path.clone())),
+        [flag, path] if flag == "--config" && !path.is_empty() && !path.starts_with('-') => {
+            Ok(Some(path.clone()))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage: bifrox [--config] <server.properties>",
+        )),
+    }
+}
+
 fn load_config() -> Result<EngineConfig, Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let config_path_opt = if args.len() > 1 && !args[1].starts_with('-') {
-        Some(args[1].clone())
+    let config_path_opt = if let Some(path) = config_argument(&args[1..])? {
+        Some(path)
     } else if let Ok(path) = env::var("BIFROX_CONFIG") {
         Some(path)
     } else if std::path::Path::new("server.properties").exists() {
@@ -144,4 +158,35 @@ async fn run(config: EngineConfig) -> Result<(), Box<dyn std::error::Error>> {
     server.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+    #[test]
+    fn accepts_positional_and_named_paths_with_spaces() {
+        let path = "C:\\Program Files\\Bifrox\\server.properties".to_string();
+        assert_eq!(
+            config_argument(std::slice::from_ref(&path)).unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(
+            config_argument(&["--config".into(), path.clone()]).unwrap(),
+            Some(path)
+        );
+        assert_eq!(config_argument(&[]).unwrap(), None);
+    }
+    #[test]
+    fn malformed_arguments_cannot_silently_select_default_configuration() {
+        for args in [
+            vec!["--config"],
+            vec!["--unknown"],
+            vec!["--config", ""],
+            vec!["a", "b"],
+        ] {
+            assert!(
+                config_argument(&args.into_iter().map(str::to_string).collect::<Vec<_>>()).is_err()
+            );
+        }
+    }
 }

@@ -90,3 +90,10 @@ metrics.allowed.ips=127.0.0.1,10.0.0.0/8
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\uninstall-service.ps1
   ```
+
+Service commands accept either a positional properties-file path or `--config <path>`.
+The wrappers quote paths or resolve `server.properties` in the configured working directory.
+Generated configuration defaults to an advertised IP of `127.0.0.1`; pass a numeric LAN IP
+with `-AdvertisedHost` for remote broker access. Confirm protocol readiness with
+`bifrox_cli --server <ip>:<port> ping` after the service starts. A WinSW packaging run
+prepares files but does not register/start the wrapper automatically.

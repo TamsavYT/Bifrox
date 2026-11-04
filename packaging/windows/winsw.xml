@@ -1,11 +1,11 @@
 <service>
   <id>BifroxEventStore</id>
   <name>Bifrox Event Streaming Store</name>
-  <description>Production Event Streaming Storage Engine Server (Kafka-compatible)</description>
+  <description>Production Event Streaming Storage Engine Server</description>
 
   <!-- Path to executable -->
   <executable>%BASE%\bifrox.exe</executable>
-  <arguments>--config %BASE%\server.properties</arguments>
+  <arguments>--config &quot;%BASE%\server.properties&quot;</arguments>
   <workingdirectory>%BASE%</workingdirectory>
 
   <!-- Service Startup Type -->
@@ -13,7 +13,6 @@
   <delayedAutoStart>true</delayedAutoStart>
 
   <!-- Graceful Shutdown Settings -->
-  <stopargument>--stop</stopargument>
   <stopparentprocessfirst>true</stopparentprocessfirst>
   <stoptimeout>30sec</stoptimeout>
   <sigkilltimeout>10sec</sigkilltimeout>

@@ -15,7 +15,7 @@ param(
     [string]$ServiceType = "WinSW",
     [int]$BrokerPort = 9092,
     [int]$MetricsPort = 10092,
-    [string]$AdvertisedHost = $env:COMPUTERNAME
+    [string]$AdvertisedHost = "127.0.0.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,7 +49,7 @@ if (Test-Path $BinPath) {
     Write-Host "[2/5] Copying binary from '$BinPath'..." -ForegroundColor Yellow
     Copy-Item -Path $BinPath -Destination "$InstallDir\bifrox.exe" -Force
 } else {
-    Write-Warning "Bifrox binary not found at target build path. Please compile with 'cargo build --release' first."
+    throw "Bifrox binary not found at target build path. Please compile with 'cargo build --release' first."
 }
 
 $PropertiesPath = "$ProjectRoot\server.properties"
@@ -62,9 +62,9 @@ if (Test-Path $PropertiesPath) {
 node.id=1
 # Bind to all interfaces, but advertise a specific dialable address to peers
 # (the broker requires an explicit advertised address, not a wildcard)
-bind.address=0.0.0.0:$BrokerPort
+listeners=PLAINTEXT://0.0.0.0:$BrokerPort
 advertised.listeners=$AdvertisedHost:$BrokerPort
-metrics.bind.address=0.0.0.0:$MetricsPort
+metrics.listeners=PLAINTEXT://0.0.0.0:$MetricsPort
 data.dir=$InstallDir\data
 log.file.dir=$InstallDir\logs
 cleanup.policy=delete
@@ -95,19 +95,30 @@ if ($ServiceType -eq "WinSW") {
     if ($nssm) {
         nssm stop BifroxEventStore 2>$null
         nssm remove BifroxEventStore confirm 2>$null
-        nssm install BifroxEventStore "$InstallDir\bifrox.exe" "--config $InstallDir\server.properties"
+        nssm install BifroxEventStore "$InstallDir\bifrox.exe"
+        if ($LASTEXITCODE -ne 0) { throw "NSSM install failed: $LASTEXITCODE" }
+        nssm set BifroxEventStore AppParameters '--config "server.properties"'
+        if ($LASTEXITCODE -ne 0) { throw "NSSM parameter setup failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppDirectory "$InstallDir"
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppStdout "$InstallDir\logs\bifrox-service.log"
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppStderr "$InstallDir\logs\bifrox-service-err.log"
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppRotateFiles 1
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppRotateBytes 20971520
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppStopMethodSkip 0
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm set BifroxEventStore AppStopMethodConsole 1500
+        if ($LASTEXITCODE -ne 0) { throw "NSSM configuration failed: $LASTEXITCODE" }
         nssm start BifroxEventStore
+        if ($LASTEXITCODE -ne 0) { throw "NSSM start failed: $LASTEXITCODE" }
         Write-Host "Bifrox service successfully registered and started via NSSM." -ForegroundColor Green
     } else {
-        Write-Warning "NSSM is not installed in PATH. Download nssm.exe or use WinSW."
+        throw "NSSM is not installed in PATH. Download nssm.exe or use WinSW."
     }
 }
 
-Write-Host "`nInstallation completed successfully!" -ForegroundColor Green
+Write-Host "`nPackaging completed. For NSSM, verify broker readiness with bifrox_cli ping; for WinSW, register and start the wrapper as instructed above." -ForegroundColor Green
