@@ -112,3 +112,22 @@ fn failed_raft_persistence_fences_voting_until_restart() {
     std::fs::remove_dir(&path).unwrap();
     assert!(!c.try_record_vote(3, 6));
 }
+
+#[tokio::test]
+async fn engine_startup_propagates_an_invalid_existing_partition_checkpoint() {
+    let t = Temp::new();
+    let cfg = EngineConfig {
+        data_dir: t.0.clone(),
+        preallocate_segments: false,
+        ..Default::default()
+    };
+    let partition = t.0.join("existing-topic-0");
+    let pm = PartitionManager::open(&partition, "existing-topic", 0, cfg.clone()).unwrap();
+    pm.produce(b"previously-stored-record").unwrap();
+    drop(pm);
+    std::fs::remove_file(partition.join("committed.offset")).unwrap();
+    assert!(
+        bifrox::StorageEngine::new(cfg).is_err(),
+        "startup must not silently skip the inaccessible legacy partition"
+    );
+}

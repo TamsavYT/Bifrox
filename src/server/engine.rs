@@ -400,7 +400,7 @@ impl StorageEngine {
                                 let (topic, part_str) = dir_name.split_at(pos);
                                 let part_str = &part_str[1..];
                                 if let Ok(partition) = part_str.parse::<u32>() {
-                                    let _ = engine.get_or_create_partition(topic, partition);
+                                    engine.get_or_create_partition(topic, partition)?;
                                 }
                             }
                         }
@@ -417,7 +417,7 @@ impl StorageEngine {
         engine.replay_transaction_state()?;
 
         // Unconditionally initialize system partition __consumer_offsets-0
-        let _ = engine.get_or_create_partition("__consumer_offsets", 0);
+        engine.get_or_create_partition("__consumer_offsets", 0)?;
 
         // 4. If Leader, register broker in the metadata log
         if engine.is_leader() {
@@ -896,7 +896,8 @@ impl StorageEngine {
             );
         }
 
-        if let Ok(pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+        {
+            let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
             let mut offset = start_offset;
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
