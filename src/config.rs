@@ -633,7 +633,7 @@ impl EngineConfig {
         let mut listener_protocol = None;
         let mut explicit_protocol = None;
 
-        for line in content.lines() {
+        for line in content.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;

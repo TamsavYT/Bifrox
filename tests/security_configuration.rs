@@ -64,3 +64,17 @@ fn incomplete_tls_material_does_not_generate_a_replacement_identity() {
     };
     assert!(bifrox::server::listener::build_tls_acceptor(&cfg).is_err());
 }
+
+#[test]
+fn reads_powershell_generated_utf8_bom_configuration() {
+    let t = Temp::new();
+    let path = t.0.join("server.properties");
+    std::fs::write(
+        &path,
+        "\u{feff}node.id=42\nlisteners=PLAINTEXT://127.0.0.1:19092\n",
+    )
+    .unwrap();
+    let config = EngineConfig::from_properties_file(path).unwrap();
+    assert_eq!(config.node_id, 42);
+    assert_eq!(config.bind_addr, "127.0.0.1:19092");
+}
