@@ -1,3 +1,4 @@
+static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use bifrox::replication::{
     grpc::send_grpc_replication_fetch, transport::PeerTransport, ReplicationFetchRequest,
 };
@@ -12,12 +13,13 @@ impl Fixture {
     fn new() -> Self {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let dir = std::env::temp_dir().join(format!(
-            "peer_tls_{}_{}",
+            "peer_tls_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = KeyPair::generate().unwrap();
@@ -79,7 +81,7 @@ async fn tls_fetch_requires_pinned_identity_and_replica_membership() {
     let pm = engine.get_or_create_partition("private", 0).unwrap();
     pm.produce(b"secret").unwrap();
     pm.update_leadership(1, 0, vec![1, 2], vec![1, 2]);
-    let server = Server::new(engine);
+    let server = Server::new(engine.clone());
     let (listener, addr) = server.bind().unwrap();
     let task = tokio::spawn(async move { server.run_with_listener(listener).await });
     let transport = PeerTransport::from_config(&f.client).unwrap();
@@ -140,6 +142,44 @@ async fn tls_fetch_requires_pinned_identity_and_replica_membership() {
     )
     .await
     .is_ok());
+    // A trusted replica certificate does not grant controller command authority.
+    use bytes::BufMut;
+    let mut payload = Vec::new();
+    bifrox::protocol::wire::write_pascal_string(&mut payload, &f.server.cluster_id);
+    payload.put_u32(2);
+    payload.put_u64(0);
+    payload.push(0);
+    bifrox::protocol::wire::write_pascal_string(&mut payload, "private");
+    payload.put_u32(0);
+    let request = bifrox::replication::encode_frame(
+        bifrox::replication::FrameType::TransactionCommand,
+        &payload,
+    );
+    let mut stream = transport.connect(&addr.to_string()).await.unwrap();
+    // The earlier heartbeat made node 2 the controller; a stale term must still fail.
+    engine.replication().set_epoch(1);
+    let reply = bifrox::replication::envelope::exchange_frame(
+        &mut stream,
+        &request,
+        bifrox::replication::FrameType::TransactionResponse,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.first(), Some(&1));
+    payload[2 + f.server.cluster_id.len()..2 + f.server.cluster_id.len() + 4]
+        .copy_from_slice(&3u32.to_be_bytes());
+    let spoof = bifrox::replication::encode_frame(
+        bifrox::replication::FrameType::TransactionCommand,
+        &payload,
+    );
+    let mut stream = transport.connect(&addr.to_string()).await.unwrap();
+    assert!(bifrox::replication::envelope::exchange_frame(
+        &mut stream,
+        &spoof,
+        bifrox::replication::FrameType::TransactionResponse
+    )
+    .await
+    .is_err());
     task.abort();
 }
 #[tokio::test]

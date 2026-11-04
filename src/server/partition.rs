@@ -691,6 +691,17 @@ impl PartitionManager {
         producer_id: u64,
         transaction_id: &str,
     ) -> IoResult<RecordBatch> {
+        let frame =
+            self.produce_control_marker_uncommitted(control_type, producer_id, transaction_id)?;
+        self.advance_committed_hw(frame.base_offset + 1)?;
+        Ok(frame)
+    }
+    pub fn produce_control_marker_uncommitted(
+        &self,
+        control_type: u8,
+        producer_id: u64,
+        transaction_id: &str,
+    ) -> IoResult<RecordBatch> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -714,7 +725,7 @@ impl PartitionManager {
                 .store(assigned_offset + 1, Ordering::Release);
             frame
         };
-        self.advance_committed_hw(frame.base_offset + 1)?;
+
         Ok(frame)
     }
 

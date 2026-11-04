@@ -97,6 +97,8 @@ pub enum FrameType {
     ReplicationFetch = 7,
     /// Leader's answer to [`FrameType::ReplicationFetch`].
     ReplicationFetchResponse = 8,
+    TransactionCommand = 9,
+    TransactionResponse = 10,
 }
 
 impl FrameType {
@@ -110,6 +112,8 @@ impl FrameType {
             6 => FrameType::VoteResponse,
             7 => FrameType::ReplicationFetch,
             8 => FrameType::ReplicationFetchResponse,
+            9 => FrameType::TransactionCommand,
+            10 => FrameType::TransactionResponse,
             _ => return None,
         })
     }

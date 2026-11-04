@@ -99,6 +99,14 @@ fn authorize_peer_frame(
 ) -> bool {
     use crate::replication::FrameType;
     match frame.frame_type {
+        FrameType::TransactionCommand => {
+            let mut reader = PayloadReader::new(frame.payload, "transaction controller");
+            reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster").is_ok()
+                && reader.u32("node").ok() == Some(id)
+                && engine
+                    .get_broker_address(id)
+                    .is_some_and(|addr| engine.leader_addr().as_ref() == Some(&addr))
+        }
         FrameType::ReplicationFetch => {
             let Ok((req, _)) = crate::replication::ReplicationFetchRequest::decode(frame.payload)
             else {
@@ -202,6 +210,19 @@ fn authorize_ingress(
             {
                 return Err("TopicAuthorizationFailed".into());
             }
+        }
+    }
+    if let ProduceBatch { transaction_id, .. } = payload {
+        if !transaction_id.is_empty()
+            && !engine.authorize(
+                principal,
+                host,
+                Op::Write as u8,
+                Res::TransactionalId as u8,
+                transaction_id,
+            )
+        {
+            return Err("TransactionalIdAuthorizationFailed".into());
         }
     }
     if let AddPartitionsToTxn { topics, .. } = payload {
@@ -344,7 +365,13 @@ where
                                 return;
                             }
                         }
-                        let response = handle_inter_node_frame(&engine, &frame);
+                        let response = if frame.frame_type
+                            == crate::replication::FrameType::TransactionCommand
+                        {
+                            Ok(engine.handle_transaction_command(frame.payload).await)
+                        } else {
+                            handle_inter_node_frame(&engine, &frame)
+                        };
                         // The cursor advances by the frame's own declared length, whatever
                         // the outcome — including a frame this build could not serve.
                         consumed += frame.total_len;
@@ -420,8 +447,9 @@ where
                             topic,
                             key,
                             num_partitions,
+                            transaction_id,
                             ..
-                        } => Some((
+                        } if transaction_id.is_empty() => Some((
                             topic.clone(),
                             if !key.is_empty() && *num_partitions > 0 {
                                 crate::server::hash_key(key.as_bytes(), *num_partitions as usize)
@@ -439,19 +467,27 @@ where
                     // above, but keyed on cluster leadership rather than partition
                     // leadership since there's a single controller, not one per
                     // partition.
-                    let is_controller_mutation = matches!(
-                        &req.payload,
-                        RequestPayload::CreateTopic { .. }
-                            | RequestPayload::DeleteTopic { .. }
-                            | RequestPayload::RegisterBroker { .. }
-                            | RequestPayload::UnregisterBroker { .. }
-                            | RequestPayload::CreateAcls { .. }
-                            | RequestPayload::DeleteAcls { .. }
-                            | RequestPayload::UpsertScramUser { .. }
-                            | RequestPayload::DeleteScramUser { .. }
-                            | RequestPayload::AlterConfigs { .. }
-                            | RequestPayload::IncrementalAlterConfigs { .. }
-                    );
+                    let transactional_produce = matches!(&req.payload,RequestPayload::ProduceBatch {transaction_id,..} if !transaction_id.is_empty());
+                    let is_controller_mutation = transactional_produce
+                        || matches!(
+                            &req.payload,
+                            RequestPayload::BeginTx { .. }
+                                | RequestPayload::CommitTx { .. }
+                                | RequestPayload::AbortTx { .. }
+                                | RequestPayload::AddPartitionsToTxn { .. }
+                                | RequestPayload::EndTxn { .. }
+                                | RequestPayload::InitProducerId { .. }
+                                | RequestPayload::CreateTopic { .. }
+                                | RequestPayload::DeleteTopic { .. }
+                                | RequestPayload::RegisterBroker { .. }
+                                | RequestPayload::UnregisterBroker { .. }
+                                | RequestPayload::CreateAcls { .. }
+                                | RequestPayload::DeleteAcls { .. }
+                                | RequestPayload::UpsertScramUser { .. }
+                                | RequestPayload::DeleteScramUser { .. }
+                                | RequestPayload::AlterConfigs { .. }
+                                | RequestPayload::IncrementalAlterConfigs { .. }
+                        );
 
                     // Controller-mediated topic creation, deliberately *before* the
                     // leadership check below.
@@ -914,6 +950,9 @@ fn handle_inter_node_frame(
 ) -> Result<Vec<u8>, PacketError> {
     use crate::replication::FrameType;
     match frame.frame_type {
+        FrameType::TransactionCommand | FrameType::TransactionResponse => Err(PacketError::new(
+            "transaction commands require async dispatch",
+        )),
         FrameType::ReplicationPush => handle_replication_push(engine, frame.payload),
         FrameType::Heartbeat => handle_heartbeat(engine, frame.payload),
         FrameType::VoteRequest => handle_vote_request(engine, frame.payload),
@@ -1390,8 +1429,11 @@ fn handle_replication_push(engine: &StorageEngine, payload: &[u8]) -> Result<Vec
     // so the broker served authorization decisions that would silently revert on restart.
     // Leaving them unapplied and NACKing instead makes the leader re-deliver the batch.
     if !write_failed {
-        for (offset, record) in pending_metadata {
-            engine.apply_metadata_record(offset, record);
+        if is_cluster_meta {
+            if let Err(error) = engine.apply_committed_metadata() {
+                tracing::error!("Failed applying committed metadata: {}", error);
+                return nack();
+            }
         }
     } else if !pending_metadata.is_empty() {
         tracing::error!(
@@ -2169,7 +2211,10 @@ async fn process_request(
             // resolved the leader from cluster metadata. Re-checking locally would reject
             // it whenever this node has not yet received that assignment through the
             // metadata log — the exact window in which the request was forwarded.
-            if !framing.is_forwarded() && !engine.is_partition_leader(&topic, target_partition) {
+            if transaction_id.is_empty()
+                && !framing.is_forwarded()
+                && !engine.is_partition_leader(&topic, target_partition)
+            {
                 return WireResponse::error("NotLeaderForPartition");
             }
             // Quota: the request's byte cost is known up front, so charge it and serve
@@ -2424,7 +2469,10 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            match engine.begin_transaction(&transaction_id, producer_id) {
+            match engine
+                .begin_transaction_coordinated(&transaction_id, producer_id)
+                .await
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("BeginTx failed: {}", e)),
             }
@@ -2439,7 +2487,16 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            match engine.commit_transaction(&transaction_id) {
+            if engine
+                .transactions()
+                .has_transactional_producer(&transaction_id)
+            {
+                return WireResponse::error("Use EndTxn with producer ID and epoch for an initialized transactional producer");
+            }
+            match engine
+                .finish_transaction_coordinated(&transaction_id, true)
+                .await
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("CommitTx failed: {}", e)),
             }
@@ -2454,7 +2511,16 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            match engine.abort_transaction(&transaction_id) {
+            if engine
+                .transactions()
+                .has_transactional_producer(&transaction_id)
+            {
+                return WireResponse::error("Use EndTxn with producer ID and epoch for an initialized transactional producer");
+            }
+            match engine
+                .finish_transaction_coordinated(&transaction_id, false)
+                .await
+            {
                 Ok(()) => WireResponse::ok(Vec::new()),
                 Err(e) => WireResponse::error(&format!("AbortTx failed: {}", e)),
             }
@@ -2471,7 +2537,7 @@ async fn process_request(
             {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            match engine.init_producer_id(&transactional_id) {
+            match engine.init_producer_id_coordinated(&transactional_id).await {
                 Ok((pid, epoch)) => {
                     let mut buf = Vec::with_capacity(10);
                     buf.put_u64(pid);
@@ -2496,12 +2562,9 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            let result = engine.add_partitions_to_txn(
-                &transactional_id,
-                producer_id,
-                producer_epoch,
-                &topics,
-            );
+            let result = engine
+                .add_partitions_coordinated(&transactional_id, producer_id, producer_epoch, &topics)
+                .await;
             if result.is_ok() {
                 WireResponse::ok(Vec::new())
             } else {
@@ -2523,8 +2586,14 @@ async fn process_request(
             ) {
                 return WireResponse::error("TransactionalIdAuthorizationFailed");
             }
-            let result =
-                engine.end_transaction(&transactional_id, producer_id, producer_epoch, committed);
+            let result = engine
+                .end_transaction_coordinated(
+                    &transactional_id,
+                    producer_id,
+                    producer_epoch,
+                    committed,
+                )
+                .await;
             if result.is_ok() {
                 WireResponse::ok(Vec::new())
             } else {
@@ -3621,9 +3690,13 @@ mod cluster_metadata_durability_tests {
             num_partitions: 1,
             replication_factor: 1,
         };
-        let frame = broker_record(0, record.encode());
+        let next = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap()
+            .latest_offset();
+        let frame = broker_record(next, record.encode());
         let epoch = engine.replication().get_epoch();
-        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 1, &[frame]);
+        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, next + 1, &[frame]);
 
         assert_eq!(
             serve_push(&engine, &packet),
@@ -4156,5 +4229,67 @@ mod zero_copy_fetch_tests {
                 .await
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod transactional_metadata_commit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn producer_epoch_is_invisible_until_commit_watermark_arrives() {
+        let path = std::env::temp_dir().join(format!(
+            "tx_commit_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = StorageEngine::new(crate::config::EngineConfig {
+            data_dir: path.clone(),
+            role: crate::replication::NodeRole::Follower,
+            preallocate_segments: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
+            transactional_id: "t".into(),
+            producer_id: 7,
+            producer_epoch: 2,
+        };
+        let batch = crate::protocol::RecordBatch::create(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            crate::protocol::BatchCompression::None,
+            &[(0, None, Some(bytes::Bytes::from(record.encode())))],
+        );
+        let entry = crate::replication::EncodedEntry::from_batch(&batch);
+        for hw in [0, 1] {
+            let frame = crate::replication::encode_replication_push(
+                &engine.config().cluster_id,
+                "__cluster_metadata",
+                0,
+                0,
+                hw,
+                if hw == 0 {
+                    std::slice::from_ref(&entry)
+                } else {
+                    &[]
+                },
+            );
+            let frame = crate::replication::envelope::decode_frame(&frame).unwrap();
+            handle_inter_node_frame(&engine, &frame).unwrap();
+            assert_eq!(
+                engine.transactions().has_transactional_producer("t"),
+                hw == 1
+            );
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(path);
     }
 }

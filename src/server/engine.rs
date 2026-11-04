@@ -1,3 +1,4 @@
+mod distributed_transactions;
 use crate::config::EngineConfig;
 use crate::consumer_group::ConsumerGroupManager;
 use crate::protocol::RecordBatch;
@@ -281,6 +282,11 @@ pub struct StorageEngine {
     topic_registry: Arc<TopicRegistry>,
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
+    transaction_gate: Arc<tokio::sync::Mutex<()>>,
+    transaction_uncertain: Arc<std::sync::atomic::AtomicBool>,
+    transaction_revisions: Arc<DashMap<String, u64>>,
+    transaction_partition_gate: Arc<tokio::sync::Mutex<()>>,
+    metadata_apply_gate: Arc<parking_lot::Mutex<()>>,
     share_groups: crate::server::share::ShareGroupManager,
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
@@ -370,6 +376,11 @@ impl StorageEngine {
             topic_registry: Arc::new(DashMap::new()),
             consumer_groups,
             transactions,
+            transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
+            transaction_uncertain: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transaction_revisions: Arc::new(DashMap::new()),
+            transaction_partition_gate: Arc::new(tokio::sync::Mutex::new(())),
+            metadata_apply_gate: Arc::new(parking_lot::Mutex::new(())),
             share_groups,
             replication,
             group_coordinator,
@@ -889,7 +900,7 @@ impl StorageEngine {
         let mut start_offset = 0u64;
         if let Some((snapshot_offset, records)) = self.read_metadata_snapshot()? {
             for rec in records {
-                self.apply_metadata_record(snapshot_offset, rec);
+                self.apply_metadata_record(snapshot_offset.saturating_sub(1), rec)?;
             }
             start_offset = snapshot_offset;
             tracing::info!(
@@ -912,7 +923,7 @@ impl StorageEngine {
                     }
                     let payload = frame.value.clone().unwrap_or_default();
                     if let Ok(rec) = crate::replication::MetadataRecord::decode(&payload) {
-                        self.apply_metadata_record(frame.offset, rec);
+                        self.apply_metadata_record(frame.offset, rec)?;
                     }
                     offset = frame.offset + 1;
                 }
@@ -1015,6 +1026,20 @@ impl StorageEngine {
             });
         }
 
+        for state in self.transactions.all_states() {
+            if let Some(revision) = self.transaction_revisions.get(&state.transaction_id) {
+                records.push(MetadataRecord::TransactionState {
+                    revision: *revision,
+                    created_at_ms: state.created_at_ms,
+                    state: encode_tx_state_record(
+                        state.status,
+                        state.producer_id,
+                        &state.transaction_id,
+                        &state.partitions,
+                    ),
+                });
+            }
+        }
         records
     }
 
@@ -1022,7 +1047,6 @@ impl StorageEngine {
     fn write_metadata_snapshot(&self, snapshot_offset: u64) -> IoResult<()> {
         let records = self.build_metadata_snapshot_records();
         let path = self.metadata_snapshot_path();
-        let tmp_path = path.with_extension("snapshot.tmp");
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&snapshot_offset.to_be_bytes());
@@ -1033,11 +1057,7 @@ impl StorageEngine {
             buf.extend_from_slice(&encoded);
         }
 
-        std::fs::write(&tmp_path, &buf)?;
-        // Rename is atomic on the same filesystem, so a crash mid-write never leaves a
-        // half-written snapshot in place of a good one.
-        std::fs::rename(&tmp_path, &path)?;
-        Ok(())
+        crate::durable::replace(&path, &buf)
     }
 
     fn read_metadata_snapshot(
@@ -1049,26 +1069,30 @@ impl StorageEngine {
         }
         let buf = std::fs::read(&path)?;
         if buf.len() < 12 {
-            return Ok(None);
+            return Err(std::io::Error::other("Truncated metadata snapshot"));
         }
         let snapshot_offset = u64::from_be_bytes(buf[0..8].try_into().unwrap());
         let record_count = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
 
         let mut cursor = &buf[12..];
+        if record_count > buf.len() / 4 {
+            return Err(std::io::Error::other("Invalid snapshot record count"));
+        }
         let mut records = Vec::with_capacity(record_count);
         for _ in 0..record_count {
             if cursor.len() < 4 {
-                break;
+                return Err(std::io::Error::other("Truncated snapshot record"));
             }
             let len = u32::from_be_bytes(cursor[0..4].try_into().unwrap()) as usize;
             cursor = &cursor[4..];
             if cursor.len() < len {
-                break;
+                return Err(std::io::Error::other("Truncated snapshot record"));
             }
-            if let Ok(rec) = crate::replication::MetadataRecord::decode(&cursor[..len]) {
-                records.push(rec);
-            }
+            records.push(crate::replication::MetadataRecord::decode(&cursor[..len])?);
             cursor = &cursor[len..];
+        }
+        if !cursor.is_empty() {
+            return Err(std::io::Error::other("Trailing snapshot data"));
         }
         Ok(Some((snapshot_offset, records)))
     }
@@ -1088,11 +1112,13 @@ impl StorageEngine {
     /// what a freshly-replaying node would ever learn about that topic.
     pub(crate) fn snapshot_metadata_if_needed(&self) {
         const MIN_NEW_RECORDS_FOR_SNAPSHOT: u64 = 500;
-
+        let _snapshot_guard = self.metadata_apply_gate.lock();
         let Ok(pm) = self.get_or_create_partition("__cluster_metadata", 0) else {
             return;
         };
-        let leo = pm.latest_offset();
+        let leo = pm
+            .high_watermark()
+            .min(self.replication.local_metadata_log_index());
 
         let last_snapshot_offset = match self.read_metadata_snapshot() {
             Ok(Some((offset, _))) => offset,
@@ -1143,13 +1169,47 @@ impl StorageEngine {
     /// `offset` is this record's position in the `__cluster_metadata` log; it is tracked
     /// as this node's "last log index" so that if it ever contests a leader election, its
     /// VoteRequest reflects how up to date its metadata log actually is (Raft §5.4.1).
+    pub(crate) fn apply_committed_metadata(&self) -> IoResult<()> {
+        let _gate = self.metadata_apply_gate.lock();
+        let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+        let mut offset = self.replication.local_metadata_log_index();
+        let committed = pm.high_watermark();
+        while offset < committed {
+            let frames = pm.fetch(offset, 1024 * 1024)?;
+            if frames.is_empty() {
+                break;
+            }
+            for frame in frames {
+                if frame.offset >= committed {
+                    return Ok(());
+                }
+                let record =
+                    crate::replication::MetadataRecord::decode(&frame.value.unwrap_or_default())?;
+                self.apply_metadata_record(frame.offset, record)?;
+                if self.replication.local_metadata_log_index() < frame.offset + 1 {
+                    return Err(std::io::Error::other("metadata application failed"));
+                }
+                offset = frame.offset + 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_metadata_record(
         &self,
         offset: u64,
         rec: crate::replication::MetadataRecord,
-    ) {
-        self.replication.set_local_metadata_log_index(offset + 1);
+    ) -> IoResult<()> {
+        if let crate::replication::MetadataRecord::TransactionState {
+            revision,
+            created_at_ms,
+            state,
+        } = &rec
+        {
+            self.install_replicated_transaction(*revision, *created_at_ms, state)?;
+        }
         match rec {
+            crate::replication::MetadataRecord::TransactionState { .. } => {}
             crate::replication::MetadataRecord::TopicPartition {
                 topic, partition, ..
             } => {
@@ -1301,6 +1361,8 @@ impl StorageEngine {
                 self.apply_topic_config_change(&topic, configs);
             }
         }
+        self.replication.set_local_metadata_log_index(offset + 1);
+        Ok(())
     }
 
     /// Returns every currently-open `PartitionManager` for `topic`, via the
@@ -1658,6 +1720,12 @@ impl StorageEngine {
         &self,
         record: crate::replication::MetadataRecord,
     ) -> IoResult<u64> {
+        let controller_proposal = matches!(
+            &record,
+            crate::replication::MetadataRecord::TransactionState { .. }
+                | crate::replication::MetadataRecord::TransactionalProducerRegistration { .. }
+        );
+        let proposal_term = self.replication.get_epoch();
         let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
         let frame = meta_pm
             .produce_frame_eos(bytes::Bytes::from(record.encode()), 0, 0, 0)?
@@ -1732,6 +1800,13 @@ impl StorageEngine {
             // `__cluster_metadata` has no pull fetcher at all (it is deliberately excluded,
             // to avoid applying records through two paths at once), so this broadcast is
             // the only thing that ever advances a follower's metadata watermark.
+            if controller_proposal
+                && (!self.is_leader() || self.replication.get_epoch() != proposal_term)
+            {
+                return Err(std::io::Error::other(
+                    "Controller term changed during proposal",
+                ));
+            }
             meta_pm.advance_committed_hw(frame.base_offset + 1)?;
             let repl = self.replication.clone();
             let committed_hw = meta_pm.high_watermark();
@@ -1755,8 +1830,18 @@ impl StorageEngine {
         // On a failed commit the record stays in the local log but is deliberately NOT
         // applied and the caller gets an error, so the leader never serves state the
         // cluster has not agreed on.
+        if controller_proposal
+            && (!self.is_leader() || self.replication.get_epoch() != proposal_term)
+        {
+            return Err(std::io::Error::other(
+                "Controller term changed during proposal",
+            ));
+        }
         meta_pm.advance_committed_hw(frame.base_offset + 1)?;
-        self.apply_metadata_record(frame.base_offset, record);
+        self.apply_committed_metadata()?;
+        if self.replication.local_metadata_log_index() < frame.base_offset + 1 {
+            return Err(std::io::Error::other("metadata application failed"));
+        }
 
         Ok(frame.base_offset)
     }
@@ -2046,7 +2131,8 @@ impl StorageEngine {
             return Ok(());
         }
 
-        if let Ok(pm) = self.get_or_create_partition("__transaction_state", 0) {
+        {
+            let pm = self.get_or_create_partition("__transaction_state", 0)?;
             let mut offset = 0u64;
             let mut latest_states: std::collections::HashMap<
                 String,
@@ -2058,10 +2144,13 @@ impl StorageEngine {
             > = std::collections::HashMap::new();
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
-                if frames.is_empty() {
+                if frames.is_empty() || offset >= pm.high_watermark() {
                     break;
                 }
                 for frame in &frames {
+                    if frame.offset >= pm.high_watermark() {
+                        break;
+                    }
                     if let Some((status, producer_id, tx_id, partitions)) =
                         decode_tx_state_record(&frame.value.clone().unwrap_or_default())
                     {
@@ -2071,6 +2160,9 @@ impl StorageEngine {
                 }
             }
             for (tx_id, (status, producer_id, partitions)) in latest_states {
+                if self.transaction_revisions.contains_key(&tx_id) {
+                    continue;
+                }
                 if matches!(
                     status,
                     crate::server::transaction::TxStatus::Ongoing
@@ -2116,7 +2208,12 @@ impl StorageEngine {
                 tx_id,
                 self.config.transaction_timeout_ms
             );
-            if let Err(e) = self.abort_transaction(&tx_id) {
+            let result = if self.transactions.get_status(&tx_id) == Some(TxStatus::PrepareCommit) {
+                self.commit_transaction(&tx_id)
+            } else {
+                self.abort_transaction(&tx_id)
+            };
+            if let Err(e) = result {
                 tracing::error!(
                     "TxTimeout: failed to abort expired transaction '{}': {}",
                     tx_id,
@@ -2128,6 +2225,22 @@ impl StorageEngine {
 
     /// Produce a batch of records to a routed partition (PARTIAL-03 async).
     pub async fn produce_batch(&self, params: ProduceBatchParams<'_>) -> IoResult<(u32, u64, u64)> {
+        if params.transaction_id.is_some() && self.distributed_transactions() {
+            return self.produce_transaction_coordinated(params).await;
+        }
+        self.produce_batch_local(params, false, None).await
+    }
+    async fn produce_batch_local(
+        &self,
+        params: ProduceBatchParams<'_>,
+        distributed: bool,
+        forced_partition: Option<u32>,
+    ) -> IoResult<(u32, u64, u64)> {
+        let _tx_guard = if params.transaction_id.is_some() && !distributed {
+            Some(self.transaction_gate.lock().await)
+        } else {
+            None
+        };
         let topic = params.topic;
         let key = params.key;
         let transaction_id = params.transaction_id;
@@ -2182,7 +2295,9 @@ impl StorageEngine {
             ));
         }
 
-        let partition_id = if !key.is_empty() && num_partitions > 0 {
+        let partition_id = if let Some(partition) = forced_partition {
+            partition
+        } else if !key.is_empty() && num_partitions > 0 {
             hash_key(key.as_bytes(), num_partitions as usize)
         } else {
             0
@@ -2218,6 +2333,22 @@ impl StorageEngine {
                     ),
                 ));
             }
+        }
+
+        if let Some(tx_id) = transaction_id.filter(|_| !distributed) {
+            let state = self
+                .transactions
+                .state(tx_id)
+                .ok_or_else(|| std::io::Error::other("Transaction not found"))?;
+            if state.status != TxStatus::Ongoing
+                || (batch.producer_id != 0 && state.producer_id != batch.producer_id)
+            {
+                return Err(std::io::Error::other(
+                    "Transaction is not active or producer mismatch",
+                ));
+            }
+            self.register_tx_partition_inner(tx_id, topic, partition_id, pm.latest_offset())
+                .map_err(std::io::Error::other)?;
         }
 
         // The actual disk work (segment append per record, plus the batch's group-commit
@@ -2257,8 +2388,9 @@ impl StorageEngine {
             .await
             .map_err(|e| std::io::Error::other(format!("produce_batch join error: {}", e)))??;
 
-        if let Some(tx_id) = transaction_id {
-            self.register_tx_partition(tx_id, topic, partition_id, first_offset);
+        if let Some(tx_id) = transaction_id.filter(|_| !distributed) {
+            self.register_tx_partition_inner(tx_id, topic, partition_id, first_offset)
+                .map_err(std::io::Error::other)?;
         }
 
         // Replication is gated on *partition* leadership, not cluster (Raft) leadership —
@@ -2303,6 +2435,11 @@ impl StorageEngine {
         // Nothing needs to be told about this commit point separately: every pull fetch
         // response already carries `leader_watermark`, so followers pick up the newly
         // committed high watermark on their own next fetch.
+        if distributed {
+            pm.flush_durable()?;
+            self.await_transaction_replication(&pm, topic, partition_id, last_offset)
+                .await?;
+        }
         pm.advance_committed_hw(last_offset + 1)?;
 
         Ok((partition_id, first_offset, last_offset))
@@ -2629,90 +2766,152 @@ impl StorageEngine {
             .fetch_offset_with_metadata(group_id, topic, partition)
     }
 
-    pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
-        let result = self
-            .transactions
-            .begin_transaction(transaction_id, producer_id);
-        if result.is_ok() {
-            let parts = self.transactions.get_partitions(transaction_id);
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-                let _ = tx_pm.produce(&record);
-            }
-        }
-        result
+    fn persist_transaction(
+        &self,
+        state: &crate::server::transaction::TransactionState,
+    ) -> Result<(), String> {
+        let pm = self
+            .get_or_create_partition("__transaction_state", 0)
+            .map_err(|e| e.to_string())?;
+        let record = encode_tx_state_record(
+            state.status,
+            state.producer_id,
+            &state.transaction_id,
+            &state.partitions,
+        );
+        pm.produce(&record).map_err(|e| e.to_string())?;
+        pm.flush_durable().map_err(|e| e.to_string())
     }
-
+    pub fn begin_transaction(&self, id: &str, pid: u64) -> Result<(), String> {
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
+        }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.transactions
+            .begin_transaction_durable(id, pid, |s| self.persist_transaction(s))
+    }
     pub fn add_partitions_to_txn(
         &self,
-        transaction_id: &str,
-        producer_id: u64,
-        producer_epoch: i16,
+        id: &str,
+        pid: u64,
+        epoch: i16,
         topics: &[(String, Vec<u32>)],
     ) -> Result<(), String> {
-        if self.transactions.has_transactional_producer(transaction_id) {
-            self.transactions.validate_transactional_producer(
-                transaction_id,
-                producer_id,
-                producer_epoch,
-            )?;
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
         }
-        let result = self.transactions.add_partitions_to_txn(
-            transaction_id,
-            producer_id,
-            producer_epoch,
-            topics,
-        );
-        if result.is_ok() {
-            let parts = self.transactions.get_partitions(transaction_id);
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-                let _ = tx_pm.produce(&record);
-            }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        if self.transactions.has_transactional_producer(id) {
+            self.transactions
+                .validate_transactional_producer(id, pid, epoch)?;
         }
-        result
+        for (topic, _) in topics {
+            validate_client_topic_name(topic).map_err(|e| e.to_string())?;
+        }
+        self.transactions
+            .add_partitions_durable(id, pid, epoch, topics, |s| self.persist_transaction(s))
     }
-
-    pub fn init_producer_id(&self, transactional_id: &str) -> Result<(u64, i16), String> {
-        if transactional_id.is_empty() {
-            return Ok((self.transactions.generate_producer_id(), 0));
+    /// Synchronous embedded API is restricted to a sole controller; network callers use the quorum API.
+    pub fn init_producer_id(&self, id: &str) -> Result<(u64, i16), String> {
+        if !self.is_leader() || !self.config.peer_addrs.is_empty() {
+            return Err("Use the async controller-coordinated InitProducerId API".into());
         }
-        if self.transactions.is_ongoing(transactional_id) {
-            self.abort_transaction(transactional_id)?;
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        if self.distributed_transactions() {
+            return Err("Use the async coordinator API".into());
         }
-        let (producer_id, producer_epoch) = self
-            .transactions
-            .init_transactional_producer(transactional_id)?;
-        let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
-            transactional_id: transactional_id.to_string(),
-            producer_id,
-            producer_epoch,
+        self.finish_previous_transaction(id)?;
+        let (pid, epoch) = if id.is_empty() {
+            (self.transactions.generate_producer_id(), 0)
+        } else {
+            self.transactions.next_transactional_producer(id)?
         };
-        let meta_pm = self
+        let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
+            transactional_id: id.into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+        };
+        let pm = self
             .get_or_create_partition("__cluster_metadata", 0)
-            .map_err(|e| format!("Failed to open metadata partition: {}", e))?;
-        meta_pm
-            .produce(&record.encode())
-            .map_err(|e| format!("Failed to persist transactional producer state: {}", e))?;
-        Ok((producer_id, producer_epoch))
+            .map_err(|e| e.to_string())?;
+        pm.produce(&record.encode()).map_err(|e| e.to_string())?;
+        pm.flush_durable().map_err(|e| e.to_string())?;
+        self.transactions
+            .restore_transactional_producer(id, pid, epoch);
+        Ok((pid, epoch))
+    }
+    fn finish_previous_transaction(&self, id: &str) -> Result<(), String> {
+        match self.transactions.get_status(id) {
+            Some(TxStatus::PrepareCommit) => self.commit_transaction_inner(id),
+            Some(TxStatus::Ongoing | TxStatus::PrepareAbort) => self.abort_transaction_inner(id),
+            _ => Ok(()),
+        }
+    }
+    pub async fn init_producer_id_coordinated(&self, id: &str) -> Result<(u64, i16), String> {
+        let _gate = self.transaction_gate.lock().await;
+        if !self.is_leader() {
+            return Err("NOT_CONTROLLER".into());
+        }
+        self.require_transaction_controller()
+            .await
+            .map_err(|e| e.to_string())?;
+        if self.distributed_transactions() {
+            if let Some(status) = self.transactions.get_status(id) {
+                if !matches!(status, TxStatus::Committed | TxStatus::Aborted) {
+                    self.finish_transaction_locked(id, status == TxStatus::PrepareCommit)
+                        .await?;
+                }
+            }
+        } else {
+            self.finish_previous_transaction(id)?;
+        }
+        let (pid, epoch) = if id.is_empty() {
+            (self.transactions.generate_producer_id(), 0)
+        } else {
+            self.transactions.next_transactional_producer(id)?
+        };
+        let result = self
+            .propose_metadata(
+                crate::replication::MetadataRecord::TransactionalProducerRegistration {
+                    transactional_id: id.into(),
+                    producer_id: pid,
+                    producer_epoch: epoch,
+                },
+            )
+            .await;
+        if result.is_err() {
+            self.transaction_uncertain
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result.map_err(|e| e.to_string())?;
+        Ok((pid, epoch))
     }
 
     pub fn commit_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        // Step 1: Transition memory state to PrepareCommit
-        let (producer_id, partitions) = self.transactions.prepare_commit(transaction_id)?;
-
-        // Step 2: Write PrepareCommit record to __transaction_state
-        let prep_record = encode_tx_state_record(
-            TxStatus::PrepareCommit,
-            producer_id,
-            transaction_id,
-            &partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&prep_record);
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
         }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.commit_transaction_inner(transaction_id)
+    }
+    fn commit_transaction_inner(&self, transaction_id: &str) -> Result<(), String> {
+        let (producer_id, partitions) = self.transactions.prepare_durable(
+            transaction_id,
+            TxStatus::PrepareCommit,
+            |state| self.persist_transaction(state),
+        )?;
 
         // Step 3: Write CTRL_COMMIT control markers to all involved data partitions,
         // recording where each partition's transactional range ends — the same bookkeeping
@@ -2739,6 +2938,7 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
+            pm.flush_durable().map_err(|e| e.to_string())?;
             end_offsets.push((topic.clone(), *partition, marker_frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Commit marker written to '{}' partition {}",
@@ -2783,7 +2983,7 @@ impl StorageEngine {
                 transaction_id, e
             )
         })?;
-        tx_pm.flush().map_err(|e| {
+        tx_pm.flush_durable().map_err(|e| {
             format!(
                 "Failed to flush commit of '{}' to __transaction_state: {}",
                 transaction_id, e
@@ -2801,19 +3001,21 @@ impl StorageEngine {
     }
 
     pub fn abort_transaction(&self, transaction_id: &str) -> Result<(), String> {
-        // Step 1: Transition memory state to PrepareAbort
-        let (producer_id, partitions) = self.transactions.prepare_abort(transaction_id)?;
-
-        // Step 2: Write PrepareAbort record to __transaction_state
-        let prep_record = encode_tx_state_record(
-            TxStatus::PrepareAbort,
-            producer_id,
-            transaction_id,
-            &partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&prep_record);
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
         }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.abort_transaction_inner(transaction_id)
+    }
+    fn abort_transaction_inner(&self, transaction_id: &str) -> Result<(), String> {
+        let (producer_id, partitions) =
+            self.transactions
+                .prepare_durable(transaction_id, TxStatus::PrepareAbort, |state| {
+                    self.persist_transaction(state)
+                })?;
 
         // Step 3: Write CTRL_ABORT control markers to all involved data partitions
         let mut end_offsets = Vec::new();
@@ -2838,7 +3040,9 @@ impl StorageEngine {
                         topic, partition, e
                     )
                 })?;
-            let _ = pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset);
+            pm.flush_durable().map_err(|e| e.to_string())?;
+            pm.append_aborted_txn(producer_id, *first_offset, frame.base_offset)
+                .map_err(|e| e.to_string())?;
             end_offsets.push((topic.clone(), *partition, frame.base_offset));
             tracing::info!(
                 "EOS 2PC: Abort marker written to '{}' partition {}",
@@ -2847,19 +3051,30 @@ impl StorageEngine {
             );
         }
 
-        // Step 4: Transition memory state to Aborted & write CompleteAbort to __transaction_state
+        let updated_partitions = partitions
+            .iter()
+            .map(|(topic, part, start, end)| {
+                (
+                    topic.clone(),
+                    *part,
+                    *start,
+                    end_offsets
+                        .iter()
+                        .find(|(t, p, _)| t == topic && p == part)
+                        .map(|(_, _, o)| *o)
+                        .unwrap_or(*end),
+                )
+            })
+            .collect();
+        self.persist_transaction(&crate::server::transaction::TransactionState {
+            transaction_id: transaction_id.into(),
+            producer_id,
+            status: TxStatus::Aborted,
+            partitions: updated_partitions,
+            created_at_ms: 0,
+        })?;
         self.transactions
             .complete_abort(transaction_id, &end_offsets)?;
-        let updated_partitions = self.transactions.get_partitions(transaction_id);
-        let abort_record = encode_tx_state_record(
-            TxStatus::Aborted,
-            producer_id,
-            transaction_id,
-            &updated_partitions,
-        );
-        if let Ok(tx_pm) = self.get_or_create_partition("__transaction_state", 0) {
-            let _ = tx_pm.produce(&abort_record);
-        }
 
         // Step 5: Clean up memory
         self.transactions
@@ -2869,36 +3084,30 @@ impl StorageEngine {
 
     pub fn register_tx_partition(
         &self,
-        transaction_id: &str,
+        id: &str,
         topic: &str,
-        partition: u32,
-        start_offset: u64,
-    ) {
-        if let Some((producer_id, parts)) =
-            self.transactions
-                .register_partition(transaction_id, topic, partition, start_offset)
-        {
-            let record =
-                encode_tx_state_record(TxStatus::Ongoing, producer_id, transaction_id, &parts);
-            match self.get_or_create_partition("__transaction_state", 0) {
-                Ok(tx_pm) => {
-                    if let Err(err) = tx_pm.produce(&record) {
-                        tracing::error!(
-                            "Failed to persist transaction partition registration for '{}': {}",
-                            transaction_id,
-                            err
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(
-                        "Failed to open __transaction_state for '{}': {}",
-                        transaction_id,
-                        err
-                    );
-                }
-            }
+        part: u32,
+        start: u64,
+    ) -> Result<(), String> {
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
         }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
+        self.register_tx_partition_inner(id, topic, part, start)
+    }
+    fn register_tx_partition_inner(
+        &self,
+        id: &str,
+        topic: &str,
+        part: u32,
+        start: u64,
+    ) -> Result<(), String> {
+        self.transactions
+            .register_partition_durable(id, topic, part, start, |s| self.persist_transaction(s))
+            .map(|_| ())
     }
 
     pub fn end_transaction(
@@ -2908,15 +3117,22 @@ impl StorageEngine {
         producer_epoch: i16,
         committed: bool,
     ) -> Result<(), String> {
+        if self.distributed_transactions() {
+            return Err("Use async transaction coordinator API in a cluster".into());
+        }
+        let _gate = self
+            .transaction_gate
+            .try_lock()
+            .map_err(|_| "Transaction operation in progress; retry")?;
         self.transactions.validate_transactional_producer(
             transactional_id,
             producer_id,
             producer_epoch,
         )?;
         if committed {
-            self.commit_transaction(transactional_id)
+            self.commit_transaction_inner(transactional_id)
         } else {
-            self.abort_transaction(transactional_id)
+            self.abort_transaction_inner(transactional_id)
         }
     }
 
@@ -4473,5 +4689,114 @@ mod discovery_warn_tests {
             .undiscovered_peers_warned
             .load(std::sync::atomic::Ordering::SeqCst));
         assert!(engine.undiscovered_peers_since.lock().is_none());
+    }
+}
+
+#[cfg(test)]
+mod transaction_snapshot_tests {
+    use super::*;
+    #[tokio::test]
+    async fn snapshots_preserve_decisions_revisions_lso_and_abort_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "tx_snapshot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = EngineConfig {
+            data_dir: dir.clone(),
+            preallocate_segments: false,
+            ..Default::default()
+        };
+        let engine = StorageEngine::new(config.clone()).unwrap();
+        engine
+            .get_or_create_partition("orders", 0)
+            .unwrap()
+            .produce(b"data")
+            .unwrap();
+        for (id, status, start, end, revision) in [
+            ("prepared", TxStatus::PrepareCommit, 3, u64::MAX, 10),
+            ("aborted", TxStatus::Aborted, 0, 1, 11),
+        ] {
+            engine
+                .propose_metadata(crate::replication::MetadataRecord::TransactionState {
+                    revision,
+                    created_at_ms: 123,
+                    state: encode_tx_state_record(
+                        status,
+                        7,
+                        id,
+                        &[("orders".into(), 0, start, end)],
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let offset = engine
+            .get_partition("__cluster_metadata", 0)
+            .unwrap()
+            .high_watermark();
+        engine.write_metadata_snapshot(offset).unwrap();
+        drop(engine);
+        let reopened = StorageEngine::new(config).unwrap();
+        assert_eq!(
+            reopened.transactions.get_status("prepared"),
+            Some(TxStatus::PrepareCommit)
+        );
+        assert_eq!(*reopened.transaction_revisions.get("prepared").unwrap(), 10);
+        assert_eq!(reopened.transactions.last_stable_offset("orders", 0), 3);
+        assert!(reopened
+            .read_committed_filter(
+                "orders",
+                0,
+                crate::protocol::wire::IsolationLevel::ReadCommitted
+            )
+            .1
+            .contains(&(0, 1)));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod transaction_metadata_wait_tests {
+    use super::*;
+    #[tokio::test]
+    async fn transaction_coordinator_waits_for_an_inflight_metadata_commit() {
+        let dir = std::env::temp_dir().join(format!("tx_metadata_wait_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = StorageEngine::new(EngineConfig {
+            data_dir: dir.clone(),
+            preallocate_segments: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let pm = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap();
+        let record = crate::replication::MetadataRecord::BrokerRegister {
+            node_id: 9,
+            bind_addr: "127.0.0.1:19009".into(),
+            roles: vec![1, 2],
+        };
+        let batch = pm
+            .produce_frame_eos(bytes::Bytes::from(record.encode()), 0, 0, 0)
+            .unwrap()
+            .unwrap();
+        let end = batch.base_offset + 1;
+        let completing = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            pm.advance_committed_hw(end).unwrap();
+        });
+        engine.require_transaction_controller().await.unwrap();
+        completing.await.unwrap();
+        assert_eq!(
+            engine.get_broker_address(9).as_deref(),
+            Some("127.0.0.1:19009")
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

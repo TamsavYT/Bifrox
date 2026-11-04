@@ -1,3 +1,4 @@
+static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use bifrox::{config::SecurityProtocol, EngineConfig, Server, StorageEngine, TestClient};
 struct Broker {
     path: std::path::PathBuf,
@@ -8,12 +9,13 @@ struct Broker {
 impl Broker {
     async fn start(protocol: SecurityProtocol, acls: bool) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "bifrox_auth_{}_{}",
+            "bifrox_auth_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let engine = StorageEngine::new(EngineConfig {
             data_dir: path.clone(),

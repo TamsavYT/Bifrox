@@ -52,4 +52,20 @@ jobs:
       run: cargo build --verbose
 
     - name: Run Integration & Unit Tests
-      run: cargo test --verbose
+      shell: python {0}
+      run: |
+        import subprocess
+        import sys
+        result = subprocess.run(
+            ["cargo", "test", "--verbose"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        print(result.stdout)
+        if result.returncode:
+            # Keep the failing assertion visible through the Checks API as well as logs.
+            detail = result.stdout[-3500:]
+            detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print("::error title=Rust test failure::" + detail)
+        sys.exit(result.returncode)
+

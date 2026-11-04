@@ -189,6 +189,22 @@ impl TransactionManager {
         self.next_producer_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Computes a candidate registration without publishing an epoch before persistence.
+    /// The coordinator serializes calls until the metadata proposal has committed.
+    pub fn next_transactional_producer(&self, id: &str) -> Result<(u64, i16), String> {
+        if let Some(current) = self.transactional_producers.get(id) {
+            Ok((
+                current.producer_id,
+                current
+                    .producer_epoch
+                    .checked_add(1)
+                    .ok_or("Producer epoch exhausted")?,
+            ))
+        } else {
+            Ok((self.generate_producer_id(), 0))
+        }
+    }
+
     pub fn init_transactional_producer(
         &self,
         transactional_id: &str,
@@ -283,146 +299,201 @@ impl TransactionManager {
             .fetch_max(next_candidate, Ordering::SeqCst);
     }
 
+    pub fn all_states(&self) -> Vec<TransactionState> {
+        self.transactions
+            .iter()
+            .map(|e| e.value().clone())
+            .collect()
+    }
+    pub fn install_state(&self, state: TransactionState) {
+        if matches!(state.status, TxStatus::Committed | TxStatus::Aborted) {
+            self.retire_from_lso_index(&state.transaction_id);
+        } else {
+            for (t, p, start, _) in &state.partitions {
+                if *start != u64::MAX {
+                    self.pin_lso(t, *p, *start, &state.transaction_id);
+                }
+            }
+        }
+        self.transactions
+            .insert(state.transaction_id.clone(), state);
+    }
+    pub fn state(&self, id: &str) -> Option<TransactionState> {
+        self.transactions.get(id).map(|s| s.clone())
+    }
+
+    fn transition(
+        &self,
+        id: &str,
+        change: impl FnOnce(Option<TransactionState>) -> Result<TransactionState, String>,
+        persist: impl FnOnce(&TransactionState) -> Result<(), String>,
+    ) -> Result<TransactionState, String> {
+        use dashmap::mapref::entry::Entry;
+        match self.transactions.entry(id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let next = change(Some(entry.get().clone()))?;
+                persist(&next)?;
+                *entry.get_mut() = next.clone();
+                for (topic, part, start, _) in &next.partitions {
+                    if *start != u64::MAX {
+                        self.pin_lso(topic, *part, *start, id);
+                    }
+                }
+                Ok(next)
+            }
+            Entry::Vacant(entry) => {
+                let next = change(None)?;
+                persist(&next)?;
+                entry.insert(next.clone());
+                for (topic, part, start, _) in &next.partitions {
+                    if *start != u64::MAX {
+                        self.pin_lso(topic, *part, *start, id);
+                    }
+                }
+                Ok(next)
+            }
+        }
+    }
+    fn new_state(id: &str, producer_id: u64) -> TransactionState {
+        TransactionState {
+            transaction_id: id.into(),
+            producer_id,
+            status: TxStatus::Ongoing,
+            partitions: Vec::new(),
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+    pub fn begin_transaction(&self, id: &str, pid: u64) -> Result<(), String> {
+        self.begin_transaction_durable(id, pid, |_| Ok(()))
+    }
+    pub fn begin_transaction_durable(
+        &self,
+        id: &str,
+        pid: u64,
+        persist: impl FnOnce(&TransactionState) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transition(
+            id,
+            |old| {
+                if old.is_some() {
+                    return Err(format!("Transaction ID '{}' already exists", id));
+                }
+                Ok(Self::new_state(id, pid))
+            },
+            persist,
+        )
+        .map(|_| ())
+    }
     pub fn add_partitions_to_txn(
         &self,
-        transaction_id: &str,
-        producer_id: u64,
-        _producer_epoch: i16, // Ignore epoch for now
+        id: &str,
+        pid: u64,
+        epoch: i16,
         topics: &[(String, Vec<u32>)],
     ) -> Result<(), String> {
-        // Implicitly begin transaction if it doesn't exist
-        if !self.transactions.contains_key(transaction_id) {
-            self.begin_transaction(transaction_id, producer_id)?;
-        }
-
-        let mut state = self
-            .transactions
-            .get_mut(transaction_id)
-            .ok_or_else(|| format!("Transaction '{}' not found", transaction_id))?;
-
-        if state.producer_id != producer_id {
-            return Err("Producer ID mismatch".to_string());
-        }
-
-        for (topic, parts) in topics {
-            for part in parts {
-                let already = state
-                    .partitions
-                    .iter()
-                    .any(|(t, p, _, _)| t == topic && p == part);
-                if !already {
-                    state
-                        .partitions
-                        .push((topic.clone(), *part, u64::MAX, u64::MAX));
+        self.add_partitions_durable(id, pid, epoch, topics, |_| Ok(()))
+    }
+    pub fn add_partitions_durable(
+        &self,
+        id: &str,
+        pid: u64,
+        _epoch: i16,
+        topics: &[(String, Vec<u32>)],
+        persist: impl FnOnce(&TransactionState) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.transition(
+            id,
+            |old| {
+                let mut next = old.unwrap_or_else(|| Self::new_state(id, pid));
+                if next.producer_id != pid || next.status != TxStatus::Ongoing {
+                    return Err("Transaction is not ongoing or producer is fenced".into());
                 }
-            }
-        }
-        Ok(())
+                for (topic, parts) in topics {
+                    for part in parts {
+                        if !next
+                            .partitions
+                            .iter()
+                            .any(|(t, p, _, _)| t == topic && p == part)
+                        {
+                            next.partitions
+                                .push((topic.clone(), *part, u64::MAX, u64::MAX));
+                        }
+                    }
+                }
+                Ok(next)
+            },
+            persist,
+        )
+        .map(|_| ())
     }
-
-    /// Begins a new transaction (RACE-04 atomic entry).
-    pub fn begin_transaction(&self, transaction_id: &str, producer_id: u64) -> Result<(), String> {
-        use dashmap::mapref::entry::Entry;
-        match self.transactions.entry(transaction_id.to_string()) {
-            Entry::Occupied(_) => Err(format!(
-                "Transaction ID '{}' already exists",
-                transaction_id
-            )),
-            Entry::Vacant(e) => {
-                let created_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                e.insert(TransactionState {
-                    transaction_id: transaction_id.to_string(),
-                    producer_id,
-                    status: TxStatus::Ongoing,
-                    partitions: Vec::new(),
-                    created_at_ms,
-                });
-                Ok(())
-            }
-        }
-    }
-
-    /// Records that a produce touched (topic, partition) with the given start_offset for this tx.
     pub fn register_partition(
         &self,
-        transaction_id: &str,
+        id: &str,
         topic: &str,
-        partition: u32,
-        start_offset: u64,
+        part: u32,
+        start: u64,
     ) -> Option<(u64, PartitionRangeList)> {
-        if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            let mut found = false;
-            // Whether this call is what established the partition's first offset — only
-            // then does a new LSO pin need recording (a later produce in the same
-            // transaction doesn't move the transaction's start).
-            let mut newly_pinned: Option<u64> = None;
-            for (t, p, ref mut so, _) in &mut state.partitions {
-                if t == topic && *p == partition {
-                    if *so == u64::MAX {
-                        *so = start_offset;
-                        newly_pinned = Some(start_offset);
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                state
-                    .partitions
-                    .push((topic.to_string(), partition, start_offset, u64::MAX));
-                newly_pinned = Some(start_offset);
-            }
-            let result = Some((state.producer_id, state.partitions.clone()));
-            let is_in_flight = matches!(
-                state.status,
-                TxStatus::Ongoing | TxStatus::PrepareCommit | TxStatus::PrepareAbort
-            );
-            drop(state);
-
-            if is_in_flight {
-                if let Some(first_offset) = newly_pinned {
-                    self.pin_lso(topic, partition, first_offset, transaction_id);
-                }
-            }
-            result
-        } else {
-            None
-        }
+        self.register_partition_durable(id, topic, part, start, |_| Ok(()))
+            .ok()
+            .map(|s| (s.producer_id, s.partitions))
     }
-
-    /// Phase 1 2PC: Transitions transaction to PrepareCommit
-    pub fn prepare_commit(
+    pub fn register_partition_durable(
         &self,
-        transaction_id: &str,
-    ) -> Result<(u64, PartitionRangeList), String> {
-        if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            if state.status != TxStatus::Ongoing {
-                return Err(format!("Transaction '{}' is not active", transaction_id));
-            }
-            state.status = TxStatus::PrepareCommit;
-            Ok((state.producer_id, state.partitions.clone()))
-        } else {
-            Err(format!("Transaction '{}' not found", transaction_id))
-        }
+        id: &str,
+        topic: &str,
+        part: u32,
+        start: u64,
+        persist: impl FnOnce(&TransactionState) -> Result<(), String>,
+    ) -> Result<TransactionState, String> {
+        self.transition(
+            id,
+            |old| {
+                let mut next = old.ok_or_else(|| format!("Transaction '{}' not found", id))?;
+                if next.status != TxStatus::Ongoing {
+                    return Err("Transaction is not ongoing".into());
+                }
+                if let Some((_, _, first, _)) = next
+                    .partitions
+                    .iter_mut()
+                    .find(|(t, p, _, _)| t == topic && *p == part)
+                {
+                    *first = (*first).min(start);
+                } else {
+                    next.partitions.push((topic.into(), part, start, u64::MAX));
+                }
+                Ok(next)
+            },
+            persist,
+        )
     }
-
-    /// Phase 1 2PC: Transitions transaction to PrepareAbort
-    pub fn prepare_abort(&self, transaction_id: &str) -> Result<(u64, PartitionRangeList), String> {
-        if let Some(mut state) = self.transactions.get_mut(transaction_id) {
-            if state.status != TxStatus::Ongoing && state.status != TxStatus::PrepareAbort {
-                return Err(format!(
-                    "Transaction '{}' cannot be aborted",
-                    transaction_id
-                ));
-            }
-            state.status = TxStatus::PrepareAbort;
-            Ok((state.producer_id, state.partitions.clone()))
-        } else {
-            Err(format!("Transaction '{}' not found", transaction_id))
-        }
+    pub fn prepare_commit(&self, id: &str) -> Result<(u64, PartitionRangeList), String> {
+        self.prepare_durable(id, TxStatus::PrepareCommit, |_| Ok(()))
+    }
+    pub fn prepare_abort(&self, id: &str) -> Result<(u64, PartitionRangeList), String> {
+        self.prepare_durable(id, TxStatus::PrepareAbort, |_| Ok(()))
+    }
+    pub fn prepare_durable(
+        &self,
+        id: &str,
+        status: TxStatus,
+        persist: impl FnOnce(&TransactionState) -> Result<(), String>,
+    ) -> Result<(u64, PartitionRangeList), String> {
+        self.transition(
+            id,
+            |old| {
+                let mut next = old.ok_or_else(|| format!("Transaction '{}' not found", id))?;
+                if next.status != TxStatus::Ongoing && next.status != status {
+                    return Err("Transaction has a different durable decision".into());
+                }
+                next.status = status;
+                Ok(next)
+            },
+            persist,
+        )
+        .map(|s| (s.producer_id, s.partitions))
     }
 
     /// Phase 2 2PC: Transitions transaction to Committed
@@ -741,21 +812,27 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
     if cursor.len() < tx_len {
         return None;
     }
-    let tx_id = String::from_utf8_lossy(&cursor[..tx_len]).to_string();
+    let tx_id = String::from_utf8(cursor[..tx_len].to_vec()).ok()?;
     cursor = &cursor[tx_len..];
 
     let mut partitions = Vec::new();
-    if cursor.len() >= 4 {
+    if cursor.len() < 4 {
+        return None;
+    }
+    {
         let count = cursor.get_u32() as usize;
+        if count > 100_000 || count > cursor.len() / 22 {
+            return None;
+        }
         for _ in 0..count {
             if cursor.len() < 2 {
-                break;
+                return None;
             }
             let t_len = cursor.get_u16() as usize;
             if cursor.len() < t_len + 4 + 8 + 8 {
-                break;
+                return None;
             }
-            let topic = String::from_utf8_lossy(&cursor[..t_len]).to_string();
+            let topic = String::from_utf8(cursor[..t_len].to_vec()).ok()?;
             cursor = &cursor[t_len..];
             let partition = cursor.get_u32();
             let start = cursor.get_u64();
@@ -764,6 +841,9 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
         }
     }
 
+    if !cursor.is_empty() {
+        return None;
+    }
     let status = match status_byte {
         0x01 => TxStatus::Ongoing,
         0x02 => TxStatus::PrepareCommit,
