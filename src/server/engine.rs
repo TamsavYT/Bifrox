@@ -178,6 +178,17 @@ fn validate_advertised_addr(addr: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn validate_client_topic_name(topic: &str) -> IoResult<()> {
+    validate_topic_name(topic)?;
+    if topic.starts_with("__") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "reserved internal topic",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_topic_name(topic: &str) -> IoResult<()> {
     if topic.is_empty()
         || topic.len() > 249
@@ -733,6 +744,7 @@ impl StorageEngine {
         topic: &str,
         partition: u32,
     ) -> IoResult<Arc<PartitionManager>> {
+        validate_client_topic_name(topic)?;
         if let Some(pm) = self.get_partition(topic, partition) {
             return Ok(pm);
         }
@@ -1430,6 +1442,7 @@ impl StorageEngine {
     /// propose — routes through the same `propose_metadata` gate as every other
     /// controller-plane mutation.
     pub async fn alter_configs(&self, topic: &str, configs: Vec<(String, String)>) -> IoResult<()> {
+        validate_client_topic_name(topic)?;
         if self.topic_registry.get(topic).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1457,6 +1470,7 @@ impl StorageEngine {
         upserts: Vec<(String, String)>,
         deletes: Vec<String>,
     ) -> IoResult<()> {
+        validate_client_topic_name(topic)?;
         let mut merged: std::collections::HashMap<String, String> = self
             .topic_registry
             .get(topic)
@@ -3590,7 +3604,13 @@ impl StorageEngine {
         num_partitions: u32,
         explicit_rf: Option<u16>,
     ) -> IoResult<()> {
-        validate_topic_name(topic)?;
+        validate_client_topic_name(topic)?;
+        if num_partitions == 0 || num_partitions > 10_000 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid partition count",
+            ));
+        }
         if self.deleting_topics.contains(topic) {
             return Err(std::io::Error::other(format!(
                 "Topic {} is currently being deleted",
@@ -4005,6 +4025,7 @@ impl StorageEngine {
     /// reported success to the client anyway. So this verifies the outcome directly after
     /// the record has been applied, and reports a failure the caller can actually see.
     pub async fn delete_topic(&self, topic: &str) -> IoResult<()> {
+        validate_client_topic_name(topic)?;
         let record = crate::replication::MetadataRecord::TopicDeleted {
             topic: topic.to_string(),
         };
