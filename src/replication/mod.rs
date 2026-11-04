@@ -551,6 +551,7 @@ impl ReplicationManager {
                                     let topic_c = topic.clone();
                                     let transport = transport.clone();
                                     let handle = tokio::spawn(async move {
+                                        let mut durable_fetch_offset = 0;
                                         loop {
                                             // Re-resolve the leader every iteration rather
                                             // than trusting the value captured when this
@@ -577,8 +578,22 @@ impl ReplicationManager {
                                             let fetch_offset = match engine_c
                                                 .get_or_create_partition(&topic_c, p_id)
                                             {
-                                                Ok(pm) => pm.latest_offset(),
-                                                Err(_) => 0,
+                                                Ok(pm) => {
+                                                    let end = pm.latest_offset();
+                                                    if end != durable_fetch_offset {
+                                                        if let Err(error) = pm.flush_durable() {
+                                                            tracing::error!("Refusing to acknowledge unsynced replica: {}",error);
+                                                            sleep(Duration::from_millis(20)).await;
+                                                            continue;
+                                                        }
+                                                        durable_fetch_offset = end;
+                                                    }
+                                                    durable_fetch_offset
+                                                }
+                                                Err(_) => {
+                                                    sleep(Duration::from_millis(20)).await;
+                                                    continue;
+                                                }
                                             };
 
                                             let req = ReplicationFetchRequest {

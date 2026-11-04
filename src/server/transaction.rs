@@ -299,6 +299,25 @@ impl TransactionManager {
             .fetch_max(next_candidate, Ordering::SeqCst);
     }
 
+    pub fn all_states(&self) -> Vec<TransactionState> {
+        self.transactions
+            .iter()
+            .map(|e| e.value().clone())
+            .collect()
+    }
+    pub fn install_state(&self, state: TransactionState) {
+        if matches!(state.status, TxStatus::Committed | TxStatus::Aborted) {
+            self.retire_from_lso_index(&state.transaction_id);
+        } else {
+            for (t, p, start, _) in &state.partitions {
+                if *start != u64::MAX {
+                    self.pin_lso(t, *p, *start, &state.transaction_id);
+                }
+            }
+        }
+        self.transactions
+            .insert(state.transaction_id.clone(), state);
+    }
     pub fn state(&self, id: &str) -> Option<TransactionState> {
         self.transactions.get(id).map(|s| s.clone())
     }
@@ -793,21 +812,27 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
     if cursor.len() < tx_len {
         return None;
     }
-    let tx_id = String::from_utf8_lossy(&cursor[..tx_len]).to_string();
+    let tx_id = String::from_utf8(cursor[..tx_len].to_vec()).ok()?;
     cursor = &cursor[tx_len..];
 
     let mut partitions = Vec::new();
-    if cursor.len() >= 4 {
+    if cursor.len() < 4 {
+        return None;
+    }
+    {
         let count = cursor.get_u32() as usize;
+        if count > 100_000 || count > cursor.len() / 22 {
+            return None;
+        }
         for _ in 0..count {
             if cursor.len() < 2 {
-                break;
+                return None;
             }
             let t_len = cursor.get_u16() as usize;
             if cursor.len() < t_len + 4 + 8 + 8 {
-                break;
+                return None;
             }
-            let topic = String::from_utf8_lossy(&cursor[..t_len]).to_string();
+            let topic = String::from_utf8(cursor[..t_len].to_vec()).ok()?;
             cursor = &cursor[t_len..];
             let partition = cursor.get_u32();
             let start = cursor.get_u64();
@@ -816,6 +841,9 @@ pub fn decode_tx_state_record(src: &[u8]) -> Option<DecodedTxStateRecord> {
         }
     }
 
+    if !cursor.is_empty() {
+        return None;
+    }
     let status = match status_byte {
         0x01 => TxStatus::Ongoing,
         0x02 => TxStatus::PrepareCommit,

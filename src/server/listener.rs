@@ -239,7 +239,7 @@ impl Server {
                 // Aborts hanging transactions (including ones restored from
                 // `__transaction_state` at startup that no producer ever resumed) once
                 // they exceed `transaction.timeout.ms` — see `sweep_expired_transactions`.
-                tx_timeout_engine.sweep_expired_transactions();
+                tx_timeout_engine.recover_transactions_coordinated().await;
             }
         });
 

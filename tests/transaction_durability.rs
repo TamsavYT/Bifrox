@@ -143,3 +143,13 @@ async fn producer_registration_requires_controller_and_quorum() {
     assert!(follower.init_producer_id_coordinated("t").await.is_err());
     assert!(!follower.transactions().has_transactional_producer("t"));
 }
+
+#[test]
+fn truncated_transaction_state_collections_are_rejected() {
+    use bifrox::server::transaction::{decode_tx_state_record, encode_tx_state_record};
+    let raw = encode_tx_state_record(TxStatus::Ongoing, 7, "t", &[("topic".into(), 0, 1, 2)]);
+    for end in 0..raw.len() {
+        assert!(decode_tx_state_record(&raw[..end]).is_none());
+    }
+    assert!(decode_tx_state_record(&raw).is_some());
+}

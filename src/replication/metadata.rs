@@ -3,6 +3,11 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataRecord {
+    TransactionState {
+        revision: u64,
+        created_at_ms: u64,
+        state: Vec<u8>,
+    },
     TopicPartition {
         topic: String,
         partition: u32,
@@ -84,6 +89,16 @@ impl MetadataRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
+            MetadataRecord::TransactionState {
+                revision,
+                created_at_ms,
+                state,
+            } => {
+                buf.put_u8(0x0D);
+                buf.put_u64(*revision);
+                buf.put_u64(*created_at_ms);
+                buf.extend_from_slice(state);
+            }
             MetadataRecord::TopicPartition {
                 topic,
                 partition,
@@ -233,6 +248,27 @@ impl MetadataRecord {
         }
         let record_type = src.get_u8();
         match record_type {
+            0x0D => {
+                if src.len() < 16 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "transaction state header",
+                    ));
+                }
+                let revision = src.get_u64();
+                let created_at_ms = src.get_u64();
+                if crate::server::transaction::decode_tx_state_record(src).is_none() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid transaction state",
+                    ));
+                }
+                Ok(Self::TransactionState {
+                    revision,
+                    created_at_ms,
+                    state: src.to_vec(),
+                })
+            }
             0x01 => {
                 let topic = read_pascal_string_io(&mut src)?;
                 if src.len() < 12 {
