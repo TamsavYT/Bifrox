@@ -11,34 +11,41 @@ use tokio::time::sleep;
 pub fn build_tls_acceptor(
     config: &crate::config::EngineConfig,
 ) -> IoResult<tokio_rustls::TlsAcceptor> {
-    let (certs, key) =
-        if let (Some(cert_path), Some(key_path)) = (&config.ssl_cert_path, &config.ssl_key_path) {
-            let cert_file = std::fs::File::open(cert_path)?;
-            let mut cert_reader = std::io::BufReader::new(cert_file);
-            let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if config.ssl_cert_path.is_some() != config.ssl_key_path.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ssl.cert.path and ssl.key.path must be configured together",
+        ));
+    }
+    let (certs, key) = if let (Some(cert_path), Some(key_path)) =
+        (&config.ssl_cert_path, &config.ssl_key_path)
+    {
+        let cert_file = std::fs::File::open(cert_path)?;
+        let mut cert_reader = std::io::BufReader::new(cert_file);
+        let certs = crate::tls_material::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
-            let key_file = std::fs::File::open(key_path)?;
-            let mut key_reader = std::io::BufReader::new(key_file);
-            let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "No private key found in SSL key file",
-                )
-            })?;
-
-            (certs, key)
-        } else {
-            // Auto-generate self-signed TLS cert for testing & zero-config SSL mode
-            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-            let cert = rcgen::generate_simple_self_signed(subject_alt_names)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let cert_der = cert.cert.der().to_vec();
-            let key_der = cert.key_pair.serialize_der();
-            (
-                vec![CertificateDer::from(cert_der)],
-                PrivateKeyDer::Pkcs8(key_der.into()),
+        let key_file = std::fs::File::open(key_path)?;
+        let mut key_reader = std::io::BufReader::new(key_file);
+        let key = crate::tls_material::private_key(&mut key_reader)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No private key found in SSL key file",
             )
-        };
+        })?;
+
+        (certs, key)
+    } else {
+        // Auto-generate self-signed TLS cert for testing & zero-config SSL mode
+        let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        (
+            vec![CertificateDer::from(cert_der)],
+            PrivateKeyDer::Pkcs8(key_der.into()),
+        )
+    };
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -52,7 +59,8 @@ pub fn build_tls_acceptor(
         if let Some(ca_path) = &config.ssl_ca_path {
             let ca_file = std::fs::File::open(ca_path)?;
             let mut ca_reader = std::io::BufReader::new(ca_file);
-            let ca_certs = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+            let ca_certs =
+                crate::tls_material::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
             for c in ca_certs {
                 root_store.add(c).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
