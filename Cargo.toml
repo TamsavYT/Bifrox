@@ -20,7 +20,6 @@ socket2 = "0.5"
 memmap2 = "0.9"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2.1"
 rcgen = "0.13"
 lz4_flex = "0.11"
 zstd = "0.13"

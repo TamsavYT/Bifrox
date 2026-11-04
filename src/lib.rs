@@ -35,3 +35,5 @@ pub use server::{
 };
 pub use share_consumer::{ShareConsumer, ShareConsumerConfig, ShareRecord};
 pub use shutdown::wait_for_shutdown_signal;
+
+mod tls_material;
