@@ -140,6 +140,8 @@ pub struct PartitionManager {
     /// implicitly by an append — so fetch/describe can expose only what's actually
     /// durable across the ISR instead of whatever the leader happens to have on disk.
     committed_hw: AtomicU64,
+    commit_checkpoint: std::path::PathBuf,
+    commit_lock: Mutex<()>,
     /// Bytes appended since the last successful `sync()` — the group-commit signal for
     /// `FlushPolicy::AsyncPeriodic`'s `max_bytes` threshold (previously declared but never
     /// read anywhere, so periodic flush only ever fired on the timer, never eagerly under
@@ -172,11 +174,39 @@ impl PartitionManager {
         let partition_dir = base_data_dir.as_ref().to_path_buf();
 
         let segment_manager = SegmentManager::open(&partition_dir, config.clone())?;
-        // Everything already on disk at startup is treated as committed — consistent
-        // with how recovery elsewhere in this codebase already trusts on-disk state.
         let recovered_offset = segment_manager.high_watermark();
         let log_end_offset = AtomicU64::new(recovered_offset);
-        let committed_hw = AtomicU64::new(recovered_offset);
+        let commit_checkpoint = partition_dir.join("committed.offset");
+        let committed = match std::fs::read(&commit_checkpoint) {
+            Ok(bytes) => {
+                let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid commit checkpoint",
+                    )
+                })?;
+                let value = u64::from_be_bytes(raw);
+                if value > recovered_offset {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "commit checkpoint exceeds recovered log",
+                    ));
+                }
+                value
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No safe way to infer a historical quorum decision from log bytes.
+                if recovered_offset > 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "legacy log lacks committed.offset; restore a verified commit checkpoint before opening"));
+                }
+                0
+            }
+            Err(e) => return Err(e),
+        };
+        if !commit_checkpoint.exists() {
+            crate::durable::replace(&commit_checkpoint, &committed.to_be_bytes())?;
+        }
+        let committed_hw = AtomicU64::new(committed);
         let snapshot_path = partition_dir.join(format!("{}.snapshot", partition));
         let producer_state_manager = ProducerStateManager::open(snapshot_path)?;
 
@@ -186,6 +216,8 @@ impl PartitionManager {
             segment_manager: Mutex::new(segment_manager),
             log_end_offset,
             committed_hw,
+            commit_checkpoint,
+            commit_lock: Mutex::new(()),
             unsynced_bytes: AtomicU64::new(0),
             producer_state_manager: Mutex::new(producer_state_manager),
             leader_id: AtomicU32::new(config.node_id),
@@ -254,14 +286,22 @@ impl PartitionManager {
 
     /// Monotonically advances the committed high watermark to `candidate` (a no-op if
     /// `candidate` isn't past the current value).
-    pub fn advance_committed_hw(&self, candidate: u64) {
-        let previous = self.committed_hw.fetch_max(candidate, Ordering::AcqRel);
-        // Only wake waiting fetches when the watermark actually moved. `fetch_max` returns
-        // the previous value, so a no-op advance (a candidate at or below where we already
-        // are) costs nothing and wakes nobody.
+    pub fn advance_committed_hw(&self, candidate: u64) -> IoResult<()> {
+        let _commit = self.commit_lock.lock();
+        let candidate = candidate.min(self.latest_offset());
+        let previous = self.high_watermark();
+        if candidate <= previous {
+            return Ok(());
+        }
+        // Persist log data before the checkpoint that promises it is committed.
+        self.segment_manager.lock().sync()?;
+        crate::durable::replace(&self.commit_checkpoint, &candidate.to_be_bytes())?;
+        self.committed_hw.store(candidate, Ordering::Release);
+        // Wake readers only after the durable checkpoint and published watermark move.
         if candidate > previous {
             self.hw_notify.notify_waiters();
         }
+        Ok(())
     }
 
     /// Waits for the committed high watermark to exceed `current`, or for `timeout` to
@@ -458,7 +498,7 @@ impl PartitionManager {
     pub fn produce_frame(&self, payload: &[u8]) -> IoResult<RecordBatch> {
         let f = self.produce_frame_eos(Bytes::copy_from_slice(payload), 0, 0, 0)?;
         let frame = f.unwrap();
-        self.advance_committed_hw(frame.base_offset + 1);
+        self.advance_committed_hw(frame.base_offset + 1)?;
         // Single-record callers (this wrapper) sync immediately under a sync-every-write
         // policy, same as before this file split fsync out of `produce_frame_eos`.
         self.flush_if_sync_policy()?;
@@ -672,11 +712,9 @@ impl PartitionManager {
             // manager's own commit/abort flow doesn't currently integrate with.
             self.log_end_offset
                 .store(assigned_offset + 1, Ordering::Release);
-            self.advance_committed_hw(assigned_offset + 1);
-
             frame
         };
-
+        self.advance_committed_hw(frame.base_offset + 1)?;
         Ok(frame)
     }
 
