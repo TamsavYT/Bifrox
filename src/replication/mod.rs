@@ -2,6 +2,7 @@ pub mod consensus;
 pub mod envelope;
 pub mod grpc;
 pub mod metadata;
+pub mod transport;
 
 pub use consensus::{BifroxConsensus, ConsensusState};
 pub use envelope::{
@@ -18,8 +19,8 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration};
+use transport::{PeerStream, PeerTransport};
 
 /// Connection timeout for inter-node TCP replication and heartbeat connections
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -160,9 +161,10 @@ pub struct ReplicationManager {
     /// Used to decide which peers are eligible for data-partition assignment (`Broker`
     /// role) versus the metadata Raft quorum (`Controller` role).
     broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
-    /// Persistent peer TCP connection pool (peer_addr -> Arc<Mutex<Option<TcpStream>>>)
+    /// Persistent peer TCP connection pool (peer_addr -> Arc<Mutex<Option<PeerStream>>>)
     /// Prevents ephemeral OS port exhaustion under high-throughput replication & heartbeats.
-    peer_connections: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<TcpStream>>>>>,
+    transport: PeerTransport,
+    peer_connections: Arc<DashMap<String, Arc<tokio::sync::Mutex<Option<PeerStream>>>>>,
 }
 
 impl ReplicationManager {
@@ -171,6 +173,22 @@ impl ReplicationManager {
         bind_addr: String,
         broker_addrs: Arc<DashMap<u32, String>>,
         broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
+    ) -> Self {
+        Self::new_with_transport(
+            config,
+            bind_addr,
+            broker_addrs,
+            broker_roles,
+            PeerTransport::default(),
+        )
+    }
+
+    pub fn new_with_transport(
+        config: ClusterConfig,
+        bind_addr: String,
+        broker_addrs: Arc<DashMap<u32, String>>,
+        broker_roles: Arc<DashMap<u32, Vec<crate::config::ProcessRole>>>,
+        transport: PeerTransport,
     ) -> Self {
         // Only controller-eligible peers participate in metadata Raft quorum math — a
         // broker-only peer never votes, so counting it here would make the majority
@@ -215,6 +233,7 @@ impl ReplicationManager {
         }
 
         let mgr = Self {
+            transport,
             config,
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             advertised_addr: Arc::new(RwLock::new(bind_addr)),
@@ -296,7 +315,7 @@ impl ReplicationManager {
     pub fn get_or_connect_peer(
         &self,
         peer_addr: &str,
-    ) -> Arc<tokio::sync::Mutex<Option<TcpStream>>> {
+    ) -> Arc<tokio::sync::Mutex<Option<PeerStream>>> {
         self.peer_connections
             .entry(peer_addr.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
@@ -467,6 +486,7 @@ impl ReplicationManager {
                         node_id,
                         current_term,
                         &current_addr,
+                        &manager.transport,
                     )
                     .await
                     {
@@ -500,6 +520,7 @@ impl ReplicationManager {
 
     /// Starts background per-partition follower fetch loops (Phase 3)
     pub fn start_per_partition_fetcher_manager(&self, engine: crate::server::StorageEngine) {
+        let transport = self.transport.clone();
         let fetchers = self.fetchers.clone();
         let node_id = self.config.node_id;
 
@@ -528,6 +549,7 @@ impl ReplicationManager {
                                 if !fetchers.contains_key(&(topic.clone(), p_id)) {
                                     let engine_c = engine.clone();
                                     let topic_c = topic.clone();
+                                    let transport = transport.clone();
                                     let handle = tokio::spawn(async move {
                                         loop {
                                             // Re-resolve the leader every iteration rather
@@ -570,9 +592,12 @@ impl ReplicationManager {
                                             if let Some(leader_addr) =
                                                 engine_c.get_broker_address(current_leader_id)
                                             {
-                                                if let Ok(resp) =
-                                                    send_grpc_replication_fetch(&leader_addr, &req)
-                                                        .await
+                                                if let Ok(resp) = send_grpc_replication_fetch(
+                                                    &leader_addr,
+                                                    &req,
+                                                    &transport,
+                                                )
+                                                .await
                                                 {
                                                     if let Ok(pm) = engine_c
                                                         .get_or_create_partition(&topic_c, p_id)
@@ -711,6 +736,7 @@ impl ReplicationManager {
     ///
     /// Uses node_id-derived jitter to avoid split-vote storms (no `rand` crate needed).
     pub(crate) fn start_election_timeout_loop(&self) {
+        let transport = self.transport.clone();
         let last_heartbeat = self.last_heartbeat.clone();
         let consensus = self.consensus.clone();
         // Only controller-eligible peers are sent VoteRequests — a broker-only peer never
@@ -810,6 +836,7 @@ impl ReplicationManager {
                         node_id,
                         new_term,
                         candidate_last_log_index,
+                        &transport,
                     )
                     .await
                     {
@@ -871,6 +898,7 @@ impl ReplicationManager {
                         let cluster_id_c = cluster_id.clone();
                         let advertised_addr_c = advertised_addr.clone();
                         let epoch_c = epoch.clone();
+                        let transport_c = transport.clone();
                         let consensus_c = consensus.clone();
                         let broker_addrs_c = broker_addrs.clone();
                         let broker_roles_c = broker_roles.clone();
@@ -895,6 +923,7 @@ impl ReplicationManager {
                                             node_id,
                                             current_term,
                                             &current_addr,
+                                            &transport_c,
                                         )
                                         .await
                                     {
@@ -1032,6 +1061,7 @@ impl ReplicationManager {
             fencing_epoch,
             leader_hw,
             entries,
+            &self.transport,
         )
         .await?;
         self.update_replica_watermark(topic, partition, peer_addr, last_offset);
@@ -1058,6 +1088,7 @@ impl ReplicationManager {
             let cid = cluster_id.clone();
             let topic_name = topic.to_string();
             let peer_conn = self.get_or_connect_peer(&peer_addr);
+            let transport = self.transport.clone();
             handles.push(tokio::spawn(async move {
                 let result = send_replication_push_pooled(
                     &peer_conn,
@@ -1068,6 +1099,7 @@ impl ReplicationManager {
                     epoch,
                     leader_hw,
                     &[],
+                    &transport,
                 )
                 .await;
                 (peer_addr, result)
@@ -1137,6 +1169,7 @@ impl ReplicationManager {
             let entries_vec = entries.to_vec();
             let cid = cluster_id.clone();
             let peer_conn = self.get_or_connect_peer(&peer_addr);
+            let transport = self.transport.clone();
             handles.push(tokio::spawn(async move {
                 // CRIT-01: pass cluster_id so the follower can authenticate this replication push.
                 let result = send_replication_push_pooled(
@@ -1148,6 +1181,7 @@ impl ReplicationManager {
                     epoch,
                     leader_hw,
                     &entries_vec,
+                    &transport,
                 )
                 .await;
                 (peer_addr, result)
@@ -1324,12 +1358,13 @@ fn decode_heartbeat_ack(
 }
 
 pub async fn send_leader_heartbeat_pooled(
-    peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    peer_conn: &Arc<tokio::sync::Mutex<Option<PeerStream>>>,
     peer_addr: &str,
     cluster_id: &str,
     node_id: u32,
     term: u64,
     leader_bind_addr: &str,
+    transport: &PeerTransport,
 ) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
     let frame = encode_heartbeat(cluster_id, node_id, term, leader_bind_addr);
 
@@ -1346,7 +1381,7 @@ pub async fn send_leader_heartbeat_pooled(
     }
 
     *lock = None;
-    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, transport.connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -1373,8 +1408,9 @@ pub async fn send_leader_heartbeat(
     node_id: u32,
     term: u64,
     leader_bind_addr: &str,
+    transport: &PeerTransport,
 ) -> IoResult<(u32, String, Vec<crate::config::ProcessRole>)> {
-    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, transport.connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -1511,7 +1547,7 @@ fn interpret_push_ack(ack: &[u8], peer_addr: &str) -> IoResult<()> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn send_replication_push_pooled(
-    peer_conn: &Arc<tokio::sync::Mutex<Option<TcpStream>>>,
+    peer_conn: &Arc<tokio::sync::Mutex<Option<PeerStream>>>,
     peer_addr: &str,
     cluster_id: &str,
     topic: &str,
@@ -1519,6 +1555,7 @@ pub async fn send_replication_push_pooled(
     epoch: u64,
     leader_hw: u64,
     entries: &[EncodedEntry],
+    transport: &PeerTransport,
 ) -> IoResult<()> {
     let frame = encode_replication_push(cluster_id, topic, partition, epoch, leader_hw, entries);
 
@@ -1542,7 +1579,7 @@ pub async fn send_replication_push_pooled(
     }
 
     *lock = None;
-    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, transport.connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -1609,8 +1646,9 @@ pub async fn send_vote_request(
     candidate_id: u32,
     term: u64,
     candidate_last_log_index: u64,
+    transport: &PeerTransport,
 ) -> IoResult<bool> {
-    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
+    let mut stream = match timeout(PEER_CONNECT_TIMEOUT, transport.connect(peer_addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::warn!(
@@ -1698,17 +1736,33 @@ mod inter_node_wire_tests {
         let (addr, peer) = fake_peer(reply, 2).await;
         let conn = Arc::new(tokio::sync::Mutex::new(None));
 
-        let first = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 5, "10.0.0.1:9092")
-            .await
-            .expect("first heartbeat");
+        let first = send_leader_heartbeat_pooled(
+            &conn,
+            &addr,
+            "c1",
+            1,
+            5,
+            "10.0.0.1:9092",
+            &PeerTransport::insecure_for_tests(),
+        )
+        .await
+        .expect("first heartbeat");
         assert_eq!(first.0, 77);
         assert_eq!(first.1, "10.0.0.7:9092");
 
         // Same pooled connection, and the unknown field from the first ACK must be nowhere
         // in the way of this one.
-        let second = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 6, "10.0.0.1:9092")
-            .await
-            .expect("second heartbeat on the pooled connection");
+        let second = send_leader_heartbeat_pooled(
+            &conn,
+            &addr,
+            "c1",
+            1,
+            6,
+            "10.0.0.1:9092",
+            &PeerTransport::insecure_for_tests(),
+        )
+        .await
+        .expect("second heartbeat on the pooled connection");
         assert_eq!(second.0, 77);
         assert_eq!(second.1, "10.0.0.7:9092");
 
@@ -1728,9 +1782,17 @@ mod inter_node_wire_tests {
         let (addr, peer) = fake_peer(wrong, 1).await;
         let conn = Arc::new(tokio::sync::Mutex::new(None));
 
-        let err = send_leader_heartbeat_pooled(&conn, &addr, "c1", 1, 1, "10.0.0.1:9092")
-            .await
-            .expect_err("a VoteResponse must not be accepted as a HeartbeatAck");
+        let err = send_leader_heartbeat_pooled(
+            &conn,
+            &addr,
+            "c1",
+            1,
+            1,
+            "10.0.0.1:9092",
+            &PeerTransport::insecure_for_tests(),
+        )
+        .await
+        .expect_err("a VoteResponse must not be accepted as a HeartbeatAck");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         peer.abort();
     }

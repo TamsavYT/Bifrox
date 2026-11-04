@@ -36,6 +36,9 @@ const SCRAM_SERVER_NONCE_LEN: usize = 18;
 /// both plain and TLS-wrapped sockets, so this trait lets the zero-copy fetch path opt in
 /// only for the plain case without duplicating the whole connection loop.
 pub trait AsPlainTcpStream {
+    fn peer_certificate(&self) -> Option<&[u8]> {
+        None
+    }
     fn as_plain_tcp_stream(&mut self) -> Option<&mut TcpStream>;
 }
 
@@ -46,6 +49,13 @@ impl AsPlainTcpStream for TcpStream {
 }
 
 impl AsPlainTcpStream for tokio_rustls::server::TlsStream<TcpStream> {
+    fn peer_certificate(&self) -> Option<&[u8]> {
+        self.get_ref()
+            .1
+            .peer_certificates()?
+            .first()
+            .map(|c| c.as_ref())
+    }
     fn as_plain_tcp_stream(&mut self) -> Option<&mut TcpStream> {
         None
     }
@@ -80,6 +90,51 @@ pub async fn handle_connection(socket: TcpStream, engine: StorageEngine) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     handle_connection_stream(socket, engine, peer_addr).await;
+}
+
+fn authorize_peer_frame(
+    engine: &StorageEngine,
+    frame: &crate::replication::InterNodeFrame<'_>,
+    id: u32,
+) -> bool {
+    use crate::replication::FrameType;
+    match frame.frame_type {
+        FrameType::ReplicationFetch => {
+            let Ok((req, _)) = crate::replication::ReplicationFetchRequest::decode(frame.payload)
+            else {
+                return false;
+            };
+            req.follower_node_id == id
+                && engine
+                    .get_partition(&req.topic, req.partition)
+                    .is_some_and(|p| p.replicas().contains(&id))
+        }
+        FrameType::Heartbeat | FrameType::VoteRequest => {
+            let mut reader = PayloadReader::new(frame.payload, "peer identity");
+            reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster").is_ok()
+                && reader.u32("node").ok() == Some(id)
+        }
+        FrameType::ReplicationPush => {
+            let mut reader = PayloadReader::new(frame.payload, "peer identity");
+            if reader.pascal_string(MAX_CLUSTER_ID_LEN, "cluster").is_err() {
+                return false;
+            }
+            let Ok(topic) = reader.pascal_string(MAX_TOPIC_NAME_LEN, "topic") else {
+                return false;
+            };
+            let Ok(partition) = reader.u32("partition") else {
+                return false;
+            };
+            if topic == "__cluster_metadata" {
+                engine
+                    .get_broker_address(id)
+                    .is_some_and(|addr| engine.leader_addr().as_ref() == Some(&addr))
+            } else {
+                engine.partition_leader_id(&topic, partition) == Some(id)
+            }
+        }
+        _ => false,
+    }
 }
 
 fn authorize_ingress(
@@ -169,6 +224,17 @@ pub async fn handle_connection_stream<S>(mut socket: S, engine: StorageEngine, p
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + AsPlainTcpStream,
 {
+    let peer_node_id = socket.peer_certificate().and_then(|presented| {
+        use rustls::pki_types::pem::PemObject;
+        engine
+            .config()
+            .replication_peer_certificates
+            .iter()
+            .find_map(|(id, path)| {
+                let cert = rustls::pki_types::CertificateDer::from_pem_file(path).ok()?;
+                (cert.as_ref() == presented).then_some(*id)
+            })
+    });
     engine.metrics().record_connection_open();
     let _conn_guard = ConnectionGuard(&engine);
 
@@ -184,40 +250,31 @@ where
     );
 
     // C4: Shared-secret authentication for client connections.
-    // Inter-node peers (addresses in peer_addrs) are exempt; they authenticate
-    // via cluster_id in every packet.  If auth_token is not configured the check
+    // Only certificate-authenticated peers are exempt. IP addresses and cluster IDs
+    // do not prove identity. If auth_token is not configured the check
     // is skipped entirely (backward-compatible default).
     if let Some(ref token) = engine.config().auth_token {
         // In SASL_* modes, enforce SASL as the sole client-auth handshake path.
         // Token auth remains available for legacy non-SASL deployments.
-        if !sasl_required {
-            let peer_ip = peer_addr.split(':').next().unwrap_or("");
-            let is_known_peer = engine
-                .config()
-                .peer_addrs
-                .iter()
-                .any(|p| p.split(':').next().unwrap_or("") == peer_ip);
-            if !is_known_peer {
-                // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
-                const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
-                let token_bytes = token.as_bytes();
-                let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
-                let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
-                    Ok(Ok(_)) => {
-                        auth_buf.starts_with(AUTH_MAGIC)
-                            && &auth_buf[AUTH_MAGIC.len()..] == token_bytes
-                    }
-                    Ok(Err(_)) => false,
-                    Err(_) => false,
-                };
-                if !ok {
-                    tracing::warn!(
-                        "Authentication failed from {} — closing connection",
-                        peer_addr
-                    );
-                    let _ = socket.write_all(b"AUTH_FAILED\n").await;
-                    return;
+        if !sasl_required && peer_node_id.is_none() {
+            // Client must send: 4-byte magic (0xCA 0xFE 0xBA 0xBE) + token bytes
+            const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
+            let token_bytes = token.as_bytes();
+            let mut auth_buf = vec![0u8; AUTH_MAGIC.len() + token_bytes.len()];
+            let ok = match timeout(AUTH_READ_TIMEOUT, socket.read_exact(&mut auth_buf)).await {
+                Ok(Ok(_)) => {
+                    auth_buf.starts_with(AUTH_MAGIC) && &auth_buf[AUTH_MAGIC.len()..] == token_bytes
                 }
+                Ok(Err(_)) => false,
+                Err(_) => false,
+            };
+            if !ok {
+                tracing::warn!(
+                    "Authentication failed from {} — closing connection",
+                    peer_addr
+                );
+                let _ = socket.write_all(b"AUTH_FAILED\n").await;
+                return;
             }
         }
     }
@@ -274,6 +331,19 @@ where
             if slice[0] == crate::replication::INTER_NODE_MAGIC {
                 match crate::replication::decode_frame(slice) {
                     Ok(frame) => {
+                        let insecure = engine.config().allow_insecure_replication
+                            && engine.config().security_protocol
+                                == crate::config::SecurityProtocol::Plaintext
+                            && !engine.config().acls_enabled
+                            && engine.config().auth_token.is_none();
+                        if !insecure && peer_node_id.is_none() {
+                            return;
+                        }
+                        if let Some(id) = peer_node_id {
+                            if !authorize_peer_frame(&engine, &frame, id) {
+                                return;
+                            }
+                        }
                         let response = handle_inter_node_frame(&engine, &frame);
                         // The cursor advances by the frame's own declared length, whatever
                         // the outcome — including a frame this build could not serve.
@@ -314,6 +384,12 @@ where
             // carries its own framing and its own version envelope.
             match WireRequest::decode_framed(slice) {
                 Ok((req, framing, bytes_used)) => {
+                    if framing.is_forwarded()
+                        && peer_node_id.is_none()
+                        && !engine.config().allow_insecure_replication
+                    {
+                        return;
+                    }
                     if let Err(message) =
                         authorize_ingress(&engine, &req.payload, &client_principal, &client_key)
                     {
@@ -443,12 +519,8 @@ where
                                         peer_addr,
                                         leader
                                     );
-                                    match forward_to_leader(
-                                        &leader,
-                                        &raw_request,
-                                        engine.config().auth_token.as_deref(),
-                                    )
-                                    .await
+                                    match forward_to_leader(&leader, &raw_request, engine.config())
+                                        .await
                                     {
                                         Ok(bytes) => {
                                             // The relay hop is always framed (it
@@ -531,12 +603,8 @@ where
                                     peer_addr,
                                     leader
                                 );
-                                match forward_to_leader(
-                                    &leader,
-                                    &raw_request,
-                                    engine.config().auth_token.as_deref(),
-                                )
-                                .await
+                                match forward_to_leader(&leader, &raw_request, engine.config())
+                                    .await
                                 {
                                     Ok(bytes) => {
                                         crate::protocol::wire::relay_response(&bytes, &framing)
@@ -689,9 +757,14 @@ where
 async fn forward_to_leader(
     leader_addr: &str,
     raw_request: &[u8],
-    auth_token: Option<&str>,
+    config: &crate::config::EngineConfig,
 ) -> std::io::Result<Vec<u8>> {
-    let mut stream = match timeout(FORWARD_TIMEOUT, TcpStream::connect(leader_addr)).await {
+    let mut stream = match timeout(
+        FORWARD_TIMEOUT,
+        crate::replication::transport::PeerTransport::from_config(config)?.connect(leader_addr),
+    )
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -706,7 +779,11 @@ async fn forward_to_leader(
     // leader's handle_connection accepts this as an authenticated client rather than
     // rejecting it (the forwarding follower is not necessarily in the leader's peer_addrs
     // exemption list, e.g. when NAT/port-forwarding changes the observed source IP).
-    if let Some(token) = auth_token {
+    if let Some(token) = config
+        .auth_token
+        .as_deref()
+        .filter(|_| config.security_protocol == crate::config::SecurityProtocol::Plaintext)
+    {
         const AUTH_MAGIC: &[u8] = b"\xCA\xFE\xBA\xBE";
         stream.write_all(AUTH_MAGIC).await?;
         stream.write_all(token.as_bytes()).await?;

@@ -329,19 +329,23 @@ pub async fn exchange_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt;
-    stream.write_all(request).await?;
-    let (header, payload) = read_frame(stream).await?;
-    if header.frame_type != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "expected a {:?} reply, got {:?}",
-                expected, header.frame_type
-            ),
-        ));
-    }
-    Ok(payload)
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(request).await?;
+        let (header, payload) = read_frame(stream).await?;
+        if header.frame_type != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected a {:?} reply, got {:?}",
+                    expected, header.frame_type
+                ),
+            ));
+        }
+        Ok(payload)
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "peer RPC timed out"))?
 }
 
 /// Writes a payload's trailing extension section.
