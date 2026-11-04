@@ -643,7 +643,23 @@ impl GroupCoordinator {
                 return Err("Member not found in group".to_string());
             }
 
-            if group.leader.as_deref() == Some(member_id) {
+            if group.leader.as_deref() == Some(member_id)
+                && (group.state != GroupState::Stable || !assignments.is_empty())
+            {
+                let mut owners = std::collections::HashSet::new();
+                for assign in &assignments {
+                    if !group.members.contains_key(&assign.member_id) {
+                        return Err("Unknown assignment member".into());
+                    }
+                    for partition in &assign.partitions {
+                        if !owners.insert((assign.topic.clone(), *partition)) {
+                            return Err("Duplicate partition ownership".into());
+                        }
+                    }
+                }
+                for member in group.members.values_mut() {
+                    member.assigned_partitions.clear();
+                }
                 for assign in assignments {
                     if let Some(member) = group.members.get_mut(&assign.member_id) {
                         member
