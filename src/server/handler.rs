@@ -1352,7 +1352,10 @@ fn handle_replication_push(engine: &StorageEngine, payload: &[u8]) -> Result<Vec
     // acknowledged them on the leader, so treating them as committed here would expose
     // uncommitted data to follower-fetch reads and would let this replica claim a
     // too-high committed offset if it were promoted.
-    pm.advance_committed_hw(leader_hw.min(pm.latest_offset()));
+    if let Err(e) = pm.advance_committed_hw(leader_hw.min(pm.latest_offset())) {
+        tracing::error!("Replication commit checkpoint failed: {}", e);
+        write_failed = true;
+    }
 
     // Group commit: one fsync for the whole replicated batch instead of one per frame
     // (see `PartitionManager::flush_if_sync_policy`).
@@ -3844,7 +3847,7 @@ mod zero_copy_fetch_tests {
         for payload in payloads {
             pm.produce_frame(payload).unwrap();
         }
-        pm.advance_committed_hw(pm.latest_offset());
+        pm.advance_committed_hw(pm.latest_offset()).unwrap();
     }
 
     /// A connected loopback pair, so the zero-copy path has a real `TcpStream` to
@@ -4020,7 +4023,7 @@ mod zero_copy_fetch_tests {
                 .unwrap()
                 .unwrap();
         }
-        pm.advance_committed_hw(1); // only offset 0 is committed
+        pm.advance_committed_hw(1).unwrap(); // only offset 0 is committed
         assert_eq!(pm.high_watermark(), 1);
         assert_eq!(pm.latest_offset(), 3);
 
@@ -4093,7 +4096,7 @@ mod zero_copy_fetch_tests {
 
         let pm = engine.get_or_create_partition(topic, 0).unwrap();
         pm.produce_frame(b"after-the-abort").unwrap();
-        pm.advance_committed_hw(pm.latest_offset());
+        pm.advance_committed_hw(pm.latest_offset()).unwrap();
         assert!(
             !pm.aborted_ranges().is_empty(),
             "the fixture must actually have an aborted range for this to test anything"
