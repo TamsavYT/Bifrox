@@ -11,6 +11,12 @@ use tokio::time::sleep;
 pub fn build_tls_acceptor(
     config: &crate::config::EngineConfig,
 ) -> IoResult<tokio_rustls::TlsAcceptor> {
+    if config.ssl_cert_path.is_some() != config.ssl_key_path.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ssl.cert.path and ssl.key.path must be configured together",
+        ));
+    }
     let (certs, key) =
         if let (Some(cert_path), Some(key_path)) = (&config.ssl_cert_path, &config.ssl_key_path) {
             let cert_file = std::fs::File::open(cert_path)?;

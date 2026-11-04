@@ -630,6 +630,8 @@ impl EngineConfig {
     pub fn from_properties_file(path: impl AsRef<Path>) -> IoResult<Self> {
         let content = fs::read_to_string(path)?;
         let mut config = Self::default();
+        let mut listener_protocol = None;
+        let mut explicit_protocol = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -663,7 +665,13 @@ impl EngineConfig {
                             _ => NodeRole::Leader,
                         };
                     }
-                    "listeners" | "bind.addr" => {
+                    "listeners" | "bind.addr" | "bind.address" => {
+                        if let Some((scheme, _)) = value.split_once("://") {
+                            listener_protocol =
+                                Some(scheme.parse::<SecurityProtocol>().map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+                                })?);
+                        }
                         let clean_addr = value
                             .strip_prefix("PLAINTEXT://")
                             .or_else(|| value.strip_prefix("SASL_PLAINTEXT://"))
@@ -682,9 +690,10 @@ impl EngineConfig {
                         config.advertised_addr = Some(clean_addr.to_string());
                     }
                     "security.protocol" => {
-                        if let Ok(sp) = value.parse() {
-                            config.security_protocol = sp;
-                        }
+                        explicit_protocol =
+                            Some(value.parse::<SecurityProtocol>().map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+                            })?);
                     }
                     "ssl.keystore.location" | "ssl.cert.path" => {
                         config.ssl_cert_path = Some(PathBuf::from(value));
@@ -1009,6 +1018,15 @@ impl EngineConfig {
             }
         }
 
+        if let (Some(listener), Some(explicit)) = (listener_protocol, explicit_protocol) {
+            if listener != explicit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "listener and security.protocol conflict",
+                ));
+            }
+        }
+        config.security_protocol = explicit_protocol.or(listener_protocol).unwrap_or_default();
         Ok(config)
     }
 }
