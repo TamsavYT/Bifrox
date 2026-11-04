@@ -1,3 +1,4 @@
+static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use bifrox::protocol::{wire::IsolationLevel, BatchCompression};
 use bifrox::server::engine::ProduceBatchParams;
 use bifrox::{EngineConfig, NodeRole, RecordBatch, Server, StorageEngine, TxStatus};
@@ -17,12 +18,13 @@ impl Cluster {
     }
     async fn with_tls(tls: bool) -> Self {
         let root = std::env::temp_dir().join(format!(
-            "distributed_tx_{}_{}",
+            "distributed_tx_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let sockets: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -286,6 +288,11 @@ async fn failed_marker_stays_prepared_and_another_controller_recovers_it() {
         .replication()
         .consensus()
         .force_candidate_state();
+    let elected_term = c.engines[1].replication().consensus().current_term();
+    assert!(c.engines[0]
+        .replication()
+        .consensus()
+        .try_record_vote(2, elected_term));
     assert!(c.engines[1]
         .replication()
         .consensus()
@@ -298,6 +305,9 @@ async fn failed_marker_stays_prepared_and_another_controller_recovers_it() {
             e.register_broker_address(i as u32 + 1, a.to_string());
         }
     }
+    c.engines[1]
+        .replication()
+        .start_heartbeat_broadcasting_if_leader();
     c.engines[1].recover_transactions_coordinated().await;
     wait(|| {
         c.engines

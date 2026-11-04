@@ -1,15 +1,17 @@
+static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use bifrox::server::transaction::{TransactionManager, TxStatus};
 use bifrox::{EngineConfig, StorageEngine};
 struct Dir(std::path::PathBuf);
 impl Dir {
     fn new() -> Self {
         let p = std::env::temp_dir().join(format!(
-            "tx_durability_{}_{}",
+            "tx_durability_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)

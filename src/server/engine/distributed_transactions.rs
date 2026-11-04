@@ -9,23 +9,29 @@ impl StorageEngine {
     pub(super) fn distributed_transactions(&self) -> bool {
         !self.config.peer_addrs.is_empty() || !self.transaction_revisions.is_empty()
     }
-    pub(super) fn require_transaction_controller(&self) -> IoResult<()> {
-        if !self.is_leader() {
-            return Err(Error::other("NOT_CONTROLLER"));
+    pub(super) async fn require_transaction_controller(&self) -> IoResult<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !self.is_leader() {
+                return Err(Error::other("NOT_CONTROLLER"));
+            }
+            if self
+                .transaction_uncertain
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Error::other("Uncertain transaction proposal; restart/recover coordinator before further mutations"));
+            }
+            self.apply_committed_metadata()?;
+            let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+            if pm.latest_offset() == pm.high_watermark() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::other(format!("Unresolved metadata log tail (LEO {}, committed {}); coordinator recovery required",pm.latest_offset(),pm.high_watermark())));
+            }
+            // Other metadata operations may be legitimately committing in parallel.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        if self
-            .transaction_uncertain
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(Error::other("Uncertain transaction proposal; restart/recover coordinator before further mutations"));
-        }
-        let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
-        if pm.latest_offset() != pm.high_watermark() {
-            return Err(Error::other(
-                "Unresolved metadata log tail; coordinator recovery required",
-            ));
-        }
-        Ok(())
     }
     pub(super) fn install_replicated_transaction(
         &self,
@@ -64,7 +70,7 @@ impl StorageEngine {
         Ok(())
     }
     async fn save_transaction(&self, state: &TransactionState) -> IoResult<u64> {
-        self.require_transaction_controller()?;
+        self.require_transaction_controller().await?;
         let term = self.replication.get_epoch();
         let revision = self
             .get_or_create_partition("__cluster_metadata", 0)?
@@ -98,6 +104,7 @@ impl StorageEngine {
         }
         let _guard = self.transaction_gate.lock().await;
         self.require_transaction_controller()
+            .await
             .map_err(|e| e.to_string())?;
         if self
             .transactions
@@ -205,6 +212,7 @@ impl StorageEngine {
         commit: bool,
     ) -> Result<(), String> {
         self.require_transaction_controller()
+            .await
             .map_err(|e| e.to_string())?;
         let mut state = self.transactions.state(id).ok_or("Transaction not found")?;
         let prepared = if commit {
@@ -261,7 +269,7 @@ impl StorageEngine {
         params: ProduceBatchParams<'_>,
     ) -> IoResult<(u32, u64, u64)> {
         let _guard = self.transaction_gate.lock().await;
-        self.require_transaction_controller()?;
+        self.require_transaction_controller().await?;
         let id = params
             .transaction_id
             .ok_or_else(|| Error::other("missing transaction id"))?;
@@ -367,14 +375,14 @@ impl StorageEngine {
         part: u32,
         command: &[u8],
     ) -> IoResult<Vec<u8>> {
-        self.require_transaction_controller()?;
+        self.require_transaction_controller().await?;
         let leader = self
             .partition_leader_id(topic, part)
             .ok_or_else(|| Error::other("Unknown partition leader"))?;
         self.transaction_command_to_node(leader, command).await
     }
     async fn transaction_command_to_node(&self, leader: u32, command: &[u8]) -> IoResult<Vec<u8>> {
-        self.require_transaction_controller()?;
+        self.require_transaction_controller().await?;
         if leader == self.config.node_id {
             return self
                 .execute_transaction_command(command, self.replication.get_epoch())

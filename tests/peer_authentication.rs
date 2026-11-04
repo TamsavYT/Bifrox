@@ -1,3 +1,4 @@
+static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use bifrox::replication::{
     grpc::send_grpc_replication_fetch, transport::PeerTransport, ReplicationFetchRequest,
 };
@@ -12,12 +13,13 @@ impl Fixture {
     fn new() -> Self {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let dir = std::env::temp_dir().join(format!(
-            "peer_tls_{}_{}",
+            "peer_tls_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let key = KeyPair::generate().unwrap();

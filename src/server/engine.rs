@@ -2862,6 +2862,7 @@ impl StorageEngine {
             return Err("NOT_CONTROLLER".into());
         }
         self.require_transaction_controller()
+            .await
             .map_err(|e| e.to_string())?;
         if self.distributed_transactions() {
             if let Some(status) = self.transactions.get_status(id) {
@@ -4755,6 +4756,47 @@ mod transaction_snapshot_tests {
             .1
             .contains(&(0, 1)));
         drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod transaction_metadata_wait_tests {
+    use super::*;
+    #[tokio::test]
+    async fn transaction_coordinator_waits_for_an_inflight_metadata_commit() {
+        let dir = std::env::temp_dir().join(format!("tx_metadata_wait_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = StorageEngine::new(EngineConfig {
+            data_dir: dir.clone(),
+            preallocate_segments: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let pm = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap();
+        let record = crate::replication::MetadataRecord::BrokerRegister {
+            node_id: 9,
+            bind_addr: "127.0.0.1:19009".into(),
+            roles: vec![1, 2],
+        };
+        let batch = pm
+            .produce_frame_eos(bytes::Bytes::from(record.encode()), 0, 0, 0)
+            .unwrap()
+            .unwrap();
+        let end = batch.base_offset + 1;
+        let completing = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            pm.advance_committed_hw(end).unwrap();
+        });
+        engine.require_transaction_controller().await.unwrap();
+        completing.await.unwrap();
+        assert_eq!(
+            engine.get_broker_address(9).as_deref(),
+            Some("127.0.0.1:19009")
+        );
+        drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
