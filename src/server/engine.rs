@@ -342,6 +342,12 @@ impl StorageEngine {
             broker_addrs.clone(),
             broker_roles.clone(),
         );
+        std::fs::create_dir_all(&config.data_dir)?;
+        replication
+            .consensus()
+            .enable_persistence(config.data_dir.join("raft-hard-state"))?;
+        replication.set_epoch(replication.consensus().current_term());
+        replication.start_election_timeout_loop();
         let group_coordinator = Arc::new(GroupCoordinator::with_config(
             std::time::Duration::from_millis(config.group_initial_rebalance_delay_ms),
             std::time::Duration::from_millis(config.max_poll_interval_ms),
@@ -396,7 +402,7 @@ impl StorageEngine {
                                 let (topic, part_str) = dir_name.split_at(pos);
                                 let part_str = &part_str[1..];
                                 if let Ok(partition) = part_str.parse::<u32>() {
-                                    let _ = engine.get_or_create_partition(topic, partition);
+                                    engine.get_or_create_partition(topic, partition)?;
                                 }
                             }
                         }
@@ -413,7 +419,7 @@ impl StorageEngine {
         engine.replay_transaction_state()?;
 
         // Unconditionally initialize system partition __consumer_offsets-0
-        let _ = engine.get_or_create_partition("__consumer_offsets", 0);
+        engine.get_or_create_partition("__consumer_offsets", 0)?;
 
         // 4. If Leader, register broker in the metadata log
         if engine.is_leader() {
@@ -892,7 +898,8 @@ impl StorageEngine {
             );
         }
 
-        if let Ok(pm) = self.get_or_create_partition("__cluster_metadata", 0) {
+        {
+            let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
             let mut offset = start_offset;
             loop {
                 let frames = pm.fetch(offset, 1024 * 1024)?;
@@ -900,6 +907,9 @@ impl StorageEngine {
                     break;
                 }
                 for frame in &frames {
+                    if frame.offset >= pm.high_watermark() {
+                        return Ok(());
+                    }
                     let payload = frame.value.clone().unwrap_or_default();
                     if let Ok(rec) = crate::replication::MetadataRecord::decode(&payload) {
                         self.apply_metadata_record(frame.offset, rec);
@@ -1649,7 +1659,9 @@ impl StorageEngine {
         record: crate::replication::MetadataRecord,
     ) -> IoResult<u64> {
         let meta_pm = self.get_or_create_partition("__cluster_metadata", 0)?;
-        let frame = meta_pm.produce_frame(&record.encode())?;
+        let frame = meta_pm
+            .produce_frame_eos(bytes::Bytes::from(record.encode()), 0, 0, 0)?
+            .map_err(|_| std::io::Error::other("unexpected duplicate metadata record"))?;
         // Force this leader's own append durable regardless of the configured flush
         // policy — `produce_frame`'s internal `flush_if_sync_policy()` is a no-op under
         // the default `AsyncPeriodic` policy. `await_metadata_commit` below counts the
@@ -1720,7 +1732,7 @@ impl StorageEngine {
             // `__cluster_metadata` has no pull fetcher at all (it is deliberately excluded,
             // to avoid applying records through two paths at once), so this broadcast is
             // the only thing that ever advances a follower's metadata watermark.
-            meta_pm.advance_committed_hw(frame.base_offset + 1);
+            meta_pm.advance_committed_hw(frame.base_offset + 1)?;
             let repl = self.replication.clone();
             let committed_hw = meta_pm.high_watermark();
             let hw_fencing_epoch = self.replication.get_epoch();
@@ -1743,6 +1755,7 @@ impl StorageEngine {
         // On a failed commit the record stays in the local log but is deliberately NOT
         // applied and the caller gets an error, so the leader never serves state the
         // cluster has not agreed on.
+        meta_pm.advance_committed_hw(frame.base_offset + 1)?;
         self.apply_metadata_record(frame.base_offset, record);
 
         Ok(frame.base_offset)
@@ -2321,7 +2334,7 @@ impl StorageEngine {
         // Nothing needs to be told about this commit point separately: every pull fetch
         // response already carries `leader_watermark`, so followers pick up the newly
         // committed high watermark on their own next fetch.
-        pm.advance_committed_hw(last_offset + 1);
+        pm.advance_committed_hw(last_offset + 1)?;
 
         Ok((partition_id, first_offset, last_offset))
     }
