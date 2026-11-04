@@ -1314,8 +1314,11 @@ fn handle_replication_push(engine: &StorageEngine, payload: &[u8]) -> Result<Vec
     // so the broker served authorization decisions that would silently revert on restart.
     // Leaving them unapplied and NACKing instead makes the leader re-deliver the batch.
     if !write_failed {
-        for (offset, record) in pending_metadata {
-            engine.apply_metadata_record(offset, record);
+        if is_cluster_meta {
+            if let Err(error) = engine.apply_committed_metadata() {
+                tracing::error!("Failed applying committed metadata: {}", error);
+                return nack();
+            }
         }
     } else if !pending_metadata.is_empty() {
         tracing::error!(
@@ -3545,9 +3548,13 @@ mod cluster_metadata_durability_tests {
             num_partitions: 1,
             replication_factor: 1,
         };
-        let frame = broker_record(0, record.encode());
+        let next = engine
+            .get_or_create_partition("__cluster_metadata", 0)
+            .unwrap()
+            .latest_offset();
+        let frame = broker_record(next, record.encode());
         let epoch = engine.replication().get_epoch();
-        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, 1, &[frame]);
+        let packet = build_push_packet(&engine, "__cluster_metadata", 0, epoch, next + 1, &[frame]);
 
         assert_eq!(
             serve_push(&engine, &packet),
@@ -4080,5 +4087,67 @@ mod zero_copy_fetch_tests {
                 .await
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod transactional_metadata_commit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn producer_epoch_is_invisible_until_commit_watermark_arrives() {
+        let path = std::env::temp_dir().join(format!(
+            "tx_commit_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = StorageEngine::new(crate::config::EngineConfig {
+            data_dir: path.clone(),
+            role: crate::replication::NodeRole::Follower,
+            preallocate_segments: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let record = crate::replication::MetadataRecord::TransactionalProducerRegistration {
+            transactional_id: "t".into(),
+            producer_id: 7,
+            producer_epoch: 2,
+        };
+        let batch = crate::protocol::RecordBatch::create(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            crate::protocol::BatchCompression::None,
+            &[(0, None, Some(bytes::Bytes::from(record.encode())))],
+        );
+        let entry = crate::replication::EncodedEntry::from_batch(&batch);
+        for hw in [0, 1] {
+            let frame = crate::replication::encode_replication_push(
+                &engine.config().cluster_id,
+                "__cluster_metadata",
+                0,
+                0,
+                hw,
+                if hw == 0 {
+                    std::slice::from_ref(&entry)
+                } else {
+                    &[]
+                },
+            );
+            let frame = crate::replication::envelope::decode_frame(&frame).unwrap();
+            handle_inter_node_frame(&engine, &frame).unwrap();
+            assert_eq!(
+                engine.transactions().has_transactional_producer("t"),
+                hw == 1
+            );
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(path);
     }
 }

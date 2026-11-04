@@ -282,6 +282,7 @@ pub struct StorageEngine {
     consumer_groups: ConsumerGroupManager,
     transactions: TransactionManager,
     transaction_gate: Arc<tokio::sync::Mutex<()>>,
+    metadata_apply_gate: Arc<parking_lot::Mutex<()>>,
     share_groups: crate::server::share::ShareGroupManager,
     replication: ReplicationManager,
     group_coordinator: Arc<GroupCoordinator>,
@@ -370,6 +371,7 @@ impl StorageEngine {
             consumer_groups,
             transactions,
             transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
+            metadata_apply_gate: Arc::new(parking_lot::Mutex::new(())),
             share_groups,
             replication,
             group_coordinator,
@@ -1143,6 +1145,29 @@ impl StorageEngine {
     /// `offset` is this record's position in the `__cluster_metadata` log; it is tracked
     /// as this node's "last log index" so that if it ever contests a leader election, its
     /// VoteRequest reflects how up to date its metadata log actually is (Raft §5.4.1).
+    pub(crate) fn apply_committed_metadata(&self) -> IoResult<()> {
+        let _gate = self.metadata_apply_gate.lock();
+        let pm = self.get_or_create_partition("__cluster_metadata", 0)?;
+        let mut offset = self.replication.local_metadata_log_index();
+        let committed = pm.high_watermark();
+        while offset < committed {
+            let frames = pm.fetch(offset, 1024 * 1024)?;
+            if frames.is_empty() {
+                break;
+            }
+            for frame in frames {
+                if frame.offset >= committed {
+                    return Ok(());
+                }
+                let record =
+                    crate::replication::MetadataRecord::decode(&frame.value.unwrap_or_default())?;
+                self.apply_metadata_record(frame.offset, record);
+                offset = frame.offset + 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_metadata_record(
         &self,
         offset: u64,

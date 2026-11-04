@@ -111,8 +111,8 @@ async fn prepared_commit_survives_restart_and_retries_without_switching_to_abort
 #[tokio::test]
 async fn registration_write_failure_does_not_publish_new_epoch() {
     let dir = Dir::new();
-    std::fs::write(dir.0.join("__cluster_metadata-0"), b"blocked").unwrap();
     let engine = StorageEngine::new(dir.config()).unwrap();
+    std::fs::create_dir(dir.0.join("__cluster_metadata-0/committed.tmp")).unwrap();
     engine
         .transactions()
         .restore_transactional_producer("t", 7, 2);
