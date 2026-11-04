@@ -535,7 +535,7 @@ impl TestClient {
                 let ca_file = std::fs::File::open(ca)?;
                 let mut ca_reader = std::io::BufReader::new(ca_file);
                 let ca_certs =
-                    rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+                    crate::tls_material::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
                 for c in ca_certs {
                     root_store.add(c).map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
@@ -549,12 +549,12 @@ impl TestClient {
                 let cert_file = std::fs::File::open(cert_path)?;
                 let mut cert_reader = std::io::BufReader::new(cert_file);
                 let client_certs =
-                    rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+                    crate::tls_material::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
                 let key_file = std::fs::File::open(key_path)?;
                 let mut key_reader = std::io::BufReader::new(key_file);
                 let client_key =
-                    rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+                    crate::tls_material::private_key(&mut key_reader)?.ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "No private key found in client SSL key file",
