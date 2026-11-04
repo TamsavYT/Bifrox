@@ -156,7 +156,9 @@ fn compute_tls_channel_binding(config: &EngineConfig) -> Option<Vec<u8>> {
     let path = config.ssl_cert_path.as_ref()?;
     let pem = std::fs::read(path).ok()?;
     // Take the first certificate in the file: the leaf, which is the one the peer binds to.
-    let der = rustls_pemfile::certs(&mut pem.as_slice()).next()?.ok()?;
+    let der = crate::tls_material::certs(&mut pem.as_slice())
+        .next()?
+        .ok()?;
     Some(crate::scram::tls_server_end_point(&der))
 }
 
