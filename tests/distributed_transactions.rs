@@ -11,12 +11,23 @@ struct Cluster {
     tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
     configs: Vec<EngineConfig>,
     addrs: Vec<SocketAddr>,
+    _isolation: tokio::sync::OwnedMutexGuard<()>,
 }
 impl Cluster {
     async fn new() -> Self {
         Self::with_tls(false).await
     }
     async fn with_tls(tls: bool) -> Self {
+        Self::with_options(tls, false).await
+    }
+    async fn with_options(tls: bool, freeze_maintenance: bool) -> Self {
+        static ISOLATION: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+            std::sync::OnceLock::new();
+        let isolation = ISOLATION
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
         let root = std::env::temp_dir().join(format!(
             "distributed_tx_{}_{}_{}",
             std::process::id(),
@@ -49,6 +60,11 @@ impl Cluster {
                     .collect(),
                 allow_insecure_replication: true,
                 preallocate_segments: false,
+                isr_check_interval_ms: if freeze_maintenance {
+                    60_000
+                } else {
+                    EngineConfig::default().isr_check_interval_ms
+                },
                 ..Default::default()
             })
             .collect();
@@ -100,12 +116,38 @@ impl Cluster {
             }
             engine.set_leader_addr(addrs[0].to_string());
         }
+        if freeze_maintenance {
+            // Seed the startup metadata prefix explicitly while automatic membership
+            // repair is disabled for the controlled missing-replica fault below.
+            let pm = engines[0].get_partition("__cluster_metadata", 0).unwrap();
+            let raw = pm.fetch_entries_for_replication(0, 65536).unwrap();
+            let mut remaining = raw.as_ref();
+            let mut entries = Vec::new();
+            while !remaining.is_empty() {
+                let (batch, used) = RecordBatch::decode(remaining).unwrap();
+                entries.push(bifrox::replication::EncodedEntry::from_batch(&batch));
+                remaining = &remaining[used..];
+            }
+            engines[0]
+                .replication()
+                .replicate_batch(
+                    "__cluster_metadata",
+                    0,
+                    engines[0].replication().get_epoch(),
+                    pm.high_watermark(),
+                    &[],
+                    &entries,
+                )
+                .await
+                .unwrap();
+        }
         Self {
             root,
             engines,
             tasks,
             configs,
             addrs,
+            _isolation: isolation,
         }
     }
     async fn topic(&self) {
@@ -348,7 +390,7 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn marker_without_data_quorum_cannot_complete_or_release_lso() {
-    let c = Cluster::new().await;
+    let c = Cluster::with_options(false, true).await;
     c.topic().await;
     let (pid, epoch) = c.engines[0]
         .init_producer_id_coordinated("quorum")
