@@ -244,13 +244,19 @@ impl MetadataRecord {
                 let partition = src.get_u32();
                 let leader_id = src.get_u32();
                 let replicas_len = src.get_u32() as usize;
+                if replicas_len > 100_000 || replicas_len > src.len() / 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "metadata collection exceeds frame or item limit",
+                    ));
+                }
                 if src.len() < replicas_len * 4 {
                     return Err(Error::new(
                         ErrorKind::UnexpectedEof,
                         "Incomplete replicas list",
                     ));
                 }
-                let mut replicas = Vec::with_capacity(replicas_len);
+                let mut replicas = metadata_collection(replicas_len)?;
                 for _ in 0..replicas_len {
                     replicas.push(src.get_u32());
                 }
@@ -325,10 +331,16 @@ impl MetadataRecord {
                 let leader_id = src.get_u32();
                 let leader_epoch = src.get_u32();
                 let isr_len = src.get_u32() as usize;
+                if isr_len > 100_000 || isr_len > src.len() / 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "metadata collection exceeds frame or item limit",
+                    ));
+                }
                 if src.len() < isr_len * 4 {
                     return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete ISR list"));
                 }
-                let mut isr = Vec::with_capacity(isr_len);
+                let mut isr = metadata_collection(isr_len)?;
                 for _ in 0..isr_len {
                     isr.push(src.get_u32());
                 }
@@ -336,13 +348,19 @@ impl MetadataRecord {
                 // field existed, which means "leave the roster alone".
                 let replicas = if src.len() >= 4 {
                     let replica_len = src.get_u32() as usize;
+                    if replica_len > 100_000 || replica_len > src.len() / 4 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "metadata collection exceeds frame or item limit",
+                        ));
+                    }
                     if src.len() < replica_len * 4 {
                         return Err(Error::new(
                             ErrorKind::UnexpectedEof,
                             "Incomplete replica list",
                         ));
                     }
-                    let mut replicas = Vec::with_capacity(replica_len);
+                    let mut replicas = metadata_collection(replica_len)?;
                     for _ in 0..replica_len {
                         replicas.push(src.get_u32());
                     }
@@ -463,7 +481,13 @@ impl MetadataRecord {
                     ));
                 }
                 let count = src.get_u32() as usize;
-                let mut configs = Vec::with_capacity(count);
+                if count > 100_000 || count > src.len() / 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "metadata collection exceeds frame or item limit",
+                    ));
+                }
+                let mut configs = metadata_collection(count)?;
                 for _ in 0..count {
                     let key = read_pascal_string_io(&mut src)?;
                     let value = read_pascal_string_io(&mut src)?;
@@ -520,4 +544,12 @@ fn read_len_prefixed_bytes(buf: &mut &[u8], field_name: &str) -> IoResult<Vec<u8
     let bytes = buf[..len].to_vec();
     *buf = &buf[len..];
     Ok(bytes)
+}
+
+fn metadata_collection<T>(count: usize) -> IoResult<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "metadata allocation failed"))?;
+    Ok(values)
 }
