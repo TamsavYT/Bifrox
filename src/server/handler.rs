@@ -82,6 +82,81 @@ pub async fn handle_connection(socket: TcpStream, engine: StorageEngine) {
     handle_connection_stream(socket, engine, peer_addr).await;
 }
 
+fn authorize_ingress(
+    engine: &StorageEngine,
+    payload: &RequestPayload,
+    principal: &str,
+    host: &str,
+) -> Result<(), String> {
+    use crate::server::acl::{AclOperation as Op, ResourceType as Res};
+    use RequestPayload::*;
+    let sasl = matches!(
+        engine.config().security_protocol,
+        crate::config::SecurityProtocol::SaslPlaintext | crate::config::SecurityProtocol::SaslSsl
+    );
+    if sasl
+        && principal == "User:ANONYMOUS"
+        && !matches!(
+            payload,
+            SaslHandshake { .. }
+                | SaslAuthenticate { .. }
+                | SetClientId { .. }
+                | Ping
+                | NegotiateProtocol
+        )
+    {
+        return Err("SaslAuthenticationRequired".into());
+    }
+    let target = match payload {
+        ProduceBatch { topic, .. } => Some((topic.as_str(), Op::Write, Res::Topic)),
+        Fetch { topic, .. }
+        | FetchCommitted { topic, .. }
+        | FetchByTimestamp { topic, .. }
+        | ShareFetch { topic, .. } => Some((topic.as_str(), Op::Read, Res::Topic)),
+        CreateTopic { topic, partitions } => {
+            if *partitions == 0 || *partitions > 10_000 {
+                return Err("Invalid partition count".into());
+            }
+            Some((topic.as_str(), Op::Create, Res::Topic))
+        }
+        DeleteTopic { topic } => Some((topic.as_str(), Op::Delete, Res::Topic)),
+        AlterConfigs { topic, .. } | IncrementalAlterConfigs { topic, .. } => {
+            Some((topic.as_str(), Op::AlterConfigs, Res::Topic))
+        }
+        RegisterBroker { .. }
+        | UnregisterBroker { .. }
+        | CreateAcls { .. }
+        | DeleteAcls { .. }
+        | UpsertScramUser { .. }
+        | DeleteScramUser { .. } => Some(("", Op::Alter, Res::Cluster)),
+        _ => None,
+    };
+    if let Some((name, op, resource)) = target {
+        if resource == Res::Topic {
+            crate::server::engine::validate_client_topic_name(name).map_err(|e| e.to_string())?;
+        }
+        if !engine.authorize(principal, host, op as u8, resource as u8, name) {
+            return Err("AuthorizationFailed".into());
+        }
+        if let ProduceBatch { num_partitions, .. } = payload {
+            if *num_partitions == 0 || *num_partitions > 10_000 {
+                return Err("Invalid partition count".into());
+            }
+            if !engine.topic_is_registered(name)
+                && !engine.authorize(principal, host, Op::Create as u8, Res::Topic as u8, name)
+            {
+                return Err("TopicAuthorizationFailed".into());
+            }
+        }
+    }
+    if let AddPartitionsToTxn { topics, .. } = payload {
+        for (topic, _) in topics {
+            crate::server::engine::validate_client_topic_name(topic).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 struct ConnectionGuard<'a>(&'a StorageEngine);
 
 impl<'a> Drop for ConnectionGuard<'a> {
@@ -100,10 +175,9 @@ where
     // Connection fallback identity for quotas when neither an authenticated principal
     // nor a logical client_id has been established on the socket.
     let client_key = peer_addr
-        .split(':')
-        .next()
-        .unwrap_or(&peer_addr)
-        .to_string();
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| peer_addr.clone());
     let sasl_required = matches!(
         engine.config().security_protocol,
         crate::config::SecurityProtocol::SaslPlaintext | crate::config::SecurityProtocol::SaslSsl
@@ -240,6 +314,19 @@ where
             // carries its own framing and its own version envelope.
             match WireRequest::decode_framed(slice) {
                 Ok((req, framing, bytes_used)) => {
+                    if let Err(message) =
+                        authorize_ingress(&engine, &req.payload, &client_principal, &client_key)
+                    {
+                        consumed += bytes_used;
+                        if socket
+                            .write_all(&WireResponse::error(&message).encode_framed(&framing))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     // Produce Forwarding: if this node is not the leader for the target
                     // partition, transparently proxy the raw request bytes to the actual
                     // partition leader broker and relay its response, rather than making
