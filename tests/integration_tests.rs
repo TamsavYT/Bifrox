@@ -81,6 +81,7 @@ async fn start_test_server_with_quota(
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: data_dir.clone(),
         max_segment_bytes: 64 * 1024,
         index_interval_bytes: 256,
@@ -136,6 +137,7 @@ async fn start_test_server_with_max_poll_interval(max_poll_interval_ms: u64) -> 
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: data_dir.clone(),
         max_segment_bytes: 64 * 1024,
         index_interval_bytes: 256,
@@ -193,6 +195,7 @@ async fn start_test_server_with_share_group_config(
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: data_dir.clone(),
         max_segment_bytes: 64 * 1024,
         index_interval_bytes: 256,
@@ -782,6 +785,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
 
     // 1. Start Follower (Node 2) on ephemeral port
     let config_node2 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
@@ -798,6 +802,7 @@ async fn test_scenario_10_multi_node_cluster_replication() {
 
     // 2. Start Leader (Node 1) with Node 2's address as peer
     let config_node1 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
@@ -895,6 +900,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
 
     // 1. Start Follower (Node 2) on ephemeral port
     let config_node2 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
@@ -911,6 +917,7 @@ async fn test_scenario_11_metadata_replayed_topic_creation() {
 
     // 2. Start Leader (Node 1) with Node 2's address as peer
     let config_node1 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
@@ -1367,6 +1374,7 @@ async fn test_scenario_17_durable_metadata_catalog() {
     std::fs::create_dir_all(&test_dir).unwrap();
 
     let config = bifrox::EngineConfig {
+        allow_insecure_replication: true,
         data_dir: test_dir.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..bifrox::EngineConfig::default()
@@ -1493,6 +1501,7 @@ async fn test_scenario_19_relative_index_and_txnindex() {
     std::fs::create_dir_all(&test_dir).unwrap();
 
     let config = bifrox::EngineConfig {
+        allow_insecure_replication: true,
         data_dir: test_dir.clone(),
         index_interval_bytes: 10,
         ..bifrox::EngineConfig::default()
@@ -1655,6 +1664,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
 
     // 1. Start Node 2 (Node ID: 2)
     let config_node2 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
@@ -1671,6 +1681,7 @@ async fn test_scenario_21_per_partition_replication_and_client_routing() {
 
     // 2. Start Node 1 (Node ID: 1)
     let config_node1 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
@@ -1912,6 +1923,7 @@ async fn test_scenario_23_cleanup_policy_log_compaction() {
     // 2. Test SegmentManager Log Compaction behavior
     let seg_dir_guard = TestDataDirGuard::new("log_compaction_segment_test");
     let config = bifrox::config::EngineConfig {
+        allow_insecure_replication: true,
         cleanup_policy: CleanupPolicy::Compact,
         max_segment_bytes: 100, // Small max_segment_bytes to force segment rotations
         ..Default::default()
@@ -2173,6 +2185,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     let addr = listener.local_addr().unwrap();
 
     let ssl_cfg = EngineConfig {
+        allow_insecure_replication: false,
         security_protocol: SecurityProtocol::Ssl,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
@@ -2215,6 +2228,7 @@ async fn test_scenario_25_tls_ssl_and_sasl_ssl() {
     sasl_users.insert("charlie".to_string(), "tls_secret_password".to_string());
 
     let sasl_ssl_cfg = EngineConfig {
+        allow_insecure_replication: false,
         security_protocol: SecurityProtocol::SaslSsl,
         sasl_mechanisms: vec!["PLAIN".to_string()],
         sasl_users,
@@ -2307,6 +2321,7 @@ async fn test_scenario_26_pem_file_tls_key_and_mtls() {
 
     // Server configured with Mutual TLS (mTLS) enabled (ssl_client_auth = true)
     let ssl_cfg = EngineConfig {
+        allow_insecure_replication: false,
         security_protocol: SecurityProtocol::Ssl,
         ssl_cert_path: Some(cert_path.clone()),
         ssl_key_path: Some(key_path.clone()),
@@ -2371,6 +2386,7 @@ async fn test_scenario_27_dynamic_broker_registration_and_membership() {
     let addr = listener.local_addr().unwrap();
 
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
@@ -2426,6 +2442,7 @@ async fn test_scenario_28_prometheus_metrics_and_lz4_compression() {
     let addr = listener.local_addr().unwrap();
 
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
@@ -2518,6 +2535,7 @@ async fn test_scenario_37_zstd_compression_end_to_end() {
     let addr = listener.local_addr().unwrap();
 
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
@@ -2594,6 +2612,7 @@ async fn test_scenario_29_scram_credentials_persist_across_restart() {
 
     let dir_guard = TestDataDirGuard::new("scram_persist_restart");
     let bootstrap_cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..Default::default()
@@ -2608,6 +2627,7 @@ async fn test_scenario_29_scram_credentials_persist_across_restart() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let restarted_cfg = EngineConfig {
+        allow_insecure_replication: false,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
         security_protocol: SecurityProtocol::SaslPlaintext,
@@ -2646,6 +2666,7 @@ async fn test_scenario_29_scram_credentials_persist_across_restart() {
 async fn test_scenario_30_transactional_epoch_fencing_and_recovery() {
     let dir_guard = TestDataDirGuard::new("tx_epoch_recovery");
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..Default::default()
@@ -3254,6 +3275,7 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
 
     // Node 2: broker-only — hosts data partitions, never contests the metadata quorum.
     let config_node2 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: node2_dir.clone(),
@@ -3271,6 +3293,7 @@ async fn test_scenario_34_dedicated_controller_and_broker_roles() {
     // Node 1: controller-only — owns the metadata Raft quorum, must never host a data
     // partition even though it's the (only) node available at topic-creation time.
     let config_node1 = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: node1_dir.clone(),
@@ -3462,6 +3485,7 @@ async fn test_scenario_36_tombstone_and_dirty_ratio_compaction() {
     // record lands in its own segment — deterministic layout without needing a manual
     // rotate hook through the client.
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: data_dir.clone(),
         max_segment_bytes: 40,
         bind_addr: "127.0.0.1:0".to_string(),
@@ -3957,6 +3981,7 @@ async fn test_scenario_42_push_never_duplicates_pull_and_metadata_still_pushes()
     // the leader's own startup bootstrap record) — set the interval far beyond this test's
     // runtime so that sweep can't fire and manufacture a false-positive push.
     let config = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: test_dir.clone(),
@@ -4165,6 +4190,7 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
 
     // Follower (node 2)
     let engine_node2 = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: base_dir.join("node2"),
@@ -4180,6 +4206,7 @@ async fn test_scenario_45_follower_pulls_after_assignment() {
 
     // Leader (node 1), with node 2 as its peer
     let engine_node1 = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("node1"),
@@ -4353,6 +4380,7 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
     let _ = std::fs::remove_dir_all(&base_dir);
 
     let engine_follower = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 2,
         role: bifrox::NodeRole::Follower,
         data_dir: base_dir.join("f"),
@@ -4367,6 +4395,7 @@ async fn test_scenario_47_metadata_catch_up_heals_a_joining_follower() {
     });
 
     let engine_leader = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("l"),
@@ -4624,6 +4653,7 @@ async fn test_scenario_49_metadata_requires_majority_before_taking_effect() {
     // A controller whose quorum peer does not exist: nothing can ever acknowledge, so no
     // metadata record can reach a majority.
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         role: bifrox::NodeRole::Leader,
         data_dir: base_dir.join("lonely"),
@@ -5605,6 +5635,7 @@ async fn test_scenario_62_auto_create_disabled_rejects_unknown_topic_without_reg
     let addr = listener.local_addr().unwrap();
 
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         data_dir: dir_guard.path.clone(),
         bind_addr: addr.to_string(),
@@ -6487,6 +6518,7 @@ async fn test_scenario_69_sigterm_delivered_mid_poll_is_not_swallowed() {
 async fn test_scenario_70_advertised_addr_resolves_to_real_bound_address() {
     let dir = TestDataDirGuard::new("advertised_addr_real");
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -6519,6 +6551,7 @@ async fn test_scenario_70_advertised_addr_resolves_to_real_bound_address() {
 async fn test_scenario_71_advertised_addr_override_takes_precedence() {
     let dir = TestDataDirGuard::new("advertised_addr_override");
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         advertised_addr: Some("203.0.113.5:9092".to_string()),
@@ -6551,6 +6584,7 @@ async fn test_scenario_71_advertised_addr_override_takes_precedence() {
 async fn test_scenario_72_wildcard_advertised_addr_refuses_to_bind() {
     let dir = TestDataDirGuard::new("advertised_addr_wildcard");
     let config = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "0.0.0.0:0".to_string(),
         ..EngineConfig::default()
@@ -6586,6 +6620,7 @@ async fn test_scenario_73_empty_peer_allowlist_accepts_heartbeat_from_any_distin
     let dir = TestDataDirGuard::new("heartbeat_empty_allowlist");
     let cluster_id = EngineConfig::default().cluster_id;
     let config = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 9,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
@@ -6605,6 +6640,7 @@ async fn test_scenario_73_empty_peer_allowlist_accepts_heartbeat_from_any_distin
         42,                // a leader node_id distinct from this node's own (9)
         1,                 // term
         "127.0.0.1:19999", // a leader address never configured anywhere
+        &bifrox::replication::transport::PeerTransport::insecure_for_tests(),
     )
     .await;
 
@@ -6632,6 +6668,7 @@ async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader(
     let cluster_id = EngineConfig::default().cluster_id;
     let whitelisted_peer = "127.0.0.1:55001".to_string();
     let config = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 9,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
@@ -6651,6 +6688,7 @@ async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader(
         42,
         1,
         "127.0.0.1:55002", // not the whitelisted peer
+        &bifrox::replication::transport::PeerTransport::insecure_for_tests(),
     )
     .await;
     assert!(
@@ -6665,6 +6703,7 @@ async fn test_scenario_74_nonempty_peer_allowlist_still_rejects_unlisted_leader(
         42,
         1,
         &whitelisted_peer,
+        &bifrox::replication::transport::PeerTransport::insecure_for_tests(),
     )
     .await;
     assert!(
@@ -6683,6 +6722,7 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
     let dir = TestDataDirGuard::new("heartbeat_crit03_empty_allowlist");
     let cluster_id = EngineConfig::default().cluster_id;
     let config = EngineConfig {
+        allow_insecure_replication: true,
         node_id: 9,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
@@ -6708,6 +6748,7 @@ async fn test_scenario_75_crit03_self_address_rejected_even_with_empty_allowlist
         42,
         1,
         &self_advertised_addr, // claims to *be* this node
+        &bifrox::replication::transport::PeerTransport::insecure_for_tests(),
     )
     .await;
 
@@ -7801,6 +7842,7 @@ async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_count
     // exactly the configuration under which the leader's self-append durability claim was
     // false before this fix.
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         node_id: 1,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
@@ -7842,6 +7884,7 @@ async fn test_scenario_84_leader_metadata_append_must_be_durable_before_it_count
 async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_records_from_there_on() {
     let dir = TestDataDirGuard::new("batch_mid_fetch");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -7898,6 +7941,7 @@ async fn test_scenario_86_fetch_from_an_offset_inside_a_batch_returns_only_recor
 async fn test_scenario_87_batch_on_disk_carries_producer_and_leader_epoch_metadata() {
     let dir = TestDataDirGuard::new("batch_metadata");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -7975,6 +8019,7 @@ async fn test_scenario_97_compression_type_producer_stores_what_arrived() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let cfg = EngineConfig {
+            allow_insecure_replication: true,
             node_id: 1,
             data_dir: dir_guard.path.clone(),
             bind_addr: addr.to_string(),
@@ -8385,6 +8430,7 @@ async fn test_scenario_100_every_log_entry_is_a_batch_including_control_markers(
 
     let dir = TestDataDirGuard::new("one_entry_format");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -8508,6 +8554,7 @@ async fn test_scenario_99_broker_authored_records_survive_a_non_default_codec() 
     ] {
         let dir = TestDataDirGuard::new(&format!("broker_authored_codec_{codec}"));
         let engine = StorageEngine::new(EngineConfig {
+            allow_insecure_replication: true,
             data_dir: dir.path.clone(),
             bind_addr: "127.0.0.1:0".to_string(),
             compression_codec: codec,
@@ -8608,6 +8655,7 @@ async fn test_scenario_93_fetch_serves_stored_bytes_without_decompressing() {
 
     let dir = TestDataDirGuard::new("fetch_serves_stored_bytes");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -8694,12 +8742,14 @@ async fn test_scenario_92_follower_log_is_byte_identical_to_the_leaders() {
     let follower_dir = TestDataDirGuard::new("replica_identical_follower");
 
     let leader = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: leader_dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
     })
     .unwrap();
     let follower = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: follower_dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -8793,6 +8843,7 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let cfg = EngineConfig {
+            allow_insecure_replication: true,
             node_id: 1,
             data_dir: dir_guard.path.clone(),
             bind_addr: addr.to_string(),
@@ -8868,6 +8919,7 @@ async fn test_scenario_91_stored_codec_is_the_producers_not_the_brokers() {
 async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() {
     let dir = TestDataDirGuard::new("produce_always_batches_raw");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -8931,6 +8983,7 @@ async fn test_scenario_88_client_produce_always_writes_record_batches_on_disk() 
 async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_watermarks() {
     let dir = TestDataDirGuard::new("batch_truncate_partition");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         ..EngineConfig::default()
@@ -9016,6 +9069,7 @@ async fn test_scenario_89_partition_truncate_after_mid_batch_leaves_consistent_w
 async fn test_scenario_90_compaction_keeps_records_inside_batches() {
     let dir = TestDataDirGuard::new("compact_keeps_batch_records");
     let engine = StorageEngine::new(EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         // Sized to force an automatic rotation at exactly the right point — see the
@@ -10214,6 +10268,7 @@ async fn test_scenario_116_delivery_count_survives_restart() {
     let group_id = "scenario-116-group";
     let dlq_topic = format!("{topic}-dlq");
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         share_group_lock_timeout_ms: 30_000,
@@ -10324,6 +10379,7 @@ async fn test_scenario_117_archived_record_not_redelivered_after_restart() {
     let group_id = "scenario-117-group";
     let dlq_topic = format!("{topic}-dlq");
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         share_group_lock_timeout_ms: 30_000,
@@ -10421,6 +10477,7 @@ async fn test_scenario_118_dead_lease_does_not_survive_restart() {
     let topic = "scenario_118_dead_lease_restart_topic";
     let group_id = "scenario-118-group";
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         share_group_lock_timeout_ms: 30_000,
@@ -10494,6 +10551,7 @@ async fn test_scenario_119_compaction_preserves_in_flight_state() {
     let group_id = format!("scenario-119-compaction-group-{}", "y".repeat(200));
     let dlq_topic = format!("{topic}-dlq");
     let cfg = EngineConfig {
+        allow_insecure_replication: true,
         data_dir: dir_guard.path.clone(),
         bind_addr: "127.0.0.1:0".to_string(),
         share_group_lock_timeout_ms: 30_000,
@@ -10656,6 +10714,7 @@ async fn test_scenario_120_every_sync_policy_recovers_identical_state() {
         let group_id = format!("scenario-120-group-{label}");
         let dlq_topic = format!("{topic}-dlq");
         let cfg = EngineConfig {
+            allow_insecure_replication: true,
             data_dir: dir_guard.path.clone(),
             bind_addr: "127.0.0.1:0".to_string(),
             share_group_lock_timeout_ms: 30_000,

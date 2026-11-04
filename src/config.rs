@@ -348,6 +348,10 @@ pub struct EngineConfig {
     pub ssl_ca_path: Option<PathBuf>,
     /// TLS/SSL Client Authentication mode (ssl.client.auth: none, requested, required)
     pub ssl_client_auth: String,
+    /// Explicit development-only opt-in; forbidden with client authentication/ACLs.
+    pub allow_insecure_replication: bool,
+    /// node id -> pinned client certificate PEM path for authenticated peer identity.
+    pub replication_peer_certificates: std::collections::HashMap<u32, PathBuf>,
     /// Enabled SASL mechanisms (e.g. PLAIN, SCRAM-SHA-256)
     pub sasl_mechanisms: Vec<String>,
     /// Legacy bootstrap SASL user accounts (username -> password). At startup Bifrox
@@ -562,6 +566,8 @@ impl Default for EngineConfig {
             ssl_cert_path: None,
             ssl_key_path: None,
             ssl_ca_path: None,
+            allow_insecure_replication: false,
+            replication_peer_certificates: Default::default(),
             ssl_client_auth: "none".to_string(),
             sasl_mechanisms: vec![
                 "PLAIN".to_string(),
@@ -643,6 +649,21 @@ impl EngineConfig {
                 let key = key.trim();
                 let value = value.trim();
 
+                if let Some(id) = key.strip_prefix("replication.peer.cert.") {
+                    let id = id
+                        .parse::<u32>()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    config
+                        .replication_peer_certificates
+                        .insert(id, PathBuf::from(value));
+                    continue;
+                }
+                if key == "replication.allow.insecure" {
+                    config.allow_insecure_replication = value
+                        .parse()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    continue;
+                }
                 if let Some(username) = key.strip_prefix("sasl.user.") {
                     config
                         .sasl_users
